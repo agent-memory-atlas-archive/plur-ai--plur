@@ -144,6 +144,39 @@ worth knowing about even if you never touch opencode.
   opts out of explicitly (`autoDiscover: false`) rather than something every
   adapter inherits by default without knowing it.
 
+### Team memory now reaches every harness, not just Claude Code
+
+**If you use PLUR Enterprise from Codex or Antigravity, your team memory was
+silently never arriving** (#1198, #1199). Cursor was affected too and is not yet
+fixed — see below.
+
+`.plur.yaml`'s `remote_url`/`remote_token` were read by exactly one integration.
+Every other adapter picked up the project `scope` and dropped the remote
+settings, so recall served local memory only — with no error and nothing to
+explain the absence. Following the documented `plur init-remote` setup gave you
+working team memory in Claude Code and silence everywhere else.
+
+**Codex and Antigravity now dial** — both Codex hooks and the Antigravity
+pre-invocation hook carry the project's remote settings and reach the server.
+
+**Cursor still does not, and this release does not fix it** (#1200). Its only
+injecting hook is bounded at 10s with no async option, so it must stay on the
+fast keyword-only path; the remote leg currently rides inside the hybrid search
+that also loads the local embedder, which that hook cannot afford. The remote
+leg does not actually need the embedder — it sends the query text and the server
+embeds — so the fix is to separate the two, and it is tracked rather than
+rushed. Cursor also recalls only once per conversation, at session start, which
+is a limit of what its hook schema can return.
+
+One helper decides this for every adapter, so the trust gate above travels with
+the capability rather than being reimplemented per harness — an adapter cannot
+adopt a project's remote settings without the gate coming with it.
+
+**If you already have a `.plur.yaml` with remote settings**, run
+`plur trust <project-dir>` once: it predates the automatic grant that
+`plur init-remote` now makes. Until you do, those harnesses serve local memory
+and say why.
+
 ### Security: a cloned repo could send your prompts to a host it named
 
 **A repository you cloned could exfiltrate your prompt text**, on every prompt,
