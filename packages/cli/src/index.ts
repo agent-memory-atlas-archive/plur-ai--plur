@@ -52,6 +52,8 @@ Commands:
   migrate [up|down|status] Run schema migrations
   stores list             List configured stores
   stores add <path>       Add a knowledge store
+  trust [dir]             Trust a directory's .plur.yaml scope/domain (default: cwd) [--list]
+  untrust [dir]           Revoke a directory's trust grant (default: cwd)
   scopes                  List authorized-but-unregistered shared scopes (#647)
   scopes register <scope> Register one; scopes dismiss <scope>; scopes --reoffer
   outbox                  Show team-scoped writes queued for an unreachable store
@@ -61,7 +63,7 @@ Commands:
   init                    Wire PLUR into detected harnesses (Claude Code, Cursor, Codex, Antigravity)
   init-remote             Opt this project into recall from a PLUR Enterprise server
   login --status          Enterprise token validity per host (probe + expiry) (#587)
-  doctor                  Diagnose Claude Code / Claude Desktop / Cursor / Codex / Antigravity integration
+  doctor                  Diagnose Claude Code / Claude Desktop / Cursor / Codex / Antigravity / opencode integration
   rerank-eval             Per-store reranker self-eval gate (advisory, #451)
                           [--reranker <name>] [--sample N] [--seed N] [--force]
   tensions [--scan]       List or scan for engram contradictions
@@ -137,6 +139,8 @@ const COMMANDS: Record<string, string> = {
   rescope: './commands/rescope.js',
   'similarity-search': './commands/similarity-search.js',
   stores: './commands/stores.js',
+  trust: './commands/trust.js',
+  untrust: './commands/untrust.js',
   scopes: './commands/scopes.js',
   outbox: './commands/outbox.js',
   'reindex-tokens': './commands/reindex-tokens.js',

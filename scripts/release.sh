@@ -1,6 +1,6 @@
 #!/bin/bash
 # PLUR Release Script
-# Usage: ./scripts/release.sh <version> [--claw <claw-version>] [--dsh <dsh-version>] [--dry-run] [--skip-tweet] [--preview-tweet]
+# Usage: ./scripts/release.sh <version> [--claw <claw-version>] [--dsh <dsh-version>] [--opencode <opencode-version>] [--dry-run] [--skip-tweet] [--preview-tweet]
 #
 # Modes:
 #   default          Full release (bump, build, test, commit, tag, push,
@@ -17,6 +17,11 @@
 #                    version track: it is pinned to a pre-1.0 DeepSeek Harness
 #                    dependency line and moves on that ecosystem's cadence, not
 #                    core's. Specify explicitly when dsh should ride along.
+#   --opencode <ver> Also bump @plur-ai/opencode at <ver>. Like claw and dsh, it
+#                    has its own version track (currently 0.1.0, independent of
+#                    core/mcp/cli's 0.19.4) — bumping it in lockstep would churn
+#                    its npm version for releases that do not touch it. Specify
+#                    explicitly when opencode should ride along.
 #   --dry-run        Bump + build + test + tweet preview, then stop before commit.
 #                    Files ARE mutated (versions bumped) — revert with git.
 #   --preview-tweet  Print the tweet that would be posted for <version>, exit.
@@ -95,6 +100,7 @@ PREVIEW_TWEET=false
 NO_WEBSITE=false
 CLAW_VERSION=""
 DSH_VERSION=""
+OPENCODE_VERSION=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -106,13 +112,34 @@ while [ $# -gt 0 ]; do
     --claw)
       shift
       CLAW_VERSION="${1:-}"
-      [ -n "$CLAW_VERSION" ] && shift
+      # Bug class (0.20.0 audit, B1): consuming the next argv slot
+      # unconditionally means `--claw --dry-run` silently swallows --dry-run
+      # as the "version" and DRY_RUN stays false — a real release runs when
+      # the operator asked for a dry run. Reject an empty value or one that
+      # looks like another flag, at parse time, before it can propagate.
+      if [ -z "$CLAW_VERSION" ] || [[ "$CLAW_VERSION" == --* ]]; then
+        echo "FAIL: --claw requires a version argument (e.g. --claw 0.5.0), got '${CLAW_VERSION:-<nothing>}'" >&2
+        exit 1
+      fi
+      shift
       ;;
     --dsh)
       shift
       DSH_VERSION="${1:-}"
-      [ -n "$DSH_VERSION" ] && shift
-  
+      if [ -z "$DSH_VERSION" ] || [[ "$DSH_VERSION" == --* ]]; then
+        echo "FAIL: --dsh requires a version argument (e.g. --dsh 0.1.0-rc.7), got '${DSH_VERSION:-<nothing>}'" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    --opencode)
+      shift
+      OPENCODE_VERSION="${1:-}"
+      if [ -z "$OPENCODE_VERSION" ] || [[ "$OPENCODE_VERSION" == --* ]]; then
+        echo "FAIL: --opencode requires a version argument (e.g. --opencode 0.2.0), got '${OPENCODE_VERSION:-<nothing>}'" >&2
+        exit 1
+      fi
+      shift
       ;;
     --*)
       echo "Unknown flag: $1" >&2
@@ -137,10 +164,27 @@ fi
 # sed-written into version constants and interpolated into a `/bin/sh -lc`
 # config command. The parity tests check equality, not shape — a malformed
 # value would pass them and land verbatim in user configs.
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]]; then
-  echo "FAIL: '$VERSION' is not a release-shaped version (expected e.g. 0.19.1)"
-  exit 1
-fi
+#
+# Applied to VERSION and to every independent track version (--claw, --dsh,
+# --opencode) that was actually provided: the 0.20.0 audit (B1) found the
+# parse loop for those three flags would swallow a following flag (e.g.
+# `--opencode --dry-run`) as the version string. The parse-time guard above
+# now rejects an empty or flag-shaped value outright, but a value that is
+# non-empty and doesn't start with `--` (garbage like "latest" or a
+# not-quite-semver typo) would still slip through without this shape check —
+# it is what gets sed-written into version.ts/package.json and interpolated
+# downstream, same as VERSION.
+validate_version_shape() {
+  local label="$1" ver="$2"
+  if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]]; then
+    echo "FAIL: '$ver' is not a release-shaped version for $label (expected e.g. 0.19.1)"
+    exit 1
+  fi
+}
+validate_version_shape "VERSION" "$VERSION"
+[ -n "$CLAW_VERSION" ] && validate_version_shape "--claw" "$CLAW_VERSION"
+[ -n "$DSH_VERSION" ] && validate_version_shape "--dsh" "$DSH_VERSION"
+[ -n "$OPENCODE_VERSION" ] && validate_version_shape "--opencode" "$OPENCODE_VERSION"
 
 # Load env
 ENV_FILE="$HOME/Data/.datacore/env/.env"
@@ -362,6 +406,29 @@ if [ -n "$DSH_VERSION" ]; then
 else
   CURRENT_DSH=$(node -e "console.log(require('./packages/dsh/package.json').version)")
   echo "  (dsh stays at $CURRENT_DSH — pass --dsh <version> to bump and publish)"
+fi
+
+# opencode is on an independent version track — only bump if --opencode was
+# provided. Like dsh, bumping it in lockstep with core would churn its npm
+# version for releases that do not touch it.
+if [ -n "$OPENCODE_VERSION" ]; then
+  echo "  --- opencode bumps (independent track: $OPENCODE_VERSION) ---"
+  node -e "
+    const fs = require('fs');
+    const path = './packages/opencode/package.json';
+    const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+    pkg.version = '$OPENCODE_VERSION';
+    fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+  "
+  echo "  ✓ packages/opencode/package.json"
+
+  # index.ts imports OPENCODE_PLUGIN_VERSION from here;
+  # opencode/test/version-parity.test.ts guards the pair.
+  sed -i '' "s/export const OPENCODE_PLUGIN_VERSION = '.*'/export const OPENCODE_PLUGIN_VERSION = '$OPENCODE_VERSION'/" packages/opencode/src/version.ts
+  echo "  ✓ packages/opencode/src/version.ts"
+else
+  CURRENT_OPENCODE=$(node -e "console.log(require('./packages/opencode/package.json').version)")
+  echo "  (opencode stays at $CURRENT_OPENCODE — pass --opencode <version> to bump and publish)"
 fi
 
 # MCP Registry / ClawHub listing — both the top-level version and the package
@@ -735,6 +802,9 @@ fi
 if [ -n "$DSH_VERSION" ]; then
   preflight_check dsh "$DSH_VERSION" || PREFLIGHT_OK=false
 fi
+if [ -n "$OPENCODE_VERSION" ]; then
+  preflight_check opencode "$OPENCODE_VERSION" || PREFLIGHT_OK=false
+fi
 if [ "$PREFLIGHT_OK" != true ]; then
   echo ""
   echo "✗ Pre-flight failed — nothing committed, tagged, or published."
@@ -862,6 +932,12 @@ if [ -n "$DSH_VERSION" ]; then
   pnpm --filter "@plur-ai/dsh" publish --access public --no-git-checks --tag next 2>&1 | tail -1
 else
   echo "  @plur-ai/dsh: skipped (no --dsh flag)"
+fi
+if [ -n "$OPENCODE_VERSION" ]; then
+  echo -n "  @plur-ai/opencode@$OPENCODE_VERSION → @next..."
+  pnpm --filter "@plur-ai/opencode" publish --access public --no-git-checks --tag next 2>&1 | tail -1
+else
+  echo "  @plur-ai/opencode: skipped (no --opencode flag)"
 fi
 echo ""
 
@@ -1056,6 +1132,10 @@ fi
 if [ -n "$CLAW_VERSION" ]; then
   echo -n "  @plur-ai/claw@$CLAW_VERSION → @latest..."
   npm dist-tag add "@plur-ai/claw@$CLAW_VERSION" latest 2>&1 | tail -1
+fi
+if [ -n "$OPENCODE_VERSION" ]; then
+  echo -n "  @plur-ai/opencode@$OPENCODE_VERSION → @latest..."
+  npm dist-tag add "@plur-ai/opencode@$OPENCODE_VERSION" latest 2>&1 | tail -1
 fi
 echo ""
 

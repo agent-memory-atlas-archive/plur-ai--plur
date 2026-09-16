@@ -42,6 +42,108 @@ rather than clobbering in silence.
 
 `plur-memory` and `plur-session-end` ride the same path and are installed too.
 
+### A new PLUR integration: `@plur-ai/opencode`
+
+**opencode agents now get persistent memory too, with no tool call required.**
+A new package, `@plur-ai/opencode`, adds automatic recall, automatic learning,
+and learn-before-compaction to the [opencode](https://opencode.ai) agent
+harness (#1195). It ships on its own version track (`--opencode <ver>`), starting at
+0.1.0, independent of this release's version — the same arrangement as
+`@plur-ai/claw` and `@plur-ai/dsh`.
+
+Structurally this is the same integration shape as `@plur-ai/claw` — an
+in-process TypeScript plugin driven by lifecycle hooks rather than a subprocess
+bridge or JSON hook shim — and the second example toward extracting a shared
+`HarnessAdapter` interface (#1034).
+
+- Recall runs once per user turn (`chat.message`) and caches a rendered memory
+  block; the system prompt is rebuilt from that cache once per model request
+  (`experimental.chat.system.transform`) without recalling again.
+- That split exists because injecting at `chat.message` persists into session
+  history and **accretes**: measured against a real opencode 1.18.30 binary,
+  one stale memory block landed in the transcript per turn, forever — 1, 2, 3
+  across three turns. That half is soundly measured. The system-prompt half is
+  not shown by the matching 0, 0, 0 message-history count — that run had
+  `chat.message` injection off, so nothing was ever available to land in
+  message history regardless of what the system prompt did. What actually
+  shows `system.transform` doesn't accrete: the `system[]` array's length
+  measured `1->2` on every model call of a tool-calling turn, never `2->3` — a
+  rebuilt array each request, not a growing one. A live acceptance gate
+  (`packages/opencode/test/e2e.manual.mjs` — not part of `pnpm test`, needs a
+  real binary and network) drives an actual opencode session and asserts the
+  accretion count stays at 0.
+- Two learning paths, mirroring claw: the model's own `🧠 I learned:`
+  self-report, and user corrections/preferences detected at confidence ≥ 0.7.
+- `plur init --opencode` writes both layers opencode needs: the `plugin` entry
+  (automatic, this package) and an `mcp.plur` entry (`@plur-ai/mcp`, explicit
+  tools) — the same three-layer strategy PLUR already commits to elsewhere.
+- **Not yet published to npm.** opencode resolves a bare plugin name by
+  fetching it from the npm registry at load time; until `@plur-ai/opencode` is
+  published, that entry silently resolves to nothing, with no error anywhere
+  in opencode's log. `plur init --opencode` writes a config that looks correct
+  and does nothing until the package is on npm. See `packages/opencode/README.md`.
+
+### Security follow-up on the opencode integration (2026-09)
+
+A follow-on adversarial audit of `@plur-ai/opencode` (above) found five more
+defects. Two reach shipped packages beyond opencode itself and are the ones
+worth knowing about even if you never touch opencode.
+
+- **A negation-inversion bug in the shared extractor is fixed, and it reaches
+  `@plur-ai/claw` too.** `learner.ts`'s `CORRECTION_PATTERNS` and
+  `PREFERENCE_PATTERNS` used to capture only the TAIL of a match — the text
+  after a directive word, or the half of an "X, not Y" contrast before
+  "not" — so "never commit the API key" was extracted as the standing
+  instruction "commit the API key," and "Deploying straight to production is
+  not allowed" as "Deploying straight to production is." Closing it took
+  three passes because each fix was narrower than the bug: `always` / `never`
+  / `you should` / `you must` / `don't` / `do not` now capture the WHOLE
+  match instead of the tail, and the "X, not Y" pattern — which ran FIRST, at
+  higher confidence, and so pre-empted the other fixes — is narrowed to
+  require a literal comma before "not" (matching "use pnpm, not npm" but not
+  a bare "is not allowed") and now also captures the whole match rather than
+  the half before "not." Pattern-group order changed too: the narrower,
+  keyword-anchored patterns run before the broad comma-based one, so a future
+  addition to either group inherits "narrow before broad" instead of relying
+  on someone remembering it. `@plur-ai/claw` shares this exact code
+  (`packages/claw/src/learner.ts` re-exports it) and both its real-time
+  `ingest()` gate and its ungated `compact()` extraction path are affected.
+- **A read-only scan for engrams the bug already wrote.** `plur audit
+  --source engrams` (new) scans a store's own statements for the two
+  truncation shapes above. Heuristic, and honestly documented as such — it
+  never rewrites anything; a human reviews each suspect and decides whether
+  to fix, retire, or dismiss it.
+- **`plur trust` / `plur untrust`** are new commands: a one-time,
+  per-directory grant — the same shape as `direnv allow` — that an adapter
+  checks before adopting a `.plur.yaml`'s `scope` / `domain` / `remote_url`.
+  `plur trust` now prints what it authorizes (the scope/domain/remote_url a
+  `.plur.yaml` at that path declares) instead of only the path, the same way
+  `direnv allow` shows you the `.envrc` at the one moment a human is actually
+  in the loop. `plur untrust <subdir-of-a-trusted-repo>` used to report "was
+  not trusted" when an ancestor's grant still covered it — false of the
+  actual question a revocation command on a security primitive is answering
+  — and now names the covering ancestor and the command that actually
+  revokes it.
+- **`plur_session_end`'s auto-harvested `engram_suggestions` are now scanned
+  for prompt injection** — a shipped-package behaviour change.
+  `detectPromptInjection` (previously reachable only from pack installs) now
+  also runs on every write tagged `claim_class: 'inferred'`, which includes
+  both `@plur-ai/mcp`'s own session-end suggestions and
+  `@plur-ai/opencode`'s auto-harvested statements — closing the gap where an
+  adapter learning from text an agent merely READ (a webpage, a quoted file,
+  tool output) could write attacker-authored instructions into the store
+  unchecked. This can refuse a legitimate write: the patterns are broad
+  enough that "After the migration you are now on schema v7" trips
+  `role_override`, and "The app has a developer mode toggle" trips
+  `jailbreak_mode`. A refusal is per-item, not per-call —
+  `plur_session_end` reports each failed suggestion in `engrams_failed[]`
+  (index, truncated statement, error) and still stores the rest of the
+  batch — and `Plur`'s default `autoDiscover` behaviour (which used to walk
+  `cwd` for a `.plur/engrams.yaml` and silently register it as a store in
+  the user's GLOBAL `~/.plur/config.yaml`) is now something `@plur-ai/opencode`
+  opts out of explicitly (`autoDiscover: false`) rather than something every
+  adapter inherits by default without knowing it.
+
 ### Nothing is silently dropped
 
 An injection payload is read head-first. Until now it led with `DIRECTIVES` —
