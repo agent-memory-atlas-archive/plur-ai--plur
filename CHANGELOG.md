@@ -144,7 +144,7 @@ worth knowing about even if you never touch opencode.
   opts out of explicitly (`autoDiscover: false`) rather than something every
   adapter inherits by default without knowing it.
 
-### Team memory now reaches every harness, not just Claude Code
+### Team memory now reaches Codex and Antigravity (Cursor still pending)
 
 **If you use PLUR Enterprise from Codex or Antigravity, your team memory was
 silently never arriving** (#1198, #1199). Cursor was affected too and is not yet
@@ -273,6 +273,10 @@ it (#1138).
   not a note. Capsule fixtures are checked by size and SHA-256, catching a binary
   edit that review could not see. The fixtures are committed and the gate can no
   longer be skipped (#1022).
+- **The vectors are pinned to LF** (#1160). Their integrity value is a SHA-256
+  over raw bytes, so a checkout that converted line endings — the default on
+  Windows — produced a hash mismatch against fixtures that were in fact
+  untouched. A `.gitattributes` entry fixes the bytes wherever they are cloned.
 - **The pack lifecycle is specified** (#1044) — how an engram changes, and what
   provenance means on import.
 
