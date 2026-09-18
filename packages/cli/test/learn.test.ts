@@ -57,13 +57,13 @@ describe('plur learn', () => {
 
   // --- PR-1 (#353): scope routing via learnRouted, no hardcoded global ---
 
-  function writeCoversConfig(covers: string[]): void {
+  function writeCoversConfig(covers: string[], scope = 'user:plur-core'): void {
     const coversYaml = covers.map(c => `      - "${c}"`).join('\n')
     writeFileSync(join(dir, 'config.yaml'),
       `index: false\n` +
       `stores:\n` +
       `  - path: ${join(dir, 'core.yaml')}\n` +
-      `    scope: "group:plur/core"\n` +
+      `    scope: "${scope}"\n` +
       `    description: "Core"\n` +
       `    covers:\n${coversYaml}\n`,
     )
@@ -74,7 +74,7 @@ describe('plur learn', () => {
     // several cover-keyword hits in the statement (each 0.2): raw ≈ 1.8 → conf > 0.5.
     writeCoversConfig(['plur.*', 'embeddings', 'index', 'engine', 'core'])
     const output = JSON.parse(run('learn "the embeddings index for the core engine" --domain plur.core.embeddings'))
-    expect(output.scope).toBe('group:plur/core')
+    expect(output.scope).toBe('user:plur-core')
   })
 
   it('CLI no-covers: an un-scoped learn flows through unscoped routing and lands global', () => {
@@ -83,6 +83,15 @@ describe('plur learn', () => {
     // was OMITTED (a hardcoded scope:'global' would have skipped routing, but the
     // landing scope is the same; the covers-present test above proves routing ran).
     const output = JSON.parse(run('learn "an unrelated note about lunch preferences"'))
+    expect(output.scope).toBe('global')
+  })
+
+  it('CLI covers-present on a SHARED scope: an un-scoped learn refuses it and lands global (#1115)', () => {
+    // The same signals as the routing test above, but the covers-declaring store
+    // is a team scope. An unscoped write must not reach it — that refusal is what
+    // keeps a personal engram out of a shared store and off its remote.
+    writeCoversConfig(['plur.*', 'embeddings', 'index', 'engine', 'core'], 'group:plur/core')
+    const output = JSON.parse(run('learn "the embeddings index for the core engine" --domain plur.core.embeddings'))
     expect(output.scope).toBe('global')
   })
 
@@ -127,7 +136,7 @@ describe('plur learn', () => {
     const output = JSON.parse(run('learn "an unrelated note about gardening"'))
     expect(output.scope).toBe('global')
     expect(output.domain_hint).toBeDefined()
-    expect(output.domain_hint).toContain('group:plur/core')
+    expect(output.domain_hint).toContain('user:plur-core')
     expect(output.domain_hint).toContain('--domain')
   })
 

@@ -1274,6 +1274,9 @@ function getAllToolDefinitions(): ToolDefinition[] {
           const isOutbox = !!(engram as any).structured_data?._outbox
           const demoted = (engram as any).structured_data?._demoted as { from: string; to: string; patterns: string } | undefined
           const routed = (engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
+          // #1115: the mirror of `_routed` — a shared scope matched this write's
+          // content but was deliberately not adopted.
+          const routeRefused = (engram as any).structured_data?._routeRefused as { scope: string; confidence: number; reason: string } | undefined
           mcpCanary.signal('learn_activity')
           // Opt-in, content-free engagement counter (default-off; no statement text).
           recordTelemetry('learn')
@@ -1335,6 +1338,12 @@ function getAllToolDefinitions(): ToolDefinition[] {
             ...(isOutbox ? { outbox: true, warning: 'Remote write failed; engram queued locally for retry on next session start or plur_sync.' } : {}),
             ...(demoted ? { demoted: true, requested_scope: demoted.from, warning: `Sensitive content (${demoted.patterns}) detected — stored at "${demoted.to}"/private instead of the requested shared scope "${demoted.from}". If this is a false positive, re-scope deliberately.` } : {}),
             ...(routed ? { routed: { scope: routed.scope, confidence: routed.confidence, reason: routed.reason }, info: `No scope was provided; auto-routed to "${routed.scope}" (confidence ${routed.confidence}) because its content matched that scope's covers. Pass an explicit scope to override.` } : {}),
+            // #1115: a shared scope matched but was NOT adopted. Said plainly,
+            // as a `warning`, because the old `info` string for the opposite
+            // outcome proved easy to miss in a long session — and this one
+            // changes what the caller should do next, rather than merely
+            // reporting where the write went.
+            ...(routeRefused ? { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason }, warning: `No scope was provided. This content matched the shared scope "${routeRefused.scope}" (confidence ${routeRefused.confidence}), but unscoped writes are never auto-routed into a shared store — it was stored at "${engram.scope}" instead. If it belongs to the team, pass scope: "${routeRefused.scope}" explicitly, or move it with plur_rescope.` } : {}),
           }
         } catch (err) {
 // learnRouted now saves to outbox on remote failure, so this
@@ -3721,12 +3730,30 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
         const minConfidence = explicit
           ?? plur.getScopeRoutingConfig().min_confidence
           ?? SUGGEST_DISPLAY_MIN_CONFIDENCE
-        const candidates = await plur.suggestScope({
+        const signals = {
           statement: args.statement as string,
           domain: args.domain as string | undefined,
           tags: args.tags as string[] | undefined,
-        }, { minConfidence })
-        return { candidates, count: candidates.length, min_confidence: minConfidence }
+        }
+        const candidates = await plur.suggestScope(signals, { minConfidence })
+        // #1115: report what an unscoped write would ACTUALLY do, from the same
+        // decision function the write path uses. Ranking and routing used to be
+        // separate answers — the ranker weighs domain, tags and keywords, while
+        // the write path routed a forward domain-prefix match deterministically
+        // and ignored the rest — so an agent could read this list, write without
+        // a scope, and land somewhere the list did not say.
+        const decision = plur.previewAutoRoute(signals)
+        const would_route =
+          decision.action === 'route' && decision.scope
+            ? { scope: decision.scope, note: 'An unscoped write of these signals would be auto-routed here.' }
+            : decision.action === 'refuse-shared' && decision.refusedShared
+              ? {
+                  scope: null,
+                  refused_shared: decision.refusedShared.scope,
+                  note: `"${decision.refusedShared.scope}" is the best match but is a SHARED scope, and unscoped writes are never auto-routed into one. An unscoped write would land at the local default instead. Pass that scope explicitly if the engram belongs to the team.`,
+                }
+              : { scope: null, note: 'An unscoped write of these signals would land at the local default — nothing matched confidently enough to route.' }
+        return { candidates, count: candidates.length, min_confidence: minConfidence, would_route }
       },
     },
 

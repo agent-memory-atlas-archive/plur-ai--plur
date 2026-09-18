@@ -40,7 +40,7 @@ import { atomicWrite, CONFIG_FILE_MODE, sync as gitSync, getSyncStatus, withLock
 import { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory, SCAN_TRUNCATED } from './secrets.js'
 import type { SecretMatch } from './secrets.js'
 import { SENSITIVITY_CATEGORIES, type ScopeMetadata, type SensitivityCategory } from './schemas/scope-metadata.js'
-import { rankScopes, SCOPE_MATCH_THRESHOLD, type ScopeSignals, type ScopeCandidate } from './scope-routing.js'
+import { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, type ScopeSignals, type ScopeCandidate, type AutoRouteDecision } from './scope-routing.js'
 import { mintedIdsWithPrefix, appendHistory, readHistoryForEngram, type HistoryEvent as HistoryEventType, generateEventId, generateInjectionId, computeQueryHash, findLatestInjectionFor, countInjectionEvents, isRecentDuplicateInjection, type InjectionEventCounts } from './history.js'
 import { computeContentHash, isHashable } from './content-hash.js'
 import { isLocalOnlyScope, assertScopeNamesATarget } from './scope-target.js'
@@ -170,7 +170,7 @@ export { runMigrations, rollbackMigrations, getSchemaVersion, setSchemaVersion, 
 export { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory } from './secrets.js'
 export { scanForInversions, type InversionSuspect } from './inversion-scan.js'
 export { ScopeMetadataSchema, ScopeSensitivitySchema, SENSITIVITY_CATEGORIES, type ScopeMetadata, type ScopeSensitivity, type SensitivityCategory } from './schemas/scope-metadata.js'
-export { rankScopes, SCOPE_MATCH_THRESHOLD, WEIGHT_TAG, SUGGEST_DISPLAY_MIN_CONFIDENCE, type ScopeSignals, type ScopeCandidate, type RankScopesOptions } from './scope-routing.js'
+export { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, WEIGHT_TAG, SUGGEST_DISPLAY_MIN_CONFIDENCE, type ScopeSignals, type ScopeCandidate, type RankScopesOptions, type AutoRouteDecision, type DecideAutoRouteOptions } from './scope-routing.js'
 
 // Scope-family predicates live in the leaf module `scope-util.ts` to break a
 // module cycle: `inject.ts` (imported by index.ts) needs `isPersonalScope`, and
@@ -2463,6 +2463,46 @@ export class Plur {
   // actually breaking, and leaving it async would have been a breaking
   // signature change that bought nothing. Shrinking the migration surface is
   // worth more than uniformity.
+  /**
+   * Registered scopes eligible as an AUTO-ROUTE target: those declaring
+   * metadata, minus readonly stores (MED-12). Shared by the write path and
+   * {@link previewAutoRoute} so the two cannot rank different candidate sets —
+   * the same drift #1115 is about, one level up from the decision itself.
+   */
+  private _writableScopeMetadata(): ScopeMetadata[] {
+    return this.listScopeMetadata().filter(md => {
+      const entry = (this.config.stores ?? []).find(s => s.scope === md.scope)
+      return entry?.readonly !== true
+    })
+  }
+
+  /**
+   * What a genuinely-unscoped write of these signals WOULD do (#1115).
+   *
+   * `suggestScope` ranks; this decides. They answered differently before: the
+   * ranker weighs domain, tags and statement keywords, while the write path
+   * routed a forward domain-prefix match deterministically and ignored the rest.
+   * A user could consult the suggestion tool and then write without a scope and
+   * land somewhere else. Both now go through `decideAutoRoute`, so a suggestion
+   * surface can report the real outcome instead of an approximation of it.
+   */
+  previewAutoRoute(input: ScopeSignals): AutoRouteDecision {
+    this.reloadConfigIfChanged()
+    if (this.config.auto_route_scope === false) {
+      return { action: 'no-match', scope: null, candidate: null, refusedShared: null }
+    }
+    const cfg = this.config.scope_routing ?? {}
+    const candidates = rankScopes(
+      input,
+      this._writableScopeMetadata(),
+      cfg.weight_tag !== undefined ? { weightTag: cfg.weight_tag } : undefined,
+    )
+    return decideAutoRoute(candidates, {
+      matchThreshold: cfg.match_threshold ?? SCOPE_MATCH_THRESHOLD,
+      allowSharedScope: cfg.allow_shared_auto_route === true,
+    })
+  }
+
   suggestScope(input: ScopeSignals, options?: { minConfidence?: number }): ScopeCandidate[] {
     this.reloadConfigIfChanged()  // pick up out-of-process config edits (#307)
     const minConfidence =
@@ -2664,7 +2704,7 @@ export class Plur {
   private async _resolveUnscopedScope(
     statement: string,
     context?: LearnContext,
-  ): Promise<{ scope: string; routed: { scope: string; confidence: number; reason: string } | null }> {
+  ): Promise<{ scope: string; routed: { scope: string; confidence: number; reason: string } | null; refusedShared: { scope: string; confidence: number; reason: string } | null }> {
     // Pick up out-of-process config edits (#307) — mirrors suggestScope. Without
     // this the WRITE path routed against a stale stores/covers snapshot: a scope
     // registered (or covers synced) by another process after startup was
@@ -2675,7 +2715,7 @@ export class Plur {
     // so the two cannot drift; reverted local→global in 0.10.0 (#353).
     const fallback = this.config.unscoped_default ?? 'global'
     if (this.config.auto_route_scope === false) {
-      return { scope: fallback, routed: null }
+      return { scope: fallback, routed: null, refusedShared: null }
     }
     // MED-12 (#353, COSMETIC/REPORTING per D3): exclude readonly / non-writable
     // scopes from the AUTO-ROUTE candidate set so a clean unscoped write is never
@@ -2687,10 +2727,7 @@ export class Plur {
     // path- and url-based stores, so this view covers both. `listScopeMetadata()`
     // and `suggestScope()` are left UNCHANGED — advisory discovery still surfaces
     // readonly scopes.
-    const writableScopeMetadata = (await this.listScopeMetadata()).filter(md => {
-      const entry = (this.config.stores ?? []).find(s => s.scope === md.scope)
-      return entry?.readonly !== true
-    })
+    const writableScopeMetadata = this._writableScopeMetadata()
     // Scope-routing tuning (#362): enterprise installs with many narrow,
     // covers-rich scopes can raise `match_threshold` to cut false-positive
     // routing, or adjust `weight_tag` to re-weight tag-only signals. Both default
@@ -2705,40 +2742,30 @@ export class Plur {
       writableScopeMetadata,
       weightTagOverride !== undefined ? { weightTag: weightTagOverride } : undefined,
     )
-    const top = candidates[0]
-    // PR-6 (#353) + reaudit finding 4: a FORWARD domain-prefix match — the scope's
-    // declared coverage CONTAINS the engram's topic (`cover ⊃ domain` or equal) —
-    // is the strongest, most deliberate routing signal. Route to it
-    // DETERMINISTICALLY — bypass the squash/threshold gate entirely — so a clean
-    // domain match routes with headroom instead of landing at exactly
-    // SCOPE_MATCH_THRESHOLD (0.5) and clearing only via the edge-of-threshold `>=`.
+    // #1115: ONE decision function, shared with `previewAutoRoute` (and through
+    // it the `plur_suggest_scope` surface), so the write path and the suggestion
+    // tool can no longer disagree about where an unscoped write lands.
     //
-    // Key the bypass on `coverContainsDomain`, NOT `domainMatch`: `domainMatch` is
-    // also true for the REVERSE direction (engram domain BROADER than the cover,
-    // `domain ⊃ cover`), and bypassing on that would over-route a broad/generic
-    // engram (domain `plur`) into a NARROW shared scope (cover `plur.core`) it
-    // doesn't belong in. The reverse match adds only the down-weighted
-    // WEIGHT_DOMAIN_REVERSE (0.5 raw, NOT the full WEIGHT_DOMAIN of 1.5), so a lone
-    // reverse hit squashes to 0.25 — BELOW SCOPE_MATCH_THRESHOLD (0.5) — and so
-    // does NOT route via the `>=` threshold path either (and never gets the
-    // deterministic bypass). rankScopes prefers a domain-match candidate at the top
-    // on equal confidence, so `top` is the right scope to route to. Weights/
-    // threshold/squash UNCHANGED.
-    if (top && top.coverContainsDomain) {
-      return { scope: top.scope, routed: { scope: top.scope, confidence: top.confidence, reason: top.reason } }
+    // Eligibility is unchanged — a FORWARD domain match routes deterministically,
+    // everything weaker stays gated by `matchThreshold`. What changed is that a
+    // SHARED candidate is refused unless this install opted in: an unscoped write
+    // whose domain prefix happened to match a team scope's covers used to land in
+    // that team store and be pushed to its remote, where local cleanup could not
+    // undo it. A refused shared candidate does not end the search — the next
+    // eligible PERSONAL candidate still wins, so personal-scope routing is intact.
+    const decision = decideAutoRoute(candidates, {
+      matchThreshold,
+      allowSharedScope: scopeRoutingCfg.allow_shared_auto_route === true,
+    })
+    const marker = (c: ScopeCandidate) => ({ scope: c.scope, confidence: c.confidence, reason: c.reason })
+    const refusedShared = decision.refusedShared ? marker(decision.refusedShared) : null
+    if (decision.action === 'route' && decision.scope && decision.candidate) {
+      return { scope: decision.scope, routed: marker(decision.candidate), refusedShared }
     }
-    // No forward domain match: a reverse domain hit, tag-only, or keyword-only
-    // candidate stays gated by the threshold. A LONE reverse-direction match
-    // squashes to 0.25 (WEIGHT_DOMAIN_REVERSE = 0.5 raw) and so does NOT clear the
-    // `>=` gate at the default threshold (0.5); it falls to the unscoped default
-    // unless additional tag/keyword evidence lifts the squashed score to
-    // >= the threshold. The threshold is configurable (#362): a higher
-    // `match_threshold` makes routing more conservative, a lower one more
-    // permissive. The deterministic forward-domain bypass above is unaffected.
-    if (top && top.confidence >= matchThreshold) {
-      return { scope: top.scope, routed: { scope: top.scope, confidence: top.confidence, reason: top.reason } }
-    }
-    return { scope: fallback, routed: null }
+    // Both 'refuse-shared' and 'no-match' fall to the unscoped default. The
+    // refusal travels separately so the caller can say what it declined to do,
+    // rather than reporting a plain unrouted write.
+    return { scope: fallback, routed: null, refusedShared }
   }
 
   /**
@@ -2755,7 +2782,7 @@ export class Plur {
   private async _guardSensitiveScope(
     statement: string,
     context?: LearnContext,
-  ): Promise<{ scope: string; context: LearnContext | undefined; demotion: { from: string; to: string; patterns: string } | null; routed: { scope: string; confidence: number; reason: string } | null }> {
+  ): Promise<{ scope: string; context: LearnContext | undefined; demotion: { from: string; to: string; patterns: string } | null; routed: { scope: string; confidence: number; reason: string } | null; refusedShared: { scope: string; confidence: number; reason: string } | null }> {
     // "Truly unscoped" = caller passed no scope AND no session/`.plur.yaml`
     // default is in effect (both land in the session scope registry). Only this
     // path auto-routes / applies unscoped_default; everything else is honored
@@ -2767,11 +2794,13 @@ export class Plur {
     // `session-scopes.ts`.
     const sessionScope = this._sessionScopes.get(context?.session)
     let routed: { scope: string; confidence: number; reason: string } | null = null
+    let refusedShared: { scope: string; confidence: number; reason: string } | null = null
     let scope: string
     if (context?.scope == null && sessionScope == null) {
       const resolved = await this._resolveUnscopedScope(statement, context)
       scope = resolved.scope
       routed = resolved.routed
+      refusedShared = resolved.refusedShared
     } else {
       // Terminal fallback respects unscoped_default so a `unscoped_default:'local'`
       // user with no session scope and no context scope is not silently forced
@@ -2784,7 +2813,7 @@ export class Plur {
     // local-file stores) stay on this machine and are exempt — same gate as
     // _offendingHitsForScope, kept in sync because this short-circuits before it.
     if (!isSharedScope(scope) && !this._isRemoteBackedScope(scope)) {
-      return { scope, context, demotion: null, routed }
+      return { scope, context, demotion: null, routed, refusedShared }
     }
     // Scan the FULL content the engram will carry — the statement AND the
     // context fields (rationale, key_files, source, …), not just the statement.
@@ -2792,7 +2821,7 @@ export class Plur {
     const scanText = `${statement}\n${JSON.stringify(context ?? {})}`
     // Single source of truth for the offending-hit policy (#353).
     const offending = this._offendingHitsForScope(scanText, scope)
-    if (offending.length === 0) return { scope, context, demotion: null, routed }
+    if (offending.length === 0) return { scope, context, demotion: null, routed, refusedShared }
 
     const patterns = [...new Set(offending.map(h => h.pattern))].join(', ')
     logger.warning(
@@ -2807,6 +2836,7 @@ export class Plur {
       context: { ...context, scope: 'local', visibility: 'private' },
       demotion: { from: scope, to: 'local', patterns },
       routed,
+      refusedShared,
     }
   }
 
@@ -3052,6 +3082,14 @@ export class Plur {
         ;(engram as any).structured_data = {
           ...((engram as any).structured_data ?? {}),
           _routed: guarded.routed,
+        }
+      }
+      // #1115 mirror: a shared scope matched and was refused. Stamped the same
+      // way and only when present, so a caller can report what did NOT happen.
+      if (guarded.refusedShared) {
+        ;(engram as any).structured_data = {
+          ...((engram as any).structured_data ?? {}),
+          _routeRefused: guarded.refusedShared,
         }
       }
 
@@ -3337,6 +3375,14 @@ export class Plur {
           _routed: guarded.routed,
         }
       }
+      // #1115 mirror: a shared scope matched and was refused. Stamped the same
+      // way and only when present, so a caller can report what did NOT happen.
+      if (guarded.refusedShared) {
+        ;(engram as any).structured_data = {
+          ...((engram as any).structured_data ?? {}),
+          _routeRefused: guarded.refusedShared,
+        }
+      }
       return engram
     }
     // Remote route — dedup against the merged local+cached-remote view,
@@ -3368,6 +3414,12 @@ export class Plur {
       ;(localPlaceholder as any).structured_data = {
         ...((localPlaceholder as any).structured_data ?? {}),
         _routed: guarded.routed,
+      }
+    }
+    if (guarded.refusedShared) {
+      ;(localPlaceholder as any).structured_data = {
+        ...((localPlaceholder as any).structured_data ?? {}),
+        _routeRefused: guarded.refusedShared,
       }
     }
     let serverEngram: Engram

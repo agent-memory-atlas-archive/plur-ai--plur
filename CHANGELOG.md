@@ -2,6 +2,34 @@
 
 ## 0.20.1
 
+### An unscoped write can no longer land in a team store
+
+**If you wrote an engram without a scope, it could be auto-routed into a shared
+team store and pushed to that store's remote** (#1115). The only signal was an
+`info` field in the response, easy to miss across a long session — and once the
+copy was remote, local cleanup could not undo it.
+
+The decision was narrower than it looked. A write whose `domain` began with a
+segment that a shared scope declared in its `covers` was routed there
+deterministically, bypassing the confidence gate, whatever its tags or its
+statement said. `plur_suggest_scope` weighed all three channels, so it could
+name one scope while an unscoped write landed in another.
+
+**Auto-routing now refuses a shared scope.** Unscoped writes still route among
+personal scopes (`local`, `global`, `user:*`, `agent:*`), where a wrong guess
+costs nothing a `plur_rescope` cannot fix. A shared candidate is passed over —
+the next eligible personal one still wins — and the response names the scope it
+declined and how to choose it deliberately. Promotion into a team store is now
+something you ask for.
+
+Both surfaces share one decision function, so `plur_suggest_scope` reports what
+an unscoped write would actually do (`would_route`) rather than an
+approximation of it.
+
+Explicit scopes are untouched: `plur_learn` with `scope: "group:acme/eng"` still
+writes there. An install that genuinely wants covers-driven team routing can set
+`scope_routing.allow_shared_auto_route: true` — deliberately, and in writing.
+
 ### opencode reaches PLUR Enterprise
 
 **If you use PLUR Enterprise from opencode, your team memory was silently never

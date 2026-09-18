@@ -328,6 +328,10 @@ describe('MCP tools', () => {
         `    scope: group:acme/engineering\n` +
         `    shared: true\n` +
         `    description: Acme engineering team store\n` +
+        `    covers: ['acme.engineering', 'kubernetes', 'terraform']\n` +
+        `  - path: ${join(coversDir, 'mine.yaml')}\n` +
+        `    scope: user:acme-me\n` +
+        `    description: Personal store with the same covers\n` +
         `    covers: ['acme.engineering', 'kubernetes', 'terraform']\n`,
       )
       coversPlur = new Plur({ path: coversDir })
