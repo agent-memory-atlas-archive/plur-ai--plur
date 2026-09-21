@@ -37,6 +37,16 @@ both markers only to decide whether to print a domain hint. Each result now
 carries `routed` / `route_refused`, and a batch summarises any refusals once at
 the top level, because a key on item 34 of 50 is not a signal.
 
+### A remote write now says who chose its scope
+
+**A server receiving a write could not tell a scope you typed from one the router picked** (#1221). The body carried the scope string and nothing else; `structured_data`, where the routing decision is recorded, never crossed the wire, and no client name or version was sent either.
+
+That is why the leak above could not be answered on the server side. Every proposed mitigation had to act on the scope alone, which meant acting on every write to a shared scope — deliberate ones included.
+
+Writes now carry `scope_source`: `explicit` (named on the call), `session` (a session or `.plur.yaml` scope was in effect), `default` (nothing named it) or `routed` (the router chose it). It is produced by the one constructor both write paths share, so the shape a server receives and the shape written locally cannot drift, and it is omitted when absent so an older outbox entry sends nothing rather than claiming something it cannot vouch for.
+
+Nothing about routing changes. The decision was always made; it was simply not legible to the other side of the wire.
+
 ## 0.20.1
 
 ### opencode reaches PLUR Enterprise
