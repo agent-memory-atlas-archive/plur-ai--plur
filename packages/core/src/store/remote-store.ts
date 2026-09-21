@@ -644,11 +644,19 @@ export class RemoteStore {
     const supersedes  = Array.isArray(e.relations?.supersedes) && e.relations.supersedes.length > 0
       ? e.relations.supersedes
       : e.supersedes
+    // #1221: who chose the scope. Stamped by learnRouted on the shape that
+    // crosses the wire; `structured_data` itself is not transmitted, so without
+    // this the server sees a scope string with no way to tell a scope the user
+    // typed from one the router picked out of `covers`. Omitted when absent, so
+    // an engram written by an older path, or replayed from an outbox predating
+    // this, sends nothing rather than claiming `explicit` it cannot vouch for.
+    const scope_source = e.structured_data?._scopeSource as string | undefined
     const body = JSON.stringify({
       statement: e.statement,
       scope:     engram.scope,
       domain:    e.domain,
       type:      e.type,
+      ...(scope_source != null ? { scope_source } : {}),
       ...(Array.isArray(e.tags) && e.tags.length > 0 ? { tags: e.tags } : {}),
       ...(e.pinned !== undefined            ? { pinned: e.pinned }             : {}),
       ...(e.rationale != null               ? { rationale: e.rationale }       : {}),

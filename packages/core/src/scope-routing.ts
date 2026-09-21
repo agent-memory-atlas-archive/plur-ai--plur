@@ -406,6 +406,23 @@ export function rankScopes(
  * highest-ranked shared candidate that was passed over either way, so the
  * caller can say what it declined to do rather than silently doing less.
  */
+/**
+ * Who chose a write's scope (#1221).
+ *
+ * A server receiving a write sees only a scope string, so a scope the user
+ * typed and one the router picked from `covers` arrive identical. That is why
+ * a server-side mirror of #1115 could not be built: the only mitigation that
+ * does not punish deliberate writes needs to tell the two apart.
+ *
+ * - `explicit` — named on the call itself.
+ * - `session`  — a session or `.plur.yaml` scope was in effect. A standing
+ *   human choice, not stated on this call.
+ * - `default`  — nothing named it; the unscoped default applied.
+ * - `routed`   — the router chose it from `covers`. The only value that means
+ *   no human picked this destination.
+ */
+export type ScopeSource = 'explicit' | 'session' | 'default' | 'routed'
+
 export interface AutoRouteDecision {
   /**
    * `route` — write to `scope`.

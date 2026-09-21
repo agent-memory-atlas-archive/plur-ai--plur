@@ -40,7 +40,7 @@ import { atomicWrite, CONFIG_FILE_MODE, sync as gitSync, getSyncStatus, withLock
 import { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory, SCAN_TRUNCATED } from './secrets.js'
 import type { SecretMatch } from './secrets.js'
 import { SENSITIVITY_CATEGORIES, type ScopeMetadata, type SensitivityCategory } from './schemas/scope-metadata.js'
-import { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, type ScopeSignals, type ScopeCandidate, type AutoRouteDecision } from './scope-routing.js'
+import { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, type ScopeSignals, type ScopeCandidate, type AutoRouteDecision, type ScopeSource } from './scope-routing.js'
 import { mintedIdsWithPrefix, appendHistory, readHistoryForEngram, type HistoryEvent as HistoryEventType, generateEventId, generateInjectionId, computeQueryHash, findLatestInjectionFor, countInjectionEvents, isRecentDuplicateInjection, type InjectionEventCounts } from './history.js'
 import { computeContentHash, isHashable } from './content-hash.js'
 import { isLocalOnlyScope, assertScopeNamesATarget } from './scope-target.js'
@@ -170,7 +170,7 @@ export { runMigrations, rollbackMigrations, getSchemaVersion, setSchemaVersion, 
 export { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory } from './secrets.js'
 export { scanForInversions, type InversionSuspect } from './inversion-scan.js'
 export { ScopeMetadataSchema, ScopeSensitivitySchema, SENSITIVITY_CATEGORIES, type ScopeMetadata, type ScopeSensitivity, type SensitivityCategory } from './schemas/scope-metadata.js'
-export { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, WEIGHT_TAG, SUGGEST_DISPLAY_MIN_CONFIDENCE, type ScopeSignals, type ScopeCandidate, type RankScopesOptions, type AutoRouteDecision, type DecideAutoRouteOptions } from './scope-routing.js'
+export { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, WEIGHT_TAG, SUGGEST_DISPLAY_MIN_CONFIDENCE, type ScopeSignals, type ScopeCandidate, type RankScopesOptions, type AutoRouteDecision, type DecideAutoRouteOptions, type ScopeSource } from './scope-routing.js'
 
 // Scope-family predicates live in the leaf module `scope-util.ts` to break a
 // module cycle: `inject.ts` (imported by index.ts) needs `isPersonalScope`, and
@@ -2782,7 +2782,7 @@ export class Plur {
   private async _guardSensitiveScope(
     statement: string,
     context?: LearnContext,
-  ): Promise<{ scope: string; context: LearnContext | undefined; demotion: { from: string; to: string; patterns: string } | null; routed: { scope: string; confidence: number; reason: string } | null; refusedShared: { scope: string; confidence: number; reason: string } | null }> {
+  ): Promise<{ scope: string; context: LearnContext | undefined; demotion: { from: string; to: string; patterns: string } | null; routed: { scope: string; confidence: number; reason: string } | null; refusedShared: { scope: string; confidence: number; reason: string } | null; scopeSource: ScopeSource }> {
     // "Truly unscoped" = caller passed no scope AND no session/`.plur.yaml`
     // default is in effect (both land in the session scope registry). Only this
     // path auto-routes / applies unscoped_default; everything else is honored
@@ -2796,16 +2796,26 @@ export class Plur {
     let routed: { scope: string; confidence: number; reason: string } | null = null
     let refusedShared: { scope: string; confidence: number; reason: string } | null = null
     let scope: string
+    // #1221: WHO chose this scope. The decision is made here and nowhere else,
+    // so it is recorded here rather than inferred later from the absence of a
+    // `_routed` marker — "the caller named it" and "nothing named it and the
+    // default applied" are different facts and both are absent-marker cases.
+    let scopeSource: ScopeSource
     if (context?.scope == null && sessionScope == null) {
       const resolved = await this._resolveUnscopedScope(statement, context)
       scope = resolved.scope
       routed = resolved.routed
       refusedShared = resolved.refusedShared
+      scopeSource = resolved.routed ? 'routed' : 'default'
     } else {
       // Terminal fallback respects unscoped_default so a `unscoped_default:'local'`
       // user with no session scope and no context scope is not silently forced
       // to global (#353). No behavior change for the default-global user.
       scope = context?.scope ?? sessionScope ?? (this.config.unscoped_default ?? 'global')
+      // A session / `.plur.yaml` scope is a human's standing choice, not a
+      // guess — deliberate, but not stated on this call, which is a distinction
+      // a server reviewing writes may reasonably care about.
+      scopeSource = context?.scope != null ? 'explicit' : 'session'
     }
     // Guard fires when the write can leave the machine: shared scope (others can
     // read it) OR remote-backed scope (routes to a remote store, e.g. a personal
@@ -2813,7 +2823,7 @@ export class Plur {
     // local-file stores) stay on this machine and are exempt — same gate as
     // _offendingHitsForScope, kept in sync because this short-circuits before it.
     if (!isSharedScope(scope) && !this._isRemoteBackedScope(scope)) {
-      return { scope, context, demotion: null, routed, refusedShared }
+      return { scope, context, demotion: null, routed, refusedShared, scopeSource }
     }
     // Scan the FULL content the engram will carry — the statement AND the
     // context fields (rationale, key_files, source, …), not just the statement.
@@ -2821,7 +2831,7 @@ export class Plur {
     const scanText = `${statement}\n${JSON.stringify(context ?? {})}`
     // Single source of truth for the offending-hit policy (#353).
     const offending = this._offendingHitsForScope(scanText, scope)
-    if (offending.length === 0) return { scope, context, demotion: null, routed, refusedShared }
+    if (offending.length === 0) return { scope, context, demotion: null, routed, refusedShared, scopeSource }
 
     const patterns = [...new Set(offending.map(h => h.pattern))].join(', ')
     logger.warning(
@@ -2837,6 +2847,8 @@ export class Plur {
       demotion: { from: scope, to: 'local', patterns },
       routed,
       refusedShared,
+      // The demotion overrode the destination; it did not change who picked it.
+      scopeSource,
     }
   }
 
@@ -3037,7 +3049,7 @@ export class Plur {
       // One constructor for every write path: `_buildEngramShape` is what the
       // remote route posts, so a field added there is a field added here.
       const engram: Engram = {
-        ...this._buildEngramShape(statement, scope, context, now, validity, id => this._ancestorsOf(engrams, id)),
+        ...this._buildEngramShape(statement, scope, context, now, validity, id => this._ancestorsOf(engrams, id), guarded.scopeSource),
         id,
       }
 
@@ -3407,7 +3419,7 @@ export class Plur {
       })
     }
     const now = new Date().toISOString()
-    const localPlaceholder = this._buildEngramShape(statement, scope, context, now)
+    const localPlaceholder = this._buildEngramShape(statement, scope, context, now, undefined, undefined, guarded.scopeSource)
     // Stamp the auto-route marker on the remote-routed shape (Stage 3b, #351) so
     // the decision survives onto the server engram and into the MCP response.
     if (guarded.routed) {
@@ -3547,6 +3559,13 @@ export class Plur {
      * may be incomplete.
      */
     ancestorsOf: (id: string) => string[] = () => [],
+    /**
+     * Who chose `scope` (#1221). Defaulted from the context so a direct call
+     * to this constructor produces the same shape the write paths do — they
+     * pass the guard's answer, which also knows about session scopes and the
+     * router, neither of which is visible from here.
+     */
+    scopeSource: ScopeSource = context?.scope != null ? 'explicit' : 'default',
   ): Engram {
     const type = context?.type ?? 'behavioral'
     const cogLevel = TYPE_TO_COGNITIVE[type] ?? 'remember'
@@ -3625,10 +3644,21 @@ export class Plur {
     }
     // Echo marker for extracted expiry (#347) — mirrors the learn() stamping
     // so the remote-routed MCP response can confirm the parse too.
-    if (validity.extracted) {
-      ;(shape as any).structured_data = {
-        _expiry_extracted: { valid_until: validity.extracted.valid_until, phrase: validity.extracted.phrase },
-      }
+    //
+    // #1221 joins it here rather than being stamped by each caller afterwards.
+    // Both write paths run through this constructor, so putting it here is what
+    // makes them agree by construction instead of by two parallel stamps that
+    // can drift — the property test/write-path-consolidation.test.ts and
+    // test/leak-surface.test.ts both exist to hold.
+    //
+    // Unlike every other marker it is unconditional: "the caller named it" is
+    // as much an answer as "the router guessed it", and a field present on only
+    // some writes cannot be read as an answer on the rest.
+    ;(shape as any).structured_data = {
+      ...(validity.extracted
+        ? { _expiry_extracted: { valid_until: validity.extracted.valid_until, phrase: validity.extracted.phrase } }
+        : {}),
+      _scopeSource: scopeSource,
     }
     return shape
   }
