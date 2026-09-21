@@ -95,6 +95,26 @@ describe('plur learn', () => {
     expect(output.scope).toBe('global')
   })
 
+  // #1115 — the CLI read both routing markers only to decide whether to print a
+  // domain hint, so it never named the scope it picked nor the shared one it
+  // declined. A write command that cannot say where the engram went is the same
+  // failure the issue reports against the MCP `info` field, one surface over.
+  it('#1115 JSON: the declined shared scope is named, not just avoided', () => {
+    writeCoversConfig(['plur.*', 'embeddings', 'index', 'engine', 'core'], 'group:plur/core')
+    const output = JSON.parse(run('learn "the embeddings index for the core engine" --domain plur.core.embeddings'))
+    expect(output.scope).toBe('global')
+    expect(output.route_refused?.scope).toBe('group:plur/core')
+    expect(output.route_refused?.reason).toBeTruthy()
+  })
+
+  it('#1115 JSON: a write that DID auto-route names where it landed', () => {
+    writeCoversConfig(['plur.*', 'embeddings', 'index', 'engine', 'core'])
+    const output = JSON.parse(run('learn "the embeddings index for the core engine" --domain plur.core.embeddings'))
+    expect(output.scope).toBe('user:plur-core')
+    expect(output.routed?.scope).toBe('user:plur-core')
+    expect(output.route_refused).toBeUndefined()
+  })
+
   it('CLI explicit: --scope is honored', () => {
     const output = JSON.parse(run('learn "explicit scope statement" --scope project:foo'))
     expect(output.scope).toBe('project:foo')

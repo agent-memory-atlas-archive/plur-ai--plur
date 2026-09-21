@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.20.1
+## Unreleased
 
 ### An unscoped write can no longer land in a team store
 
@@ -29,6 +29,15 @@ approximation of it.
 Explicit scopes are untouched: `plur_learn` with `scope: "group:acme/eng"` still
 writes there. An install that genuinely wants covers-driven team routing can set
 `scope_routing.allow_shared_auto_route: true` — deliberately, and in writing.
+
+**Both batch and CLI writes now report the outcome too.** `plur_learn_batch`
+echoed neither decision — a batch write could route, or be declined from a
+shared scope, with no signal of either reaching the caller — and the CLI read
+both markers only to decide whether to print a domain hint. Each result now
+carries `routed` / `route_refused`, and a batch summarises any refusals once at
+the top level, because a key on item 34 of 50 is not a signal.
+
+## 0.20.1
 
 ### opencode reaches PLUR Enterprise
 
