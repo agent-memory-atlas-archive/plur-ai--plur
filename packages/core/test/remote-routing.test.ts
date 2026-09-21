@@ -169,7 +169,7 @@ describe('learn() — remote routing (issue #25)', () => {
       mockSuccessfulAppend()
       writeStoresConfig(primaryDir, [REMOTE])
       const plur = new Plur({ path: primaryDir })
-      plur.setSessionScope(REMOTE.scope, 's1')
+      plur.setSessionScope(REMOTE.scope, { session: 's1' })
       await plur.learnRouted('a fact written under a session scope', { session: 's1', type: 'behavioral' })
       expect((await postedBody()).scope_source).toBe('session')
     })
