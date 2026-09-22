@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### An unscoped write can no longer land in a team store
+
+**If you wrote an engram without a scope, it could be auto-routed into a shared
+team store and pushed to that store's remote** (#1115). The only signal was an
+`info` field in the response, easy to miss across a long session — and once the
+copy was remote, local cleanup could not undo it.
+
+The decision was narrower than it looked. A write whose `domain` began with a
+segment that a shared scope declared in its `covers` was routed there
+deterministically, bypassing the confidence gate, whatever its tags or its
+statement said. `plur_suggest_scope` weighed all three channels, so it could
+name one scope while an unscoped write landed in another.
+
+**Auto-routing now refuses a shared scope.** Unscoped writes still route among
+personal scopes (`local`, `global`, `user:*`, `agent:*`), where a wrong guess
+costs nothing a `plur_rescope` cannot fix. A shared candidate is passed over —
+the next eligible personal one still wins — and the response names the scope it
+declined and how to choose it deliberately. Promotion into a team store is now
+something you ask for.
+
+Both surfaces share one decision function, so `plur_suggest_scope` reports what
+an unscoped write would actually do (`would_route`) rather than an
+approximation of it.
+
+Explicit scopes are untouched: `plur_learn` with `scope: "group:acme/eng"` still
+writes there. An install that genuinely wants covers-driven team routing can set
+`scope_routing.allow_shared_auto_route: true` — deliberately, and in writing.
+
+**Both batch and CLI writes now report the outcome too.** `plur_learn_batch`
+echoed neither decision — a batch write could route, or be declined from a
+shared scope, with no signal of either reaching the caller — and the CLI read
+both markers only to decide whether to print a domain hint. Each result now
+carries `routed` / `route_refused`, and a batch summarises any refusals once at
+the top level, because a key on item 34 of 50 is not a signal.
+
+### A remote write now says who chose its scope
+
+**A server receiving a write could not tell a scope you typed from one the router picked** (#1221). The body carried the scope string and nothing else; `structured_data`, where the routing decision is recorded, never crossed the wire, and no client name or version was sent either.
+
+That is why the leak above could not be answered on the server side. Every proposed mitigation had to act on the scope alone, which meant acting on every write to a shared scope — deliberate ones included.
+
+Writes now carry `scope_source`: `explicit` (named on the call), `session` (a session or `.plur.yaml` scope was in effect), `default` (nothing named it) or `routed` (the router chose it). It is produced by the one constructor both write paths share, so the shape a server receives and the shape written locally cannot drift, and it is omitted when absent so an older outbox entry sends nothing rather than claiming something it cannot vouch for.
+
+Nothing about routing changes. The decision was always made; it was simply not legible to the other side of the wire.
+
 ## 0.20.1
 
 ### opencode reaches PLUR Enterprise

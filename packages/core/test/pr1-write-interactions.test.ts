@@ -28,7 +28,7 @@ describe('PR-1 — auto-route still fires after the default revert (#353)', () =
     writeFileSync(join(dir, 'config.yaml'), yaml.dump({
       index: false,
       stores: [
-        { path: join(dir, 'core.yaml'), scope: 'group:plur/core', description: 'Core', covers: ['plur.*', 'embeddings', 'core'] },
+        { path: join(dir, 'core.yaml'), scope: 'user:plur-core', description: 'Core', covers: ['plur.*', 'embeddings', 'core'] },
       ],
     }, { noRefs: true }))
     const plur = new Plur({ path: dir })
@@ -37,8 +37,8 @@ describe('PR-1 — auto-route still fires after the default revert (#353)', () =
       domain: 'plur.core.embeddings',
       tags: ['embeddings'],
     }) as { scope: string; structured_data?: { _routed?: { scope: string; confidence: number } } }
-    expect(e.scope).toBe('group:plur/core')
-    expect(e.structured_data?._routed?.scope).toBe('group:plur/core')
+    expect(e.scope).toBe('user:plur-core')
+    expect(e.structured_data?._routed?.scope).toBe('user:plur-core')
     expect(e.structured_data?._routed?.confidence).toBeGreaterThanOrEqual(SCOPE_MATCH_THRESHOLD)
   })
 })
@@ -75,7 +75,7 @@ describe('PR-1 — SECONDARY-STORE rename preserved (#353)', () => {
     writeFileSync(join(primaryDir, 'config.yaml'), yaml.dump({
       index: false,
       stores: [
-        { path: join(storeDir, 'engrams.yaml'), scope: 'group:plur/core' },
+        { path: join(storeDir, 'engrams.yaml'), scope: 'user:plur-core' },
       ],
     }, { noRefs: true }))
     const plur = new Plur({ path: primaryDir })
@@ -84,6 +84,6 @@ describe('PR-1 — SECONDARY-STORE rename preserved (#353)', () => {
     // store's scope (cross-store narrowing) — UNCHANGED behavior.
     const loaded = (await plur.list()).filter(e => (e as any)._originalId === seeded.id)
     expect(loaded.length).toBe(1)
-    expect(loaded[0].scope).toBe('group:plur/core')
+    expect(loaded[0].scope).toBe('user:plur-core')
   })
 })

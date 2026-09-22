@@ -249,7 +249,14 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // --domain, no --scope, the write did NOT auto-route, and at least one
   // registered scope declares covers. Advisory only — never fails the write.
   let domainHint: string | undefined
-  const routed = (engram as { structured_data?: { _routed?: unknown } }).structured_data?._routed
+  const routed = (engram as { structured_data?: { _routed?: { scope: string; confidence: number; reason: string } } })
+    .structured_data?._routed
+  // #1115: both routing outcomes were read here only to decide whether to show
+  // a domain hint, so the CLI never named the destination it picked, nor the
+  // shared scope it declined. Both change where the engram ended up, which is
+  // the one thing a write command has to be able to say.
+  const routeRefused = (engram as { structured_data?: { _routeRefused?: { scope: string; confidence: number; reason: string } } })
+    .structured_data?._routeRefused
   if (!domain && !scopeProvided && !routed) {
     try {
       const coversScopes = plur.listScopeMetadata()
@@ -277,6 +284,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
         ? { demoted: { from: demoted.from, to: demoted.to, patterns: demoted.patterns }, ...(scopeProvided ? { requested_scope: demoted.from } : {}) }
         : {}),
       ...(domainHint ? { domain_hint: domainHint } : {}),
+      ...(routed ? { routed: { scope: routed.scope, confidence: routed.confidence, reason: routed.reason } } : {}),
+      ...(routeRefused ? { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason } } : {}),
     })
   } else {
     // Confirmation of a requested mutation → suppressed by --quiet (#730).
@@ -287,6 +296,24 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       outputText(
         `  Warning: Sensitive content (${demoted.patterns}) detected — stored at ` +
         `${demoted.to}/private instead of ${demoted.from}; re-scope deliberately if false positive.`,
+      )
+    }
+    if (routed) {
+      // Where it landed, when the caller did not choose — same class as the
+      // demotion above: the write is not where a reader of the command would
+      // assume, so it is stated rather than hinted.
+      outputText(
+        `  Note: No scope was given — auto-routed to ${routed.scope} ` +
+        `(confidence ${routed.confidence}) because its content matched that scope's covers. ` +
+        `Pass --scope to choose deliberately.`,
+      )
+    }
+    if (routeRefused) {
+      outputText(
+        `  Warning: No scope was given. This content matched the shared scope ${routeRefused.scope} ` +
+        `(confidence ${routeRefused.confidence}), which unscoped writes are never auto-routed into — ` +
+        `it was stored at ${engram.scope} instead. Pass --scope ${routeRefused.scope} if it belongs to ` +
+        `the team, or move it with plur rescope.`,
       )
     }
     if (domainHint) {

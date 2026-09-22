@@ -193,6 +193,24 @@ export const ScopeRoutingConfigSchema = z.object({
    * key is set.
    */
   min_confidence: z.number().min(0).max(1).optional().catch(undefined),
+  /**
+   * Opt in to auto-routing a genuinely-unscoped write into a SHARED scope
+   * (`group:`/`project:`/`space:`/`team:`/`org:`/`public`). Default FALSE
+   * (#1115).
+   *
+   * Auto-routing used to send an unscoped write wherever a scope's `covers`
+   * matched its domain prefix, shared scopes included — so a personal engram
+   * could land in a team store and be pushed to its remote, announced only by
+   * an `info` field in the response. Once there, local cleanup could not undo
+   * it. Routing among PERSONAL scopes is unaffected: a wrong guess there costs
+   * nothing a `plur_rescope` cannot fix.
+   *
+   * Set true only if covers-driven team routing is something this install
+   * actually wants. Even then, prefer raising `match_threshold` alongside it:
+   * a lone forward domain-prefix match bypasses the threshold entirely, so the
+   * gate does not protect that path.
+   */
+  allow_shared_auto_route: z.boolean().optional().catch(undefined),
 }).partial()
 
 export type ScopeRoutingConfig = z.infer<typeof ScopeRoutingConfigSchema>

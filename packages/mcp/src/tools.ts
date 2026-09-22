@@ -1274,6 +1274,9 @@ function getAllToolDefinitions(): ToolDefinition[] {
           const isOutbox = !!(engram as any).structured_data?._outbox
           const demoted = (engram as any).structured_data?._demoted as { from: string; to: string; patterns: string } | undefined
           const routed = (engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
+          // #1115: the mirror of `_routed` — a shared scope matched this write's
+          // content but was deliberately not adopted.
+          const routeRefused = (engram as any).structured_data?._routeRefused as { scope: string; confidence: number; reason: string } | undefined
           mcpCanary.signal('learn_activity')
           // Opt-in, content-free engagement counter (default-off; no statement text).
           recordTelemetry('learn')
@@ -1335,6 +1338,12 @@ function getAllToolDefinitions(): ToolDefinition[] {
             ...(isOutbox ? { outbox: true, warning: 'Remote write failed; engram queued locally for retry on next session start or plur_sync.' } : {}),
             ...(demoted ? { demoted: true, requested_scope: demoted.from, warning: `Sensitive content (${demoted.patterns}) detected — stored at "${demoted.to}"/private instead of the requested shared scope "${demoted.from}". If this is a false positive, re-scope deliberately.` } : {}),
             ...(routed ? { routed: { scope: routed.scope, confidence: routed.confidence, reason: routed.reason }, info: `No scope was provided; auto-routed to "${routed.scope}" (confidence ${routed.confidence}) because its content matched that scope's covers. Pass an explicit scope to override.` } : {}),
+            // #1115: a shared scope matched but was NOT adopted. Said plainly,
+            // as a `warning`, because the old `info` string for the opposite
+            // outcome proved easy to miss in a long session — and this one
+            // changes what the caller should do next, rather than merely
+            // reporting where the write went.
+            ...(routeRefused ? { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason }, warning: `No scope was provided. This content matched the shared scope "${routeRefused.scope}" (confidence ${routeRefused.confidence}), but unscoped writes are never auto-routed into a shared store — it was stored at "${engram.scope}" instead. If it belongs to the team, pass scope: "${routeRefused.scope}" explicitly, or move it with plur_rescope.` } : {}),
           }
         } catch (err) {
 // learnRouted now saves to outbox on remote failure, so this
@@ -1508,10 +1517,36 @@ function getAllToolDefinitions(): ToolDefinition[] {
             }
           } catch { /* advisory only — never fail the batch over a hint */ }
         }
+        // A per-result key is not a signal in a batch of fifty. The refusal
+        // changes what the caller should do next, so it is also summarised at
+        // the top level, where `warning` already is.
+        const refusedScopes = [...new Set(results
+          .map(r => ((r.engram as any).structured_data?._routeRefused as { scope: string } | undefined)?.scope)
+          .filter((sc): sc is string => typeof sc === 'string'))]
+        const refusedCount = results.filter(r => (r.engram as any).structured_data?._routeRefused !== undefined).length
+        const warnings: string[] = []
+        if (failures.length > 0) {
+          warnings.push(`${failures.length} of ${raw.length} engram(s) failed to persist; the rest were written.`)
+        }
+        if (refusedCount > 0) {
+          warnings.push(
+            `${refusedCount} of ${raw.length} engram(s) had no scope and matched the shared scope(s) ` +
+            `${refusedScopes.join(', ')}, which unscoped writes are never auto-routed into — they were stored ` +
+            `in a personal scope instead. Pass an explicit scope on those items if they belong to the team, ` +
+            `or move them with plur_rescope.`)
+        }
+
         return {
           ids,
           results: results.map((r) => {
             const isOutbox = !!(r.engram as any).structured_data?._outbox
+            // #1115: the batch mirror of what plur_learn already reports.
+            // `_routed` was read above to suppress a domain hint and
+            // `_routeRefused` was read nowhere, so a batch write that routed
+            // into a store the caller never named — or was declined from a
+            // shared one — reached the caller with no signal of either.
+            const routed = (r.engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
+            const routeRefused = (r.engram as any).structured_data?._routeRefused as { scope: string; confidence: number; reason: string } | undefined
             return {
             input_index: r.input_index,
             id: isOutbox ? r.engram.id : plur.readIdFor(r.engram),
@@ -1524,13 +1559,14 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // reporting it exists for reached no caller — "anything below the
             // bar is still reported" was not observable anywhere.
             ...(r.dedup ? { dedup: r.dedup } : {}),
+            ...(routed ? { routed: { scope: routed.scope, confidence: routed.confidence, reason: routed.reason } } : {}),
+            ...(routeRefused ? { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason } } : {}),
           }
           }),
           stats,
           ...batchDomainHint,
-          ...(failures.length > 0
-            ? { failures, warning: `${failures.length} of ${raw.length} engram(s) failed to persist; the rest were written.` }
-            : {}),
+          ...(failures.length > 0 ? { failures } : {}),
+          ...(warnings.length > 0 ? { warning: warnings.join(' ') } : {}),
         }
       },
     },
@@ -3721,12 +3757,30 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
         const minConfidence = explicit
           ?? plur.getScopeRoutingConfig().min_confidence
           ?? SUGGEST_DISPLAY_MIN_CONFIDENCE
-        const candidates = await plur.suggestScope({
+        const signals = {
           statement: args.statement as string,
           domain: args.domain as string | undefined,
           tags: args.tags as string[] | undefined,
-        }, { minConfidence })
-        return { candidates, count: candidates.length, min_confidence: minConfidence }
+        }
+        const candidates = await plur.suggestScope(signals, { minConfidence })
+        // #1115: report what an unscoped write would ACTUALLY do, from the same
+        // decision function the write path uses. Ranking and routing used to be
+        // separate answers — the ranker weighs domain, tags and keywords, while
+        // the write path routed a forward domain-prefix match deterministically
+        // and ignored the rest — so an agent could read this list, write without
+        // a scope, and land somewhere the list did not say.
+        const decision = plur.previewAutoRoute(signals)
+        const would_route =
+          decision.action === 'route' && decision.scope
+            ? { scope: decision.scope, note: 'An unscoped write of these signals would be auto-routed here.' }
+            : decision.action === 'refuse-shared' && decision.refusedShared
+              ? {
+                  scope: null,
+                  refused_shared: decision.refusedShared.scope,
+                  note: `"${decision.refusedShared.scope}" is the best match but is a SHARED scope, and unscoped writes are never auto-routed into one. An unscoped write would land at the local default instead. Pass that scope explicitly if the engram belongs to the team.`,
+                }
+              : { scope: null, note: 'An unscoped write of these signals would land at the local default — nothing matched confidently enough to route.' }
+        return { candidates, count: candidates.length, min_confidence: minConfidence, would_route }
       },
     },
 
