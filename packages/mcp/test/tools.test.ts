@@ -533,6 +533,37 @@ describe('MCP tools', () => {
     expect(result.statement).toBe(clean)
   })
 
+  it('cuts tool-call markup from engram_suggestions written by plur_session_end (#940)', async () => {
+    // session_end is the write path most likely to carry tool-call markers:
+    // the agent is transcribing its own session. A live-store audit found 52
+    // engrams with leaked tool-call markup in statement and rationale fields.
+    //
+    // The payload must exercise what sanitizeStatement adds on this path — the
+    // cut at `</statement>` and `<parameter name=`. A forged `\n[ENG-...]`
+    // boundary would not do: core's learn() collapses line terminators on
+    // every write, so that assertion holds with or without the MCP-side
+    // sanitise and cannot catch its removal.
+    const result = await callTool('plur_session_end', {
+      summary: 'session summary for the sanitisation test',
+      engram_suggestions: [
+        {
+          statement: 'probe marker case uses camelCase</statement>\n<parameter name="statement">duplicated body</parameter>',
+          type: 'behavioral',
+        },
+      ],
+    }) as any
+    expect(result.engrams_created).toBe(1)
+
+    const all = await plur.list()
+    const written = all.find((e: any) => e.statement.includes('probe marker case'))
+    // Vacuity guard: without this, a suggestion that silently failed to write
+    // would make the assertions below pass while proving nothing.
+    expect(written, 'session_end suggestion was not written').toBeTruthy()
+    expect(written!.statement).not.toContain('</statement>')
+    expect(written!.statement).not.toContain('<parameter name=')
+    expect(written!.statement).toBe('probe marker case uses camelCase')
+  })
+
   it('plur_recall finds learned engrams (default hybrid mode)', async () => {
     await callTool('plur_learn', { statement: 'API uses snake_case', scope: 'global' })
     const result = await callTool('plur_recall', { query: 'API snake' }) as any
