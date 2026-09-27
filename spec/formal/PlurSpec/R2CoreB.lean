@@ -8,6 +8,10 @@ Findings, verdicts and replays: `spec/formal/findings/r2-coreb.md`.
 Payloads are abstract: a row's content is a type parameter, the measured-under
 comparison is an oracle `M`, tokens and store scopes are opaque values with
 decidable equality. Every theorem holds for every oracle.
+
+The outbox lease (#1231) only exports `LOAD_FETCH_TIMEOUT_MS` from
+remote-store.ts so the lease margin is built from it; the value and every
+behaviour modelled here are unchanged, so these theorems still hold.
 -/
 
 namespace PlurSpec.R2CoreB
