@@ -492,8 +492,10 @@ end EmbCache
 
 `recordEvent` / `settleSpilledEvents` (telemetry-counters.ts). The final full run lost one
 event of 160 under load: a recorder that could not take the counters lock within ~1 s
-dropped its event. Now it appends the event to a spill file (no lock) and the next lock
-holder folds the spill into the counters. State for one day: events in counters.json,
+dropped its event. Now it writes the event to its own spill file (temp name, then rename;
+no lock) and the next lock holder folds every complete spill file into the counters. One
+file per event matters: with one shared spill file an append could land in a copy the
+folder had already read and deleted (the second full run lost 1 of 160 that way). State for one day: events in counters.json,
 events in the spill. A contended record grows the spill, an uncontended one the counters,
 and a fold moves the whole spill into the counters. -/
 namespace Spill

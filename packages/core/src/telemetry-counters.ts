@@ -30,14 +30,13 @@
 // lands in a fresh pending file instead of being deleted with the sent one.
 // Invariant, per date: shipped + on disk (counters, pending, claims) = recorded.
 // If the lock cannot be taken (contended for ~1 s) the event is not written
-// unlocked and not dropped: it is APPENDED to `<countersPath>.spill` (one short
-// O_APPEND write, no lock) and the next writer holding the lock folds the spill
-// in. Telemetry still never blocks or fails the tool call, and events are
-// conserved — the final full run showed the old drop losing 1 of 160 under load.
-// Spill files count as "on disk" in the invariant above.
+// unlocked and not dropped: it is written to its own spill file
+// (`<countersPath>.spill.<uuid>`, temp name then rename, no lock) and the next
+// writer holding the lock, or the flush, folds the spill files in. Telemetry
+// still never blocks or fails the tool call, and events are conserved — the
+// old drop lost 1 of 160 under load. Spill files count as "on disk" above.
 
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -217,37 +216,37 @@ function spillPath(countersPath: string): string {
   return `${countersPath}.spill`
 }
 
-/** Append one event for later folding. Never throws: a failed spill is the
- *  only remaining way an event is lost, and it must not fail the tool call. */
+/** Leave one event for later folding, as its OWN file: written under a temp
+ *  name and renamed into place, so a folder only ever sees complete files and
+ *  nothing is ever appended to a file being folded. (A single shared spill
+ *  file lost an event: an append that opened the file before the folder
+ *  claimed it landed in the claimed copy after it was read.) Never throws. */
 function spillEvent(countersPath: string, event: CounterEvent, date: string): void {
   try {
     ensureParentDir(countersPath)
-    appendFileSync(spillPath(countersPath), JSON.stringify({ e: event, d: date }) + '\n')
+    const id = randomUUID()
+    const tmp = `${spillPath(countersPath)}.${id}.tmp`
+    writeFileSync(tmp, JSON.stringify({ e: event, d: date }) + '\n', { flag: 'wx' })
+    renameSync(tmp, `${spillPath(countersPath)}.${id}`)
   } catch { /* telemetry never fails the caller */ }
 }
 
 /**
- * Under the counters lock: claim every spill file (the live one by atomic
- * rename, so appends after this point start a fresh one; plus any claim a
- * crashed holder left behind) and return their events with the claim paths.
- * The caller unlinks the claims only after counters.json is written.
+ * Under the counters lock: every complete spill file (one event each). The
+ * caller unlinks them only after counters.json / pending are written.
  */
 function claimSpills(countersPath: string): { events: Array<{ e: CounterEvent; d: string }>; claims: string[] } {
   const events: Array<{ e: CounterEvent; d: string }> = []
   const claims: string[] = []
-  const live = spillPath(countersPath)
-  try {
-    if (existsSync(live)) renameSync(live, `${live}.${randomUUID()}`)
-  } catch { /* nothing to claim, or a concurrent append recreated it — next time */ }
   const dir = dirname(countersPath)
-  const prefix = `${live.slice(dir.length + 1)}.`
+  const prefix = `${spillPath(countersPath).slice(dir.length + 1)}.`
   let names: string[] = []
-  try { names = readdirSync(dir).filter(n => n.startsWith(prefix)) } catch { return { events, claims } }
+  try { names = readdirSync(dir).filter(n => n.startsWith(prefix) && !n.endsWith('.tmp')) } catch { return { events, claims } }
   for (const n of names) {
     const path = join(dir, n)
-    claims.push(path)
     let raw = ''
     try { raw = readFileSync(path, 'utf8') } catch { continue }
+    claims.push(path)
     for (const line of raw.split('\n')) {
       if (!line.trim()) continue
       try {
@@ -255,7 +254,7 @@ function claimSpills(countersPath: string): { events: Array<{ e: CounterEvent; d
         if ((v.e === 'learn' || v.e === 'recall' || v.e === 'session') && typeof v.d === 'string') {
           events.push({ e: v.e, d: v.d })
         }
-      } catch { /* a torn last line from a crash: skip it */ }
+      } catch { /* malformed: skip */ }
     }
   }
   return { events, claims }
