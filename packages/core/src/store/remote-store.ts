@@ -86,7 +86,7 @@ function sanitiseResponseBody(raw: string): string {
 // the hot path — a degraded network that never delivers headers must still
 // eventually unblock the caller (#504). 30 s is generous for a healthy
 // server while still keeping the process mortal on a blackholed route.
-const LOAD_FETCH_TIMEOUT_MS = 30_000
+export const LOAD_FETCH_TIMEOUT_MS = 30_000
 
 /**
  * Canonical endpoint identity for a configured remote URL (scope-audit

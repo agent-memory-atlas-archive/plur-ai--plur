@@ -16,28 +16,53 @@
  *
  * The guarantee is timed, as every lease is: a holder starts a push only while
  * at least `OUTBOX_LEASE_MARGIN_MS` of its lease remains, and that margin
- * covers one bounded request (30 s, `RemoteStore.fetchBounded`) plus the
- * merge-back. Two assumptions remain, both stated in the model: clocks of the
- * processes sharing a store agree to within the margin, and a holder that the
- * remote accepted a push from is not killed before its merge-back (a crash
- * THERE re-delivers after the TTL — the same at-least-once edge the
- * single-process path has always had and warns about).
+ * covers everything between the start of a push and the merge-back that hands
+ * the row off (audit of #1231, finding 2): one bounded request (30 s,
+ * `RemoteStore.fetchBounded`), the wait for the store lock (bounded by the file
+ * lock's own `DEFAULT_ACQUIRE_TIMEOUT`, 180 s — a holder past it fails every
+ * other writer too), the write itself, and the clock skew tolerated between
+ * processes. The merge-back runs once per batch, after the LAST push, and that
+ * push started at least the margin before expiry, so the whole batch is handed
+ * off inside the lease. Two assumptions remain, both stated in the model
+ * (WritePath §1c): clocks of the processes sharing a store agree to within
+ * `OUTBOX_LEASE_SKEW_MS`, and a holder that the remote accepted a push from
+ * completes its merge-back inside that bound — it is not killed first, and its
+ * wait for the store lock does not end in a timeout. Either failure re-delivers
+ * after the TTL: the at-least-once edge the single-process path has always had
+ * and warns about.
+ *
+ * Every holder reads its clock for the lease INSIDE the store lock, after the
+ * load (audit of #1231, finding 1): a reading taken before a long lock wait
+ * made another process's fresh lease look further out than any live holder
+ * could write, and the far-future clause of `leaseFree` then treated it as free.
  *
  * Format: additive. A row without the field is unleased; an older client
  * ignores the field (and so is not excluded by it — the protection holds
  * between clients that know the lease).
  */
 import { randomUUID } from 'crypto'
+import { DEFAULT_ACQUIRE_TIMEOUT } from './store/async-lock.js'
+import { LOAD_FETCH_TIMEOUT_MS } from './store/remote-store.js'
 
 /** How long a lease lives. Generous: it only bounds how long a crashed holder blocks its rows. */
 export const OUTBOX_LEASE_TTL_MS = 10 * 60_000
 
+/** Clock skew tolerated between processes sharing a store. */
+export const OUTBOX_LEASE_SKEW_MS = 60_000
+
+/** The merge-back's own write (a full corpus save on YAML), with room to spare. */
+export const OUTBOX_MERGE_WRITE_MS = 30_000
+
 /**
  * A holder starts a push or retire only while at least this much of its lease
- * remains: one bounded request (30 s) plus the merge-back, with room to spare.
- * Also the clock skew tolerated between processes sharing a store.
+ * remains: one bounded request, the wait for the store lock, the merge-back
+ * write, and the clock skew — 30 + 180 + 30 + 60 s = 5 min. Before the audit
+ * of #1231 it was 2 min and left the lock wait out, so a merge-back that
+ * queued behind a long lock holder landed after the lease had expired and
+ * another process re-delivered rows the remote had already accepted.
  */
-export const OUTBOX_LEASE_MARGIN_MS = 2 * 60_000
+export const OUTBOX_LEASE_MARGIN_MS =
+  LOAD_FETCH_TIMEOUT_MS + DEFAULT_ACQUIRE_TIMEOUT + OUTBOX_MERGE_WRITE_MS + OUTBOX_LEASE_SKEW_MS
 
 /** The bookkeeping key the lease is stored under, in `structured_data`. */
 export const OUTBOX_LEASE_KEY = '_outboxLease'
@@ -73,7 +98,8 @@ export function readLease(sd: unknown): OutboxLease | undefined {
  * unleased, the lease is its own, or the lease has expired. A lease claiming
  * more than a TTL (plus the skew margin) into the future cannot have been
  * written by a live holder with a sane clock, so it does not block either —
- * otherwise one bad write would park the row forever.
+ * otherwise one bad write would park the row forever. Sound only for a `nowMs`
+ * read while the caller holds the store lock (finding 1 of the #1231 audit).
  */
 export function leaseFree(sd: unknown, holder: string, nowMs: number): boolean {
   const lease = readLease(sd)

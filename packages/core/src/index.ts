@@ -33,6 +33,16 @@ import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, compute
 import type { ExportOptions } from './packs.js'
 import { learnContextContent, engramContentFields } from './content-fields.js'
 import { newLeaseHolder, makeLease, leaseFree, readLease, canStartPush, dropOwnLease, OUTBOX_LEASE_KEY, OUTBOX_LEASE_TTL_MS } from './outbox-lease.js'
+
+/** One flush's on-disk leases (decision D2), shared with `flushOutbox()` so a throw can release them. */
+interface OutboxFlushLeases {
+  /** Rows this flush leased. */
+  leased: Set<string>
+  /** Rows whose POST/DELETE the remote accepted: their lease stays until the hand-off. */
+  settled: Set<string>
+  /** The merge-back ran (it releases every lease itself), or nothing was leased. */
+  mergedBack: boolean
+}
 export { LEARN_CONTEXT_FIELD_ROLES, LEARN_CONTENT_FIELDS, learnContextContent, engramContentFields } from './content-fields.js'
 // SP5 imports (deferred — vault-export, registry not yet merged)
 // import { exportVault, type VaultExportOptions, type VaultExportResult } from './vault-export.js'
@@ -8420,9 +8430,10 @@ export class Plur {
     attempt_count: number
     last_error?: string
     age_days: number
-    /** Set while another flush holds a live lease on the row (decision D2):
-     *  the row is not stuck, it is being delivered, until this time. Only the
-     *  expiry is reported — the holder id names a process. */
+    /** Set while a live lease is on the row (decision D2) — any holder's,
+     *  THIS instance's own in-progress flush or learn() push included: the row
+     *  is not stuck, it is being delivered, until this time. Only the expiry
+     *  is reported — the holder id names a process. */
     leased_until?: string
   }>> {
     const engrams = await this._loadCached(this.paths.engrams)
@@ -8447,7 +8458,9 @@ export class Plur {
     }
     for (const e of engrams) {
       const sd = (e as any).structured_data as { _outbox?: Entry; _retireRemote?: Entry } | undefined
-      // A lease no flush could take right now is live; '' is nobody's holder id.
+      // Any holder's live lease, this instance's own included: judged as a
+      // stranger would ('' is nobody's holder id), so a push this instance has
+      // on the wire is reported as in progress, the same as another process's.
       const lease = sd && !leaseFree(sd, '', now) ? readLease(sd) : undefined
       const leased = lease ? { leased_until: lease.expires_at } : {}
       if (sd?._outbox && e.status !== 'retired') out.push({ ...toEntry(e.id, 'push', sd._outbox), ...leased })
@@ -8469,10 +8482,46 @@ export class Plur {
     this._assertWritable()
     // Ids this flush claims in `_outboxInFlight`, released however it ends.
     const claimed = new Set<string>()
+    const leases: OutboxFlushLeases = { leased: new Set(), settled: new Set(), mergedBack: false }
     try {
-      return await this._flushOutboxClaimed(claimed)
+      return await this._flushOutboxClaimed(claimed, leases)
     } finally {
+      // Audit of #1231, finding 4: a flush that threw between leasing and its
+      // merge-back left its on-disk leases for a full TTL, blocking every other
+      // process. Release them, best effort, BEFORE the in-process claims. Not
+      // for a row the remote already accepted (`settled`): its lease is what
+      // keeps another process from delivering it a second time until the TTL
+      // runs out, which is the at-least-once edge the lease documents.
+      if (!leases.mergedBack && leases.leased.size > 0) {
+        await this._releaseOutboxLeases([...leases.leased].filter(id => !leases.settled.has(id)))
+      }
       for (const id of claimed) this._outboxInFlight.delete(id)
+    }
+  }
+
+  /** Drop this instance's outbox lease from `ids`, under the store lock. Best effort: never throws. */
+  private async _releaseOutboxLeases(ids: string[]): Promise<void> {
+    if (ids.length === 0) return
+    try {
+      await this._withStoreLock(this.paths.engrams, async () => {
+        const fresh = await this._primaryStore.load()
+        const want = new Set(ids)
+        const changed: Engram[] = []
+        for (const e of fresh) {
+          const sd = (e as any).structured_data as Record<string, unknown> | undefined
+          if (!want.has(e.id) || !sd) continue
+          const next = { ...sd }
+          if (!dropOwnLease(next, this._outboxLeaseHolder)) continue
+          ;(e as any).structured_data = Object.keys(next).length > 0 ? next : undefined
+          changed.push(e)
+        }
+        if (changed.length > 0) await this._updateEngrams(fresh, changed)
+      })
+    } catch (err) {
+      logger.warning(
+        `[plur:outbox] could not release ${ids.length} outbox lease(s) after a failed flush: ${(err as Error).message}. `
+        + `They expire on their own within ${Math.round(OUTBOX_LEASE_TTL_MS / 60_000)} min.`,
+      )
     }
   }
 
@@ -8529,21 +8578,131 @@ export class Plur {
 
   private async _flushOutboxClaimed(
     claimed: Set<string>,
+    leases: OutboxFlushLeases,
   ): Promise<{ flushed: number; failed: number; expired_warnings: string[] }> {
     // The re-guard below promises the target scope's CURRENT policy (R2-D #12);
     // without this a long-running process flushed against the config it
     // started with (core-index#9, round 2).
     this.reloadConfigIfChanged()
+    let flushed = 0
+    let failed = 0
+    let skipped = 0
+    /** Warn once per host, not once per queued engram (#785). */
+    const cooldownSkippedHosts = new Set<string>()
+    const expired_warnings: string[] = []
+    const TTL_MS = 7 * 24 * 60 * 60 * 1000
+    let now = new Date()
+    type OutboxEntry = {
+      target_url: string; target_scope: string; queued_at: string
+      last_attempt: string; attempt_count: number; last_error: string
+    }
+    const warnIfOld = (engram: Engram, outbox: OutboxEntry): void => {
+      const ageMs = now.getTime() - new Date(outbox.queued_at).getTime()
+      if (ageMs > TTL_MS) {
+        expired_warnings.push(
+          `${engram.id} queued ${outbox.queued_at} (${Math.floor(ageMs / 86400000)}d ago) — consider manual resolution`
+        )
+      }
+    }
+    /**
+     * Will this queued row be POSTed now, and to which store? A row that will
+     * not — held back, no store, host in cooldown — needs no network call, so
+     * it is neither leased nor claimed (audit of #1231, finding 3: a flush
+     * that attempted nothing still rewrote the whole store twice). Consulted at
+     * selection AND again right before the push, since this flush's own
+     * failures can open a host's breaker mid-batch.
+     */
+    const routeFor = (engram: Engram, outbox: OutboxEntry):
+      { storeEntry: StoreEntry } | { skip: 'failed' | 'skipped'; warning?: string } => {
+      // Invariant `_outbox ⇒ scope === _outbox.target_scope` (formal WritePath,
+      // candidate 2). Every in-process writer now keeps it: rescope() cancels
+      // or retargets (#848), updateEngram() does the same (decision D4), and
+      // cross-scope recurrence never widens a queued row (decision D3). Kept as
+      // DEFENCE, because it is still reachable: a hand-edited engrams.yaml, an
+      // older client sharing the store, or an update that keeps the scope but
+      // supplies its own `_outbox`. Pushing such a row delivered it, carrying its
+      // scope, to another store. Held back, loudly and non-destructively: the
+      // entry stays queued, so rescoping the engram decides where it goes.
+      if (engram.scope !== outbox.target_scope) {
+        return {
+          skip: 'failed',
+          warning: `${engram.id}: NOT pushed — its scope is now "${engram.scope}" but it was queued for `
+            + `"${outbox.target_scope}". Rescope it (to "${outbox.target_scope}" to deliver, or to a local `
+            + `scope to cancel the delivery).`,
+        }
+      }
+      // Resolve remote driver from current config (don't store tokens in outbox)
+      const storeEntry = (this.config.stores ?? []).find(
+        s => s.url && s.scope === outbox.target_scope && !s.readonly
+      )
+      if (!storeEntry) {
+        return { skip: 'failed', warning: `${engram.id}: no matching remote store for scope ${outbox.target_scope}` }
+      }
+      // #785: consult the per-host breaker the RECALL leg maintains before
+      // spending a full fetch timeout on a host already known to be down.
+      //
+      // Without this, N queued engrams for an unreachable host cost N
+      // sequential timeouts on EVERY session start — and those failures never
+      // fed back, so the recall leg learned nothing from them either. Two legs,
+      // one host, two independent opinions about whether it is reachable.
+      //
+      // Skipping leaves the engrams queued: the outbox already retries on the
+      // next flush, and the breaker's own cooldown is what decides when that
+      // becomes worth attempting.
+      // `remoteHealthStatePath()`, explicitly — NOT the default (2026-08-13
+      // panel). The default is `remoteHealthPath()`, which resolves from
+      // PLUR_PATH; the recall leg passes `this.remoteHealthStatePath()`, which
+      // resolves from `paths.root`. For `new Plur({ path })`, `plur --path`,
+      // and every embedded consumer those are DIFFERENT FILES, so the two legs
+      // kept two independent opinions about whether a host is reachable —
+      // which is exactly the split #785 exists to close, reintroduced one
+      // level down. Measured: recall wrote plur-store-…/cache/remote-health.json
+      // while the write leg wrote plur-env-…/cache/remote-health.json. #785's
+      // test set PLUR_PATH and `path` to the same directory, the one
+      // configuration in which the bug is invisible.
+      const healthPath = this.remoteHealthStatePath()
+      // Per credential (R2-CoreB core-policy#3): a 429 on another token for
+      // this url does not park this one.
+      const cooldown = isHostInCooldown(storeEntry.url!, Date.now(), healthPath, storeEntry.token)
+      if (cooldown.inCooldown) {
+        if (cooldownSkippedHosts.has(storeEntry.url!)) return { skip: 'skipped' }
+        cooldownSkippedHosts.add(storeEntry.url!)
+        const secs = Math.max(1, Math.ceil(((cooldown.until ?? 0) - Date.now()) / 1000))
+        return {
+          skip: 'skipped',
+          warning: `${storeEntry.url}: skipped — ${cooldown.reason === 'rate_limit' ? 'rate-limited' : 'circuit breaker open'}, `
+            + `retrying in ~${secs}s. Queued engrams stay queued.`,
+        }
+      }
+      return { storeEntry }
+    }
+    const holdBack = (r: { skip: 'failed' | 'skipped'; warning?: string }): void => {
+      if (r.warning) expired_warnings.push(r.warning)
+      if (r.skip === 'failed') failed++
+      else skipped++
+    }
+    type RetireEntry = { target_url: string; target_scope: string; server_id: string; queued_at: string; last_attempt: string; attempt_count: number; last_error: string }
+    const retireStoreFor = (entry: RetireEntry): StoreEntry | undefined => (this.config.stores ?? []).find(
+      s => s.url && s.scope === entry.target_scope && normalizeEndpointUrl(s.url) === normalizeEndpointUrl(entry.target_url),
+    )
+
     // Decision D2: select AND lease under the store lock, so of two processes
     // flushing this store the second to take the lock sees the first's leases.
     const holder = this._outboxLeaseHolder
-    const leaseTakenAt = Date.now()
-    const leaseUntil = leaseTakenAt + OUTBOX_LEASE_TTL_MS
+    let leaseUntil = 0
     let engrams: Engram[] = []
     let pending: Engram[] = []
     let retiring: Engram[] = []
     await this._withStoreLock(this.paths.engrams, async () => {
       engrams = await this._primaryStore.load()
+      // Audit of #1231, finding 1: the lease clock is read HERE, inside the
+      // lock and after the load — never before waiting for the lock. A reading
+      // taken before a long wait made a lease another process wrote meanwhile
+      // look more than TTL + margin away, which `leaseFree`'s far-future clause
+      // treats as bogus, i.e. free: both processes POSTed.
+      const leaseTakenAt = Date.now()
+      leaseUntil = leaseTakenAt + OUTBOX_LEASE_TTL_MS
+      now = new Date(leaseTakenAt)
       // A row another pusher is delivering right now is not ours to push: in
       // this process (`_outboxInFlight`: learn()'s immediate push, a
       // concurrent flush) or in another one (a live foreign lease). Pushing it
@@ -8554,7 +8713,18 @@ export class Plur {
       // remote and resurrected. The cancel-outbox path in forget() strips _outbox
       // on retirement; this guard is belt-and-suspenders for any path that retires
       // without explicitly cancelling (e.g. direct YAML edits, older client versions).
-      pending = engrams.filter(e => Plur._stillQueued(e) && free(e))
+      pending = engrams.filter(e => {
+        if (!Plur._stillQueued(e) || !free(e)) return false
+        // A row owing a retire is decided in the push loop (after its retire).
+        if ((e as any).structured_data._retireRemote) return true
+        const outbox = (e as any).structured_data._outbox as OutboxEntry
+        const route = routeFor(e, outbox)
+        if ('storeEntry' in route) return true
+        // Finding 3: not attempted now — reported, not leased.
+        warnIfOld(e, outbox)
+        holdBack(route)
+        return false
+      })
       for (const e of pending) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
       // Decision D1: queued "retire on remote" entries — retired or rescoped
       // rows whose remote copy was accepted after the delivery was cancelled.
@@ -8563,20 +8733,35 @@ export class Plur {
       // THIS flush through `pending`, so it is not skipped as in flight: the
       // old copy is retired here, before the push to the new store below.
       const pendingClaimed = new Set(pending.map(e => e.id))
-      retiring = engrams.filter(e =>
-        !!(e as any).structured_data?._retireRemote && (pendingClaimed.has(e.id) || free(e))
-      )
+      retiring = engrams.filter(e => {
+        const entry = (e as any).structured_data?._retireRemote as RetireEntry | undefined
+        if (!entry || !(pendingClaimed.has(e.id) || free(e))) return false
+        if (retireStoreFor(entry)) return true
+        // Finding 3: no store to send the DELETE to — reported, not leased.
+        expired_warnings.push(
+          `${e.id}: remote copy ${entry.server_id} is queued for retirement on "${entry.target_scope}", `
+          + `but no store with that url and scope is configured — still queued.`,
+        )
+        failed++
+        return false
+      })
       for (const e of retiring) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
-      const leased = [...pending, ...retiring]
+      const leased = [...new Map([...pending, ...retiring].map(e => [e.id, e] as const)).values()]
+      if (leased.length === 0) return
       for (const e of leased) {
         ;(e as any).structured_data = { ...(e as any).structured_data, [OUTBOX_LEASE_KEY]: makeLease(holder, leaseTakenAt) }
+        leases.leased.add(e.id)
       }
       // Incremental write (#740): only the lease changed on these rows.
       await this._updateEngrams(engrams, leased)
     })
-    if (pending.length === 0 && retiring.length === 0) return { flushed: 0, failed: 0, expired_warnings: [] }
+    // Finding 3: nothing to attempt, nothing leased — no merge-back, no write.
+    if (pending.length === 0 && retiring.length === 0) {
+      leases.mergedBack = true
+      return { flushed, failed, expired_warnings }
+    }
     /** Ids this flush leased — each one's lease is released in the merge-back. */
-    const leasedIds = new Set([...pending, ...retiring].map(e => e.id))
+    const leasedIds = leases.leased
     /**
      * Decision D2: start a push/retire only while enough of the lease remains
      * for it and the merge-back to finish inside it. A row left over stays
@@ -8627,11 +8812,6 @@ export class Plur {
     const localToServer = new Map<string, string>()
     let idMapDirty = false
 
-    let flushed = 0
-    let failed = 0
-    let skipped = 0
-    /** Warn once per host, not once per queued engram (#785). */
-    const cooldownSkippedHosts = new Set<string>()
     /**
      * Engrams this flush DEMOTED to local/private on a policy change.
      *
@@ -8643,22 +8823,16 @@ export class Plur {
      * not.
      */
     const demotedIds = new Set<string>()
-    const expired_warnings: string[] = []
-    const now = new Date()
-    const TTL_MS = 7 * 24 * 60 * 60 * 1000
 
     // Decision D1: retire accepted-after-cancel remote copies. A DELETE by the
     // server id the remote assigned; 404/410 means already gone (done). The
     // outcome is merged below: `undefined` = done (entry removed), otherwise
     // the entry with its attempt bookkeeping bumped.
-    type RetireEntry = { target_url: string; target_scope: string; server_id: string; queued_at: string; last_attempt: string; attempt_count: number; last_error: string }
     const retireOutcome = new Map<string, { serverId: string; next: RetireEntry | undefined }>()
     for (const row of retiring) {
       if (!leaseStillCovers()) continue
       const entry = (row as any).structured_data._retireRemote as RetireEntry
-      const storeEntry = (this.config.stores ?? []).find(
-        s => s.url && s.scope === entry.target_scope && normalizeEndpointUrl(s.url) === normalizeEndpointUrl(entry.target_url),
-      )
+      const storeEntry = retireStoreFor(entry)
       if (!storeEntry) {
         expired_warnings.push(
           `${row.id}: remote copy ${entry.server_id} is queued for retirement on "${entry.target_scope}", `
@@ -8670,6 +8844,7 @@ export class Plur {
       const driver = this._getRemoteDriver({ url: storeEntry.url!, token: storeEntry.token, scope: storeEntry.scope })
       try {
         await driver.removeIdempotent(entry.server_id)
+        leases.settled.add(row.id)
         retireOutcome.set(row.id, { serverId: entry.server_id, next: undefined })
         flushed++
         this._appendHistory({
@@ -8691,10 +8866,7 @@ export class Plur {
     const pushedTo = new Map<string, { url: string; scope: string }>()
 
     for (const engram of pending) {
-      const outbox = (engram as any).structured_data._outbox as {
-        target_url: string; target_scope: string; queued_at: string
-        last_attempt: string; attempt_count: number; last_error: string
-      }
+      const outbox = (engram as any).structured_data._outbox as OutboxEntry
 
       // Audit of #1228, finding 1: a row still owing a retire of an older
       // remote copy is delivered only once that retire is done. Pushing first
@@ -8712,80 +8884,10 @@ export class Plur {
         }
       }
 
-      // Check TTL warning
-      const ageMs = now.getTime() - new Date(outbox.queued_at).getTime()
-      if (ageMs > TTL_MS) {
-        expired_warnings.push(
-          `${engram.id} queued ${outbox.queued_at} (${Math.floor(ageMs / 86400000)}d ago) — consider manual resolution`
-        )
-      }
-
-      // Invariant `_outbox ⇒ scope === _outbox.target_scope` (formal WritePath,
-      // candidate 2). Every in-process writer now keeps it: rescope() cancels
-      // or retargets (#848), updateEngram() does the same (decision D4), and
-      // cross-scope recurrence never widens a queued row (decision D3). Kept as
-      // DEFENCE, because it is still reachable: a hand-edited engrams.yaml, an
-      // older client sharing the store, or an update that keeps the scope but
-      // supplies its own `_outbox`. Pushing such a row delivered it, carrying its
-      // scope, to another store. Held back, loudly and non-destructively: the
-      // entry stays queued, so rescoping the engram decides where it goes.
-      if (engram.scope !== outbox.target_scope) {
-        expired_warnings.push(
-          `${engram.id}: NOT pushed — its scope is now "${engram.scope}" but it was queued for `
-          + `"${outbox.target_scope}". Rescope it (to "${outbox.target_scope}" to deliver, or to a local `
-          + `scope to cancel the delivery).`,
-        )
-        failed++
-        continue
-      }
-
-      // Resolve remote driver from current config (don't store tokens in outbox)
-      const storeEntry = (this.config.stores ?? []).find(
-        s => s.url && s.scope === outbox.target_scope && !s.readonly
-      )
-      if (!storeEntry) {
-        expired_warnings.push(`${engram.id}: no matching remote store for scope ${outbox.target_scope}`)
-        failed++
-        continue
-      }
-      // #785: consult the per-host breaker the RECALL leg maintains before
-      // spending a full fetch timeout on a host already known to be down.
-      //
-      // Without this, N queued engrams for an unreachable host cost N
-      // sequential timeouts on EVERY session start — and those failures never
-      // fed back, so the recall leg learned nothing from them either. Two legs,
-      // one host, two independent opinions about whether it is reachable.
-      //
-      // Skipping leaves the engrams queued: the outbox already retries on the
-      // next flush, and the breaker's own cooldown is what decides when that
-      // becomes worth attempting.
-      // `remoteHealthStatePath()`, explicitly — NOT the default (2026-08-13
-      // panel). The default is `remoteHealthPath()`, which resolves from
-      // PLUR_PATH; the recall leg passes `this.remoteHealthStatePath()`, which
-      // resolves from `paths.root`. For `new Plur({ path })`, `plur --path`,
-      // and every embedded consumer those are DIFFERENT FILES, so the two legs
-      // kept two independent opinions about whether a host is reachable —
-      // which is exactly the split #785 exists to close, reintroduced one
-      // level down. Measured: recall wrote plur-store-…/cache/remote-health.json
-      // while the write leg wrote plur-env-…/cache/remote-health.json. #785's
-      // test set PLUR_PATH and `path` to the same directory, the one
-      // configuration in which the bug is invisible.
-      const healthPath = this.remoteHealthStatePath()
-      // Per credential (R2-CoreB core-policy#3): a 429 on another token for
-      // this url does not park this one.
-      const cooldown = isHostInCooldown(storeEntry.url!, Date.now(), healthPath, storeEntry.token)
-      if (cooldown.inCooldown) {
-        if (!cooldownSkippedHosts.has(storeEntry.url!)) {
-          cooldownSkippedHosts.add(storeEntry.url!)
-          const secs = Math.max(1, Math.ceil(((cooldown.until ?? 0) - Date.now()) / 1000))
-          expired_warnings.push(
-            `${storeEntry.url}: skipped — ${cooldown.reason === 'rate_limit' ? 'rate-limited' : 'circuit breaker open'}, `
-            + `retrying in ~${secs}s. Queued engrams stay queued.`,
-          )
-        }
-        skipped++
-        continue
-      }
+      warnIfOld(engram, outbox)
+      const route = routeFor(engram, outbox)
+      if (!('storeEntry' in route)) { holdBack(route); continue }
+      const { storeEntry } = route
 
       const driver = this._getRemoteDriver({ url: storeEntry.url!, token: storeEntry.token, scope: storeEntry.scope })
 
@@ -8884,6 +8986,7 @@ export class Plur {
       if (!leaseStillCovers()) continue
       try {
         const pushed = await driver.appendAndGetServerId(cleanEngram)
+        leases.settled.add(engram.id)
         // #863: remember the mapping so a later engram in this same flush can
         // point at the server id rather than the local one.
         pushedTo.set(engram.id, { url: storeEntry.url!, scope: outbox.target_scope })
@@ -8945,8 +9048,9 @@ export class Plur {
       )
     }
     // Always merge when anything was leased: the leases are released here even
-    // when nothing was attempted (cooldown, lease ran short).
-    if (flushed > 0 || failed > 0 || leasedIds.size > 0) {
+    // when a leased row was not attempted after all (a breaker opened mid-batch,
+    // the lease ran short). A flush that leased nothing returned above.
+    if (leasedIds.size > 0) {
       const consideredIds = new Set(pending.map(e => e.id))
       const retiredAt = new Date().toISOString()
       const survivorsById = new Map(
@@ -8963,6 +9067,18 @@ export class Plur {
           .filter(e => {
             if (!(consideredIds.has(e.id) && !survivorsById.has(e.id))) return true
             const dest = pushedTo.get(e.id)
+            // Our lease is gone and another holder's is on the row: ours ran
+            // out before this merge-back (the store lock was held past the
+            // margin's bound, or the clocks disagree by more than the skew) and
+            // another process took the row. It may be delivering it again —
+            // the at-least-once edge the lease documents. Say so.
+            const onRow = readLease((e as any).structured_data)
+            if (onRow && onRow.holder !== holder) {
+              expired_warnings.push(
+                `${e.id}: the remote accepted it, but this flush's lease ran out before the hand-off and another `
+                + `process took the row over — it may be delivered twice.`,
+              )
+            }
             // Handed off only while still queued FOR THE STORE IT WENT TO — a
             // D4 update / rescope that retargeted it mid-push leaves it queued
             // for a store that has not received it (audit of #1228, finding 1).
@@ -9036,6 +9152,7 @@ export class Plur {
         // The dropped engrams are the ones the remote accepted — a deliberate
         // handoff, not a loss (audit #794 shrink guard).
         await this._writeEngrams(this.paths.engrams, merged, { allowShrink: true })
+        leases.mergedBack = true
       })
       await this._syncIndex()
     }

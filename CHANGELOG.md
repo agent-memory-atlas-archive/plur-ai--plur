@@ -15,6 +15,17 @@ rows for at most ten minutes. The same applies to queued remote retirements.
 The field is additive: rows without it behave as before, and an older client
 ignores it. (Decision D2.)
 
+A flush reads the clock for its lease after it gets the store lock, not before
+waiting for it, so a long wait can no longer make another process's fresh
+lease look bogus. A push starts only while five minutes of the lease remain
+(was two): enough for the request, a wait for the store lock up to its own
+timeout, and the write that hands the row off, so a flush that queues behind a
+long lock holder at the end of its batch no longer lets another process
+deliver the same rows again. A flush with nothing it can send right now (every
+queued row's host in cooldown, or no store configured) leases nothing and
+leaves the store file untouched, as before the lease; and a flush that fails
+part-way releases the leases it took instead of holding them for ten minutes.
+
 ### PGLite recall reports its fusion score
 
 With `PLUR_BACKEND=pglite`, hybrid recall returned no top score, and the opt-in

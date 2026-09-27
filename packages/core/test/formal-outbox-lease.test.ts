@@ -22,6 +22,8 @@ import yaml from 'js-yaml'
 import { Plur } from '../src/index.js'
 import { PLUR_BOOKKEEPING_KEYS, userStructuredData } from '../src/content-fields.js'
 import { StubServer } from './helpers/stub-server.js'
+import { withAsyncLock, DEFAULT_ACQUIRE_TIMEOUT } from '../src/store/async-lock.js'
+import { recordWriteOutcome } from '../src/remote-recall.js'
 import {
   leaseFree, canStartPush, dropOwnLease, newLeaseHolder, OUTBOX_LEASE_TTL_MS, OUTBOX_LEASE_MARGIN_MS,
 } from '../src/outbox-lease.js'
@@ -231,7 +233,10 @@ describe('outbox lease — two processes flushing one store', () => {
       ...stored,
       structured_data: {
         ...((stored as any).structured_data ?? {}),
-        _outboxLease: { holder: 'forged', expires_at: '2099-01-01T00:00:00.000Z' },
+        // Audit of #1231: a forged lease inside TTL + margin — one that WOULD
+        // block the flush if it were persisted. A 2099 lease is ignored by the
+        // far-future clause anyway, so the assertion below passed vacuously.
+        _outboxLease: { holder: 'forged', expires_at: new Date(Date.now() + 9 * 60_000).toISOString() },
       },
     } as any)
     expect(rowOf(e.id)?.structured_data?._outboxLease, 'a caller-set lease was persisted').toBeUndefined()
@@ -246,6 +251,130 @@ describe('outbox lease — two processes flushing one store', () => {
     const r = await new Plur({ path: dir }).flushOutbox()
     expect(r.flushed).toBe(1)
     expect(server.appendCalls).toBe(1)
+  })
+
+  // ---- Audit of #1231 -------------------------------------------------------
+
+  /** Shift `Date.now()` for this process by `off()` ms (clocks of all "processes" agree). */
+  function shiftClock() {
+    const real = Date.now
+    let off = 0
+    Date.now = () => real() + off
+    return { add: (ms: number) => { off += ms }, restore: () => { Date.now = real } }
+  }
+  /** Take the store lock in-process and keep it until `release()`. */
+  async function holdStoreLock() {
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    let inside!: () => void
+    const entered = new Promise<void>(r => { inside = r })
+    const held = withAsyncLock(engramsFile(), async () => { inside(); await gate })
+    await entered
+    return { release: async () => { release(); await held } }
+  }
+
+  it('finding 1: a flush that waited for the store lock reads the lease clock after it, not before', async () => {
+    const a = new Plur({ path: dir })
+    const e = await queued(a, 'a team fact another process leased while A waited for the lock')
+    const clock = shiftClock()
+    try {
+      const lock = await holdStoreLock()
+      const flushingA = a.flushOutbox() // waits for the lock
+      await new Promise(r => setTimeout(r, 50))
+      // Six minutes pass (a long sync holds the lock); meanwhile another
+      // process took the row with a fresh, LIVE lease.
+      clock.add(6 * 60_000)
+      editRow(e.id, row => {
+        row.structured_data._outboxLease = { holder: 'process-b', expires_at: new Date(Date.now() + OUTBOX_LEASE_TTL_MS).toISOString() }
+      })
+      await lock.release()
+      const ra = await flushingA
+      expect(ra.flushed).toBe(0)
+      expect(server.appendCalls, "A judged B's live lease from a clock read before the lock wait").toBe(0)
+      expect(rowOf(e.id)?.structured_data?._outboxLease?.holder).toBe('process-b')
+    } finally { clock.restore() }
+  })
+
+  it('finding 2: a merge-back that waits on the store lock still lands inside the lease (no redelivery)', async () => {
+    const a = new Plur({ path: dir })
+    const b = new Plur({ path: dir })
+    const e1 = await queued(a, 'the first team fact of a slow batch')
+    const e2 = await queued(a, 'the second team fact of a slow batch')
+    const gates: Array<() => void> = []
+    let arrivals = 0
+    server.appendHook = async () => { arrivals++; await new Promise<void>(r => gates.push(r)) }
+    const clock = shiftClock()
+    try {
+      const flushingA = a.flushOutbox()
+      await waitFor(() => arrivals === 1, "A's first POST")
+      // The batch ran long: the second push starts at the last moment the
+      // margin allows.
+      clock.add(OUTBOX_LEASE_TTL_MS - OUTBOX_LEASE_MARGIN_MS - 5_000)
+      gates[0]()
+      await waitFor(() => arrivals === 2, "A's second POST")
+      // A long lock holder takes the store lock; B queues behind it, A's
+      // merge-back queues behind B.
+      const lock = await holdStoreLock()
+      clock.add(30_000) // the POST takes its full request bound
+      clock.add(DEFAULT_ACQUIRE_TIMEOUT) // the lock is held for the whole acquire bound
+      const flushingB = b.flushOutbox()
+      await new Promise(r => setTimeout(r, 20))
+      server.appendHook = null // any later POST (a redelivery) answers at once
+      gates[1]()
+      await new Promise(r => setTimeout(r, 50))
+      await lock.release()
+      const rb = await flushingB
+      const ra = await flushingA
+      expect(ra.flushed).toBe(2)
+      expect(rb.flushed, 'B took rows A had already delivered').toBe(0)
+      expect(server.appendCalls, 'a statement was delivered twice').toBe(2)
+      expect(rowOf(e1.id)).toBeUndefined()
+      expect(rowOf(e2.id)).toBeUndefined()
+    } finally { clock.restore(); for (const g of gates) g() }
+  })
+
+  it('finding 3: a flush that attempts nothing (breaker open) writes nothing and leases nothing', async () => {
+    const a = new Plur({ path: dir })
+    const e = await queued(a, 'a team fact queued for a host whose breaker is open')
+    for (let i = 0; i < 10; i++) recordWriteOutcome(url, false, Date.now(), a.remoteHealthStatePath())
+    const before = readFileSync(engramsFile(), 'utf8')
+    let writes = 0
+    const orig = (a as any)._writeEngrams.bind(a)
+    ;(a as any)._writeEngrams = async (...args: any[]) => { writes++; return orig(...args) }
+    const origUpd = (a as any)._updateEngrams.bind(a)
+    ;(a as any)._updateEngrams = async (...args: any[]) => { writes++; return origUpd(...args) }
+    const r = await a.flushOutbox()
+    expect(r.flushed).toBe(0)
+    expect(r.expired_warnings.some(w => w.includes('circuit breaker open'))).toBe(true)
+    expect(writes, 'the store was rewritten for a flush that attempted nothing').toBe(0)
+    expect(readFileSync(engramsFile(), 'utf8')).toBe(before)
+    expect(rowOf(e.id)?.structured_data?._outbox).toBeTruthy()
+    expect(server.appendCalls).toBe(0)
+  })
+
+  it('finding 4: a flush that throws after leasing releases its leases', async () => {
+    const a = new Plur({ path: dir })
+    const e = await queued(a, 'a team fact whose flush blows up mid-way')
+    ;(a as any)._getRemoteDriver = () => { throw new Error('driver construction failed') }
+    await expect(a.flushOutbox()).rejects.toThrow('driver construction failed')
+    expect(rowOf(e.id)?.structured_data?._outboxLease, 'a lease outlived the flush that took it').toBeUndefined()
+    expect(rowOf(e.id)?.structured_data?._outbox).toBeTruthy()
+    const r = await new Plur({ path: dir }).flushOutbox()
+    expect(r.flushed).toBe(1)
+  })
+
+  it("listOutbox reports leased_until for a row being pushed now, this instance's own push included", async () => {
+    const a = new Plur({ path: dir })
+    const e = await queued(a, 'a team fact listed while its push is on the wire')
+    const hold = holdNextAppend()
+    const flushing = a.flushOutbox()
+    await waitFor(hold.arrived, 'the POST to be on the wire')
+    const own = (await a.listOutbox()).find(x => x.id === e.id)
+    const other = (await new Plur({ path: dir }).listOutbox()).find(x => x.id === e.id)
+    expect(own?.leased_until).toBeTruthy()
+    expect(other?.leased_until).toBe(own?.leased_until)
+    hold.release()
+    await flushing
   })
 })
 
@@ -266,6 +395,11 @@ describe('outbox-lease helpers', () => {
   it('a lease further out than TTL + margin cannot block (one bad write does not park a row forever)', () => {
     expect(leaseFree(sd('other', OUTBOX_LEASE_TTL_MS + OUTBOX_LEASE_MARGIN_MS), 'me', now)).toBe(false)
     expect(leaseFree(sd('other', OUTBOX_LEASE_TTL_MS + OUTBOX_LEASE_MARGIN_MS + 1), 'me', now)).toBe(true)
+  })
+
+  it('the margin covers a request, the store-lock wait, the merge-back write and the skew (audit of #1231)', () => {
+    expect(OUTBOX_LEASE_MARGIN_MS).toBeGreaterThanOrEqual(30_000 + DEFAULT_ACQUIRE_TIMEOUT + 60_000)
+    expect(OUTBOX_LEASE_MARGIN_MS).toBeLessThan(OUTBOX_LEASE_TTL_MS)
   })
 
   it('a push starts only while the margin still fits in the lease', () => {
