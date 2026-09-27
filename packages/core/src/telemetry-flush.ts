@@ -31,6 +31,7 @@ import {
   migrateStaleCounters,
   recoverOrphanClaims,
   releaseClaim,
+  settleSpilledEvents,
   type CounterSnapshot,
   type CountersOpts,
 } from './telemetry-counters.js'
@@ -124,6 +125,8 @@ export async function sendHeartbeat(
 
 export async function flushIfNeeded(opts: FlushOpts = {}): Promise<void> {
   if (!isTelemetryEnabled({ env: opts.env, configPath: opts.configPath })) return
+  // Fold events contended recorders spilled, so a quiet process still ships them.
+  settleSpilledEvents(opts)
 
   const countersPath = opts.countersPath
   // Privacy invariant 2: telemetry-on but no on-disk state → zero network.

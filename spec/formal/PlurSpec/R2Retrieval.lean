@@ -487,4 +487,82 @@ theorem old_stale_blocks : hit 2 (mergeOld (some ⟨1, 10⟩) ⟨2, 20⟩) = fal
 
 end EmbCache
 
+
+/-! ## Contended recorders spill instead of dropping (gap closure, 2026-09-27)
+
+`recordEvent` / `settleSpilledEvents` (telemetry-counters.ts). The final full run lost one
+event of 160 under load: a recorder that could not take the counters lock within ~1 s
+dropped its event. Now it appends the event to a spill file (no lock) and the next lock
+holder folds the spill into the counters. State for one day: events in counters.json,
+events in the spill. A contended record grows the spill, an uncontended one the counters,
+and a fold moves the whole spill into the counters. -/
+namespace Spill
+
+structure St where
+  counted : Nat
+  spilled : Nat
+  deriving DecidableEq, Repr
+
+inductive Op where
+  | record (contended : Bool)
+  | fold
+
+def step (st : St) : Op → St
+  | .record true  => { st with spilled := st.spilled + 1 }
+  | .record false => { st with counted := st.counted + 1 }
+  | .fold         => { counted := st.counted + st.spilled, spilled := 0 }
+
+def recorded : List Op → Nat
+  | [] => 0
+  | .record _ :: ops => recorded ops + 1
+  | .fold :: ops => recorded ops
+
+def run (st : St) : List Op → St
+  | [] => st
+  | op :: ops => run (step st op) ops
+
+/-- **Conservation:** whatever the interleaving of contended and uncontended records and
+folds, counted + spilled = recorded. Nothing is lost and nothing counted twice. -/
+theorem conserved (ops : List Op) (st : St) :
+    (run st ops).counted + (run st ops).spilled = st.counted + st.spilled + recorded ops := by
+  induction ops generalizing st with
+  | nil => simp [run, recorded]
+  | cons op ops ih =>
+    cases op with
+    | record c =>
+      cases c <;> simp [run, step, recorded, ih] <;> (try omega)
+    | fold => simp [run, step, recorded, ih] <;> (try omega)
+
+theorem run_append (st : St) (ops : List Op) (op : Op) :
+    run st (ops ++ [op]) = step (run st ops) op := by
+  induction ops generalizing st with
+  | nil => rfl
+  | cons o ops ih => simp [run, ih]
+
+theorem recorded_fold (ops : List Op) : recorded (ops ++ [Op.fold]) = recorded ops := by
+  induction ops with
+  | nil => rfl
+  | cons op ops ih => cases op <;> simp [recorded, ih]
+
+/-- After a final fold every recorded event is in the counters. -/
+theorem fold_counts_all (ops : List Op) :
+    (run ⟨0, 0⟩ (ops ++ [.fold])).counted = recorded ops := by
+  have h := conserved (ops ++ [.fold]) ⟨0, 0⟩
+  have hs : (run ⟨0, 0⟩ (ops ++ [.fold])).spilled = 0 := by
+    rw [run_append]; rfl
+  rw [recorded_fold] at h
+  simp at h
+  omega
+
+/-- **Old counterexample:** a contended record that drops its event loses it. -/
+def stepOld (st : St) : Op → St
+  | .record true  => st
+  | .record false => { st with counted := st.counted + 1 }
+  | .fold         => st
+
+theorem old_drops : (stepOld ⟨0, 0⟩ (.record true)).counted +
+    (stepOld ⟨0, 0⟩ (.record true)).spilled = 0 := rfl
+
+end Spill
+
 end PlurSpec.R2Retrieval

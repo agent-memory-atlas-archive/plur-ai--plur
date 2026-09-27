@@ -36,7 +36,7 @@ vi.mock('node:fs', async (importOriginal) => {
 })
 
 const fs = await vi.importActual<typeof import('node:fs')>('node:fs')
-const { recordEvent, readPendingCounters, listPendingDates } = await import('../src/telemetry-counters.js')
+const { recordEvent, readPendingCounters, listPendingDates, settleSpilledEvents } = await import('../src/telemetry-counters.js')
 const { flushIfNeeded } = await import('../src/telemetry-flush.js')
 
 const D = '2026-05-10'
@@ -98,6 +98,9 @@ describe('formal R2 core-retrieval#7 — telemetry counters conserve events', ()
     await new Promise((r) => setTimeout(r, 1500)) // let every child reach the barrier
     fs.writeFileSync(go, '')
     expect(await Promise.all(done)).toEqual(Array(N).fill(0))
+    // A recorder that could not take the lock spilled its event instead of
+    // dropping it (gap closure 2026-09-27); fold the spill before counting.
+    settleSpilledEvents({ ...base, now: dayD1 })
     expect(readPendingCounters(D, base)?.learn).toBe(5)
     expect(readCounters().learn).toBe(N * 40)
   }, 60_000)

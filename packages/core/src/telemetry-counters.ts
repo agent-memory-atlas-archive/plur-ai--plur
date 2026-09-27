@@ -29,11 +29,15 @@
 // POST, so a second flusher cannot send it again and a later merge for that date
 // lands in a fresh pending file instead of being deleted with the sent one.
 // Invariant, per date: shipped + on disk (counters, pending, claims) = recorded.
-// If the lock cannot be taken (contended for ~1 s) the event is DROPPED rather
-// than written unlocked: telemetry never blocks or fails the tool call, and an
-// undercount is the conservative error.
+// If the lock cannot be taken (contended for ~1 s) the event is not written
+// unlocked and not dropped: it is APPENDED to `<countersPath>.spill` (one short
+// O_APPEND write, no lock) and the next writer holding the lock folds the spill
+// in. Telemetry still never blocks or fails the tool call, and events are
+// conserved — the final full run showed the old drop losing 1 of 160 under load.
+// Spill files count as "on disk" in the invariant above.
 
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -208,6 +212,96 @@ function moveToPending(stored: StoredCounters, pendingDir: string): void {
   atomicWriteJson(path, merged)
 }
 
+/** Where a contended recorder leaves its event for the next lock holder. */
+function spillPath(countersPath: string): string {
+  return `${countersPath}.spill`
+}
+
+/** Append one event for later folding. Never throws: a failed spill is the
+ *  only remaining way an event is lost, and it must not fail the tool call. */
+function spillEvent(countersPath: string, event: CounterEvent, date: string): void {
+  try {
+    ensureParentDir(countersPath)
+    appendFileSync(spillPath(countersPath), JSON.stringify({ e: event, d: date }) + '\n')
+  } catch { /* telemetry never fails the caller */ }
+}
+
+/**
+ * Under the counters lock: claim every spill file (the live one by atomic
+ * rename, so appends after this point start a fresh one; plus any claim a
+ * crashed holder left behind) and return their events with the claim paths.
+ * The caller unlinks the claims only after counters.json is written.
+ */
+function claimSpills(countersPath: string): { events: Array<{ e: CounterEvent; d: string }>; claims: string[] } {
+  const events: Array<{ e: CounterEvent; d: string }> = []
+  const claims: string[] = []
+  const live = spillPath(countersPath)
+  try {
+    if (existsSync(live)) renameSync(live, `${live}.${randomUUID()}`)
+  } catch { /* nothing to claim, or a concurrent append recreated it — next time */ }
+  const dir = dirname(countersPath)
+  const prefix = `${live.slice(dir.length + 1)}.`
+  let names: string[] = []
+  try { names = readdirSync(dir).filter(n => n.startsWith(prefix)) } catch { return { events, claims } }
+  for (const n of names) {
+    const path = join(dir, n)
+    claims.push(path)
+    let raw = ''
+    try { raw = readFileSync(path, 'utf8') } catch { continue }
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const v = JSON.parse(line) as { e?: unknown; d?: unknown }
+        if ((v.e === 'learn' || v.e === 'recall' || v.e === 'session') && typeof v.d === 'string') {
+          events.push({ e: v.e, d: v.d })
+        }
+      } catch { /* a torn last line from a crash: skip it */ }
+    }
+  }
+  return { events, claims }
+}
+
+/** Apply one event to a day's counters, with the session rule. */
+function applyEvent(c: StoredCounters, event: CounterEvent): void {
+  const sessionAlreadyCounted = c.session > 0
+  if (event === 'learn') c.learn += 1
+  else if (event === 'recall') c.recall += 1
+  else if (event === 'session') c.session += 1
+  if ((event === 'learn' || event === 'recall') && !sessionAlreadyCounted) c.session += 1
+}
+
+/**
+ * Fold any spilled events into counters/pending without recording a new one.
+ * Called by the flush first, so a quiet process ships what contended recorders
+ * left behind. `false` when the lock could not be taken (they stay on disk).
+ */
+export function settleSpilledEvents(opts: CountersOpts = {}): boolean {
+  const countersPath = opts.countersPath ?? defaultCountersPath()
+  const pendingDir = opts.pendingDir ?? defaultPendingDir()
+  return underCountersLock(opts, () => {
+    const { events, claims } = claimSpills(countersPath)
+    if (events.length === 0) {
+      for (const c of claims) { try { unlinkSync(c) } catch { /* gone */ } }
+      return true
+    }
+    // No counters yet (the very first events all contended): the latest spilled
+    // day becomes counters.json, so today's counts are not shipped as a past day.
+    const latest = events.map(x => x.d).sort().at(-1)!
+    const current = readStoredCounters(countersPath) ?? freshCounters(latest)
+    const byDay = new Map<string, StoredCounters>()
+    for (const s of events) {
+      if (s.d === current.date) { applyEvent(current, s.e); continue }
+      const day = byDay.get(s.d) ?? freshCounters(s.d)
+      applyEvent(day, s.e)
+      byDay.set(s.d, day)
+    }
+    atomicWriteJson(countersPath, current)
+    for (const day of byDay.values()) moveToPending(day, pendingDir)
+    for (const c of claims) { try { unlinkSync(c) } catch { /* gone */ } }
+    return true
+  }) ?? false
+}
+
 export function recordEvent(event: CounterEvent, opts: CountersOpts = {}): boolean {
   if (!isTelemetryEnabled(gateOpts(opts))) return false
 
@@ -215,7 +309,7 @@ export function recordEvent(event: CounterEvent, opts: CountersOpts = {}): boole
   const installIdPath = opts.installIdPath ?? defaultInstallIdPath()
   const pendingDir = opts.pendingDir ?? defaultPendingDir()
 
-  return underCountersLock(opts, () => {
+  const result = underCountersLock(opts, () => {
     // Read the clock under the lock: a `today` taken before waiting could be
     // yesterday by the time we hold it.
     const now = (opts.now ?? (() => new Date()))()
@@ -237,19 +331,32 @@ export function recordEvent(event: CounterEvent, opts: CountersOpts = {}): boole
     } else {
       current = stored ?? freshCounters(today)
     }
-    const sessionAlreadyCounted = current.session > 0
 
-    if (event === 'learn') current.learn += 1
-    else if (event === 'recall') current.recall += 1
-    else if (event === 'session') current.session += 1
-
-    if ((event === 'learn' || event === 'recall') && !sessionAlreadyCounted) {
-      current.session += 1
+    // Fold in events other recorders spilled while this lock was contended:
+    // today's into counters.json, an earlier day's into that day's pending file.
+    const { events, claims } = claimSpills(countersPath)
+    const older = new Map<string, StoredCounters>()
+    for (const s of events) {
+      if (s.d === current.date) { applyEvent(current, s.e); continue }
+      const day = older.get(s.d) ?? freshCounters(s.d)
+      applyEvent(day, s.e)
+      older.set(s.d, day)
     }
+    for (const day of older.values()) moveToPending(day, pendingDir)
+
+    applyEvent(current, event)
 
     atomicWriteJson(countersPath, current)
+    // Only now are the claimed events durable in counters/pending.
+    for (const c of claims) { try { unlinkSync(c) } catch { /* already gone */ } }
     return rolledOver
-  }) ?? false
+  })
+  if (result === undefined) {
+    const now = (opts.now ?? (() => new Date()))()
+    spillEvent(countersPath, event, utcDate(now))
+    return false
+  }
+  return result
 }
 
 // Pending-flush directory helpers (#128). flushIfNeeded uses these to drain
