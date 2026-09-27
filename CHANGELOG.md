@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### A corrected memory stops being injected, and a project's memories stay in that project
+### A corrected memory stops being injected, and a project's memories stay in that project (#1232)
 
 **A correction no longer arrives beside the advice it corrected.** When an
 engram is superseded (`plur learn --supersedes`, `plur_learn` with
