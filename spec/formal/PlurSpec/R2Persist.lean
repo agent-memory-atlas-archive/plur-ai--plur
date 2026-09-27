@@ -4,6 +4,11 @@
 Models of `packages/core/src/{store/async-lock.ts, sync.ts, engrams.ts, backup.ts,
 storage-pglite.ts, storage-postgres.ts, migrations/runner.ts}`.
 Findings, verdicts and replays: `spec/formal/findings/r2-persist.md`.
+
+Checked against commit af693450 (2026-09-27): storage-postgres.ts changed only `initSchema`'s
+unlock failure path (the init advisory lock; modelled by `Persistence.PgLock`). The save/dup-id
+paths these sections model (`resolveSaveBatch`, rename listeners) are untouched, so every
+theorem here still holds.
 -/
 
 set_option linter.deprecated false
