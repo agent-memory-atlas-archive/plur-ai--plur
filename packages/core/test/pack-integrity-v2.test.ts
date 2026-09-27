@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, cpSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { tmpdir } from 'node:os'
+import { tmpdir, hostname } from 'node:os'
 import { join } from 'node:path'
 import yaml from 'js-yaml'
 import { EngramSchema } from '../src/schemas/engram.js'
@@ -232,5 +232,142 @@ describe('migratePackIntegrity — re-baselining installed v1 rows', () => {
 
   it('an empty or absent packs directory is a no-op', () => {
     expect(migratePackIntegrity(join(tmp, 'nowhere')).packs).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Audit of #1229, finding 1: a v1 match is not evidence against the v1
+// weaknesses (§5.5), so migration must not present it as one. With the recorded
+// source still on disk, the installed pack is re-verified against what
+// installing that source produces; without it, the baseline is carried forward
+// and says so.
+
+describe('migratePackIntegrity — a v1 match does not certify the pack', () => {
+  let packs: string
+  let installed: string
+  const src = () => join(tmp, 'src-edited')
+  beforeEach(async () => {
+    packs = join(tmp, 'packs')
+    installed = await legacyInstall(packs, 'edited')
+  })
+
+  const rows = () => (yaml.load(readFileSync(join(packs, 'registry.yaml'), 'utf8')) as {
+    packs: Array<{ name: string; integrity: string; integrity_carried_from?: string }>
+  }).packs
+  const row = () => rows().find(r => r.name === 'edited')!
+  const listed = () => listPacks(packs).find(p => p.name === 'edited')!
+
+  /** The two v1-invisible edits from the audit replay. */
+  const edits: Record<string, (dir: string) => void> = {
+    'boundary shift': (dir) => shiftBoundary(dir, 1),
+    'added manifest.yaml': (dir) => writeFileSync(join(dir, 'manifest.yaml'), 'name: edited\nversion: 6.6.6\n'),
+  }
+
+  for (const [label, edit] of Object.entries(edits)) {
+    it(`${label}, source still on disk: skipped-modified, the v1 row is kept`, () => {
+      const v1Before = row().integrity
+      edit(installed)
+      expect(packIntegrityMatches(v1Before, installed)).toBe(true) // invisible to v1: the premise
+      const report = migratePackIntegrity(packs)
+      const p = report.packs.find(x => x.name === 'edited')!
+      expect(p.action).toBe('skipped-modified')
+      expect(p.reason).toBe('differs-from-source')
+      expect(report.migrated).toBe(0)
+      expect(row().integrity).toBe(v1Before)
+      expect(row().integrity_carried_from).toBeUndefined()
+    })
+
+    it(`${label}, source gone: migrated AS CARRIED, and listed as carried`, () => {
+      edit(installed)
+      rmSync(src(), { recursive: true, force: true })
+      const report = migratePackIntegrity(packs)
+      const p = report.packs.find(x => x.name === 'edited')!
+      expect(p.action).toBe('migrated')
+      expect(p.baseline).toBe('carried-from-v1')
+      expect(report.carried).toBe(1)
+      expect(row().integrity).toMatch(V2)
+      expect(row().integrity_carried_from).toBe('v1')
+      const l = listed()
+      expect(l.integrity_status).toBe('ok')
+      expect(l.baseline).toBe('carried-from-v1') // never shown as a verified v2 install
+    })
+  }
+
+  it('an unedited pack whose source is on disk is re-verified, not carried', () => {
+    const report = migratePackIntegrity(packs)
+    const p = report.packs.find(x => x.name === 'edited')!
+    expect(p.action).toBe('migrated')
+    expect(p.baseline).toBe('source-verified')
+    expect(report.carried).toBe(0)
+    expect(row().integrity).toBe(computePackIntegrity(installed))
+    expect(row().integrity_carried_from).toBeUndefined()
+    expect(listed().baseline).toBeUndefined()
+  })
+
+  it('a source that install had to neutralize still re-verifies (same transformation as install)', async () => {
+    // A pinned engram is stripped on install, so the installed engrams.yaml is
+    // not the source's. Comparing raw source bytes would call this pack modified.
+    const out = join(tmp, 'src-pinned')
+    exportPack([engram('ENG-2026-09-26-002')], out, { name: 'pinned', version: '1.0.0', license: 'cc-by-4.0' })
+    const ep = join(out, 'engrams.yaml')
+    writeFileSync(ep, readFileSync(ep, 'utf8').replace('status: active', 'status: active\n    pinned: true'))
+    writeFileSync(join(out, 'INTEGRITY'), `${computePackIntegrity(out)}\n`)
+    await installPack(packs, out)
+    const dest = join(packs, 'src-pinned')
+    expect(readFileSync(join(dest, 'engrams.yaml'), 'utf8')).not.toContain('pinned')
+    const regPath = join(packs, 'registry.yaml')
+    const reg = yaml.load(readFileSync(regPath, 'utf8')) as { packs: Array<{ name: string; integrity: string }> }
+    reg.packs.find(r => r.name === 'pinned')!.integrity = v1Of(dest)
+    writeFileSync(regPath, yaml.dump(reg))
+    const p = migratePackIntegrity(packs).packs.find(x => x.name === 'pinned')!
+    expect(p.action).toBe('migrated')
+    expect(p.baseline).toBe('source-verified')
+  })
+
+  it('a reinstall replaces a carried baseline with a fresh one', async () => {
+    const out = join(tmp, 'keep')
+    cpSync(src(), out, { recursive: true })
+    rmSync(src(), { recursive: true, force: true })
+    migratePackIntegrity(packs)
+    expect(row().integrity_carried_from).toBe('v1')
+    cpSync(out, src(), { recursive: true })
+    await installPack(packs, src())
+    expect(row().integrity_carried_from).toBeUndefined()
+    expect(listed().baseline).toBeUndefined()
+  })
+
+  it('a dry run reports the same verdicts and does not take the registry lock', () => {
+    rmSync(src(), { recursive: true, force: true })
+    // A live holder of the registry lock: a real run would wait for it and
+    // then give up; a read-only dry run has no reason to.
+    const lock = join(packs, 'registry.yaml.lock')
+    writeFileSync(lock, `${hostname()}:${process.pid}:0:0`)
+    try {
+      const report = migratePackIntegrity(packs, { dryRun: true })
+      const p = report.packs.find(x => x.name === 'edited')!
+      expect(p.action).toBe('migrated')
+      expect(p.baseline).toBe('carried-from-v1')
+      expect(row().integrity).toMatch(/^sha256:[0-9a-f]{64}$/)
+    } finally {
+      rmSync(lock, { force: true })
+    }
+  })
+})
+
+describe('migratePackIntegrity — transient and non-pack entries (audit #1229 findings 3/4)', () => {
+  it('staging and displaced copies left by an install are not treated as packs', async () => {
+    const packs = join(tmp, 'packs')
+    const installed = await legacyInstall(packs, 'clean')
+    // A crash-leftover staging copy shares the manifest name `clean`.
+    cpSync(installed, join(packs, 'src-clean.installing-123-456'), { recursive: true })
+    cpSync(installed, join(packs, 'src-clean.replacing-123-456'), { recursive: true })
+    writeFileSync(join(packs, 'stray-file.txt'), 'x')
+    const dry = migratePackIntegrity(packs, { dryRun: true })
+    const real = migratePackIntegrity(packs)
+    for (const r of [dry, real]) {
+      expect(r.packs.map(p => p.dir)).toEqual(['src-clean'])
+      expect(r.packs[0].action).toBe('migrated')
+    }
+    expect(listPacks(packs).map(p => p.name)).toEqual(['clean'])
   })
 })

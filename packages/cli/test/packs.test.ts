@@ -315,4 +315,35 @@ describe('plur packs — text surface', () => {
     await packs(['list'], true)
     expect(JSON.parse(stdout()).count).toBe(0)
   })
+
+  it('list shows enough of a v2 value to tell packs apart (audit of #1229, finding 5)', async () => {
+    const packDir = writePack('shown', [engram('ENG-2026-0101-001')])
+    await packs(['install', packDir])
+    out.length = 0
+    await packs(['list'])
+    // `sha256:v2:` plus 12 hex digits — slice(0, 16) left six.
+    expect(stdout()).toMatch(/\[sha256:v2:[0-9a-f]{12}\]/)
+  })
+
+  it('a baseline carried from v1 is labelled as carried in migrate and in list (audit of #1229, finding 1)', async () => {
+    const packDir = writePack('carried', [engram('ENG-2026-0101-001')])
+    await packs(['install', packDir])
+    const installed = join(dir, 'packs', basename(packDir))
+    const v1 = 'sha256:' + createHash('sha256')
+      .update(readFileSync(join(installed, 'SKILL.md')))
+      .update(readFileSync(join(installed, 'engrams.yaml'))).digest('hex')
+    const regPath = join(dir, 'packs', 'registry.yaml')
+    writeFileSync(regPath, readFileSync(regPath, 'utf8').replace(/integrity: .*/, `integrity: "${v1}"`))
+    rmSync(packDir, { recursive: true, force: true }) // the recorded source is gone
+    out.length = 0
+    await packs(['migrate-integrity', '--yes'])
+    expect(stdout()).toMatch(/carried from v1/i)
+    expect(stdout()).toMatch(/not re-verified/i)
+    out.length = 0
+    await packs(['list'])
+    expect(stdout()).toMatch(/baseline carried from v1/i)
+    out.length = 0
+    await packs(['list'], true)
+    expect(JSON.parse(stdout()).packs[0].baseline).toBe('carried-from-v1')
+  })
 })

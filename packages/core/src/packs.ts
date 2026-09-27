@@ -127,6 +127,41 @@ export interface RegistryEntry {
   integrity: string
   version?: string
   creator?: string
+  /**
+   * Set when `integrity` is a v2 value that `migratePackIntegrity` carried
+   * forward from a v1 row WITHOUT re-verifying the pack against its source
+   * (§5.5). v1 cannot see bytes moved across the SKILL.md / engrams.yaml
+   * boundary or an added `manifest.yaml`, so a carried value inherits v1's
+   * trust and nothing more: it detects changes made AFTER the migration, not
+   * changes made before it. A reinstall writes a fresh row without it.
+   */
+  integrity_carried_from?: 'v1'
+}
+
+/**
+ * A directory an install creates next to the live pack and removes again
+ * (`<dest>.installing-<pid>-<ms>` while staging, `<dest>.replacing-<pid>-<ms>`
+ * during the swap). A crash can leave one behind. It is never a pack in its
+ * own right — it carries the same manifest name as the pack it shadows — so
+ * nothing that walks the packs directory may treat it as one.
+ */
+export function isTransientPackDir(entry: string): boolean {
+  return /\.(installing|replacing)-\d+-\d+$/.test(entry)
+}
+
+/**
+ * Is `p` a directory right now? `false` when it is not, or when it vanished
+ * between the `readdir` that named it and this check — an install that
+ * finished mid-walk renames its staging directory away, and that must not
+ * abort a listing or a migration (audit of #1229, finding 3).
+ */
+function isDirNow(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory()
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw err
+  }
 }
 
 function registryPath(packsDir: string): string {
@@ -1103,6 +1138,36 @@ function fsyncTree(dir: string): void {
   try { fsyncDir(dir) } catch { /* not a syncable directory */ }
 }
 
+/**
+ * The transformations install applies to a staged copy before hashing it: a
+ * deprecated `manifest.yaml`-only pack is upgraded to `SKILL.md` (#325), and
+ * host-overriding engram fields are neutralized (§5.6.1 step 3). Mutates
+ * `dir`. Shared by install and by `migratePackIntegrity`, which must reproduce
+ * the installed form of a source byte for byte to re-verify against it.
+ */
+function normalizeStagedPack(dir: string, manifest: PackManifest): {
+  upgradedManifest: boolean
+  engrams: Engram[]
+  sanitized: ReturnType<typeof sanitizePackEngrams>
+} {
+  const skillMd = path.join(dir, 'SKILL.md')
+  const manifestYaml = path.join(dir, 'manifest.yaml')
+  let upgradedManifest = false
+  if (!fs.existsSync(skillMd) && fs.existsSync(manifestYaml)) {
+    fs.writeFileSync(skillMd, manifestToSkillMd(manifest))
+    fs.rmSync(manifestYaml)
+    upgradedManifest = true
+  }
+  const engramsPath = path.join(dir, 'engrams.yaml')
+  let engrams = fs.existsSync(engramsPath) ? loadEngrams(engramsPath) : []
+  const sanitized = sanitizePackEngrams(engrams)
+  if (sanitized.changed) {
+    engrams = sanitized.engrams
+    saveEngrams(engramsPath, engrams)
+  }
+  return { upgradedManifest, engrams, sanitized }
+}
+
 function _installPackDir(
   packsDir: string,
   source: string,
@@ -1278,25 +1343,20 @@ function _installPackDir(
   // warning), but the managed copy is normalized to the canonical SKILL.md so
   // the integrity value below covers the SKILL.md that is actually installed.
   // Done before computePackIntegrity so the recorded integrity reflects the upgrade.
-  const destSkillMd = path.join(staging, 'SKILL.md')
-  const destManifestYaml = path.join(staging, 'manifest.yaml')
-  if (!fs.existsSync(destSkillMd) && fs.existsSync(destManifestYaml)) {
-    fs.writeFileSync(destSkillMd, manifestToSkillMd(preview.manifest))
-    fs.rmSync(destManifestYaml)
+  //
+  // Load engrams, then clamp host-overriding fields (pinned / locked commitment)
+  // before they can reach injection. Re-save the sanitized copy so the on-disk
+  // pack AND the integrity hash reflect the clamped content.
+  //
+  // Both steps live in `normalizeStagedPack` so that `migratePackIntegrity`
+  // can reproduce the installed form of a source exactly (§5.5 re-baselining).
+  const { upgradedManifest, engrams: newEngrams, sanitized } = normalizeStagedPack(staging, preview.manifest)
+  if (upgradedManifest) {
     logger.warning(
       `installPack: pack '${preview.manifest.name}' shipped a deprecated manifest.yaml — upgraded to SKILL.md in the installed copy`,
     )
   }
-
-  // Load engrams, then clamp host-overriding fields (pinned / locked commitment)
-  // before they can reach injection. Re-save the sanitized copy so the on-disk
-  // pack AND the integrity hash reflect the clamped content.
-  const engramsPath = path.join(staging, 'engrams.yaml')
-  let newEngrams = fs.existsSync(engramsPath) ? loadEngrams(engramsPath) : []
-  const sanitized = sanitizePackEngrams(newEngrams)
   if (sanitized.changed) {
-    newEngrams = sanitized.engrams
-    saveEngrams(engramsPath, newEngrams)
     // Each field on its own line (§5.6.5: "which field was changed"). The
     // locked downgrade had no line at all, so a pack that shipped only locked
     // commitments was altered in silence.
@@ -1537,6 +1597,16 @@ export interface PackInfo {
    */
   integrity_status?: 'ok' | 'modified' | 'unverified'
   /**
+   * `'carried-from-v1'` when the registry's v2 baseline was carried forward
+   * from a v1 row without re-verifying the pack against its source (§5.5,
+   * `RegistryEntry.integrity_carried_from`). `integrity_status: 'ok'` then
+   * means "unchanged since the migration", not "matches what was installed":
+   * an edit v1 could not see, made before the migration, is inside the
+   * baseline. Absent for a baseline written by an install or re-verified
+   * against the source.
+   */
+  baseline?: 'carried-from-v1'
+  /**
    * Why this pack could not be read, when it could not (audit 2026-08-03,
    * finding 13). A damaged pack is listed with what is known about it rather
    * than aborting the listing or appearing as a healthy pack with 0 engrams.
@@ -1552,8 +1622,9 @@ export function listPacks(packsDir: string): PackInfo[] {
 
   const result: PackInfo[] = []
   for (const entry of fs.readdirSync(packsDir)) {
+    if (isTransientPackDir(entry)) continue
     const packDir = path.join(packsDir, entry)
-    if (!fs.statSync(packDir).isDirectory()) continue
+    if (!isDirNow(packDir)) continue
 
     try {
       const pack = loadPack(packDir)
@@ -1572,6 +1643,9 @@ export function listPacks(packsDir: string): PackInfo[] {
         source: reg?.source,
         integrity_ok: integrityOk,
         integrity_status: reg ? (integrityOk ? 'ok' : 'modified') : 'unverified',
+        ...(reg?.integrity_carried_from === 'v1' && INTEGRITY_V2_RE.test(reg.integrity)
+          ? { baseline: 'carried-from-v1' as const }
+          : {}),
       })
     } catch (manifestErr) {
       // Per-pack fallback: the manifest would not load, so report what can
@@ -2360,11 +2434,20 @@ export function packIntegrityMatches(recorded: string, packDir: string): boolean
 // --- Migration: v1 -> v2 registry baselines ---
 
 export type PackIntegrityMigrationAction =
-  /** v1 row, pack verifies clean under v1: re-baselined (or would be, on a dry run). */
+  /**
+   * v1 row, pack verifies clean under v1: re-baselined to v2 (or would be, on a
+   * dry run). `baseline` says whether the pack was re-verified against its
+   * source or the v1 trust was only carried forward.
+   */
   | 'migrated'
   /** The row already carries v2. Nothing to do. */
   | 'already-v2'
-  /** v1 row, but the pack no longer matches it. Left as v1, so it keeps reporting `modified`. */
+  /**
+   * Left as v1. `reason` says why: the pack no longer matches its v1 value
+   * (`differs-from-v1`, it goes on reporting `modified`), or it matches v1 but
+   * not what installing its recorded source produces (`differs-from-source`,
+   * an edit v1 cannot see — or a source that has moved on since install).
+   */
   | 'skipped-modified'
   /** No registry row for this pack. No baseline is invented. */
   | 'skipped-no-entry'
@@ -2375,68 +2458,159 @@ export type PackIntegrityMigrationAction =
 
 export interface PackIntegrityMigrationReport {
   dry_run: boolean
-  /** How many rows were (or, on a dry run, would be) re-baselined to v2. */
+  /** How many rows were (or, on a dry run, would be) re-baselined to v2, carried ones included. */
   migrated: number
+  /** Of `migrated`, how many were carried forward without re-verification. */
+  carried: number
   packs: Array<{
     /** Directory name under the packs directory. */
     dir: string
     /** Manifest name, when it could be read. */
     name?: string
     action: PackIntegrityMigrationAction
+    /** For `migrated`: how the new baseline was established. */
+    baseline?: 'source-verified' | 'carried-from-v1'
+    /** For `skipped-modified`: which comparison failed. */
+    reason?: 'differs-from-v1' | 'differs-from-source'
     from?: string
     to?: string
   }>
 }
 
 /**
+ * The v2 value installing `source` would record today, or `null` when the
+ * source is not a local pack directory that can be read (a URL, a path that no
+ * longer exists, the installed directory itself, anything that fails to load).
+ *
+ * Only the three hashed parts are copied, into a temporary directory, and put
+ * through the same `normalizeStagedPack` install uses, so a source that install
+ * had to neutralize still reproduces the installed bytes.
+ */
+function expectedInstalledIntegrity(source: string | undefined, packDir: string): string | null {
+  if (!source || isPackUrl(source)) return null
+  const src = path.resolve(source)
+  if (src === path.resolve(packDir) || !isDirNow(src)) return null
+  let tmp: string | undefined
+  try {
+    const manifest = loadPack(src).manifest
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'plur-pack-reverify-'))
+    for (const name of PACK_INTEGRITY_V2_PARTS) {
+      const from = path.join(src, name)
+      let st: fs.Stats
+      try { st = fs.lstatSync(from) } catch { continue } // absent part
+      if (!st.isFile()) return null // a link or special file: install would refuse it
+      fs.copyFileSync(from, path.join(tmp, name))
+    }
+    normalizeStagedPack(tmp, manifest)
+    return computePackIntegrity(tmp)
+  } catch {
+    return null
+  } finally {
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+/**
  * Re-baseline installed packs' registry integrity from v1 to v2 (§5.5).
  *
- * A row is rewritten ONLY when its pack still verifies clean under v1. A pack
- * that no longer matches its v1 baseline keeps that baseline, so it goes on
- * reporting `modified` — re-hashing it would bless the modification. Nothing
- * else in the row changes, and a pack's shipped `INTEGRITY` file is never
- * touched (it is the producer's value, §5.5.1).
+ * A v1 match is NOT evidence that a pack is unchanged: v1 cannot see bytes
+ * moved across the SKILL.md / engrams.yaml boundary, nor a `manifest.yaml`
+ * added beside SKILL.md (audit of #1229, finding 1). So a row whose pack still
+ * matches v1 is handled in one of two ways:
  *
- * Idempotent: a second run finds every clean row already v2. With
- * `dryRun: true` it reports what it would do and writes nothing. Runs under the
- * registry lock, and writes the registry once, only if a row changed.
+ *   - its recorded `source` is still a local pack directory: the pack is
+ *     re-verified against what installing that source produces, and
+ *     re-baselined only if it matches (`baseline: 'source-verified'`), else
+ *     left as v1 (`skipped-modified`, `reason: 'differs-from-source'`);
+ *   - otherwise the v2 value is recorded but marked
+ *     `integrity_carried_from: 'v1'` (`baseline: 'carried-from-v1'`), and
+ *     `listPacks` reports it as carried. It inherits v1's trust; it certifies
+ *     nothing.
+ *
+ * A pack that no longer matches its v1 value keeps it and goes on reporting
+ * `modified`. Nothing else in the row changes, and a pack's shipped
+ * `INTEGRITY` file is never touched (it is the producer's value, §5.5.1).
+ *
+ * Staging (`*.installing-*`) and displaced (`*.replacing-*`) directories and
+ * non-directories are skipped, and an entry that vanishes mid-walk is skipped
+ * rather than aborting the run. The hashing is done WITHOUT the registry lock;
+ * only a real run takes it, briefly, to write rows whose value is still the one
+ * it planned from. A dry run never takes it. Idempotent.
  */
 export function migratePackIntegrity(
   packsDir: string,
   opts: { dryRun?: boolean } = {},
 ): PackIntegrityMigrationReport {
   const dryRun = opts.dryRun === true
-  const report: PackIntegrityMigrationReport = { dry_run: dryRun, migrated: 0, packs: [] }
+  const report: PackIntegrityMigrationReport = { dry_run: dryRun, migrated: 0, carried: 0, packs: [] }
   if (!fs.existsSync(packsDir)) return report
 
-  withRegistryLock(packsDir, () => {
-    const entries = loadRegistry(packsDir)
-    let changed = false
-    for (const dir of fs.readdirSync(packsDir).sort()) {
-      const packDir = path.join(packsDir, dir)
-      if (!fs.statSync(packDir).isDirectory()) continue
-      let name: string
-      try { name = loadPack(packDir).manifest.name } catch {
-        report.packs.push({ dir, action: 'skipped-unreadable' })
-        continue
-      }
-      const row = entries.find(e => e.name === name)
-      if (!row) { report.packs.push({ dir, name, action: 'skipped-no-entry' }); continue }
-      if (INTEGRITY_V2_RE.test(row.integrity)) { report.packs.push({ dir, name, action: 'already-v2' }); continue }
-      if (!INTEGRITY_V1_RE.test(row.integrity)) {
-        report.packs.push({ dir, name, action: 'skipped-unknown-format', from: row.integrity })
-        continue
-      }
-      if (!packIntegrityMatches(row.integrity, packDir)) {
-        report.packs.push({ dir, name, action: 'skipped-modified', from: row.integrity })
-        continue
-      }
-      const to = computePackIntegrity(packDir)
-      report.packs.push({ dir, name, action: 'migrated', from: row.integrity, to })
-      report.migrated++
-      if (!dryRun) { row.integrity = to; changed = true }
+  const entries = loadRegistry(packsDir)
+  const plan: Array<{ name: string; from: string; to: string; carried: boolean }> = []
+  for (const dir of fs.readdirSync(packsDir).sort()) {
+    if (isTransientPackDir(dir)) continue
+    const packDir = path.join(packsDir, dir)
+    if (!isDirNow(packDir)) continue
+    let name: string
+    try { name = loadPack(packDir).manifest.name } catch {
+      if (!fs.existsSync(packDir)) continue // removed mid-walk
+      report.packs.push({ dir, action: 'skipped-unreadable' })
+      continue
     }
-    if (changed) saveRegistry(packsDir, entries)
-  })
+    const row = entries.find(e => e.name === name)
+    if (!row) { report.packs.push({ dir, name, action: 'skipped-no-entry' }); continue }
+    if (INTEGRITY_V2_RE.test(row.integrity)) { report.packs.push({ dir, name, action: 'already-v2' }); continue }
+    if (!INTEGRITY_V1_RE.test(row.integrity)) {
+      report.packs.push({ dir, name, action: 'skipped-unknown-format', from: row.integrity })
+      continue
+    }
+    if (!packIntegrityMatches(row.integrity, packDir)) {
+      report.packs.push({ dir, name, action: 'skipped-modified', reason: 'differs-from-v1', from: row.integrity })
+      continue
+    }
+    const to = computePackIntegrity(packDir)
+    const expected = expectedInstalledIntegrity(row.source, packDir)
+    if (expected !== null && expected !== to) {
+      report.packs.push({ dir, name, action: 'skipped-modified', reason: 'differs-from-source', from: row.integrity })
+      continue
+    }
+    const carried = expected === null
+    report.packs.push({
+      dir, name, action: 'migrated',
+      baseline: carried ? 'carried-from-v1' : 'source-verified',
+      from: row.integrity, to,
+    })
+    report.migrated++
+    if (carried) report.carried++
+    plan.push({ name, from: row.integrity, to, carried })
+  }
+
+  if (!dryRun && plan.length > 0) {
+    withRegistryLock(packsDir, () => {
+      // Re-read under the lock: an install or uninstall may have landed since
+      // the plan was made. Only a row still holding the value planned from is
+      // rewritten; anything else was changed by somebody else and is theirs.
+      const current = loadRegistry(packsDir)
+      let changed = false
+      for (const step of plan) {
+        const row = current.find(e => e.name === step.name)
+        if (!row || row.integrity !== step.from) continue
+        row.integrity = step.to
+        if (step.carried) row.integrity_carried_from = 'v1'
+        else delete row.integrity_carried_from
+        changed = true
+      }
+      if (changed) saveRegistry(packsDir, current)
+    })
+  }
   return report
+}
+
+/**
+ * A short form of a §5.5 value for display, long enough to tell packs apart:
+ * the form prefix (`sha256:v2:` or `sha256:`) and the first 12 hex digits.
+ */
+export function shortPackIntegrity(value: string): string {
+  const m = /^(sha256:(?:v2:)?)([0-9a-f]+)$/.exec(value)
+  return m ? `${m[1]}${m[2].slice(0, 12)}` : value.slice(0, 22)
 }

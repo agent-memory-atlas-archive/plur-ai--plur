@@ -33,6 +33,26 @@
       "note": "§5.5 v2: the shipped value is `sha256:v2:` over named, length-prefixed parts, and recomputing over raw bytes must reproduce it. What every new export writes."
     },
     {
+      "pack": "manifest-yaml-only-v2",
+      "engram_count": 2,
+      "computed_integrity": "sha256:8c9cee1ac3df2564dc751be8bb016f78c08629c6f9554f21773bcb78f10a504a",
+      "computed_integrity_v2": "sha256:v2:4c0e3341be563b80f298943182eca50d46c5780951ee2daae7ae8bf27f00cd5b",
+      "shipped_integrity": "sha256:v2:4c0e3341be563b80f298943182eca50d46c5780951ee2daae7ae8bf27f00cd5b",
+      "expect": "load",
+      "integrity_status": "ok",
+      "note": "§5.5 v2 with SKILL.md absent: the pack ships only the deprecated manifest.yaml (§5.1), so the SKILL.md part is spelled `-` and the manifest.yaml part carries the manifest. v1 does not cover manifest.yaml at all; v2 does. The layout is deprecated and still loads."
+    },
+    {
+      "pack": "no-engrams-v2",
+      "engram_count": 0,
+      "computed_integrity": "sha256:cf9993968ac82f7f4e947e333bbb37b2235263bba8c2c3f53de0badae5f6b4a0",
+      "computed_integrity_v2": "sha256:v2:3409b7752dca8b3e7d1c0d8fdb9b1ce805d1873546e2ca95d88024f2db58c00e",
+      "shipped_integrity": "sha256:v2:3409b7752dca8b3e7d1c0d8fdb9b1ce805d1873546e2ca95d88024f2db58c00e",
+      "expect": "load",
+      "integrity_status": "ok",
+      "note": "§5.5 v2 with engrams.yaml absent: its part is spelled `-`, which is not how an empty file is spelled (`0`), so adding an empty engrams.yaml moves the v2 value. Under v1 an absent file and an empty one hash the same."
+    },
+    {
       "pack": "with-provenance",
       "engram_count": 2,
       "computed_integrity": "sha256:d97e15bbf4972dc02d714d6df61c9aa938347629db74a2be2c358ba0ebf9c163",

@@ -49,7 +49,7 @@ vectors/
 ├── verify.py           checks packs, declarations and capsules from outside
 ├── index.json          the packs, what to expect, and every count to report
 ├── capsules.json       the capsules, what to expect, and the reason for each rejection
-├── packs/              15 pack directories
+├── packs/              17 pack directories
 └── capsules/           13 .plur files
 ```
 
@@ -88,6 +88,8 @@ can run it anywhere, including in a container that has no package index.
 | `minimal` | load | `INTEGRITY` is OPTIONAL on disk (§5.1); its absence is a third verdict, not a pass (§5.6.1 step 1) |
 | `with-integrity` | load | the ordinary case: recomputing over raw bytes reproduces the shipped value — a legacy v1 `sha256:` value, which MUST still verify |
 | `with-integrity-v2` | load | §5.5 v2: a `sha256:v2:` value over named, length-prefixed parts reproduces from raw bytes |
+| `manifest-yaml-only-v2` | load | §5.5 v2 with `SKILL.md` absent: only the deprecated `manifest.yaml` ships, so `SKILL.md`'s part is spelled `-` and the manifest is covered (v1 does not cover it) |
+| `no-engrams-v2` | load | §5.5 v2 with `engrams.yaml` absent: its part is spelled `-`, not as an empty file — under v1 the two hash the same |
 | `with-provenance` | load | `provenance/` is OPTIONAL and **not covered by the hash**; the records survive the install (profile §5.4.1) |
 | `non-latin` | load | §5.5 hashes raw bytes; the fixture is checked to contain bytes above 0x7f, so an encoding assumption has somewhere to fail |
 | `unknown-root-field` | load | §10.3 rule 2: an unknown root manifest field survives into the parsed manifest |

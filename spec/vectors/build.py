@@ -206,6 +206,7 @@ def write_pack(
     root: Path | None = None,
     integrity_version: int = 1,
     shift_boundary: int = 0,
+    omit_engrams: bool = False,
 ) -> dict:
     """Write one vector. Returns its index entry.
 
@@ -215,7 +216,8 @@ def write_pack(
     legacy `sha256:<hex>`, which every pre-v2 vector carries) or 2
     (`sha256:v2:<hex>`). `shift_boundary=k` writes the correct value for the
     pack as built, then moves the last k bytes of SKILL.md to the front of
-    engrams.yaml — which v1 cannot see and v2 must.
+    engrams.yaml — which v1 cannot see and v2 must. `omit_engrams=True` ships
+    no engrams.yaml at all, so its v2 part is spelled absent (`-`).
     """
     root = root or PACKS
     d = root / slug
@@ -234,8 +236,18 @@ def write_pack(
         manifest_text = skill_md(manifest, prose).split("---")[1].strip() + "\n"
     manifest_bytes = manifest_text.encode("utf-8")
 
+    def v2_parts(m: bytes, e: bytes) -> dict[str, bytes]:
+        parts = {manifest_filename: m}
+        if not omit_engrams:
+            parts["engrams.yaml"] = e
+        return parts
+
+    if omit_engrams:
+        assert not engrams, "a pack with no engrams.yaml ships no engrams"
+        engram_bytes = b""
+
     # What the producer hashed: the pack as built, before any shift.
-    built_v2 = pack_integrity_v2({manifest_filename: manifest_bytes, "engrams.yaml": engram_bytes})
+    built_v2 = pack_integrity_v2(v2_parts(manifest_bytes, engram_bytes))
 
     if shift_boundary:
         assert manifest_filename == "SKILL.md" and 0 < shift_boundary <= len(manifest_bytes)
@@ -243,14 +255,15 @@ def write_pack(
         manifest_bytes = manifest_bytes[:-shift_boundary]
 
     (d / manifest_filename).write_bytes(manifest_bytes)
-    (d / "engrams.yaml").write_bytes(engram_bytes)
+    if not omit_engrams:
+        (d / "engrams.yaml").write_bytes(engram_bytes)
 
     # §5.5 v1 hashes SKILL.md ‖ engrams.yaml. A pack shipping only manifest.yaml
     # has no SKILL.md byte contribution, which is exactly what v1 says. v2 names
     # every part, so a manifest.yaml IS covered.
     hashed_manifest = manifest_bytes if manifest_filename == "SKILL.md" else b""
     correct = pack_integrity(hashed_manifest, engram_bytes)
-    correct_v2 = pack_integrity_v2({manifest_filename: manifest_bytes, "engrams.yaml": engram_bytes})
+    correct_v2 = pack_integrity_v2(v2_parts(manifest_bytes, engram_bytes))
 
     if integrity is True:
         value = correct if integrity_version == 1 else built_v2
@@ -355,6 +368,27 @@ def build(root: Path) -> list[dict]:
         note="§5.5 v2: the shipped value is `sha256:v2:` over named, length-prefixed "
              "parts, and recomputing over raw bytes must reproduce it. What every new "
              "export writes.",
+    )
+
+    add(
+        write_pack("manifest-yaml-only-v2", base_manifest("manifest-yaml-only-v2"), BASE_ENGRAMS,
+                   manifest_filename="manifest.yaml", integrity_version=2, root=root),
+        expect="load",
+        integrity_status="ok",
+        note="§5.5 v2 with SKILL.md absent: the pack ships only the deprecated "
+             "manifest.yaml (§5.1), so the SKILL.md part is spelled `-` and the "
+             "manifest.yaml part carries the manifest. v1 does not cover manifest.yaml "
+             "at all; v2 does. The layout is deprecated and still loads.",
+    )
+
+    add(
+        write_pack("no-engrams-v2", base_manifest("no-engrams-v2"), [],
+                   integrity_version=2, omit_engrams=True, root=root),
+        expect="load",
+        integrity_status="ok",
+        note="§5.5 v2 with engrams.yaml absent: its part is spelled `-`, which is not "
+             "how an empty file is spelled (`0`), so adding an empty engrams.yaml moves "
+             "the v2 value. Under v1 an absent file and an empty one hash the same.",
     )
 
     add(

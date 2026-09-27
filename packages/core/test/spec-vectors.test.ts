@@ -40,7 +40,7 @@
  * vector to match the code without establishing that first.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync, cpSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -129,6 +129,24 @@ describe('golden pack vectors — the hash', () => {
       expect(computePackIntegrity(dirOf(v))).not.toBe(v.shipped_integrity)
     } finally {
       rmSync(unshifted, { recursive: true, force: true })
+    }
+  })
+
+  it('no-engrams-v2 and manifest-yaml-only-v2: an absent part is not an empty one, under v2 only', () => {
+    // The two absent-part vectors. Adding an empty engrams.yaml, or an empty
+    // SKILL.md, leaves v1 where it was and moves v2 off the shipped value.
+    for (const [name, part] of [['no-engrams-v2', 'engrams.yaml'], ['manifest-yaml-only-v2', 'SKILL.md']] as const) {
+      const v = byName(name)
+      expect(existsSync(join(dirOf(v), part)), `${name} ships no ${part}`).toBe(false)
+      const copy = mkdtempSync(join(tmpdir(), 'plur-spec-absent-'))
+      try {
+        cpSync(dirOf(v), copy, { recursive: true })
+        writeFileSync(join(copy, part), '')
+        expect(`sha256:${computePackHash(copy)}`).toBe(v.computed_integrity)
+        expect(computePackIntegrity(copy)).not.toBe(v.computed_integrity_v2)
+      } finally {
+        rmSync(copy, { recursive: true, force: true })
+      }
     }
   })
 

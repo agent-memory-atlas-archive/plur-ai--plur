@@ -22,17 +22,44 @@ and a registry row written by an earlier install, are checked in the form they
 were recorded in, exactly as before.
 
 **To move installed packs to v2**, run `plur packs migrate-integrity`. It is a
-dry run until you add `--yes`. It re-baselines a pack only if the pack still
-matches its v1 value, so it never blesses a pack that has been changed since it
-was installed. Those packs keep their v1 value and keep reporting `modified`.
+dry run until you add `--yes`, and the dry run writes nothing and takes no lock.
+A pack that no longer matches its v1 value keeps it and keeps reporting
+`modified`. For a pack that does still match, remember what v1 cannot see: a
+v1 match is not proof the pack is unchanged. So:
+
+- if the directory the pack was installed from is still on disk, the installed
+  pack is re-checked against what installing that source produces today, and
+  moves to v2 only if the two agree. If they differ it stays on v1 and is
+  reported `skipped-modified`;
+- otherwise the v2 value is **carried over from v1**, and marked as such.
+  Re-baselining this way carries v1's trust forward; it does not certify the
+  pack. `plur packs list` keeps saying `ok` for it but adds "baseline carried
+  from v1", and the JSON and `plur_packs_list` output carry
+  `baseline: "carried-from-v1"`. It will catch any change from now on, not an
+  edit v1 could not see before the migration. Reinstall such a pack from a
+  trusted source to get a verified baseline.
+
 Running it twice changes nothing the second time. It never touches a pack's
-shipped `INTEGRITY` file.
+shipped `INTEGRITY` file. It ignores the temporary directories an install leaves
+while it runs (or after a crash), and an install finishing mid-run no longer
+aborts it.
+
+**Going back to an older PLUR after migrating** (or after installing anything
+with this version): older versions only understand v1, so every registry row
+written as v2 shows as `modified` in their `packs list`, and they refuse a pack
+that ships a v2 `INTEGRITY` unless forced. Nothing is damaged — return to this
+version and the rows verify again — but do not "fix" those packs from the older
+version.
+
+`plur packs list` now shows the form prefix plus 12 hex digits of a v2 value
+(`sha256:v2:1a2b3c4d5e6f`), where it used to cut it to six.
 
 The standard moves to 1.8. Producers SHOULD write v2, and receivers MUST accept
 both forms. A consumer that only understands v1 will refuse v2 packs, so it
-needs updating before its producers switch. Two conformance vectors were added
-(`with-integrity-v2`, `boundary-shift-v2`), and every vector now declares its v2
-value as well.
+needs updating before its producers switch. Four conformance vectors were added
+(`with-integrity-v2`, `boundary-shift-v2`, and `manifest-yaml-only-v2` and
+`no-engrams-v2` for an absent `SKILL.md` and an absent `engrams.yaml`), and every
+vector now declares its v2 value as well.
 
 ### An unscoped write can no longer land in a team store
 

@@ -563,8 +563,19 @@ export function loadAllPacks(packsDir: string): LoadedPack[] {
   if (!fs.existsSync(packsDir)) return []
   const packs: LoadedPack[] = []
   for (const entry of fs.readdirSync(packsDir)) {
+    // An install's staging / displaced copy is not a pack: it shares the live
+    // pack's manifest name and would load its engrams twice.
+    if (/\.(installing|replacing)-\d+-\d+$/.test(entry)) continue
     const packDir = `${packsDir}/${entry}`
-    if (!fs.statSync(packDir).isDirectory()) continue
+    // An entry can vanish between readdir and stat — the registry lock file
+    // released by a concurrent install or migration, or a staging directory
+    // renamed into place. That is not an error in this listing.
+    let isDir: boolean
+    try { isDir = fs.statSync(packDir).isDirectory() } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue
+      throw err
+    }
+    if (!isDir) continue
     if (!fs.existsSync(`${packDir}/SKILL.md`) && !fs.existsSync(`${packDir}/manifest.yaml`)) continue
     try {
       packs.push(loadPack(packDir))
