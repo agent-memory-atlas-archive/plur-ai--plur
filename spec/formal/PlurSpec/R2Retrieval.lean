@@ -6,6 +6,11 @@ Models of `packages/core/src/{telemetry-counters.ts, telemetry-flush.ts,
 intent/rewrite.ts, search-orchestrator.ts, hybrid-search.ts, query-expansion.ts,
 importers/engine.ts, capsule.ts, embeddings.ts}`.
 Findings, verdicts and replays: `spec/formal/findings/r2-retrieval.md`.
+
+Checked against the pre-merge audit fixes (commit c0ddc498, 2026-09-27): telemetry-counters.ts
+now rolls a stale counters.json over before `settleSpilledEvents` folds today's spills. The
+§Spill model counts events per day without dates, so conservation (`conserved`,
+`fold_counts_all`) is unaffected; the rollover fix only decides WHICH day's file an event lands in.
 -/
 
 namespace PlurSpec.R2Retrieval

@@ -9,6 +9,14 @@ Checked against commit af693450 (2026-09-27): storage-postgres.ts changed only `
 unlock failure path (the init advisory lock; modelled by `Persistence.PgLock`). The save/dup-id
 paths these sections model (`resolveSaveBatch`, rename listeners) are untouched, so every
 theorem here still holds.
+
+Checked against the pre-merge audit fixes (commit c0ddc498, 2026-09-27): sync.ts now writes the
+held records to a durable recovery file before resetting the tree (crash safety is modelled and
+proved in Persistence §Sync, "Round 3": `crash_safe`, `recover_no_loss`), and engrams.ts records
+duplicate-id renames on the next write instead of on every load. This file's DupIds and Restore
+sections model WHICH ids are renamed and that every record stays readable — not when the history
+event is written — so `resolve_ids_distinct`, `resolve_no_loss`, `restore_both_reachable` and the
+rest still hold.
 -/
 
 set_option linter.deprecated false
