@@ -1,5 +1,5 @@
 import { Plur, isDirectoryTrusted, type ProjectConfig } from '@plur-ai/core'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { homedir } from 'os'
 import type { OutputOptions } from './output.js'
 
@@ -143,9 +143,35 @@ export function createPlur(flags: GlobalFlags, options?: { readonly?: boolean })
 }
 
 
-/** The one question the scope gate asks — `Plur` answers it (`plur trust`). */
+/**
+ * The one question the scope gate asks — `Plur` answers it (`plur trust`).
+ * `storageRoot` (a `Plur` has it) is the store whose `trust.yaml` answers, so
+ * the notice can name a command that writes to THAT store.
+ */
 export interface ScopeTrustCheck {
   isDirectoryTrusted(dir: string): boolean
+  readonly storageRoot?: string
+}
+
+/** Quote a shell word only when it needs it, so the common case stays readable. */
+function shellWord(s: string): string {
+  return /^[A-Za-z0-9_@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * The trust command a notice tells the user to run (audit 1228-c #1).
+ *
+ * `plur trust <dir>` writes `trust.yaml` in the store the CLI resolves —
+ * `--path`, else `PLUR_PATH`, else `~/.plur`. A hook or server running on a
+ * different store (its own `PLUR_PATH`, `--path`, an MCP config's env) checks
+ * THAT store's file, and the user's shell usually has none of those set: the
+ * bare command wrote a grant the adapter never read, and the notice repeated.
+ * So when the store is not the default one, the command names it.
+ */
+export function trustCommand(dir: string | null, storageRoot?: string): string {
+  const target = dir === null ? '<dir>' : shellWord(dir)
+  if (!storageRoot || resolve(storageRoot) === resolve(join(homedir(), '.plur'))) return `plur trust ${target}`
+  return `plur --path ${shellWord(storageRoot)} trust ${target}`
 }
 
 /** What a hook may adopt from `.plur.yaml`, and what to tell the user when it may not. */
@@ -190,7 +216,7 @@ export function trustedProjectScope(
   return {
     notice:
       `[PLUR] Ignored the ${declared} in ${file} — ${configDir ?? 'its directory'} is not a trusted directory, ` +
-      `so the local default scope is used instead. If this project is yours, run: plur trust ${configDir ?? '<dir>'}`,
+      `so the local default scope is used instead. If this project is yours, run: ${trustCommand(configDir, trust.storageRoot)}`,
   }
 }
 
@@ -201,5 +227,5 @@ export function trustedProjectScope(
  */
 export function storeTrustCheck(flags: GlobalFlags): ScopeTrustCheck {
   const root = flags.path || process.env.PLUR_PATH || join(homedir(), '.plur')
-  return { isDirectoryTrusted: (dir: string) => isDirectoryTrusted(dir, root) }
+  return { isDirectoryTrusted: (dir: string) => isDirectoryTrusted(dir, root), storageRoot: root }
 }

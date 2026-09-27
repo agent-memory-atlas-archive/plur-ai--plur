@@ -34,7 +34,7 @@ import { createMemoryCache, renderBlock } from './memory-section.js'
 import { createRefreshPolicy } from './refresh.js'
 import { createScopeResolver, readScope } from './scope.js'
 import { recallQueryFrom, type LogEvent } from './session-log.js'
-import { trustedWorkspaceScope } from './workspace-scope.js'
+import { trustedWorkspaceScope, trustRemedy, type TrustSupport } from './workspace-scope.js'
 import { registerSkills } from './skills.js'
 import { createEngine } from './engine.js'
 import { createViewer } from './viewer.js'
@@ -120,7 +120,13 @@ export function apply(ctx: Context, config: Config, injected?: PlurClient): void
     if (typeof p.trusts === 'function') return p.trusts(dir)
     return p.isDirectoryTrusted?.(dir) === true
   }
-  const scopes = createScopeResolver(config, trustedWorkspaceScope(trusts, msg => console.warn(msg)))
+  const scopes = createScopeResolver(config, trustedWorkspaceScope(trusts, msg => console.warn(msg), async (dir) => {
+    const p = plur as PlurClient & { trustSupport?: () => Promise<TrustSupport> }
+    const support: TrustSupport = typeof p.trustSupport === 'function'
+      ? await p.trustSupport()
+      : typeof p.isDirectoryTrusted === 'function' ? 'ok' : 'no-trust'
+    return trustRemedy(dir, support, config.path || process.env.PLUR_PATH)
+  }))
   const live = new Map<string, AgentState>()
   // ONE queue for the whole plugin's ENGRAM WRITES — learn, capture, and the
   // tools. Previously learn.ts and capture.ts each made their own and the

@@ -283,10 +283,22 @@ export function settleSpilledEvents(opts: CountersOpts = {}): boolean {
       for (const c of claims) { try { unlinkSync(c) } catch { /* gone */ } }
       return true
     }
-    // No counters yet (the very first events all contended): the latest spilled
-    // day becomes counters.json, so today's counts are not shipped as a past day.
-    const latest = events.map(x => x.d).sort().at(-1)!
-    const current = readStoredCounters(countersPath) ?? freshCounters(latest)
+    // Roll a stale counters.json over FIRST, exactly as recordEvent does (audit
+    // of #1228, finding 3). Without it a spill dated today, folded while
+    // counters.json still said yesterday, went to pending/<today>.json and was
+    // shipped by this very flush — and the events recorded later today shipped
+    // again at the next rollover: two heartbeats for one date.
+    const today = utcDate((opts.now ?? (() => new Date()))())
+    const stored = readStoredCounters(countersPath)
+    let current: StoredCounters
+    if (stored && stored.date !== today) {
+      moveToPending(stored, pendingDir)
+      current = freshCounters(today)
+    } else {
+      // No counters yet (the very first events all contended): today's become
+      // counters.json; an earlier day's spills go to that day's pending file.
+      current = stored ?? freshCounters(today)
+    }
     const byDay = new Map<string, StoredCounters>()
     for (const s of events) {
       if (s.d === current.date) { applyEvent(current, s.e); continue }

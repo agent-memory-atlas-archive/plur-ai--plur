@@ -156,7 +156,7 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
         : `[PLUR Memory — ${result.count} engrams recalled for this prompt via ${mode}]`
       const refusal = isFirst
         ? [
-          projectRemote.refusedFrom ? projectRemoteRefusalNotice(projectRemote.refusedFrom) : null,
+          projectRemote.refusedFrom ? projectRemoteRefusalNotice(projectRemote.refusedFrom, plur.storageRoot) : null,
           projectConfig.notice ?? null,
         ].filter(Boolean).map(n => `${n}\n\n`).join('')
         : ''

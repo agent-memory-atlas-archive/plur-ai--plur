@@ -68,6 +68,11 @@ describe('P1: the loader keeps both copies of a clashing id and renames the late
     const b = loadEngrams(file)
     // Deterministic: every reader and every load agree on the new id.
     expect(b.map(x => x.id)).toEqual(a.map(x => x.id))
+    // Audit of #1228, finding 2: a load is a read and writes no history; the
+    // write that puts the new id on disk records the rename, once.
+    expect(allEvents(root).filter(x => x.event === 'engram_rekeyed')).toHaveLength(0)
+    saveEngrams(file, b)
+    loadEngrams(file)
     const newId = a[1].id
     const ev = readHistoryForEngram(root, newId).filter(x => x.event === 'engram_rekeyed')
     expect(ev).toHaveLength(1)

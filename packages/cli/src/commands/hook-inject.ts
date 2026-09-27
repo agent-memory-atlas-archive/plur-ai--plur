@@ -631,7 +631,7 @@ async function injectAndReport(
   // #1196: say so. A remote leg that silently stops working is the regression
   // this gate could otherwise introduce — the user must be able to tell
   // "refused, here is the one command" from "quietly broken".
-  if (remoteRefusedFrom) parts.push(projectRemoteRefusalNotice(remoteRefusedFrom))
+  if (remoteRefusedFrom) parts.push(projectRemoteRefusalNotice(remoteRefusedFrom, plur.storageRoot))
   // E3: an ignored scope/domain is said too, naming the file and `plur trust`.
   if (projectConfig.notice && !isRehydrate) parts.push(projectConfig.notice)
 

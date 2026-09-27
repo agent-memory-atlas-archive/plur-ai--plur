@@ -1,7 +1,7 @@
 import { existsSync, unlinkSync } from 'fs'
-import { join, dirname } from 'path'
+import { join, dirname, resolve } from 'path'
 import { homedir } from 'os'
-import { Plur, extractMetaEngrams, validateMetaEngram, confidenceBand, generateProfile, getProfileForInjection, markProfileDirty, selectModelForOperation, readHistoryForEngram, getCachedUpdateCheck, minorVersionsBehind, scanForTensions, CapabilityCanary, NO_SESSION, findProjectConfigPath, readProjectConfigFromPath, isSharedScope, resolveRerankerName, getReranker, classifyRerankerFailure, hfCacheDirName, SUGGEST_DISPLAY_MIN_CONFIDENCE, mcpRemoteWarningLine, doctorRemoteRemediation, normalizeEndpointUrl, REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES, bareEngramId, summariseProvenance, renderProvenanceSummary, type LearnContext } from '@plur-ai/core'
+import { Plur, extractMetaEngrams, validateMetaEngram, confidenceBand, generateProfile, getProfileForInjection, markProfileDirty, selectModelForOperation, readHistoryForEngram, getCachedUpdateCheck, minorVersionsBehind, scanForTensions, CapabilityCanary, NO_SESSION, findProjectConfigPath, readProjectConfigFromPath, isSharedScope, resolveRerankerName, getReranker, classifyRerankerFailure, hfCacheDirName, SUGGEST_DISPLAY_MIN_CONFIDENCE, mcpRemoteWarningLine, doctorRemoteRemediation, normalizeEndpointUrl, REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES, bareEngramId, summariseProvenance, formatLayer3, renderProvenanceSummary, type LearnContext } from '@plur-ai/core'
 import type { LlmFunction, MetaField, TensionStatus, RerankerEvalResult, HistoryEvent, Receipt, RemoteStoreStatusEntry } from '@plur-ai/core'
 import { recordTelemetry } from './telemetry.js'
 import { VERSION } from './version.js'
@@ -709,8 +709,53 @@ function learnDecision(engram: { id: string; write_count?: number }): { decision
  * once per file per process.
  */
 const _warnedUntrustedConfigs = new Set<string>()
+
+/**
+ * What a not-yet-stored pinned engram will cost in the pinned set, in tokens —
+ * for plur_learn_batch's per-item quota walk (audit 1228-c #2). The engram
+ * does not exist yet, so this renders the fields it will carry the way core's
+ * `estimateTokens` does (layer 3, with its field-sum floor) under a
+ * placeholder id of a real id's width. An estimate: enough to stop a batch
+ * from claiming the same free room five times, not an exact pre-check.
+ */
+function _estimatePinnedCost(
+  statement: string,
+  ctx: { domain?: string; rationale?: string; commitment?: unknown },
+): number {
+  const id = 'ENG-0000-0000-000'
+  const text = String(statement ?? '')
+  const commitment = typeof ctx.commitment === 'string' ? ctx.commitment : undefined
+  let rendered = 0
+  try {
+    rendered = formatLayer3({ id, statement: text, domain: ctx.domain, rationale: ctx.rationale, commitment, confidence_score: 0 } as never).length + 1
+  } catch { /* fall back to the field sum */ }
+  const fieldSum = id.length + 4 + text.length +
+    (ctx.rationale ? 15 + ctx.rationale.length : 0) +
+    (ctx.domain ? ctx.domain.length + 10 : 0) + (commitment ? commitment.length + 14 : 0) + 23
+  return Math.ceil(Math.max(rendered, fieldSum) / 4)
+}
+
+/** Quote a shell word only when it needs it. */
+function _shellWord(s: string): string {
+  return /^[A-Za-z0-9_@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * The trust command the warning names (audit 1228-c #1). The server checks
+ * `<its store root>/trust.yaml`; a bare `plur trust <dir>` writes the store the
+ * user's SHELL resolves (`PLUR_PATH` or `~/.plur`), which is not this one when
+ * the MCP config gives the server its own `PLUR_PATH` — the grant landed
+ * where the server never looked and the warning repeated. A non-default store
+ * is therefore named with `--path`.
+ */
+export function trustCommand(dir: string | null, storageRoot?: string): string {
+  const target = dir === null ? '<dir>' : _shellWord(dir)
+  if (!storageRoot || resolve(storageRoot) === resolve(join(homedir(), '.plur'))) return `plur trust ${target}`
+  return `plur --path ${_shellWord(storageRoot)} trust ${target}`
+}
+
 export function readTrustedProjectConfig(
-  trust: { isDirectoryTrusted(dir: string): boolean },
+  trust: { isDirectoryTrusted(dir: string): boolean; readonly storageRoot?: string },
 ): { scope?: string; domain?: string; warning?: string } {
   const configPath = findProjectConfigPath()
   const raw = readProjectConfigFromPath(configPath)
@@ -730,7 +775,7 @@ export function readTrustedProjectConfig(
   const warning =
     `${configPath ?? '.plur.yaml'} declares ${declared}, but ${configDir ?? 'its directory'} is not a trusted ` +
     `directory — ignoring it and using the local default scope instead. If this project is yours, run: ` +
-    `plur trust ${configDir ?? '<dir>'}`
+    trustCommand(configDir, trust.storageRoot)
   if (configPath && !_warnedUntrustedConfigs.has(configPath)) {
     _warnedUntrustedConfigs.add(configPath)
     try { process.stderr.write(`[plur] ${warning}\n`) } catch { /* never fail a tool over a log line */ }
@@ -1017,7 +1062,8 @@ function buildAdminDispatchTool(all: ToolDefinition[]): ToolDefinition {
         // which dispatched tool rejected the args, but keep the #297 hint,
         // received_fields, and _isError marker intact (audit fix — see
         // validateToolArgs's docstring).
-        return { ...validated.errorPayload, error: `${action}: ${validated.errorPayload.error}` }
+        const inner = String(validated.errorPayload.error)
+        return { ...validated.errorPayload, error: inner.startsWith(`${action}:`) ? inner : `${action}: ${inner}` }
       }
       try {
         return await target.handler(validated.data, plur)
@@ -1029,8 +1075,10 @@ function buildAdminDispatchTool(all: ToolDefinition[]): ToolDefinition {
         // so without this the log can never say which of the ~31 wrapped
         // operations actually broke. Prefixing the action name here means
         // it survives into that log message even though the tool name doesn't.
+        // Once: a handler whose own messages already name it (plur_session_scope
+        // does) read "plur_session_scope: plur_session_scope: …" (audit 1228-c #7).
         const message = (err as Error)?.message ?? String(err)
-        throw new Error(`${action}: ${message}`)
+        throw new Error(message.startsWith(`${action}:`) ? message : `${action}: ${message}`)
       }
     },
   }
@@ -1602,27 +1650,35 @@ function getAllToolDefinitions(): ToolDefinition[] {
         const maxLlmCalls = typeof args.max_llm_calls === 'number' ? args.max_llm_calls : undefined
         // The pinned-quota gate plur_learn applies (#1138 review), per item.
         // Forwarding `pinned` without it made the batch the one entry point
-        // that could still pin past a full quota. Same coarse predicate —
-        // "no room at all" — checked once for the call; a refused item is a
-        // per-item failure, the rest of the batch is still written.
+        // that could still pin past a full quota. Same coarse predicate as
+        // plur_learn — "no room at all" — but against the room LEFT after the
+        // pinned items admitted before this one (audit 1228-c #2): checked once
+        // per call, five pinned items were all admitted into a quota with room
+        // for one, and the set was over quota afterwards. Each admitted pinned
+        // item's estimated cost is subtracted as the batch is walked; a refused
+        // item is a per-item failure, the rest of the batch is still written.
         const gateFailures: Array<{ index: number; statement: string; error: string }> = []
         let admitted: number[] = items.map((_, i) => i)
         if (items.some(it => it.context.pinned === true)) {
           const q = await plur.pinnedQuota()
-          if (q.free <= 0) {
-            admitted = []
-            items.forEach((it, i) => {
-              if (it.context.pinned === true) {
-                gateFailures.push({
-                  index: i,
-                  statement: String(it.statement ?? '').slice(0, 80),
-                  error: `pinned_quota_exceeded: the pinned set has no room (quota ${q.quota}, used ${q.used}); this item was NOT stored — learn it unpinned or unpin something first (plur_pin {list:true}).`,
-                })
-              } else {
-                admitted.push(i)
-              }
-            })
-          }
+          let free = q.free
+          admitted = []
+          items.forEach((it, i) => {
+            if (it.context.pinned !== true) { admitted.push(i); return }
+            if (free <= 0) {
+              const claimed = q.free - free
+              gateFailures.push({
+                index: i,
+                statement: String(it.statement ?? '').slice(0, 80),
+                error: `pinned_quota_exceeded: the pinned set has no room (quota ${q.quota}, used ${q.used}` +
+                  `${claimed > 0 ? `, plus ~${claimed} claimed by earlier pinned items in this batch` : ''}); ` +
+                  'this item was NOT stored — learn it unpinned or unpin something first (plur_pin {list:true}).',
+              })
+              return
+            }
+            admitted.push(i)
+            free -= _estimatePinnedCost(it.statement, it.context)
+          })
         }
         const batchOut = admitted.length === 0
           ? { results: [], stats: { added: 0, updated: 0, merged: 0, noops: 0, failed: 0 }, failures: [] }

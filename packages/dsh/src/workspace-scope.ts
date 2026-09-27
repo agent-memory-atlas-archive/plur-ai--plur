@@ -9,7 +9,8 @@
  * @module
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import yaml from 'js-yaml'
 
 /**
@@ -91,6 +92,7 @@ export function findWorkspaceScope(cwd: string): WorkspaceScopeDecl | undefined 
 export function trustedWorkspaceScope(
   trusts: (dir: string) => Promise<boolean> | boolean,
   warn: (msg: string) => void,
+  remedy: (dir: string) => Promise<string> | string = dir => `If this project is yours, run: ${trustCommand(dir)}`,
 ): (cwd: string) => Promise<string | undefined> {
   const warned = new Set<string>()
   const once = (key: string, msg: string) => {
@@ -115,9 +117,52 @@ export function trustedWorkspaceScope(
       trusted = false
     }
     if (trusted) return decl.scope
+    let fix: string
+    try {
+      fix = await remedy(dir)
+    } catch {
+      fix = `If this project is yours, run: ${trustCommand(dir)}`
+    }
     once(decl.file,
       `[plur] Ignored scope "${decl.scope}" in ${decl.file} — ${dir} is not a trusted directory, so the ` +
-      `workspace default scope is used instead. If this project is yours, run: plur trust ${dir}`)
+      `workspace default scope is used instead. ${fix}`)
     return undefined
   }
+}
+
+/** Quote a shell word only when it needs it. */
+function shellWord(s: string): string {
+  return /^[A-Za-z0-9_@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * The trust command that reaches the store this plugin checks (audit 1228-c #1):
+ * a store configured with `path` (or the plugin's `PLUR_PATH`) is not the one a
+ * bare `plur trust <dir>` in the user's shell writes, so it is named.
+ */
+export function trustCommand(dir: string, storageRoot?: string): string {
+  if (!storageRoot || resolve(storageRoot) === resolve(join(homedir(), '.plur'))) return `plur trust ${shellWord(dir)}`
+  return `plur --path ${shellWord(storageRoot)} trust ${shellWord(dir)}`
+}
+
+/** What the engine can do about trust — decides which remedy is honest. */
+export type TrustSupport = 'ok' | 'no-engine' | 'no-trust'
+
+/**
+ * The sentence after "is not a trusted directory" (audit 1228-c, dsh with an
+ * older core). The gate fails closed when the engine cannot answer, which is
+ * right — but telling the user to run `plur trust` then promised a fix that
+ * could not work: an engine without `isDirectoryTrusted` never reads the
+ * grant, and one that did not load answers nothing.
+ */
+export function trustRemedy(dir: string, support: TrustSupport, storageRoot?: string): string {
+  if (support === 'no-trust') {
+    return 'The installed @plur-ai/core cannot check directory trust, so trusting this directory would not ' +
+      `change this; upgrade @plur-ai/core, then run: ${trustCommand(dir, storageRoot)}`
+  }
+  if (support === 'no-engine') {
+    return 'The PLUR memory engine did not load, so directory trust cannot be checked; fix that first ' +
+      '(the load error was reported when the plugin started).'
+  }
+  return `If this project is yours, run: ${trustCommand(dir, storageRoot)}`
 }

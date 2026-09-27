@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { homedir } from 'os'
-import { createPlur, type GlobalFlags } from '../plur.js'
+import { createPlur, trustCommand, type GlobalFlags } from '../plur.js'
 import { outputText, outputInfo, outputError } from '../output.js'
 
 /**
@@ -427,7 +427,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     // like remote recall is simply broken.
     outputText(
       `⚠ Could not record directory trust (${(err as Error)?.message ?? 'unknown error'}). ` +
-      `Remote memory stays off for this project until you run: plur trust ${process.cwd()}`,
+      `Remote memory stays off for this project until you run: ${trustCommand(process.cwd(), flags.path || process.env.PLUR_PATH)}`,
     )
   }
   if (opts.scopes && opts.scopes.length > 0) {

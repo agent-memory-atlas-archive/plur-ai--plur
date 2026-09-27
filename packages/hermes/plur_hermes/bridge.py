@@ -26,6 +26,13 @@ logger = logging.getLogger("plur_hermes.bridge")
 # demotion and unscoped auto-routing on the npx-fallback path. release.sh
 # rewrites this to the release version on every release (mirroring the pyproject
 # bump), and check_version_sync.py enforces pin >= the published @plur-ai/cli.
+#
+# TODO(release): the first @plur-ai/cli after 0.20.1 is the first that honours
+# `--` (recall / inject / learn / capture / …). Until this pin reaches that
+# release, the npx fallback runs a CLI that reads `--` as the query: the bridge
+# therefore uses `--` ONLY for text that begins with "-" (every other query and
+# task keeps its pre-`--` argv), and sends learn/capture text on stdin. The bump
+# itself is release.sh's job (RELEASING.md), not a hand edit.
 _NPX_CLI_VERSION = "0.20.1"
 
 _DEFAULT_DEDUP_CACHE_SIZE = 256
@@ -317,16 +324,16 @@ class PlurBridge:
         effective_timeout = timeout if timeout is not None else self._timeout
         effective_retries = retries if self._retry_enabled else 0
 
+        # Global flags go straight after the command, before any argument
+        # (audit 1228-c): the CLI reads them anywhere before a `--` separator,
+        # and inserting `--path` before the first "--" in the argv split a
+        # flag from a VALUE that happened to be "--" (forget(search="--")).
+        head = ["--json"] + (["--path", self._plur_path] if self._plur_path else [])
         if binary.startswith("npx:"):
             package = binary.split(":", 1)[1]
-            cmd = ["npx", "-y", package, command, "--json"] + args
+            cmd = ["npx", "-y", package, command] + head + args
         else:
-            cmd = [binary, command, "--json"] + args
-
-        if self._plur_path:
-            # Before a "--" separator: everything after it is positional.
-            at = cmd.index("--") if "--" in cmd else len(cmd)
-            cmd[at:at] = ["--path", self._plur_path]
+            cmd = [binary, command] + head + args
 
         # Two-layer retry:
         #   OUTER (Miles's, slow 5/15/30s) — TimeoutExpired = hung CLI.
@@ -535,9 +542,17 @@ class PlurBridge:
         return self.call("recall", args)
 
     def inject(self, task: str, budget: int = 2000, fast: bool = True) -> dict:
-        args = [task, "--budget", str(budget)]
+        # The task is the user's message — data, not argv (audit 1228-c). One
+        # that begins with "-" ("--path=/x …") was read by the CLI's global
+        # parser: it re-pointed the store, or the CLI exited 1 and the turn had
+        # no memory. It travels after "--" (`plur inject` honours it since the
+        # release after 0.20.1); every other task keeps its argv shape.
+        flag_like = task.lstrip().startswith("-")
+        args = ([] if flag_like else [task]) + ["--budget", str(budget)]
         if fast:
             args.append("--fast")
+        if flag_like:
+            args += ["--", task]
         # Short timeout, no retries — inject runs on the pre-LLM blocking path.
         return self.call("inject", args, timeout=self._inject_timeout, retries=0)
 
@@ -608,9 +623,13 @@ class PlurBridge:
         return self.call("ingest", args)
 
     def capture(self, summary: str, agent: str = "hermes", session: str | None = None) -> dict:
-        args = [summary, "--agent", agent]
+        # A summary that begins with "-" goes on stdin, which `plur capture`
+        # reads when argv carries none — on every CLI version, unlike "--"
+        # (audit 1228-c). Every other summary keeps its argv shape.
+        via_stdin = summary.lstrip().startswith("-")
+        args = ([] if via_stdin else [summary]) + ["--agent", agent]
         if session: args.extend(["--session", session])
-        return self.call("capture", args)
+        return self.call("capture", args, stdin=summary if via_stdin else None)
 
     def timeline(self, query: str | None = None, limit: int = 20) -> dict:
         args = ["--limit", str(limit)]

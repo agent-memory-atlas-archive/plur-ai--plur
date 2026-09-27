@@ -185,7 +185,10 @@ Two details worth knowing:
   you have registered — so until you trust it the declaration is ignored, a
   warning names the file and the command, and the workspace default applies.
   This is the same rule `@plur-ai/opencode`, the MCP server and the CLI hooks
-  follow. `scope: global` in a workspace file is never used.
+  follow. `scope: global` in a workspace file is never used. With a `path`
+  (or `PLUR_PATH`) other than `~/.plur` the warning names `plur --path <store>
+  trust <dir>`, the store this plugin reads; with a `@plur-ai/core` too old to
+  check trust it says to upgrade instead of naming a command that cannot help.
 
 A trusted workspace's own `.plur.yaml` scope wins. The `scope` setting below applies
 when the workspace declares none — set it, or turn injection off entirely:

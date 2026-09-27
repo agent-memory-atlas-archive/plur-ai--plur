@@ -96,7 +96,7 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
     // unaffected, but they should know the remote settings were not honoured —
     // for the trust reason here, and for #1200 regardless.
     const refusal = [
-      projectRemote.refusedFrom ? projectRemoteRefusalNotice(projectRemote.refusedFrom) : null,
+      projectRemote.refusedFrom ? projectRemoteRefusalNotice(projectRemote.refusedFrom, plur.storageRoot) : null,
       projectConfig.notice ?? null,
     ].filter(Boolean).map(n => `${n}\n\n`).join('')
     fullContext = refusal + (context ? `${header}\n\n${context}` : header)

@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, unlinkS
 import { join, dirname, relative } from 'path'
 import * as yaml from 'js-yaml'
 import { isSharedScope } from './scope-util.js'
-import { engramStoreEntries, freshDuplicateId, sameEngramContent, recordIdRenames, type IdRename } from './engrams.js'
+import { engramStoreEntries, sameEngramContent, recordIdRenames, mergeHeldRecords, readHeldRecovery, writeHeldRecovery, heldRecoveryPath, SYNC_HELD_RENAME_REASON, type IdRename, type HeldFile } from './engrams.js'
 import { recordLastWritten } from './backup.js'
 import { DEFAULT_STALE_THRESHOLD, holderIsAlive, makeToken, startHeartbeat, heartbeatHeldLocks, stealGuardPath, judgeStealSlot, STEAL_GUARD_SLOTS, GIT_COMMAND_TIMEOUT_MS } from './store/async-lock.js'
 
@@ -565,20 +565,8 @@ function hasConflictMarkers(root: string): boolean {
   return result !== null && result.length > 0
 }
 
-/**
- * A store file whose working-tree copy holds records the push set withholds
- * (scope:local engrams; on a `shared` remote also personal/private engrams and
- * derived sibling records). Kept in memory across the pull.
- */
-interface WithheldFile {
-  file: string
-  /** Working-tree bytes before the hold — restored verbatim when the pull left the file alone. */
-  saved: string
-  /** The index blob the working tree was reset to (== HEAD after commitChanges). */
-  staged: string
-  /** Records present in the working tree but never committed. */
-  held: unknown[]
-}
+/** A store file whose held records are set aside across the pull — see {@link HeldFile}. */
+type WithheldFile = HeldFile
 
 /**
  * Formal-verification finding (spec/formal/findings/persistence.md, candidate 1).
@@ -591,8 +579,15 @@ interface WithheldFile {
  *
  * Hold the withheld records aside instead: reset each such file to its staged
  * (= committed, stripped) blob so the tree is clean, pull, then put the held
- * records back. Nothing withheld reaches a commit — it is only ever in memory
- * and the working tree — and nothing is lost: see `restoreWithheld`.
+ * records back. Nothing withheld reaches a commit.
+ *
+ * CRASH SAFETY (audit of #1228, finding 1): the held records are written to
+ * `.git/plur-held.json` (fsynced; inside `.git`, so never staged) BEFORE any
+ * file is reset, and that file is deleted only after every record is back. They
+ * used to be in memory only, and a signal during the (up to 30 s) pull —
+ * `finally` does not run on SIGINT/SIGTERM/SIGKILL — deleted every scope:local
+ * engram. While the file exists every reader counts its records as part of the
+ * store (`loadEngrams`), and the next sync or store write restores them.
  */
 function holdWithheld(root: string, remoteType: SyncRemoteType): WithheldFile[] {
   const files: WithheldFile[] = []
@@ -616,38 +611,18 @@ function holdWithheld(root: string, remoteType: SyncRemoteType): WithheldFile[] 
     // gitSafe trims; compare on trimmed content.
     if (saved.trim() === staged) continue
     files.push({ file, saved, staged, held })
-    git(['checkout', '--', file], root)
   }
+  if (files.length === 0) return files
+  // Durable BEFORE the tree is touched: from here until the restore completes,
+  // this file is the only copy of the held records.
+  writeHeldRecovery(root, files)
+  for (const f of files) git(['checkout', '--', f.file], root)
   return files
 }
 
-/**
- * Owner decision P1b: give each held record whose id the pull brought a fresh
- * id (the loader's {@link freshDuplicateId}); a held record identical to the
- * pulled one is not a clash and is not appended twice.
- */
-function rekeyHeldAgainstPulled(pulled: unknown[], held: unknown[]): { held: unknown[]; renames: IdRename[] } {
-  const idOf = (r: unknown) => (r as { id?: unknown } | null)?.id
-  const pulledById = new Map<string, unknown[]>()
-  const taken = new Set<string>()
-  for (const r of [...pulled, ...held]) { const id = idOf(r); if (typeof id === 'string') taken.add(id) }
-  for (const r of pulled) {
-    const id = idOf(r)
-    if (typeof id === 'string') pulledById.set(id, [...(pulledById.get(id) ?? []), r])
-  }
-  const out: unknown[] = []
-  const renames: IdRename[] = []
-  for (const r of held) {
-    const id = idOf(r)
-    const same = typeof id === 'string' ? pulledById.get(id) : undefined
-    if (!same) { out.push(r); continue }
-    if (same.some(p => sameEngramContent(p, r))) continue
-    const to = freshDuplicateId(id as string, r, taken)
-    taken.add(to)
-    renames.push({ from: id as string, to })
-    out.push({ ...(r as object), id: to })
-  }
-  return { held: out, renames }
+/** The committed blob of `file` at HEAD (trimmed, like `gitSafe`), or null when HEAD does not carry it. */
+function headBlob(root: string, file: string): string | null {
+  return gitSafe(['show', `HEAD:${file}`], root)
 }
 
 /** Replace engram-id tokens in a record by `map` (old id -> new id), everywhere in it. */
@@ -660,33 +635,62 @@ function renameIdRefs(v: unknown, map: ReadonlyMap<string, string>): unknown {
   return v
 }
 
+/** Held sibling records not already present verbatim in `current` — a restore may be re-run after a crash. */
+function missingSiblingRecords(current: readonly unknown[], held: readonly unknown[]): unknown[] {
+  return held.filter(h => !current.some(c => sameEngramContent(c, h)))
+}
+
 /**
- * Put held records back after a pull (successful or not).
+ * Put held records back after a pull (successful, failed, or interrupted and
+ * now being recovered). Safe to run again on its own output.
  *
+ * - The file is as it was before the hold (the process died before resetting
+ *   it) → nothing to do.
  * - The pull did not change the file → write the saved bytes back verbatim.
- * - The pull changed it → the new file plus every held record, appended. Held
- *   records were never committed, so the pulled file cannot already carry them.
- *   A same-id record from another machine (both minted the same day) is a
+ * - The pull changed it → the new file plus every held record not already in
+ *   it. A same-id record from another machine (both minted the same day) is a
  *   DIFFERENT engram: owner decision P1b (2026-09-27) — the held LOCAL record is
- *   re-id'd, since it was never pushed and nothing outside this machine refers
- *   to it; the pulled record keeps the id; the rename is recorded in history,
- *   and held sibling records that name the old id follow it. Before, both copies
- *   were appended under one id and every lookup returned the remote record.
- * - The new file is unreadable (should not happen: conflicts abort) → saved bytes
- *   verbatim, so the only possible outcome of a bad pull is "not pulled", never
- *   "lost".
+ *   re-id'd ({@link mergeHeldRecords}), since it was never pushed and nothing
+ *   outside this machine refers to it; the pulled record keeps the id; the
+ *   rename is recorded in history, and held sibling records that name the old
+ *   id follow it.
+ * - The file is unreadable now (the remote pushed a file the loader refuses):
+ *   if HEAD carries that pulled version, it is KEPT and the file is returned as
+ *   `unresolved` — its held records stay in the recovery file until the file is
+ *   readable again. Writing the pre-pull bytes back here (the old behaviour)
+ *   put a revert of the remote's change in the working tree, which the next
+ *   sync committed and pushed. Only when HEAD still holds the pre-pull blob
+ *   (nothing was integrated) do the saved bytes go back.
  */
-function restoreWithheld(root: string, files: WithheldFile[]): { renames: IdRename[]; rewrote: string[] } {
+function restoreWithheld(root: string, files: WithheldFile[]): { renames: IdRename[]; rewrote: string[]; unresolved: WithheldFile[] } {
   // engrams.yaml first: its renames (P1b) are applied to held sibling records.
   const ordered = [...files].sort((a, b) => Number(b.file === 'engrams.yaml') - Number(a.file === 'engrams.yaml'))
   const renamed = new Map<string, string>()
   const allRenames: IdRename[] = []
   const rewrote: string[] = []
+  const unresolved: WithheldFile[] = []
   for (const f of ordered) {
     const path = join(root, f.file)
     const current = existsSync(path) ? readFileSync(path, 'utf8') : null
-    if (current === null || current.trim() === f.staged) {
-      if (renamed.size > 0 && f.file !== 'engrams.yaml' && current !== null) {
+    const head = headBlob(root, f.file)
+    const pulledMoved = head !== f.staged
+    // Not integrated → "not pulled", the saved bytes go back. Integrated but
+    // unusable → keep the pull, hold the records.
+    const unusable = (): void => {
+      if (pulledMoved) unresolved.push(f)
+      else atomicWrite(path, f.saved)
+    }
+    if (current === f.saved) continue
+    if (current === null) {
+      if (!pulledMoved || head !== null) { atomicWrite(path, f.saved); continue }
+      // The pull deleted the file: keep that, but not the never-pushed records.
+      atomicWrite(path, f.file === 'engrams.yaml'
+        ? yaml.dump({ engrams: f.held }, YAML_DUMP_OPTS)
+        : yaml.dump(f.held, SIBLING_DUMP_OPTS))
+      continue
+    }
+    if (current.trim() === f.staged) {
+      if (renamed.size > 0 && f.file !== 'engrams.yaml') {
         // The pull left this sibling alone, but it holds records naming a held
         // engram that was just re-id'd: put them back under the new id.
         let base: unknown
@@ -704,31 +708,58 @@ function restoreWithheld(root: string, files: WithheldFile[]): { renames: IdRena
     try {
       raw = yaml.load(current)
     } catch {
-      atomicWrite(path, f.saved)
+      unusable()
       continue
     }
     if (f.file === 'engrams.yaml') {
-      // Same shape rule as every other reader: a pulled file the loader would
-      // refuse is not merged into — the saved bytes go back ("not pulled").
+      // Same shape rule as every other reader.
       let pulledOk = true
       try { engramStoreEntries(path, current, Buffer.byteLength(current)) } catch { pulledOk = false }
       if (pulledOk && raw && typeof raw === 'object' && Array.isArray((raw as any).engrams)) {
         const pulled = (raw as any).engrams as unknown[]
-        const { held, renames } = rekeyHeldAgainstPulled(pulled, f.held)
-        atomicWrite(path, yaml.dump({ ...(raw as object), engrams: [...pulled, ...held] }, YAML_DUMP_OPTS))
+        const { held, renames } = mergeHeldRecords(pulled, f.held)
+        if (held.length > 0) atomicWrite(path, yaml.dump({ ...(raw as object), engrams: [...pulled, ...held] }, YAML_DUMP_OPTS))
         for (const r of renames) { renamed.set(r.from, r.to); allRenames.push(r) }
       } else {
-        atomicWrite(path, f.saved)
+        unusable()
       }
     } else if (Array.isArray(raw)) {
-      const held = renamed.size > 0 ? f.held.map(r => renameIdRefs(r, renamed)) : f.held
-      if (renamed.size > 0 && JSON.stringify(held) !== JSON.stringify(f.held)) rewrote.push(f.file)
-      atomicWrite(path, yaml.dump([...raw, ...held], SIBLING_DUMP_OPTS))
+      const heldNow = renamed.size > 0 ? f.held.map(r => renameIdRefs(r, renamed)) : f.held
+      if (renamed.size > 0 && JSON.stringify(heldNow) !== JSON.stringify(f.held)) rewrote.push(f.file)
+      const missing = missingSiblingRecords(raw, heldNow)
+      if (missing.length > 0) atomicWrite(path, yaml.dump([...raw, ...missing], SIBLING_DUMP_OPTS))
     } else {
-      atomicWrite(path, f.saved)
+      unusable()
     }
   }
-  return { renames: allRenames, rewrote }
+  return { renames: allRenames, rewrote, unresolved }
+}
+
+/** Sync-result text for held records that are waiting on an unreadable store file. */
+function heldPendingNote(root: string, unresolved: readonly WithheldFile[]): string | undefined {
+  if (unresolved.length === 0) return undefined
+  const n = unresolved.reduce((k, f) => k + f.held.length, 0)
+  return `${unresolved.map(f => f.file).join(', ')} as pulled cannot be read, so ${n} scope:local record(s) were NOT put back: ` +
+    `they are kept in ${relative(root, heldRecoveryPath(root))} (and every PLUR reader still sees them). ` +
+    `The remote's version was kept, not reverted. Fix the file, then sync again to restore them.`
+}
+
+/**
+ * Put back the held records of a sync that did not finish (killed, crashed, or
+ * power lost between holding and restoring) — the first thing every sync does.
+ * Deletes the recovery file only once everything in it is back; whatever still
+ * cannot be restored (an unreadable store file) stays in it.
+ */
+function recoverHeld(root: string): WithheldFile[] {
+  const files = readHeldRecovery(root)
+  if (!files) return []
+  const restored = restoreWithheld(root, files)
+  if (restored.renames.length > 0) {
+    recordIdRenames(root, restored.renames, SYNC_HELD_RENAME_REASON,
+      { store: join(root, 'engrams.yaml'), cause: 'sync-recovery', files: restored.rewrote })
+  }
+  writeHeldRecovery(root, restored.unresolved)
+  return restored.unresolved
 }
 
 /**
@@ -783,27 +814,29 @@ function rewriteLocalSiblingRefs(root: string, renamed: ReadonlyMap<string, stri
   return rewrote
 }
 
-/** @returns whether the pull integrated, and the sibling files rewritten after a P1b rename (to commit). */
-function pullRebase(root: string, remoteType: SyncRemoteType): { ok: boolean; rewroteSiblings: string[] } {
+/** @returns whether the pull integrated, the sibling files rewritten after a P1b rename (to commit), and held files still waiting. */
+function pullRebase(root: string, remoteType: SyncRemoteType): { ok: boolean; rewroteSiblings: string[]; unresolved: WithheldFile[] } {
   const before = readSiblingsBeforePull(root)
   const held = holdWithheld(root, remoteType)
   let ok = false
-  let restored: { renames: IdRename[]; rewrote: string[] } = { renames: [], rewrote: [] }
+  let restored: { renames: IdRename[]; rewrote: string[]; unresolved: WithheldFile[] } = { renames: [], rewrote: [], unresolved: [] }
   try {
     ok = pullRebaseClean(root, remoteType)
   } finally {
+    // On a throw from the restore the recovery file stays: the next sync or
+    // store write finishes the job.
     restored = restoreWithheld(root, held)
   }
-  if (restored.renames.length === 0) return { ok, rewroteSiblings: [] }
-  const renamed = new Map(restored.renames.map(r => [r.from, r.to] as const))
-  const committed = rewriteLocalSiblingRefs(root, renamed, before)
-  const files = [...new Set([...restored.rewrote, ...committed])]
-  recordIdRenames(
-    root, restored.renames,
-    'sync: a pulled engram arrived with the id of a local engram that was never pushed; the local one was given a fresh id (P1b)',
-    { store: join(root, 'engrams.yaml'), cause: 'sync-pull', files },
-  )
-  return { ok, rewroteSiblings: committed }
+  let committed: string[] = []
+  if (restored.renames.length > 0) {
+    const renamed = new Map(restored.renames.map(r => [r.from, r.to] as const))
+    committed = rewriteLocalSiblingRefs(root, renamed, before)
+    const files = [...new Set([...restored.rewrote, ...committed])]
+    recordIdRenames(root, restored.renames, SYNC_HELD_RENAME_REASON, { store: join(root, 'engrams.yaml'), cause: 'sync-pull', files })
+  }
+  // LAST: only now is every held record back (or still in the file, if unresolved).
+  if (held.length > 0) writeHeldRecovery(root, restored.unresolved)
+  return { ok, rewroteSiblings: committed, unresolved: restored.unresolved }
 }
 
 function pullRebaseClean(root: string, remoteType: SyncRemoteType): boolean {
@@ -812,7 +845,10 @@ function pullRebaseClean(root: string, remoteType: SyncRemoteType): boolean {
   if (result !== null) return true
   // Rebase conflict — abort and try merge
   gitSafe(['rebase', '--abort'], root)
-  const mergeResult = gitSafe(['pull', 'origin', branch, '--no-edit'], root)
+  // `--no-rebase` is explicit: git 2.27+ refuses a pull of divergent branches
+  // unless a reconcile mode is configured, so the bare form failed in exactly
+  // the case this fallback exists for and sync reported "NOT pulled".
+  const mergeResult = gitSafe(['pull', '--no-rebase', 'origin', branch, '--no-edit'], root)
   if (mergeResult !== null) return true
   // Merge conflict — check for conflict markers before staging
   if (hasConflictMarkers(root)) {
@@ -886,6 +922,10 @@ export function sync(root: string, remote?: string, options?: { remoteType?: Syn
     }
   }
 
+  // Held records of a sync that never finished go back before anything else
+  // reads or commits the store (audit of #1228, finding 1).
+  let heldPending = recoverHeld(root)
+
   // Add remote if provided and not yet set
   const existingRemote = getRemote(root)
   if (remote && !existingRemote) {
@@ -923,6 +963,7 @@ export function sync(root: string, remote?: string, options?: { remoteType?: Syn
     const before = existsSync(storePath) ? readFileSync(storePath, 'utf8') : null
     const pulledResult = pullRebase(root, remoteType)
     pullFailed = !pulledResult.ok
+    if (pulledResult.unresolved.length > 0) heldPending = readHeldRecovery(root) ?? pulledResult.unresolved
     recordPulledCount(storePath, before)
     // Committed sibling records rewritten after a P1b rename: commit them now so
     // this sync pushes the correction (it is the user's own remote).
@@ -948,7 +989,15 @@ export function sync(root: string, remote?: string, options?: { remoteType?: Syn
     }
   }
 
-  if (filesChanged === 0 && behind === 0 && aheadBefore === 0) {
+  const heldNote = heldPendingNote(root, heldPending)
+  const warn = (): string | undefined => {
+    // stripWarning parses engrams.yaml; with held records pending it may be the unreadable file.
+    let w: string | undefined
+    try { w = stripWarning(root, remoteType) } catch { w = undefined }
+    return heldNote ? (w ? `${heldNote} ${w}` : heldNote) : w
+  }
+
+  if (filesChanged === 0 && behind === 0 && aheadBefore === 0 && !heldNote) {
     return { action: 'up-to-date', message: 'Already in sync.', remote: existingRemote, files_changed: 0, warning: stripWarning(root, remoteType) }
   }
 
@@ -968,13 +1017,14 @@ export function sync(root: string, remote?: string, options?: { remoteType?: Syn
   if (aheadAfter > 0 && !pushError) parts.push('pushed')
   // Say it in the message too — a caller reading only the text still sees it.
   if (pushError) parts.push('NOT pushed — the commit is local only')
+  if (heldNote) parts.push(`scope:local records NOT restored — see ${relative(root, heldRecoveryPath(root))}`)
 
   return {
     action: 'synced',
     message: `Synced. ${parts.join(', ')}.`,
     remote: existingRemote,
     files_changed: filesChanged,
-    warning: stripWarning(root, remoteType),
+    warning: warn(),
     ...(pushError ? { push_error: pushError } : {}),
   }
 }

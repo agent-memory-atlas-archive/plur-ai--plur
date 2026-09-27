@@ -4,7 +4,6 @@ import {
   readProjectConfigFromPath,
   findProjectConfigPath,
   resolveProjectRemoteFromConfig,
-  projectRemoteRefusalNotice,
   type ProjectRemote,
 } from '@plur-ai/core'
 // Type-only: the host contract is untyped at runtime — `@opencode-ai/plugin`
@@ -17,7 +16,7 @@ import { RenderPath } from './capability.js'
 import { TurnBuffer } from './turn.js'
 import { learnFromTurn, learnFromUserText } from './learn.js'
 import { OPENCODE_PLUGIN_VERSION } from './version.js'
-import { resolveScopeRoot, resolveTrustedScope } from './scope.js'
+import { resolveScopeRoot, resolveTrustedScope, projectRemoteRefusalNotice } from './scope.js'
 
 const log = (msg: string) => { if (process.env.PLUR_DEBUG) console.error(`[plur:opencode] ${msg}`) }
 // Unconditional — unlike `log` above. A `.plur.yaml` scope the plugin refuses
@@ -104,7 +103,7 @@ export const PlurPlugin: Plugin = async (ctx) => {
   // Refusal is unconditional like the scope one: team memory that silently
   // never arrives is indistinguishable from a broken remote leg, which is the
   // failure #1198 was filed about.
-  if (projectRemote?.refusedFrom) warn(projectRemoteRefusalNotice(projectRemote.refusedFrom))
+  if (projectRemote?.refusedFrom) warn(projectRemoteRefusalNotice(projectRemote.refusedFrom, plur.storageRoot))
   // Host only, never the token — this line exists so a user can see WHICH
   // store the session will dial, not to echo the credential that reaches it.
   if (projectRemote?.remoteProject) log(`project remote: ${projectRemote.remoteProject.url}`)

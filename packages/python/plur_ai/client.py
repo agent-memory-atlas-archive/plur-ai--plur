@@ -99,9 +99,15 @@ class Plur:
         plus ``count`` and ``tokens_used`` — the same payload the MCP server's
         ``plur_inject`` tool returns.
         """
-        args = ["inject", task]
+        # The task is data (audit 1228-c): one that begins with "-" could be
+        # read by the CLI as a flag (``--path=…`` would pick another store), so
+        # it travels after ``--``. Every other task keeps its argv shape.
+        flag_like = task.lstrip().startswith("-")
+        args = ["inject"] if flag_like else ["inject", task]
         if budget is not None:
             args += ["--budget", str(budget)]
+        if flag_like:
+            args += ["--", task]
         return self._run(args, timeout=min(self.timeout, 15)) or {}
 
     def status(self) -> dict:

@@ -53,8 +53,9 @@ describe('MCP .plur.yaml scope/domain needs directory trust (E3)', () => {
     expect(r.default_domain).toBeUndefined()
     const warning = String(r.project_config_warning ?? '')
     expect(warning).toContain(join(repo, '.plur.yaml'))
-    expect(warning).toContain(`plur trust ${repo}`)
-    expect(String(r.guide)).toContain(`plur trust ${repo}`)
+    // The store here is not ~/.plur, so the command names it (audit 1228-c #1).
+    expect(warning).toContain(`plur --path ${join(root, 'store')} trust ${repo}`)
+    expect(String(r.guide)).toContain(`plur --path ${join(root, 'store')} trust ${repo}`)
   })
 
   it('untrusted: an unscoped plur_learn neither takes the repo scope nor its domain', async () => {

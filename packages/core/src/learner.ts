@@ -137,7 +137,13 @@ const PREFERENCE_PATTERNS = [
   // deploy, run the smoke tests" was stored as "never you deploy, run the
   // smoke tests". The directive word now needs word boundaries, and a
   // directly preceding negation is captured with it.
-  { re: /((?:\b(?:don['\u2019]?t|do not|not)\s+)?\b(?:always|never)\b\s+.+)/i, type: 'behavioral' as const, confidence: 0.7 },
+  //
+  // Audit of #1228 (finding 3): "negation" is every contracted form
+  // (`\w+n't` — doesn't, can't, won't, shouldn't, isn't, mustn't …), the
+  // same forms typed without the apostrophe, and `cannot` — not only
+  // don't / do not / not, or "cannot always trust the cache" was stored as
+  // "always trust the cache". A word merely ending in -nt ("want") is not one.
+  { re: /((?:\b(?:\w+n['\u2019]t|(?:do|does|did|ca|wo|sha|should|could|would|must|need|is|are|was|were|has|have|had|ai)nt|cannot|do not|not)\s+)?\b(?:always|never)\b\s+.+)/i, type: 'behavioral' as const, confidence: 0.7 },
   { re: /((?:you should|you must|don't|do not)\s+.+)/i, type: 'behavioral' as const, confidence: 0.6 },
   { re: /(?:your purpose is|you are)\s+(.{15,})/i, type: 'behavioral' as const, confidence: 0.6 },
   { re: /(?:i want you to)\s+(.+)/i, type: 'behavioral' as const, confidence: 0.6 },

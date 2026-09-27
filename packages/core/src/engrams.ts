@@ -4,11 +4,11 @@ import * as yaml from 'js-yaml'
 import { EngramSchemaPassthrough, type Engram } from './schemas/engram.js'
 import { PackManifestSchema, type PackManifest } from './schemas/pack.js'
 import { logger } from './logger.js'
-import { atomicWrite } from './sync.js'
+import { atomicWrite, fsyncDir } from './sync.js'
 import { recordLastWritten } from './backup.js'
 import { normalizeEngramInput } from './normalize-engram.js'
 import { createHash } from 'crypto'
-import { appendHistory, readHistoryForEngram } from './history.js'
+import { appendHistoryBatch, readRekeyedPairs, type HistoryEvent } from './history.js'
 
 /**
  * Error thrown when the engram file exists but cannot be read as engrams.
@@ -228,12 +228,21 @@ export function resolveDuplicateIds<T extends { id: string }>(
   alsoTaken: Iterable<string> = [],
 ): { engrams: T[]; renames: IdRename[]; exactDuplicates: number } {
   const taken = new Set<string>(alsoTaken)
-  for (const e of entries) taken.add(e.id)
+  const repeated = new Set<string>()
+  for (const e of entries) {
+    if (taken.has(e.id)) repeated.add(e.id)
+    taken.add(e.id)
+  }
+  // Canonical content is only needed for ids that occur more than once — the
+  // common store has none, so a load pays one Set pass, not a re-serialisation
+  // of every record.
+  if (repeated.size === 0) return { engrams: [...entries], renames: [], exactDuplicates: 0 }
   const keptContent = new Map<string, string[]>()
   const engrams: T[] = []
   const renames: IdRename[] = []
   let exactDuplicates = 0
   for (const e of entries) {
+    if (!repeated.has(e.id)) { engrams.push(e); continue }
     const content = canonicalJson(e)
     const prior = keptContent.get(e.id)
     if (!prior) {
@@ -252,36 +261,187 @@ export function resolveDuplicateIds<T extends { id: string }>(
   return { engrams, renames, exactDuplicates }
 }
 
-/** Renames already written to history by this process — keeps repeated loads cheap. */
+/** Renames already written to history by this process — keeps repeated writes cheap. */
 const recordedRenames = new Set<string>()
 
 /**
  * Record id renames in `<root>/history` as `engram_rekeyed` events, once each.
  *
- * Idempotent across loads and processes: a rename already in the log (same
+ * Idempotent across writes and processes: a rename already in the log (same
  * `from` → `to`) is not written again, and because {@link freshDuplicateId} is
  * deterministic a re-read of an unchanged file produces the same renames.
+ *
+ * ONE history pass for all of `renames` (audit of #1228, finding 2): this used
+ * to call `readHistoryForEngram` per rename, re-reading every month each time,
+ * and it ran from `loadEngrams` — so every read-only process paid renames ×
+ * the whole log (250 s for 300 renames against a 29 MB log). Write paths only:
+ * see {@link loadEngrams} and {@link saveEngrams}.
  */
 export function recordIdRenames(root: string, renames: readonly IdRename[], reason: string, data: Record<string, unknown> = {}): void {
-  for (const r of renames) {
-    const key = `${path.resolve(root)}\0${r.from}\0${r.to}`
-    if (recordedRenames.has(key)) continue
-    let already = false
-    try {
-      already = readHistoryForEngram(root, r.to).some(ev => ev.event === 'engram_rekeyed' && (ev.data as any)?.from === r.from)
-    } catch { /* unreadable history: write the event; a repeat is harmless, a gap is not */ }
-    if (!already) {
-      appendHistory(root, {
-        event: 'engram_rekeyed',
-        engram_id: r.to,
-        timestamp: new Date().toISOString(),
-        data: { from: r.from, to: r.to, ...data },
-        reason,
-      })
+  const keyOf = (r: IdRename) => `${path.resolve(root)}\0${r.from}\0${r.to}`
+  const todo = renames.filter(r => !recordedRenames.has(keyOf(r)))
+  if (todo.length === 0) return
+  let already = new Set<string>()
+  try {
+    already = readRekeyedPairs(root)
+  } catch { /* unreadable history: write the events; a repeat is harmless, a gap is not */ }
+  const events: HistoryEvent[] = []
+  const timestamp = new Date().toISOString()
+  for (const r of todo) {
+    const pair = `${r.from}\0${r.to}`
+    if (!already.has(pair)) {
+      events.push({ event: 'engram_rekeyed', engram_id: r.to, timestamp, data: { from: r.from, to: r.to, ...data }, reason })
+      already.add(pair)
     }
-    recordedRenames.add(key)
+    recordedRenames.add(keyOf(r))
+  }
+  if (events.length > 0) appendHistoryBatch(root, events)
+}
+
+/**
+ * Renames the last load of a store file made in memory and nothing has written
+ * yet, keyed like the quarantine map. A load is a READ — hooks, recall, the
+ * index sync — and must not append history (audit of #1228, finding 2), so the
+ * rename is recorded by the next {@link saveEngrams} of that file, the write
+ * that actually puts the new id on disk (and runs under the store lock).
+ */
+interface PendingRename extends IdRename { reason: string; data: Record<string, unknown> }
+const pendingRenamesByPath = new Map<string, PendingRename[]>()
+
+// ---------------------------------------------------------------------------
+// Held records of an in-flight (or interrupted) git sync
+// ---------------------------------------------------------------------------
+
+/**
+ * A store file whose working-tree copy held records the sync push set withholds
+ * (scope:local engrams; on a `shared` remote also personal/private engrams and
+ * derived sibling records), set aside while `git pull` runs.
+ */
+export interface HeldFile {
+  file: string
+  /** Working-tree bytes before the hold — restored verbatim when the pull left the file alone. */
+  saved: string
+  /** The index blob the working tree was reset to (== HEAD after the sync's commit), trimmed. */
+  staged: string
+  /** Records present in the working tree but never committed. */
+  held: unknown[]
+}
+
+/** Recovery file for held records, inside `.git` so no `git add` can ever stage it. */
+export const HELD_RECOVERY_FILE = 'plur-held.json'
+
+/** Where a sync rooted at `root` keeps its held records while the tree is reset. */
+export function heldRecoveryPath(root: string): string {
+  return path.join(root, '.git', HELD_RECOVERY_FILE)
+}
+
+/** Thrown when a held-records recovery file exists but cannot be read. */
+export class HeldRecoveryUnreadableError extends Error {
+  constructor(readonly filePath: string, readonly cause: unknown) {
+    super(
+      `[plur] cannot read ${filePath}: ${cause}\n` +
+      `This file holds scope:local (never-pushed) records that an interrupted 'plur sync' set aside. ` +
+      `PLUR will not sync or delete it while it is unreadable. Inspect it (it is JSON), repair it, and retry.`,
+    )
+    this.name = 'HeldRecoveryUnreadableError'
   }
 }
+
+/**
+ * The held records of a sync that has not finished restoring them, or null when
+ * there are none. Audit of #1228, finding 1: these used to live only in the
+ * sync process's memory between resetting the working tree and restoring it,
+ * so a Ctrl-C, SIGTERM or SIGKILL during the (up to 30 s) pull deleted every
+ * scope:local engram.
+ */
+export function readHeldRecovery(root: string): HeldFile[] | null {
+  const p = heldRecoveryPath(root)
+  if (!fs.existsSync(p)) return null
+  let v: unknown
+  try {
+    v = JSON.parse(fs.readFileSync(p, 'utf8'))
+  } catch (err) {
+    throw new HeldRecoveryUnreadableError(p, err)
+  }
+  const files = (v as { files?: unknown } | null)?.files
+  if (!Array.isArray(files) || !files.every(f =>
+    f && typeof f.file === 'string' && typeof f.saved === 'string' && typeof f.staged === 'string' && Array.isArray(f.held))) {
+    throw new HeldRecoveryUnreadableError(p, new Error('not a held-records file'))
+  }
+  return files as HeldFile[]
+}
+
+/**
+ * Durably record `files` as held (write + fsync + rename + fsync dir), or delete
+ * the recovery file when `files` is empty. Called BEFORE the tree is reset and
+ * again, to delete it, only AFTER every held record is back.
+ */
+export function writeHeldRecovery(root: string, files: readonly HeldFile[]): void {
+  const p = heldRecoveryPath(root)
+  if (files.length === 0) {
+    try { fs.unlinkSync(p) } catch { return }
+    fsyncDir(path.dirname(p))
+    return
+  }
+  atomicWrite(p, JSON.stringify({
+    version: 1,
+    note: 'Records a plur sync set aside during git pull (never pushed). Restored automatically; do not delete by hand.',
+    files,
+  }), { mode: 0o600 })
+}
+
+/**
+ * Held records to put back into a record list, and the renames that needs.
+ *
+ * Owner decision P1b: a held record whose id the list already carries with
+ * DIFFERENT content is a different engram (two machines minting the same id on
+ * the same day) — the held one, never pushed, gets {@link freshDuplicateId}. A
+ * held record identical to one already there is not appended twice (the
+ * restore already happened, or a writer persisted it). Deterministic, so a
+ * reader's view and the eventual restore agree on every id.
+ */
+export function mergeHeldRecords(current: readonly unknown[], held: readonly unknown[]): { held: unknown[]; renames: IdRename[] } {
+  const idOf = (r: unknown) => (r as { id?: unknown } | null)?.id
+  const byId = new Map<string, unknown[]>()
+  const taken = new Set<string>()
+  for (const r of [...current, ...held]) { const id = idOf(r); if (typeof id === 'string') taken.add(id) }
+  for (const r of current) {
+    const id = idOf(r)
+    if (typeof id === 'string') byId.set(id, [...(byId.get(id) ?? []), r])
+  }
+  const out: unknown[] = []
+  const renames: IdRename[] = []
+  for (const r of held) {
+    const id = idOf(r)
+    const same = typeof id === 'string' ? byId.get(id) : undefined
+    if (!same) { out.push(r); continue }
+    if (same.some(p => sameEngramContent(p, r))) continue
+    // Already restored under its fresh id (an earlier, interrupted restore).
+    const first = freshDuplicateId(id as string, r, new Set())
+    if ((byId.get(first) ?? []).some(p => sameEngramContent(p, { ...(r as object), id: first }))) continue
+    const to = freshDuplicateId(id as string, r, taken)
+    taken.add(to)
+    renames.push({ from: id as string, to })
+    out.push({ ...(r as object), id: to })
+  }
+  return { held: out, renames }
+}
+
+/** Held engrams.yaml records for the store at `filePath`, or null (not a synced root / nothing held / unreadable). */
+function heldEngramsFor(filePath: string): unknown[] | null {
+  if (path.basename(filePath) !== 'engrams.yaml') return null
+  const root = path.dirname(path.resolve(filePath))
+  if (!fs.existsSync(heldRecoveryPath(root))) return null
+  try {
+    return readHeldRecovery(root)?.find(f => f.file === 'engrams.yaml')?.held ?? null
+  } catch (err) {
+    logger.warning(`${(err as Error).message}`)
+    return null
+  }
+}
+
+/** Store files whose last load folded in held records from a recovery file. */
+const heldMergedPaths = new Set<string>()
 
 /**
  * The PLUR root a store file's history belongs to, or null. A store file is
@@ -314,7 +474,14 @@ export function parseEngramFile(
   content: string,
   byteLength: number,
 ): { valid: Engram[]; quarantined: unknown[]; renames: IdRename[]; exactDuplicates: number } {
-  const entries = engramStoreEntries(filePath, content, byteLength)
+  return parseEngramEntries(filePath, engramStoreEntries(filePath, content, byteLength))
+}
+
+/** {@link parseEngramFile} for entries already read by {@link engramStoreEntries}. */
+function parseEngramEntries(
+  filePath: string,
+  entries: unknown[],
+): { valid: Engram[]; quarantined: unknown[]; renames: IdRename[]; exactDuplicates: number } {
   const parsedValid: Engram[] = []
   const quarantined: unknown[] = []
   for (const entry of entries) {
@@ -428,14 +595,70 @@ export function loadEngrams(filePath: string): Engram[] {
   const stat = fs.statSync(filePath)
   if (stat.isDirectory()) return []
   const content = fs.readFileSync(filePath, 'utf8')
-  const { valid, quarantined, renames, exactDuplicates } = parseEngramFile(filePath, content, stat.size)
+  let entries = engramStoreEntries(filePath, content, stat.size)
+  // Audit of #1228, finding 1: while a sync has scope:local records set aside
+  // (or after one was killed before putting them back), they are in the
+  // recovery file, not in engrams.yaml. They are part of the store: every
+  // reader sees them, and the next write of this file persists them.
+  const key = resolveKey(filePath)
+  const held = heldEngramsFor(filePath)
+  let heldRenames: IdRename[] = []
+  heldMergedPaths.delete(key)
+  if (held) {
+    const merged = mergeHeldRecords(entries, held)
+    if (merged.held.length > 0) entries = [...entries, ...merged.held]
+    heldRenames = merged.renames
+    heldMergedPaths.add(key)
+  }
+  const { valid, quarantined, renames, exactDuplicates } = parseEngramEntries(filePath, entries)
   setQuarantine(filePath, quarantined)
   setExactDuplicates(filePath, exactDuplicates)
-  if (renames.length > 0) {
-    const root = historyRootFor(filePath)
-    if (root) recordIdRenames(root, renames, 'duplicate id: a later, different copy was given a fresh id (P1)', { store: filePath })
-  }
+  // Recorded by the next write, not here: a load is a read (finding 2).
+  const pending: PendingRename[] = [
+    ...heldRenames.map(r => ({ ...r, reason: SYNC_HELD_RENAME_REASON, data: { store: filePath, cause: 'sync-recovery' } })),
+    ...renames.map(r => ({ ...r, reason: 'duplicate id: a later, different copy was given a fresh id (P1)', data: { store: filePath } })),
+  ]
+  if (pending.length > 0) pendingRenamesByPath.set(key, pending)
+  else pendingRenamesByPath.delete(key)
   return valid
+}
+
+/** History reason for a held (never-pushed) record re-id'd against a pulled one (P1b). */
+export const SYNC_HELD_RENAME_REASON =
+  'sync: a pulled engram arrived with the id of a local engram that was never pushed; the local one was given a fresh id (P1b)'
+
+/**
+ * After a write of `filePath` lands: record the renames its last load made and
+ * this write put on disk, and — if that load folded in held records from an
+ * interrupted sync — drop them from the recovery file, since the file now holds
+ * them. Runs under the store lock (every writer loads under it before saving),
+ * which a running sync also holds, so no live sync is mid-restore here.
+ */
+function settleAfterWrite(filePath: string, written: readonly Engram[]): void {
+  const key = resolveKey(filePath)
+  const pending = pendingRenamesByPath.get(key)
+  pendingRenamesByPath.delete(key)
+  if (pending && pending.length > 0) {
+    const root = historyRootFor(filePath)
+    if (root) {
+      const ids = new Set(written.map(e => e.id))
+      const byReason = new Map<string, PendingRename[]>()
+      for (const r of pending) {
+        if (!ids.has(r.to)) continue // this write dropped it: nothing was renamed on disk
+        byReason.set(r.reason, [...(byReason.get(r.reason) ?? []), r])
+      }
+      for (const [reason, rs] of byReason) recordIdRenames(root, rs, reason, rs[0].data)
+    }
+  }
+  if (heldMergedPaths.delete(key)) {
+    const root = path.dirname(path.resolve(filePath))
+    try {
+      const files = readHeldRecovery(root)
+      if (files) writeHeldRecovery(root, files.filter(f => f.file !== 'engrams.yaml'))
+    } catch (err) {
+      logger.warning(`${(err as Error).message}`)
+    }
+  }
 }
 
 /**
@@ -640,6 +863,7 @@ export function saveEngrams(filePath: string, engrams: Engram[], opts: SaveEngra
   // Only after the write landed: a refused or failed write leaves the run as it was.
   shrinkRuns.set(resolveKey(filePath), run)
   setExactDuplicates(filePath, 0)
+  settleAfterWrite(filePath, outgoing)
   if (quarantineRenames.length > 0) {
     // The file now holds the renamed entries; the next load quarantines them
     // under their new ids.

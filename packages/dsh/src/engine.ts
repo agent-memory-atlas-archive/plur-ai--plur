@@ -30,6 +30,8 @@ export interface Engine extends PlurClient {
    * the check throws — the workspace-scope gate fails closed (decision E3).
    */
   trusts(dir: string): Promise<boolean>
+  /** Can the engine answer `trusts` at all? Picks an honest remedy (audit 1228-c). */
+  trustSupport(): Promise<'ok' | 'no-engine' | 'no-trust'>
 }
 
 /**
@@ -85,6 +87,11 @@ export function createEngine(
 
   return {
     ready: async () => (await engine()) !== undefined,
+    trustSupport: async () => {
+      const plur = await engine()
+      if (!plur) return 'no-engine'
+      return typeof plur.isDirectoryTrusted === 'function' ? 'ok' : 'no-trust'
+    },
     trusts: async (dir) => {
       try {
         return (await engine())?.isDirectoryTrusted?.(dir) === true

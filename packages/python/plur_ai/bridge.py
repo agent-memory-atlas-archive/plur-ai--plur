@@ -28,6 +28,12 @@ from typing import Any, Sequence
 # packages/hermes/scripts/check_version_sync.py enforces pin >= published
 # @plur-ai/cli. A stale pin silently runs a pre-release CLI on the npx-fallback
 # write path, bypassing that release's scope-routing / leak-guard fixes.
+#
+# TODO(release): the first @plur-ai/cli after 0.20.1 is the first that honours
+# `--`. Until this pin reaches it, the npx fallback reads `--` as the query, so
+# the client uses `--` ONLY for text that begins with "-" (every other query or
+# task keeps its old argv) and sends such a statement to `learn` on stdin. The
+# bump is release.sh's job (RELEASING.md), not a hand edit.
 _NPX_CLI_VERSION = "0.20.1"
 _DEFAULT_TIMEOUT = 30
 
@@ -158,9 +164,16 @@ def run_json(
     ``-`` reaches it verbatim instead of being parsed as a flag.
     """
     args = list(args)
-    # `--json` goes before a `--` separator: everything after it is positional.
-    at = args.index("--") if "--" in args else len(args)
-    cmd = _resolve_base_command(binary) + args[:at] + ["--json"] + args[at:]
+    # `--json` must precede a `--` separator (everything after it is
+    # positional). Inserting it before the FIRST "--" split a flag from a value
+    # that happened to be "--" (audit 1228-c), so with a separator present it
+    # goes straight after the command; without one it stays last, the argv
+    # every CLI version has always accepted.
+    if "--" in args and args:
+        args = args[:1] + ["--json"] + args[1:]
+    else:
+        args = args + ["--json"]
+    cmd = _resolve_base_command(binary) + args
     env = dict(os.environ)
     if path:
         env["PLUR_PATH"] = path

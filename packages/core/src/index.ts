@@ -1948,12 +1948,30 @@ export class Plur {
     return this._isRemoteBackedScope(scope) && !this._isOwnRemoteNamespace(scope)
   }
 
-  /** Find which store owns an engram by ID. For namespaced IDs, strips prefix to find in store. */
-  private async _findEngramStore(id: string): Promise<{ path: string; readonly: boolean; originalId: string } | null> {
+  /**
+   * Find which store owns an engram by ID. For namespaced IDs, strips prefix to find in store.
+   *
+   * `storeScope` — the loader's `_storeScope` stamp of the row, when the caller
+   * holds one — names the store exactly. `storePrefix` is three letters, so
+   * two store scopes can share one (group:plur/eng and group:plur/ops are both
+   * GPL) and a namespaced id alone then names both; ids collide across stores
+   * as the common case, so the first store with the bare id was the wrong one
+   * (audit of #1228). A stamped row is never the primary's.
+   *
+   * The stored id may itself carry the prefix (a row from another client or
+   * a sync): namespacing on load is idempotent, so the loaded id IS the stored
+   * id, and the stripped form is not in the file (audit of #1228, finding 2).
+   * Both forms are tried; `originalId` is the id as the store file has it.
+   */
+  private async _findEngramStore(
+    id: string, storeScope?: string,
+  ): Promise<{ path: string; readonly: boolean; originalId: string } | null> {
     // Check primary first (uses mtime cache)
-    const primaryEngrams = await this._loadCached(this.paths.engrams)
-    if (primaryEngrams.find(e => e.id === id)) {
-      return { path: this.paths.engrams, readonly: false, originalId: id }
+    if (storeScope === undefined) {
+      const primaryEngrams = await this._loadCached(this.paths.engrams)
+      if (primaryEngrams.find(e => e.id === id)) {
+        return { path: this.paths.engrams, readonly: false, originalId: id }
+      }
     }
 
     // Check stores — ID might be namespaced. Remote stores are skipped
@@ -1963,14 +1981,17 @@ export class Plur {
     const stores = this.config.stores ?? []
     for (const store of stores) {
       if (!store.path) continue
+      if (storeScope !== undefined && store.scope !== storeScope) continue
       const prefix = storePrefix(store.scope)
       const nsPattern = new RegExp(`^(ENG|ABS|META)-${prefix}-`)
       if (nsPattern.test(id)) {
-        // Strip the namespace prefix to get the original ID
-        const originalId = id.replace(nsPattern, '$1-')
+        // Strip the namespace prefix to get the original ID — or the id as it
+        // is, when the store file already holds it namespaced.
+        const stripped = id.replace(nsPattern, '$1-')
         const storeEngrams = await this._loadCached(store.path)
-        if (storeEngrams.find(e => e.id === originalId)) {
-          return { path: store.path, readonly: store.readonly ?? false, originalId }
+        const found = storeEngrams.find(e => e.id === stripped) ?? storeEngrams.find(e => e.id === id)
+        if (found) {
+          return { path: store.path, readonly: store.readonly ?? false, originalId: found.id }
         }
       }
     }
@@ -2285,7 +2306,7 @@ export class Plur {
       // is counted in memory only, as before (a remote retire is a whole
       // DELETE; the server owns its row).
       // Lock order primary → secondary, same as `_recordCrossScopeRecurrence`.
-      const storeInfo = await this._findEngramStore(hit.id)
+      const storeInfo = await this._findEngramStore(hit.id, (hit as any)._storeScope)
       if (storeInfo && storeInfo.path !== this.paths.engrams && !storeInfo.readonly) {
         const sourceEntry = ((target as any).sources as unknown[]).at(-1)
         await this._withStoreLock(storeInfo.path, async () => {
@@ -2466,7 +2487,7 @@ export class Plur {
       if (target !== hit) syncHitFrom(target)
     } else {
       // primaryIdx already proved this isn't in primary; only check writability.
-      const storeInfo = await this._findEngramStore(hit.id)
+      const storeInfo = await this._findEngramStore(hit.id, (hit as any)._storeScope)
       if (storeInfo && !storeInfo.readonly) {
         // Under the SECONDARY store's own lock. This read-modify-write had none
         // at all, while the identical operation on the primary store took one:
@@ -3224,7 +3245,7 @@ export class Plur {
     if ((hit as any)._pack) return 'pack'
     const storeScope = (hit as any)._storeScope as string | undefined
     if (storeScope === undefined) return 'primary'
-    const info = await this._findEngramStore(hit.id)
+    const info = await this._findEngramStore(hit.id, storeScope)
     if (info) {
       if (info.path === this.paths.engrams) return 'primary'
       return info.readonly ? 'readonly' : 'secondary'
@@ -3601,26 +3622,34 @@ export class Plur {
               // a full load until there is a `remove`/`deleteMany` seam.
               const fresh = await this._primaryStore.load()
               const idx = fresh.findIndex(e => e.id === engram.id)
-              // Hand off only a row that is STILL queued. A forget() or a local
-              // rescope that landed while the POST was in flight cancelled the
-              // delivery (#766, #848); deleting the row now would erase that
-              // decision while the remote keeps a live copy. Keep it and say so.
-              if (idx !== -1 && !Plur._stillQueued(fresh[idx])) {
+              // Hand off only a row that is STILL queued FOR THIS STORE. A
+              // forget() or a local rescope that landed while the POST was in
+              // flight cancelled the delivery (#766, #848); a D4 update or a
+              // rescope to another store RETARGETED it (audit of #1228,
+              // finding 1) — the row still carries `_outbox`, but for a store
+              // that has not received it. Deleting the row in either case
+              // loses a decision; keep it and say so.
+              const pushedTarget = storeEntry ? { url: storeEntry.url!, scope } : undefined
+              if (idx !== -1 && !Plur._stillQueuedFor(fresh[idx], pushedTarget)) {
+                const retargeted = Plur._stillQueued(fresh[idx])
                 // Decision D1: queue a durable "retire on remote" entry for the
-                // copy the remote just accepted; flushOutbox() retries it.
+                // copy the remote just accepted; flushOutbox() retries it (and,
+                // for a retargeted row, before it delivers to the new store).
                 const queuedRetire = serverId
                   ? Plur._queueRetireRemote(fresh[idx], {
-                      target_url: (engram as any).structured_data?._outbox?.target_url ?? '',
-                      target_scope: (engram as any).structured_data?._outbox?.target_scope ?? scope,
+                      target_url: pushedTarget?.url ?? '',
+                      target_scope: scope,
                       server_id: serverId,
                     }, new Date().toISOString())
                   : false
                 if (queuedRetire) await this._updateEngrams(fresh, [fresh[idx]])
                 logger.warning(
                   `[plur:outbox] ${engram.id} reached the remote${serverId ? ` as ${serverId}` : ''} after its delivery `
-                  + `was cancelled locally (forget/rescope during the push). The local record is kept`
+                  + (retargeted
+                    ? `was retargeted to another store during the push. The local record stays queued for the new store`
+                    : `was cancelled locally (forget/rescope during the push). The local record is kept`)
                   + (queuedRetire
-                    ? `; the remote copy is queued for retirement and the next flush retires it.`
+                    ? `; the old copy is queued for retirement and the next flush retires it.`
                     : `; the remote copy must be retired there.`),
                 )
                 return
@@ -6626,8 +6655,20 @@ export class Plur {
     // and PATCH every store — in order until one answered, so store A's
     // stricter policy refused an update of store B's engram, and B's content
     // was sent to A first. A bare id keeps the full walk (ownership unknown).
+    // Audit of #1228: `storePrefix` is three letters, so two store scopes can
+    // share one and a namespaced id then names both. Disambiguate on the full
+    // store scope — the loader's `_storeScope` stamp when the caller passes
+    // the row it got from us, else the store whose scope holds the row's
+    // scope. Neither narrows to nothing: an unmatched hint keeps `namedBy`.
     const writableRemotes = (this.config.stores ?? []).filter(e => !!e.url && e.readonly !== true)
-    const namedBy = writableRemotes.filter(e => this._stripRemotePrefix(updated.id, e.scope) !== updated.id)
+    let namedBy = writableRemotes.filter(e => this._stripRemotePrefix(updated.id, e.scope) !== updated.id)
+    if (namedBy.length > 1) {
+      const stamp = (updated as any)._storeScope as string | undefined
+      const byStamp = stamp ? namedBy.filter(e => e.scope === stamp) : []
+      const byScope = typeof updated.scope === 'string' ? namedBy.filter(e => isScopeWithin(updated.scope, e.scope)) : []
+      if (byStamp.length > 0) namedBy = byStamp
+      else if (byScope.length > 0) namedBy = byScope
+    }
     for (const entry of (namedBy.length > 0 ? namedBy : writableRemotes)) {
       // Leak guard (#353): remote-resident, explicit update → THROW on a
       // forbidden hit (no coherent demotion for a remote engram).
@@ -8414,6 +8455,23 @@ export class Plur {
   }
 
   /**
+   * Still queued AND still queued for the store a push just went to (audit of
+   * #1228, finding 1). A D4 update or a rescope can retarget `_outbox` to
+   * another store while the POST to the old one is on the wire; the fresh row
+   * then still carries `_outbox`, but for a store that has NOT received it.
+   * Only a row whose entry still names the same url and scope is handed off.
+   */
+  private static _stillQueuedFor(
+    e: Engram | undefined,
+    target: { url: string; scope: string } | undefined,
+  ): boolean {
+    if (!target || !Plur._stillQueued(e)) return false
+    const ob = (e as any).structured_data._outbox as { target_url?: string; target_scope?: string }
+    return ob.target_scope === target.scope
+      && !!ob.target_url && normalizeEndpointUrl(ob.target_url) === normalizeEndpointUrl(target.url)
+  }
+
+  /**
    * Decision D1 "queue-retire": stamp a durable "retire on remote" entry on the
    * local row — the copy a remote accepted AFTER a forget/rescope cancelled
    * its delivery. `flushOutbox()` retries it like any other queued write, as a
@@ -8457,8 +8515,14 @@ export class Plur {
     for (const e of pending) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
     // Decision D1: queued "retire on remote" entries — retired or rescoped
     // rows whose remote copy was accepted after the delivery was cancelled.
+    // A row can carry both (audit of #1228, finding 1: retargeted to another
+    // store while the push to the old one was in flight) — it is claimed by
+    // THIS flush through `pending`, so it is not skipped as in flight: the old
+    // copy is retired here, before the push to the new store below.
+    const pendingClaimed = new Set(pending.map(e => e.id))
     const retiring = engrams.filter(e =>
-      !!(e as any).structured_data?._retireRemote && !this._outboxInFlight.has(e.id)
+      !!(e as any).structured_data?._retireRemote
+      && (!this._outboxInFlight.has(e.id) || pendingClaimed.has(e.id))
     )
     for (const e of retiring) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
     if (pending.length === 0 && retiring.length === 0) return { flushed: 0, failed: 0, expired_warnings: [] }
@@ -8567,6 +8631,22 @@ export class Plur {
       const outbox = (engram as any).structured_data._outbox as {
         target_url: string; target_scope: string; queued_at: string
         last_attempt: string; attempt_count: number; last_error: string
+      }
+
+      // Audit of #1228, finding 1: a row still owing a retire of an older
+      // remote copy is delivered only once that retire is done. Pushing first
+      // and then losing the row on hand-off would drop the retire entry with it.
+      const owedRetire = (engram as any).structured_data._retireRemote as { server_id?: string } | undefined
+      if (owedRetire) {
+        const r = retireOutcome.get(engram.id)
+        if (!r || r.serverId !== owedRetire.server_id || r.next !== undefined) {
+          expired_warnings.push(
+            `${engram.id}: NOT pushed yet — its earlier remote copy ${owedRetire.server_id ?? '?'} must be retired `
+            + `first (still queued; the next flush retries both).`,
+          )
+          failed++
+          continue
+        }
       }
 
       // Check TTL warning
@@ -8808,16 +8888,21 @@ export class Plur {
           // keep the local record and report the stray remote copy (#766).
           .filter(e => {
             if (!(consideredIds.has(e.id) && !survivorsById.has(e.id))) return true
-            if (Plur._stillQueued(e)) return false
+            const dest = pushedTo.get(e.id)
+            // Handed off only while still queued FOR THE STORE IT WENT TO — a
+            // D4 update / rescope that retargeted it mid-push leaves it queued
+            // for a store that has not received it (audit of #1228, finding 1).
+            if (Plur._stillQueuedFor(e, dest)) return false
+            const retargeted = Plur._stillQueued(e)
             const serverId = localToServer.get(e.id)
             // Decision D1: queue the accepted copy for retirement on the remote
             // (durable, on this kept row); the next flush DELETEs it.
-            const dest = pushedTo.get(e.id)
             const queuedRetire = !!(serverId && dest)
               && Plur._queueRetireRemote(e, { target_url: dest!.url, target_scope: dest!.scope, server_id: serverId! }, retiredAt)
             expired_warnings.push(
-              `${e.id}: delivery was cancelled locally (forget/rescope) while the push was in flight, but `
-              + `the remote accepted it${serverId ? ` as ${serverId}` : ''}. The local record is kept; `
+              `${e.id}: delivery was ${retargeted ? 'retargeted to another store' : 'cancelled locally (forget/rescope)'} `
+              + `while the push was in flight, but the remote accepted it${serverId ? ` as ${serverId}` : ''}. `
+              + `The local record is kept${retargeted ? ', still queued for the new store' : ''}; `
               + (queuedRetire || (serverId && (e as any).structured_data?._retireRemote?.server_id === serverId)
                 ? `the remote copy is queued for retirement (next flush).`
                 : `retire the remote copy there if it should not exist.`),
@@ -8832,6 +8917,11 @@ export class Plur {
             // snapshot's `_outbox` back would re-queue it; leave the row alone.
             if (!Plur._stillQueued(e)) return e
             const sSd = (survivor as any).structured_data as Record<string, unknown> | undefined
+            // Audit of #1228, finding 1: retargeted meanwhile (D4 update /
+            // rescope to another store). The snapshot's `_outbox` names the OLD
+            // store; copying it back would re-point the row there.
+            const sOb = sSd?._outbox as { target_url?: string; target_scope?: string } | undefined
+            if (sOb?.target_url && !Plur._stillQueuedFor(e, { url: sOb.target_url, scope: sOb.target_scope ?? '' })) return e
             const fSd = { ...((e as any).structured_data as Record<string, unknown> | undefined ?? {}) }
             // `_outbox` and `_demoted` are the flush's own bookkeeping: copy
             // them across (including their ABSENCE, which is how a cancelled
