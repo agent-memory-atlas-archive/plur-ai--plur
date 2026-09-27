@@ -1,7 +1,7 @@
-import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync, renameSync, openSync, closeSync } from 'fs'
+import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync, renameSync, openSync, closeSync, linkSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { tmpdir, homedir } from 'os'
-import { randomUUID } from 'crypto'
+import { randomUUID, randomBytes } from 'crypto'
 import { createPlur, trustedProjectScope, storeTrustCheck, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
 import { ensureSessionDir, cleanupStaleSessionFiles } from '../lib/codex-hook-io.js'
@@ -205,7 +205,13 @@ function touchReminder(path: string | null): void {
  *   'unavailable' — cannot lock at all (no trustworthy dir, I/O error);
  *                   proceed unlocked, the pre-#519 behaviour (fail open)
  */
-export function acquireInjectLock(path: string | null, staleMs: number = LOCK_STALE_MS, now: () => number = Date.now): 'acquired' | 'busy' | 'unavailable' {
+export function acquireInjectLock(
+  path: string | null,
+  staleMs: number = LOCK_STALE_MS,
+  now: () => number = Date.now,
+  /** Test seam: runs between the staleness check and the takeover. */
+  _beforeTakeover?: () => void,
+): 'acquired' | 'busy' | 'unavailable' {
   if (!path) return 'unavailable'
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -214,8 +220,24 @@ export function acquireInjectLock(path: string | null, staleMs: number = LOCK_ST
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return 'unavailable'
       try {
-        if (now() - statSync(path).mtimeMs < staleMs) return 'busy'
-        unlinkSync(path) // stale: the holder crashed — take it over
+        const seen = statSync(path)
+        if (now() - seen.mtimeMs < staleMs) return 'busy'
+        _beforeTakeover?.()
+        // Stale: the holder crashed — take it over. A plain unlink here let two
+        // hooks that both saw it stale delete each other's fresh lock and both
+        // inject (formal verification, R2-CLI item 3). Move whatever is at
+        // `path` aside atomically, then check it is the stale file we judged.
+        const aside = `${path}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
+        renameSync(path, aside)
+        if (statSync(aside).ino === seen.ino) {
+          unlinkSync(aside)
+        } else {
+          // A live lock arrived in between: put it back (link fails if yet
+          // another holder already exists — either way someone holds it).
+          try { linkSync(aside, path) } catch { /* a newer holder exists */ }
+          unlinkSync(aside)
+          return 'busy'
+        }
       } catch { /* vanished between open and stat — retry */ }
     }
   }

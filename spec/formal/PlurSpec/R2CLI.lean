@@ -464,4 +464,43 @@ theorem fixed_even_a_flag_name :
 
 end DashDash
 
+
+/-! ## Stale inject-lock takeover (coordinator gap closure, 2026-09-27)
+
+`acquireInjectLock` (hook-inject.ts). A hook that judged the lock stale takes it over.
+Old: `unlink(path)` — whatever is there now, even a fresh lock another hook just took.
+New: `rename(path, aside)`, then compare the moved file's inode with the one judged
+stale; a different inode is put back and the hook reports busy. The lock file is
+modelled by its inode (`none` = no file); the hook remembers the inode it judged. -/
+namespace InjectLock
+
+/-- Old takeover: unlink whatever is at the path. -/
+def oldTakeover (_seen : Nat) (_cur : Option Nat) : Option Nat := none
+
+/-- New takeover: remove the file only if it is the one judged stale. -/
+def newTakeover (seen : Nat) (cur : Option Nat) : Option Nat :=
+  match cur with
+  | some i => if i = seen then none else some i
+  | none   => none
+
+/-- A lock is live (someone holds it) when it is not the stale inode the hook judged. -/
+def removesLive (take : Nat → Option Nat → Option Nat) (seen : Nat) (cur : Option Nat) : Prop :=
+  ∃ i, cur = some i ∧ i ≠ seen ∧ take seen cur = none
+
+/-- **The new takeover never removes a live lock.** -/
+theorem new_never_removes_live (seen : Nat) (cur : Option Nat) : ¬ removesLive newTakeover seen cur := by
+  rintro ⟨i, rfl, hne, h⟩
+  simp [newTakeover, hne] at h
+
+/-- The new takeover still removes the stale lock (the good case is reachable). -/
+theorem new_removes_stale (seen : Nat) : newTakeover seen (some seen) = none := by
+  simp [newTakeover]
+
+/-- **Old counterexample:** hook B, having judged inode 1 stale, removes the fresh
+lock (inode 2) that hook A took in between. -/
+theorem old_removes_live : removesLive oldTakeover 1 (some 2) :=
+  ⟨2, rfl, by decide, rfl⟩
+
+end InjectLock
+
 end PlurSpec.R2CLI
