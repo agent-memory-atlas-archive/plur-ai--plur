@@ -157,7 +157,10 @@ def run_json(
     from stdin when argv carries none, which is how a statement starting with
     ``-`` reaches it verbatim instead of being parsed as a flag.
     """
-    cmd = _resolve_base_command(binary) + list(args) + ["--json"]
+    args = list(args)
+    # `--json` goes before a `--` separator: everything after it is positional.
+    at = args.index("--") if "--" in args else len(args)
+    cmd = _resolve_base_command(binary) + args[:at] + ["--json"] + args[at:]
     env = dict(os.environ)
     if path:
         env["PLUR_PATH"] = path

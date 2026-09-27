@@ -211,7 +211,7 @@ All settings live under the `plur` namespace in `$DSH_HOME/settings.yaml`
 | `refreshIntervalMs` | `0` | Floor between recalls; `0` means once per turn |
 | `autoLearn` | `true` | Detect corrections in your messages and store them |
 | `autoCapture` | `true` | Record an episode summary at turn end |
-| `timeoutMs` | `5000` | How long a memory call is waited for. A tool answers "unavailable" at this bound; a write keeps running and keeps the write queue until it finishes or 60 s (or `timeoutMs`, if larger) pass, then the queue moves on with a warning |
+| `timeoutMs` | `5000` | How long a memory call is waited for. A tool answers "unavailable" at this bound; a write keeps running and keeps the write queue until it finishes or 60 s (or `timeoutMs`, if larger) pass, then the queue moves on with a warning. The 60 s cap is a constant (it matches core's store-lock stale threshold), not a setting; only a larger `timeoutMs` raises it |
 | `viewerEnabled` | `true` | Register the `/plur-memory` command |
 | `includeGlobal` | `true` | Whether global engrams accompany the workspace scope |
 

@@ -7,6 +7,8 @@ import { logger } from './logger.js'
 import { atomicWrite } from './sync.js'
 import { recordLastWritten } from './backup.js'
 import { normalizeEngramInput } from './normalize-engram.js'
+import { createHash } from 'crypto'
+import { appendHistory, readHistoryForEngram } from './history.js'
 
 /**
  * Error thrown when the engram file exists but cannot be read as engrams.
@@ -82,25 +84,16 @@ export class EngramStoreUnreadableError extends Error {
  * the file is a data-loss problem, and the second is worse.
  */
 /**
- * Parse store bytes into valid and quarantined entries, or throw.
+ * The shape rule for an engram store document — THE one definition, shared by
+ * every reader of a store file (formal round 2, core-persistence#11): this
+ * loader, sync's push-set strip (sync.ts `readEngramList`) and the backup gate
+ * (backup.ts `validateStore`). Before, sync also accepted a bare top-level
+ * array that this loader refuses, so sync would strip, commit and push a file
+ * PLUR itself cannot load.
  *
- * The single definition of "is this a readable engram store". It exists as a
- * standalone function because the rules were previously written out twice —
- * once in {@link loadEngrams} and once in a since-removed parallel YAML
- * store — and the copies drifted:
- * #766 hardened the first and left the second returning `[]` for a file it
- * could not parse (audit #794, F14). Anything that reads a store file goes
- * through here so that cannot recur.
- *
- * `byteLength` is passed separately because the caller may have read the file
- * with either the sync or async API, and the zero-length check must be made on
- * the bytes actually read rather than a second stat that could race.
+ * Returns the raw entries of `engrams:`, or throws {@link EngramStoreUnreadableError}.
  */
-export function parseEngramFile(
-  filePath: string,
-  content: string,
-  byteLength: number,
-): { valid: Engram[]; quarantined: unknown[] } {
+export function engramStoreEntries(filePath: string, content: string, byteLength: number): unknown[] {
   if (byteLength === 0) {
     throw new EngramStoreUnreadableError(filePath, new Error('file is empty (0 bytes)'))
   }
@@ -140,13 +133,193 @@ export function parseEngramFile(
   if (!Array.isArray(raw.engrams)) {
     throw new EngramStoreUnreadableError(filePath, new Error('"engrams" is present but is not a list'))
   }
-  const valid: Engram[] = []
+  return raw.engrams as unknown[]
+}
+
+/**
+ * Per-entry rule: normalise, then validate. The ONE definition of "this entry is
+ * an engram", shared by the loader and the backup gate. `null` = quarantine.
+ */
+export function parseEngramEntry(entry: unknown): Engram | null {
+  // Field-compat rules live in ONE place (#877) — normalise before parse, so
+  // "absent" is still distinguishable from "Zod filled the default".
+  const result = EngramSchemaPassthrough.safeParse(normalizeEngramInput(entry))
+  return result.success ? (result.data as Engram) : null
+}
+
+/**
+ * Ids carried by more than one entry, in first-occurrence order — the ONE
+ * duplicate-id detector (backup gate, Postgres save/updateMany, PGLite index).
+ * Entries without a string id are ignored here (the schema rejects them).
+ */
+export function duplicateEngramIds(entries: readonly unknown[]): string[] {
+  const seen = new Set<string>()
+  const dups = new Set<string>()
+  for (const e of entries) {
+    const id = (e as { id?: unknown } | null)?.id
+    if (typeof id !== 'string' || id.length === 0) continue
+    if (seen.has(id)) dups.add(id)
+    else seen.add(id)
+  }
+  return [...dups]
+}
+
+/** Key-sorted JSON: two records are "the same content" iff this is equal. */
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']'
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return '{' + Object.keys(o).filter(k => o[k] !== undefined).sort()
+      .map(k => JSON.stringify(k) + ':' + canonicalJson(o[k])).join(',') + '}'
+  }
+  return JSON.stringify(v) ?? 'null'
+}
+
+/** Whether two raw records carry the same content (key order ignored) — the P1 "exact duplicate" test. */
+export function sameEngramContent(a: unknown, b: unknown): boolean {
+  return canonicalJson(a) === canonicalJson(b)
+}
+
+/** One id change made by {@link resolveDuplicateIds} (or by sync's restore). */
+export interface IdRename { from: string; to: string }
+
+/**
+ * The fresh id a clashing copy gets: `<id>-D<8 hex of sha256(content)>`, with
+ * `-2`, `-3`, … appended only if that is already taken.
+ *
+ * DETERMINISTIC on purpose. The rename happens when a reader detects the clash,
+ * and several readers read one file (the loader, the PGLite index, a second
+ * process) before anyone writes it back. Derived from the copy's own content,
+ * every one of them arrives at the same id without coordinating, and reading
+ * the file twice records one rename, not two. Keeps the original id as a prefix
+ * so the date and the history trail stay legible, and matches the schema's id
+ * pattern (`^(ENG|ABS|META)-[A-Za-z0-9-]+$`).
+ */
+export function freshDuplicateId(id: string, entry: unknown, taken: ReadonlySet<string>): string {
+  const h = createHash('sha256').update(canonicalJson(entry)).digest('hex').slice(0, 8)
+  const base = `${id}-D${h}`
+  let candidate = base
+  for (let k = 2; taken.has(candidate); k++) candidate = `${base}-${k}`
+  return candidate
+}
+
+/**
+ * THE duplicate-id rule (owner decision P1, 2026-09-27: "keep both, rename
+ * one"). One rule for every reader — the loader, the PGLite index, the
+ * Postgres writer; the backup gate accepts what this resolves.
+ *
+ * Two different engrams can carry one id without anyone editing a file:
+ * `generateEngramId` mints `max(same-day suffix)+1` per machine, so two synced
+ * machines that learn on the same day mint the same id. Before this rule the
+ * readers disagreed on which copy was "the" engram (YAML lookups saw the first,
+ * the PGLite index the last, Postgres refused), and the other copy could not be
+ * reached by id at all.
+ *
+ * - The FIRST copy keeps the id.
+ * - A LATER copy with different content gets {@link freshDuplicateId}.
+ * - A later copy identical to a kept copy of that id is an exact duplicate, not
+ *   a clash: it is dropped (nothing is lost) and counted in `exactDuplicates`.
+ *
+ * Pure. Callers record `renames` (see {@link recordIdRenames}). `alsoTaken`
+ * reserves ids that are not in `entries` (e.g. quarantined rows).
+ */
+export function resolveDuplicateIds<T extends { id: string }>(
+  entries: readonly T[],
+  alsoTaken: Iterable<string> = [],
+): { engrams: T[]; renames: IdRename[]; exactDuplicates: number } {
+  const taken = new Set<string>(alsoTaken)
+  for (const e of entries) taken.add(e.id)
+  const keptContent = new Map<string, string[]>()
+  const engrams: T[] = []
+  const renames: IdRename[] = []
+  let exactDuplicates = 0
+  for (const e of entries) {
+    const content = canonicalJson(e)
+    const prior = keptContent.get(e.id)
+    if (!prior) {
+      keptContent.set(e.id, [content])
+      engrams.push(e)
+    } else if (prior.includes(content)) {
+      exactDuplicates++
+    } else {
+      const to = freshDuplicateId(e.id, e, taken)
+      taken.add(to)
+      prior.push(content)
+      renames.push({ from: e.id, to })
+      engrams.push({ ...e, id: to })
+    }
+  }
+  return { engrams, renames, exactDuplicates }
+}
+
+/** Renames already written to history by this process — keeps repeated loads cheap. */
+const recordedRenames = new Set<string>()
+
+/**
+ * Record id renames in `<root>/history` as `engram_rekeyed` events, once each.
+ *
+ * Idempotent across loads and processes: a rename already in the log (same
+ * `from` → `to`) is not written again, and because {@link freshDuplicateId} is
+ * deterministic a re-read of an unchanged file produces the same renames.
+ */
+export function recordIdRenames(root: string, renames: readonly IdRename[], reason: string, data: Record<string, unknown> = {}): void {
+  for (const r of renames) {
+    const key = `${path.resolve(root)}\0${r.from}\0${r.to}`
+    if (recordedRenames.has(key)) continue
+    let already = false
+    try {
+      already = readHistoryForEngram(root, r.to).some(ev => ev.event === 'engram_rekeyed' && (ev.data as any)?.from === r.from)
+    } catch { /* unreadable history: write the event; a repeat is harmless, a gap is not */ }
+    if (!already) {
+      appendHistory(root, {
+        event: 'engram_rekeyed',
+        engram_id: r.to,
+        timestamp: new Date().toISOString(),
+        data: { from: r.from, to: r.to, ...data },
+        reason,
+      })
+    }
+    recordedRenames.add(key)
+  }
+}
+
+/**
+ * The PLUR root a store file's history belongs to, or null. A store file is
+ * `<root>/engrams.yaml`; a directory that is not a PLUR root (a pack, a bare
+ * `stores[].path`) gets no history directory created in it.
+ */
+function historyRootFor(filePath: string): string | null {
+  const dir = path.dirname(path.resolve(filePath))
+  if (fs.existsSync(path.join(dir, 'history')) || fs.existsSync(path.join(dir, 'config.yaml'))) return dir
+  return null
+}
+
+/**
+ * Parse store bytes into valid and quarantined entries, or throw.
+ *
+ * The single definition of "is this a readable engram store". It exists as a
+ * standalone function because the rules were previously written out twice —
+ * once in {@link loadEngrams} and once in a since-removed parallel YAML
+ * store — and the copies drifted:
+ * #766 hardened the first and left the second returning `[]` for a file it
+ * could not parse (audit #794, F14). Anything that reads a store file goes
+ * through here so that cannot recur.
+ *
+ * `byteLength` is passed separately because the caller may have read the file
+ * with either the sync or async API, and the zero-length check must be made on
+ * the bytes actually read rather than a second stat that could race.
+ */
+export function parseEngramFile(
+  filePath: string,
+  content: string,
+  byteLength: number,
+): { valid: Engram[]; quarantined: unknown[]; renames: IdRename[]; exactDuplicates: number } {
+  const entries = engramStoreEntries(filePath, content, byteLength)
+  const parsedValid: Engram[] = []
   const quarantined: unknown[] = []
-  for (const entry of raw.engrams) {
-    // Field-compat rules live in ONE place (#877) — normalise before parse, so
-    // "absent" is still distinguishable from "Zod filled the default".
-    const result = EngramSchemaPassthrough.safeParse(normalizeEngramInput(entry))
-    if (result.success) valid.push(result.data)
+  for (const entry of entries) {
+    const parsed = parseEngramEntry(entry)
+    if (parsed) parsedValid.push(parsed)
     // Quarantine the ORIGINAL entry, not the normalised one: quarantined
     // entries are written back verbatim, and a rejected engram must not be
     // silently rewritten on its way to being preserved.
@@ -158,7 +331,21 @@ export function parseEngramFile(
       `they are excluded from recall but PRESERVED in the file. Run 'plur doctor' to inspect them.`,
     )
   }
-  return { valid, quarantined }
+  // Owner decision P1: a clashing id keeps both copies, the later one renamed.
+  const quarantinedIds = quarantined.map(q => (q as { id?: unknown } | null)?.id).filter((x): x is string => typeof x === 'string')
+  const { engrams: valid, renames, exactDuplicates } = resolveDuplicateIds(parsedValid, quarantinedIds)
+  if (renames.length > 0 || exactDuplicates > 0) {
+    logger.warning(
+      `[plur] ${filePath}: ` +
+      (renames.length > 0
+        ? `${renames.length} engram(s) shared an id with an earlier, different engram and were given fresh ids ` +
+          `(${renames.slice(0, 3).map(r => `${r.from} -> ${r.to}`).join(', ')}${renames.length > 3 ? ', …' : ''}). `
+        : '') +
+      (exactDuplicates > 0 ? `${exactDuplicates} exact duplicate record(s) are read once. ` : '') +
+      `The file changes on the next write.`,
+    )
+  }
+  return { valid, quarantined, renames, exactDuplicates }
 }
 
 /**
@@ -241,9 +428,29 @@ export function loadEngrams(filePath: string): Engram[] {
   const stat = fs.statSync(filePath)
   if (stat.isDirectory()) return []
   const content = fs.readFileSync(filePath, 'utf8')
-  const { valid, quarantined } = parseEngramFile(filePath, content, stat.size)
+  const { valid, quarantined, renames, exactDuplicates } = parseEngramFile(filePath, content, stat.size)
   setQuarantine(filePath, quarantined)
+  setExactDuplicates(filePath, exactDuplicates)
+  if (renames.length > 0) {
+    const root = historyRootFor(filePath)
+    if (root) recordIdRenames(root, renames, 'duplicate id: a later, different copy was given a fresh id (P1)', { store: filePath })
+  }
   return valid
+}
+
+/**
+ * Exact-duplicate records the last load of a path read once (P1). The file
+ * still holds them until the next write, and the shrink guard counts records
+ * on disk — so without this, dropping the duplicate copy would look like a
+ * removal (a two-record store holding one record twice is a 50% "shrink").
+ * Same precondition as the quarantine map: load before save, in this process.
+ */
+const exactDuplicatesByPath = new Map<string, number>()
+
+function setExactDuplicates(filePath: string, n: number): void {
+  const key = resolveKey(filePath)
+  if (n === 0) exactDuplicatesByPath.delete(key)
+  else exactDuplicatesByPath.set(key, n)
 }
 
 /**
@@ -292,9 +499,13 @@ export function getQuarantinedEntries(filePath: string): unknown[] {
 
 /** Thrown by {@link saveEngrams} when a write would shrink the store past the guard. */
 export class EngramStoreShrinkError extends Error {
-  constructor(readonly filePath: string, readonly before: number, readonly after: number) {
+  constructor(readonly filePath: string, readonly before: number, readonly after: number, readonly baseline: number = before) {
     super(
       `[plur] refusing to write ${filePath}: it holds ${before} engram(s) and this write would leave ${after}.\n` +
+      (baseline > before
+        ? `Undeclared writes by this process already took it from ${baseline} to ${before}; the 10% tolerance is ` +
+          `cumulative since the last write that did not shrink it (owner decision P2), and this one would exceed it.\n`
+        : '') +
       `A write path replaces the whole file, so an unexpected shrink is how a corpus gets destroyed — ` +
       `most often because the file was read as empty or partially unreadable first.\n` +
       `Operations that legitimately remove engrams (compact, forget, outbox flush, pack uninstall) ` +
@@ -318,11 +529,33 @@ export interface SaveEngramsOptions {
 }
 
 /**
- * How much of the corpus a single non-shrinking write may remove before it is
- * treated as corruption. Small deletions still happen legitimately through
- * paths that forget to declare themselves; a >10% drop is not a rounding error.
+ * How much of the corpus undeclared writes may remove before it is treated as
+ * corruption. Small deletions still happen legitimately through paths that
+ * forget to declare themselves; a >10% drop is not a rounding error.
+ *
+ * CUMULATIVE (owner decision P2, 2026-09-27, "gate every removal"; proved by
+ * `PlurSpec.R2Persist.Shrink.base_bounds`): the 10% is measured from the
+ * baseline — the count at this process's last write to the file that did not
+ * shrink it, or that declared `allowShrink`. It used to be measured from the
+ * file as it was just then, so ten tolerated writes took 100 engrams to 37
+ * without a refusal. See {@link shrinkRuns}.
  */
 const SHRINK_TOLERANCE = 0.1
+
+/**
+ * Per store file: the baseline of the current run of undeclared shrinks, and
+ * the record count this process last wrote there. In process only — no new
+ * persisted state; a restart starts a new run.
+ *
+ * `last` is how a run ends when someone ELSE writes the file: if the count on
+ * disk is no longer what this process wrote (another process, a sync pull, a
+ * hand edit), this process cannot judge that change, so the baseline restarts
+ * at the file as it now is. Otherwise a legitimate removal made elsewhere would
+ * leave a stale, higher baseline here and refuse this process's next small
+ * removal.
+ */
+interface ShrinkRun { base: number; last: number }
+const shrinkRuns = new Map<string, ShrinkRun>()
 
 /**
  * Write the whole corpus to a store file.
@@ -348,13 +581,30 @@ export function saveEngrams(filePath: string, engrams: Engram[], opts: SaveEngra
   // so it could not act on them, which also means it cannot be expected to
   // carry them — that is this function's job.
   const quarantined = getQuarantinedEntries(filePath)
+  const quarantineRenames: IdRename[] = []
   if (quarantined.length > 0) {
-    const ids = new Set(outgoing.map(e => e.id))
+    const taken = new Set<string>(outgoing.map(e => e.id))
     for (const entry of quarantined) {
       const id = (entry as any)?.id
-      // An entry that has since been re-added properly must not come back as a
-      // malformed duplicate.
-      if (typeof id === 'string' && ids.has(id)) continue
+      if (typeof id === 'string') taken.add(id)
+    }
+    const valid = new Set(outgoing.map(e => e.id))
+    for (const entry of quarantined) {
+      const id = (entry as any)?.id
+      // A quarantined entry whose id a valid engram also carries used to be
+      // DROPPED here ("re-added properly, must not come back as a malformed
+      // duplicate"). That lost the entry whenever the two were different
+      // engrams — the same-day id clash P1 is about. Owner principle "keep both,
+      // rename one — nothing lost or hidden" (2026-09-27): keep it, verbatim
+      // except for a fresh id by the same rule as the loader, so both stay
+      // addressable; recorded in history.
+      if (typeof id === 'string' && valid.has(id)) {
+        const to = freshDuplicateId(id, entry, taken)
+        taken.add(to)
+        quarantineRenames.push({ from: id, to })
+        outgoing.push({ ...(entry as object), id: to } as Engram)
+        continue
+      }
       outgoing.push(entry as Engram)
     }
   }
@@ -383,8 +633,28 @@ export function saveEngrams(filePath: string, engrams: Engram[], opts: SaveEngra
   //   the old parse-based count would have added 246ms to that same save.
   // So the guard now runs on every write for a quarter of what it used to cost
   // on the rare writes it actually ran on.
-  if (!opts.allowShrink) assertShrinkAllowed(filePath, outgoing.length)
+  const run: ShrinkRun = opts.allowShrink
+    ? { base: outgoing.length, last: outgoing.length }
+    : judgeShrink(filePath, outgoing.length)
   atomicWrite(filePath, content)
+  // Only after the write landed: a refused or failed write leaves the run as it was.
+  shrinkRuns.set(resolveKey(filePath), run)
+  setExactDuplicates(filePath, 0)
+  if (quarantineRenames.length > 0) {
+    // The file now holds the renamed entries; the next load quarantines them
+    // under their new ids.
+    setQuarantine(filePath, outgoing.slice(outgoing.length - quarantined.length))
+    const root = historyRootFor(filePath)
+    if (root) {
+      recordIdRenames(root, quarantineRenames,
+        'duplicate id: a schema-invalid (quarantined) entry shared a valid engram\'s id and was given a fresh id so both are kept',
+        { store: filePath, quarantined: true })
+    }
+    logger.warning(
+      `[plur] ${filePath}: ${quarantineRenames.length} quarantined entr(y/ies) shared an id with a valid engram and ` +
+      `were kept under fresh ids (${quarantineRenames.slice(0, 3).map(r => `${r.from} -> ${r.to}`).join(', ')}).`,
+    )
+  }
   // Record what PLUR itself wrote (owner decision P2, formal run 2026-09-26):
   // the daily backup's shrink gate compares the file against this count, so a
   // deliberate removal re-baselines it while a file that shrank without PLUR
@@ -405,41 +675,71 @@ export function saveEngrams(filePath: string, engrams: Engram[], opts: SaveEngra
  * tracks making it a type every writer must pass through.
  */
 export function assertShrinkAllowed(filePath: string, outgoingCount: number): void {
-  const before = countEngramsOnDisk(filePath)
-  if (before !== null && outgoingCount < before * (1 - SHRINK_TOLERANCE)) {
-    throw new EngramStoreShrinkError(filePath, before, outgoingCount)
+  judgeShrink(filePath, outgoingCount)
+}
+
+/**
+ * The guard itself: throws, or returns the run state to record once the write
+ * lands. Branch for branch `ratchetBase` in `PlurSpec.R2Persist.Shrink`:
+ *
+ *   - nothing to compare against (no file)          -> allowed, new run at `out`
+ *   - `out >= disk` (not a shrink)                   -> allowed, new run at `out`
+ *   - a shrink: baseline = the run's, if the file is
+ *     still what this process last wrote, else disk -> allowed iff
+ *                                                      `out >= 90% of baseline`
+ *
+ * Since the baseline is never below the file's count, a write allowed here is
+ * always allowed by the old per-write rule too (theorem `new_implies_old`).
+ */
+function judgeShrink(filePath: string, outgoingCount: number): ShrinkRun {
+  const key = resolveKey(filePath)
+  const counted = countEngramsOnDisk(filePath)
+  if (counted === null) return { base: outgoingCount, last: outgoingCount }
+  // Exact duplicates the loader read once are not engrams this write removes (P1).
+  const disk = Math.max(0, counted - (exactDuplicatesByPath.get(key) ?? 0))
+  if (outgoingCount >= disk) return { base: outgoingCount, last: outgoingCount }
+  const prior = shrinkRuns.get(key)
+  const base = prior && prior.last === counted ? Math.max(prior.base, disk) : disk
+  if (outgoingCount < base * (1 - SHRINK_TOLERANCE)) {
+    throw new EngramStoreShrinkError(filePath, disk, outgoingCount, base)
   }
+  return { base, last: outgoingCount }
 }
 
 /**
  * Count engram records currently on disk, or `null` when there is nothing to
- * compare against (no file yet).
+ * compare against (no file yet, or a directory — a misconfiguration the write
+ * itself fails on, not a data-loss risk).
  *
- * Deliberately tolerant: an unreadable file returns `null` rather than throwing,
- * because the guard's job is to catch a shrink against a KNOWN baseline. Callers
- * that must not proceed on an unreadable store get that from `loadEngrams`,
- * which every one of them already went through to build the array being saved.
+ * An EXISTING file it cannot count THROWS {@link EngramStoreUnreadableError}
+ * (formal round 2, core-persistence#12). It used to return `null` here too, and
+ * `null` lets every write through: a store with merge-conflict markers (both
+ * sides' engrams in it), a zero-byte file, or one this process cannot read was
+ * replaced by whatever array the caller held. The comment then said callers
+ * "already went through `loadEngrams`" — true of the file as it was THEN, not of
+ * the file being replaced now. Same rule as the loader: PLUR cannot tell an
+ * empty corpus from a destroyed one, so it does not overwrite either. A caller
+ * that declared `allowShrink` never reaches this.
  */
 function countEngramsOnDisk(filePath: string): number | null {
+  let text: string
   try {
     if (!fs.existsSync(filePath)) return null
-    const stat = fs.statSync(filePath)
-    if (stat.isDirectory() || stat.size === 0) return null
-    const text = fs.readFileSync(filePath, 'utf8')
-    const scanned = countRecordStarts(text)
-    // The scan recognised the document's shape — trust it. It is exact for any
-    // block-sequence `engrams:` list, which is what `yaml.dump` emits and what
-    // every store file in the wild is.
-    if (scanned !== null) return scanned
-    // Unrecognised shape (flow sequence `engrams: [...]`, anchors, an exotic
-    // hand edit). Fall back to the authoritative parse rather than guess: this
-    // number can REFUSE a write, so it is never allowed to be an approximation.
-    const raw: any = yaml.load(text)
-    if (raw == null || typeof raw !== 'object' || !Array.isArray(raw.engrams)) return null
-    return raw.engrams.length
-  } catch {
-    return null
+    if (fs.statSync(filePath).isDirectory()) return null
+    text = fs.readFileSync(filePath, 'utf8')
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return null // removed since the existence check
+    throw new EngramStoreUnreadableError(filePath, err)
   }
+  const scanned = countRecordStarts(text)
+  // The scan recognised the document's shape — trust it. It is exact for any
+  // block-sequence `engrams:` list, which is what `yaml.dump` emits and what
+  // every store file in the wild is.
+  if (scanned !== null) return scanned
+  // Unrecognised shape (flow sequence `engrams: [...]`, anchors, an exotic
+  // hand edit): the loader's own rule decides — it counts, or it throws. This
+  // number can REFUSE a write, so it is never allowed to be an approximation.
+  return engramStoreEntries(filePath, text, Buffer.byteLength(text)).length
 }
 
 /**

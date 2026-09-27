@@ -95,14 +95,22 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
     // memory (F9).
     const cached = readAgyTurnCache(conversationId)
 
-    const isFirst = cached === null && Number(input.invocationNum ?? 0) === 0
+    // "First" is the conversation's first turn. The absence of a cache alone
+    // cannot say that: with an unusable cache dir it is absent on EVERY turn,
+    // and every turn got the session-start header, budget and refusal notice
+    // (formal r2, cli#12). When the transcript is readable it decides.
+    const isFirst = cached === null && Number(input.invocationNum ?? 0) === 0 &&
+      (user === null || user.firstInTranscript)
     // `cached === null` counts as a new turn when a user message exists: it
     // covers both the genuine first turn and the fail-open path where the
     // cache dir is unusable (writeAgyTurnCache no-ops). In the latter case
     // every invocation re-recalls — slow, but memory keeps flowing, which is
     // the right direction to degrade.
+    // The line offset separates two identical messages when step_index is
+    // missing (both -1) — the replay-stale-memory case (cli#12).
     const isNewTurn = user !== null &&
-      (cached === null || user.stepIndex > cached.step || userHash !== cached.textHash)
+      (cached === null || user.stepIndex > cached.step || userHash !== cached.textHash ||
+        (cached.offset !== undefined && user.offset !== cached.offset))
     if (!isFirst && !isNewTurn) {
       // Mid-turn invocation — or an unreadable transcript, which is
       // indistinguishable from one. Replay this turn's memory so it survives
@@ -184,6 +192,7 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
       step: user?.stepIndex ?? 0,
       textHash: userHash,
       message,
+      ...(user ? { offset: user.offset } : {}),
     })
 
     if (!message) return

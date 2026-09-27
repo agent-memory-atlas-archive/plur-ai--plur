@@ -243,6 +243,18 @@ class PlurBridge:
         self._inject_timeout = int(os.environ.get("PLUR_BRIDGE_INJECT_TIMEOUT", str(_DEFAULT_INJECT_TIMEOUT)))
         self._retry_enabled = os.environ.get("PLUR_BRIDGE_RETRY", "true").lower() != "false"
 
+    @staticmethod
+    def _cache_key(normalized: str, scope: str | None) -> str:
+        """Dedup-cache key (formal R2 #5). Core's content-hash dedup is
+        scope-aware — the same statement in another scope is a new engram — so
+        the bridge's shortcut is keyed by the REQUESTED scope too. An unscoped
+        request keeps the bare statement as its key: its entry only ever comes
+        from a real learn, i.e. from core's own routing decision."""
+        return normalized if scope is None else f"{scope}\x1f{normalized}"
+
+    def _cache_clear(self) -> None:
+        self._dedup_cache.clear()
+
     def _cache_get(self, normalized: str) -> dict | None:
         if self._dedup_cache_size == 0 or not normalized:
             return None
@@ -312,7 +324,9 @@ class PlurBridge:
             cmd = [binary, command, "--json"] + args
 
         if self._plur_path:
-            cmd.extend(["--path", self._plur_path])
+            # Before a "--" separator: everything after it is positional.
+            at = cmd.index("--") if "--" in cmd else len(cmd)
+            cmd[at:at] = ["--path", self._plur_path]
 
         # Two-layer retry:
         #   OUTER (Miles's, slow 5/15/30s) — TimeoutExpired = hung CLI.
@@ -417,14 +431,20 @@ class PlurBridge:
               derived_from: str | None = None,
               force: bool = False) -> dict:
         needle = statement.strip().casefold()
+        key = self._cache_key(needle, scope) if needle else ""
 
         if not force:
-            cached = self._cache_get(needle)
+            cached = self._cache_get(key)
             if cached is not None:
                 return {**cached, "deduplicated": True}
-            existing = self._find_duplicate(statement)
+            # Scope-aware (formal R2 #5): a recall hit counts only when it is in
+            # the scope this write names. An UNSCOPED write goes to core, whose
+            # routing (auto-route / unscoped_default) picks the scope and whose
+            # own dedup is scope-aware — the bridge cannot know that scope, and
+            # a false dedup loses the write (a missed one costs a recurrence).
+            existing = self._find_duplicate(statement, scope) if scope is not None else None
             if existing is not None:
-                self._cache_put(needle, existing)
+                self._cache_put(key, existing)
                 return {**existing, "deduplicated": True}
 
         # Scope is OMITTED when the caller didn't specify one (#9): passing no
@@ -473,14 +493,17 @@ class PlurBridge:
                     "warning": "plur learn timed out; it is unknown whether the engram was stored — "
                                "recall it before re-learning."}
         if result.get("id"):
-            self._cache_put(needle, {
+            self._cache_put(key, {
                 "id": result["id"],
                 "statement": result.get("statement", statement),
             })
         return result
 
-    def _find_duplicate(self, statement: str) -> dict | None:
-        """Return existing engram if statement matches verbatim, else None.
+    def _find_duplicate(self, statement: str, scope: str | None = None) -> dict | None:
+        """Return existing engram if statement matches verbatim IN `scope`, else None.
+
+        A hit whose scope differs from (or does not report) the requested scope
+        is not a duplicate: core would store the statement there (formal R2 #5).
 
         Falls through silently on any recall failure so learn() never blocks
         on a bridge issue.
@@ -494,14 +517,21 @@ class PlurBridge:
             return None
         for engram in response.get("results", []) or []:
             existing_statement = (engram.get("statement") or "").strip().casefold()
-            if existing_statement and existing_statement == needle:
+            if existing_statement and existing_statement == needle \
+                    and (scope is None or engram.get("scope") == scope):
                 return {"id": engram.get("id"), "statement": engram.get("statement")}
         return None
 
     def recall(self, query: str, limit: int = 10, fast: bool = False) -> dict:
-        args = [query, "--limit", str(limit)]
+        # A query is data (formal R2 follow-up): one that begins with "-" could
+        # be read as a flag, so it travels after "--", which `plur recall`
+        # honours. Every other query keeps its argv shape.
+        flag_like = query.lstrip().startswith("-")
+        args = ([] if flag_like else [query]) + ["--limit", str(limit)]
         if fast:
             args.append("--fast")
+        if flag_like:
+            args += ["--", query]
         return self.call("recall", args)
 
     def inject(self, task: str, budget: int = 2000, fast: bool = True) -> dict:
@@ -533,6 +563,11 @@ class PlurBridge:
             args.extend(["--search", search])
         if reason:
             args.extend(["--reason", reason])
+        # A forget invalidates the dedup cache (formal R2 #5): a cached entry
+        # would otherwise report a retired engram as the live duplicate until
+        # its TTL runs out. Cleared before the call — a failed or timed-out
+        # forget may still have retired something.
+        self._cache_clear()
         return self.call("forget", args)
 
     def feedback(self, id: str | None = None, signal: str | None = None,

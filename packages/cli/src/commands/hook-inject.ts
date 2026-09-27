@@ -1,9 +1,12 @@
-import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync } from 'fs'
+import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync, renameSync, openSync, closeSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { tmpdir, homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { createPlur, trustedProjectScope, storeTrustCheck, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
+import { ensureSessionDir, cleanupStaleSessionFiles } from '../lib/codex-hook-io.js'
+import { safeSessionKey } from '../lib/session-key.js'
+import { checkpointRoot } from './hook-learn-check.js'
 
 // Remote budget for the recall leg inside injectHybrid (#776). The hook is
 // on the hot path of every prompt; slow networks make this a perceptible
@@ -118,23 +121,37 @@ function surfaceRemoteOutcomes(plur: Plur): string[] {
   }
 }
 
-function sessionDir(): string {
+/**
+ * The Claude Code hook family's state dir, VETTED (formal r2, cli#8) like the
+ * Codex/Cursor/Antigravity dirs since #1060: a symlinked, foreign or
+ * loose-mode dir returns null and every caller degrades to "no persistence"
+ * — no marker (so each prompt injects), no reminder timer, no inject lock.
+ * The old bare mkdirSync followed a planted symlink and trusted a marker
+ * anyone could have written, which suppresses injection for the session.
+ */
+function sessionDir(): string | null {
   const dir = join(tmpdir(), 'plur-sessions')
-  // Fail-open: an unwritable $TMPDIR (read-only tmpfs, full disk) must never
-  // crash the prompt. Swallow the mkdir error and return the path anyway —
-  // downstream state-dir writes are individually wrapped and degrade to no-ops.
-  try { mkdirSync(dir, { recursive: true }) } catch { /* fail-open */ }
-  return dir
+  return ensureSessionDir(dir) ? dir : null
 }
 
-function sessionMarkerPath(): string {
-  const ppid = process.ppid || 'unknown'
-  return join(sessionDir(), `${ppid}.marker`)
+/**
+ * Which Claude Code session is this? (formal r2, cli#7)
+ *
+ * Every Claude Code hook payload carries `session_id`. The marker used to be
+ * keyed by `process.ppid` alone, while the session guard keys by session_id:
+ * `/clear` starts a new session in the SAME process, and a recycled PID is a
+ * new process with an old number — both found the previous session's marker
+ * and skipped injection entirely. The payload id is the identity; ppid is the
+ * fallback for payloads without one (and keeps those paths byte-identical to
+ * before). The `sid-` prefix keeps the two key spaces disjoint.
+ */
+export function injectSessionKey(input: Record<string, unknown>, ppid: number | string = process.ppid || 'unknown'): string {
+  const sid = typeof input.session_id === 'string' ? input.session_id : ''
+  return sid ? `sid-${safeSessionKey(sid)}` : String(ppid)
 }
 
-function lastReminderPath(): string {
-  const ppid = process.ppid || 'unknown'
-  return join(sessionDir(), `${ppid}.reminded`)
+function statePath(dir: string | null, key: string, ext: string): string | null {
+  return dir ? join(dir, `${key}.${ext}`) : null
 }
 
 function readStdinSync(): Record<string, unknown> {
@@ -157,8 +174,8 @@ function readStdinSync(): Record<string, unknown> {
   }
 }
 
-function isReminderDue(): boolean {
-  const path = lastReminderPath()
+function isReminderDue(path: string | null): boolean {
+  if (!path) return false // no trustworthy timer — do not remind on every prompt
   try {
     const stat = statSync(path)
     return Date.now() - stat.mtimeMs > REMINDER_INTERVAL_MS
@@ -168,10 +185,41 @@ function isReminderDue(): boolean {
   }
 }
 
-function touchReminder(): void {
+function touchReminder(path: string | null): void {
   // Fail-open: a state-dir write failing (unwritable $TMPDIR) must never crash
   // the prompt. The reminder timer is best-effort bookkeeping.
-  try { writeFileSync(lastReminderPath(), String(Date.now())) } catch { /* fail-open */ }
+  if (!path) return
+  try { writeFileSync(path, String(Date.now()), { mode: 0o600 }) } catch { /* fail-open */ }
+}
+
+/**
+ * Take the per-session inject lock (#519) with O_EXCL (formal r2, cli#7).
+ *
+ * The previous stat-then-write let two hooks that fired together both see
+ * "no lock" and both write one — exactly the concurrent BGE loads the lock
+ * exists to prevent. `wx` makes creation the test. A lock older than
+ * LOCK_STALE_MS belongs to a crashed run and is taken over (one retry).
+ *
+ *   'acquired'    — ours; the caller MUST release it (in a finally)
+ *   'busy'        — a live run holds it; bail
+ *   'unavailable' — cannot lock at all (no trustworthy dir, I/O error);
+ *                   proceed unlocked, the pre-#519 behaviour (fail open)
+ */
+export function acquireInjectLock(path: string | null, staleMs: number = LOCK_STALE_MS, now: () => number = Date.now): 'acquired' | 'busy' | 'unavailable' {
+  if (!path) return 'unavailable'
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      closeSync(openSync(path, 'wx', 0o600))
+      return 'acquired'
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return 'unavailable'
+      try {
+        if (now() - statSync(path).mtimeMs < staleMs) return 'busy'
+        unlinkSync(path) // stale: the holder crashed — take it over
+      } catch { /* vanished between open and stat — retry */ }
+    }
+  }
+  return 'busy'
 }
 
 function extractEventTask(input: Record<string, unknown>, event: string): string {
@@ -207,25 +255,50 @@ function extractEventTask(input: Record<string, unknown>, event: string): string
   }
 }
 
+/** Is a process with this pid alive? EPERM means alive but not ours. */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false
+  try { process.kill(pid, 0); return true } catch (err: unknown) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM'
+  }
+}
+
 /**
- * Deferred wrap-up (#216): detect orphaned sessions from previous runs.
+ * Deferred wrap-up (#216): recover sessions that ended without wrap-up.
  *
- * Scans ~/.plur/sessions/ for checkpoint files without a matching
- * session_end episode. If found, generates a brief recovery notice
- * and cleans up the checkpoint. Returns a notice string or null.
+ * Scans <store>/sessions/ for checkpoint files left behind (plur_session_end
+ * and hook-session-end both remove theirs). Formal r2, cli#6 — the property
+ * is: A CHECKPOINT IS REMOVED ONLY AFTER A DURABLE CAPTURE
+ * (PlurSpec/R2CLI.lean §2, `removed_only_after_capture`). Before:
+ *   - a valid orphan produced a one-off notice in THIS session's context and
+ *     was unlinked — nothing durable, so the previous session's only record
+ *     was gone after a transient string (hook-session-end had been fixed for
+ *     exactly this in #217; this path never was);
+ *   - an unparseable checkpoint was unlinked outright;
+ *   - "idle > 5 min" was the only orphan test, so a session still running in
+ *     another terminal, between checkpoints (one every 10 responses), was
+ *     declared dead and its checkpoint destroyed;
+ *   - the scan read PLUR_PATH only, while the store and hook-session-end
+ *     honour --path.
+ * Now: an orphan is captured as an episode FIRST and unlinked only if that
+ * succeeded; a corrupt checkpoint is renamed aside (kept, never rescanned);
+ * a checkpoint whose key is a pid that is still alive is left alone (the
+ * writer keys by ppid when CLAUDE_SESSION_ID is unset — the common case).
  *
  * Conservative: only reports metadata (stop count, duration, cwd).
- * Does not attempt LLM-quality summaries — that context is gone.
  */
-function processDeferredWrapups(): string | null {
-  const plurDir = process.env.PLUR_PATH ?? join(homedir(), '.plur')
-  const sessionsDir = join(plurDir, 'sessions')
+export function processDeferredWrapups(
+  plur: Pick<Plur, 'capture'>,
+  root: string,
+  now: number = Date.now(),
+  isAlive: (pid: number) => boolean = pidAlive,
+): string | null {
+  const sessionsDir = join(root, 'sessions')
   if (!existsSync(sessionsDir)) return null
 
   const notices: string[] = []
   try {
     const files = readdirSync(sessionsDir).filter(f => f.endsWith('.checkpoint.json'))
-    const now = Date.now()
     // Skip checkpoints touched within the stale threshold — that session may
     // still be active in another terminal. Default 5 min; override via
     // PLUR_CHECKPOINT_STALE_MIN (minutes) for slower-cadence users.
@@ -234,33 +307,54 @@ function processDeferredWrapups(): string | null {
 
     for (const file of files) {
       const path = join(sessionsDir, file)
+      const key = file.slice(0, -'.checkpoint.json'.length)
+      let checkpoint: any
+      let lastCheckpoint: number
       try {
-        const checkpoint = JSON.parse(readFileSync(path, 'utf8'))
-        const lastCheckpoint = new Date(checkpoint.last_checkpoint).getTime()
-
-        // Skip if checkpoint is too recent (session may still be active elsewhere)
-        if (now - lastCheckpoint < STALE_THRESHOLD_MS) continue
-
-        // Calculate session duration
-        const started = new Date(checkpoint.started_at)
-        const ended = new Date(checkpoint.last_checkpoint)
-        const durationMin = Math.round((ended.getTime() - started.getTime()) / 60000)
-        const durationStr = durationMin >= 60
-          ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}m`
-          : `${durationMin}m`
-
-        notices.push(
-          `Previous session (${durationStr}, ${checkpoint.stop_count} responses` +
-          `${checkpoint.cwd ? ', ' + checkpoint.cwd.split('/').slice(-2).join('/') : ''}) ` +
-          `ended without wrap-up.`,
-        )
-
-        // Clean up the checkpoint
-        unlinkSync(path)
+        checkpoint = JSON.parse(readFileSync(path, 'utf8'))
+        lastCheckpoint = new Date(checkpoint.last_checkpoint).getTime()
+        if (!checkpoint || typeof checkpoint !== 'object' || Number.isNaN(lastCheckpoint)) throw new Error('corrupt')
       } catch {
-        // Corrupt checkpoint — remove it
-        try { unlinkSync(path) } catch {}
+        // Unparseable: keep the bytes (they are the session's only record),
+        // move them out of the scan so they are not re-reported forever.
+        try { renameSync(path, `${path}.corrupt`) } catch { /* leave it */ }
+        continue
       }
+
+      // Too recent — the session may still be active elsewhere.
+      if (now - lastCheckpoint < STALE_THRESHOLD_MS) continue
+      // A pid-keyed checkpoint whose process is alive is a LIVE session that
+      // simply has not reached its next checkpoint. (PID reuse can only make
+      // this skip a dead session — the safe direction; it is retried later.)
+      if (/^\d+$/.test(key) && isAlive(Number(key))) continue
+
+      // Calculate session duration
+      const started = new Date(checkpoint.started_at)
+      const durationMin = Math.max(0, Math.round((lastCheckpoint - started.getTime()) / 60000))
+      const durationStr = Number.isNaN(durationMin) ? '?m' : durationMin >= 60
+        ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}m`
+        : `${durationMin}m`
+      const where = typeof checkpoint.cwd === 'string' && checkpoint.cwd
+        ? ', ' + checkpoint.cwd.split('/').slice(-2).join('/') : ''
+      const facts = `${durationStr}, ${checkpoint.stop_count ?? 0} responses${where}`
+
+      // Durable FIRST. Only a successful capture licenses the unlink.
+      try {
+        plur.capture(
+          `Session ended without wrap-up (${facts}); recovered at the next session start.`,
+          {
+            channel: 'hook',
+            agent: 'claude-code',
+            session_id: typeof checkpoint.session_id === 'string' ? checkpoint.session_id : key,
+            tags: ['session-end', 'deferred-wrapup'],
+          },
+        )
+      } catch (err: unknown) {
+        process.stderr.write(`[plur] deferred wrap-up: capture failed, keeping ${file}: ${(err as Error)?.message ?? err}\n`)
+        continue
+      }
+      try { unlinkSync(path) } catch { /* captured; a leftover is re-captured at worst */ }
+      notices.push(`Previous session (${facts}) ended without wrap-up.`)
     }
   } catch {
     return null
@@ -304,11 +398,15 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   const isRehydrate = args.includes('--rehydrate')
   const eventIdx = args.indexOf('--event')
   const event = eventIdx >= 0 ? args[eventIdx + 1] : null
-  const marker = sessionMarkerPath()
+  // Read the payload first: it carries the session identity (cli#7).
+  const input = readStdinSync()
+  const stateDir = sessionDir()
+  const key = injectSessionKey(input)
+  const marker = statePath(stateDir, key, 'marker')
+  const reminderPath = statePath(stateDir, key, 'reminded')
 
   // Contextual injection for specific events (plan_mode, skill, agent, subagent)
   if (event) {
-    const input = readStdinSync()
     const task = extractEventTask(input, event)
     if (!task) {
       // Passthrough — nothing to inject for
@@ -333,7 +431,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     // the memory receipt can count (engram, session) pairs from hook traffic —
     // which is the large majority of all injections.
     let eventSessionId: string | undefined
-    try { eventSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
+    try { if (marker) eventSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
     const result = await plur.inject(task, { budget: 3000, source: 'hook', session_id: eventSessionId })
     if (result.count > 0) {
       const parts: string[] = []
@@ -347,9 +445,9 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   }
 
   // Session already started — check if periodic reminder is due
-  if (!isRehydrate && existsSync(marker)) {
-    if (isReminderDue()) {
-      touchReminder()
+  if (!isRehydrate && marker && existsSync(marker)) {
+    if (isReminderDue(reminderPath)) {
+      touchReminder(reminderPath)
       // Same trust gate as session start (decision E3): an untrusted
       // .plur.yaml does not get to name the scope the model writes under.
       const reminderRemote = resolveProjectRemote(storeTrustCheck(flags))
@@ -368,15 +466,27 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Multiple rapid async firings (datacore#33) otherwise pile up at ~160 MB
   // RSS each and trigger an OOM cascade. Lock is stale after HOOK_CEILING_MS
   // so a crashed process never permanently blocks subsequent invocations.
-  const injectLock = join(sessionDir(), `${process.ppid || 'unknown'}.injecting`)
-  let injectLockAcquired = false
+  const lock = acquireInjectLock(statePath(stateDir, key, 'injecting'))
+  if (lock === 'busy') return
+  const lockPath = lock === 'acquired' ? statePath(stateDir, key, 'injecting') : null
+  // Released on EVERY exit from here on, including a throw (cli#7): the
+  // BM25 fallback, createPlur and the project-config reads can all throw,
+  // and a lock left behind silenced injection for LOCK_STALE_MS (55 s).
   try {
-    const s = statSync(injectLock)
-    if (Date.now() - s.mtimeMs < LOCK_STALE_MS) return
-  } catch { /* no lock file — proceed */ }
-  try { writeFileSync(injectLock, ''); injectLockAcquired = true } catch { /* fail-open */ }
+    await injectAndReport(isRehydrate, input, marker, reminderPath, stateDir, flags)
+  } finally {
+    if (lockPath) try { unlinkSync(lockPath) } catch { /* already gone */ }
+  }
+}
 
-  const input = readStdinSync()
+async function injectAndReport(
+  isRehydrate: boolean,
+  input: Record<string, unknown>,
+  marker: string | null,
+  reminderPath: string | null,
+  stateDir: string | null,
+  flags: GlobalFlags,
+): Promise<void> {
   // Project remote routing is resolved with the Plur instance, below — see
   // lib/project-remote.ts. `scope`/`domain` are gated on directory trust too
   // (decision E3): they are not only a read filter — the header tells the
@@ -389,6 +499,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     const summary = (input.compact_summary as string) || ''
     let original = ''
     try {
+      if (!marker) throw new Error('no marker')
       const raw = readFileSync(marker, 'utf8')
       // Marker is JSON since 0.8.2 (was plain text before)
       try { original = JSON.parse(raw).task || raw } catch { original = raw }
@@ -404,8 +515,11 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     // Fail-open: if the state dir is unwritable, skip the marker (the session
     // header is read back defensively below) rather than crash the prompt.
     const sessionId = randomUUID()
-    try { writeFileSync(marker, JSON.stringify({ task, sessionId })) } catch { /* fail-open */ }
-    touchReminder() // Reset reminder timer on first message
+    if (marker) try { writeFileSync(marker, JSON.stringify({ task, sessionId }), { mode: 0o600 }) } catch { /* fail-open */ }
+    touchReminder(reminderPath) // Reset reminder timer on first message
+    // Keyed by session id now, so markers accumulate one per session: sweep
+    // week-old state like every other hook family does (vetted dir only).
+    if (stateDir) cleanupStaleSessionFiles(Date.now(), stateDir)
   }
 
   // Inject engrams (with project scope if configured). Read the session marker
@@ -421,7 +535,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   const remoteRefusedFrom = projectRemote.refusedFrom
 
   let injectSessionId: string | undefined
-  try { injectSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
+  try { if (marker) injectSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
   // #776: the remote leg rides INSIDE injectHybrid — at most one remote call
   // per host per prompt. `.plur.yaml`'s remote_url/remote_token pass through
   // as remote_project (project config wins for the hook path; its presence
@@ -485,7 +599,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     if (projectConfig.scope) parts.push(`Project scope: ${projectConfig.scope} — use this scope for plur_learn calls`)
 
     // Deferred wrap-up: notify about orphaned previous sessions (#216)
-    const deferredNotice = processDeferredWrapups()
+    const deferredNotice = processDeferredWrapups(plur, checkpointRoot(flags))
     if (deferredNotice) parts.push('', deferredNotice)
   }
 
@@ -504,7 +618,6 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     parts.push(context)
   }
 
-  if (injectLockAcquired) try { unlinkSync(injectLock) } catch {}
   if (parts.length === 0) return
 
   const output = { additionalContext: parts.join('\n') }

@@ -19,6 +19,19 @@
 // counters.json is rewritten for today. flushIfNeeded drains that directory.
 // Without this, a long-lived process emitting an event after midnight would
 // silently overwrite yesterday's data on disk.
+//
+// Cross-process safety (formal verification R2, core-retrieval#7): every
+// read-modify-write of counters.json and pending/ runs under ONE lock file
+// (`<countersPath>.lock`, the `withLock` from sync.ts). Without it two
+// processes reading the same snapshot merged yesterday into pending twice and
+// lost same-day increments (replayed: spec/formal/findings/r2-retrieval.md §1).
+// A flush CLAIMS a pending file by renaming it (under the same lock) before the
+// POST, so a second flusher cannot send it again and a later merge for that date
+// lands in a fresh pending file instead of being deleted with the sent one.
+// Invariant, per date: shipped + on disk (counters, pending, claims) = recorded.
+// If the lock cannot be taken (contended for ~1 s) the event is DROPPED rather
+// than written unlocked: telemetry never blocks or fails the tool call, and an
+// undercount is the conservative error.
 
 import {
   existsSync,
@@ -29,11 +42,13 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import { isTelemetryEnabled } from './telemetry.js'
+import { withLock } from './sync.js'
+import { holderIsAlive } from './store/async-lock.js'
 
 export type CounterEvent = 'learn' | 'recall' | 'session'
 
@@ -102,6 +117,28 @@ function atomicWriteString(path: string, data: string): void {
   renameSync(tmp, path)
 }
 
+// Held for a few file operations only, so retry fast: ~1 s of backoff in all.
+const COUNTERS_LOCK = { maxRetries: 8, baseDelay: 2 }
+
+/**
+ * Run `fn` holding the counters lock. `undefined` when the lock could not be
+ * taken (fn never ran); an error thrown BY fn propagates as before.
+ */
+function underCountersLock<T>(opts: CountersOpts, fn: () => T): T | undefined {
+  const target = opts.countersPath ?? defaultCountersPath()
+  let ran = false
+  try {
+    ensureParentDir(target)
+    return withLock(target, () => {
+      ran = true
+      return fn()
+    }, COUNTERS_LOCK)
+  } catch (err) {
+    if (!ran) return undefined
+    throw err
+  }
+}
+
 export function readOrCreateInstallId(path: string): string {
   if (existsSync(path)) {
     const raw = readFileSync(path, 'utf8').trim()
@@ -153,9 +190,11 @@ function viewAsToday(stored: StoredCounters | null, today: string): StoredCounte
 
 function moveToPending(stored: StoredCounters, pendingDir: string): void {
   const path = join(pendingDir, `${stored.date}.json`)
-  // If a pending file already exists for this date (e.g. multiple processes
-  // each detected the same rollover), merge counts so we don't double-count
-  // OR drop the smaller snapshot.
+  // If a pending file already exists for this date (a failed flush's claim put
+  // back, or counters.json carrying that date again), merge counts so we don't
+  // drop either snapshot. Caller holds the counters lock, so the two are
+  // disjoint sets of events: two processes can no longer both merge the SAME
+  // stale snapshot, which is what this merge used to double-count (#7).
   const existing = readStoredCounters(path)
   const merged: StoredCounters =
     existing && existing.date === stored.date
@@ -175,37 +214,42 @@ export function recordEvent(event: CounterEvent, opts: CountersOpts = {}): boole
   const countersPath = opts.countersPath ?? defaultCountersPath()
   const installIdPath = opts.installIdPath ?? defaultInstallIdPath()
   const pendingDir = opts.pendingDir ?? defaultPendingDir()
-  const now = (opts.now ?? (() => new Date()))()
-  const today = utcDate(now)
 
-  readOrCreateInstallId(installIdPath)
+  return underCountersLock(opts, () => {
+    // Read the clock under the lock: a `today` taken before waiting could be
+    // yesterday by the time we hold it.
+    const now = (opts.now ?? (() => new Date()))()
+    const today = utcDate(now)
 
-  const stored = readStoredCounters(countersPath)
-  let current: StoredCounters
-  let rolledOver = false
-  if (stored && stored.date !== today) {
-    // Rollover: preserve yesterday's snapshot in pending-dir BEFORE overwriting
-    // counters.json with today's fresh state. This is the load-bearing fix for
-    // #128 — without it, a long-lived process emitting an event after midnight
-    // would silently discard yesterday's counts.
-    moveToPending(stored, pendingDir)
-    current = freshCounters(today)
-    rolledOver = true
-  } else {
-    current = stored ?? freshCounters(today)
-  }
-  const sessionAlreadyCounted = current.session > 0
+    readOrCreateInstallId(installIdPath)
 
-  if (event === 'learn') current.learn += 1
-  else if (event === 'recall') current.recall += 1
-  else if (event === 'session') current.session += 1
+    const stored = readStoredCounters(countersPath)
+    let current: StoredCounters
+    let rolledOver = false
+    if (stored && stored.date !== today) {
+      // Rollover: preserve yesterday's snapshot in pending-dir BEFORE overwriting
+      // counters.json with today's fresh state. This is the load-bearing fix for
+      // #128 — without it, a long-lived process emitting an event after midnight
+      // would silently discard yesterday's counts.
+      moveToPending(stored, pendingDir)
+      current = freshCounters(today)
+      rolledOver = true
+    } else {
+      current = stored ?? freshCounters(today)
+    }
+    const sessionAlreadyCounted = current.session > 0
 
-  if ((event === 'learn' || event === 'recall') && !sessionAlreadyCounted) {
-    current.session += 1
-  }
+    if (event === 'learn') current.learn += 1
+    else if (event === 'recall') current.recall += 1
+    else if (event === 'session') current.session += 1
 
-  atomicWriteJson(countersPath, current)
-  return rolledOver
+    if ((event === 'learn' || event === 'recall') && !sessionAlreadyCounted) {
+      current.session += 1
+    }
+
+    atomicWriteJson(countersPath, current)
+    return rolledOver
+  }) ?? false
 }
 
 // Pending-flush directory helpers (#128). flushIfNeeded uses these to drain
@@ -245,13 +289,105 @@ export function migrateStaleCounters(opts: CountersOpts = {}): boolean {
   if (!isTelemetryEnabled(gateOpts(opts))) return false
   const countersPath = opts.countersPath ?? defaultCountersPath()
   const pendingDir = opts.pendingDir ?? defaultPendingDir()
-  const now = (opts.now ?? (() => new Date()))()
-  const today = utcDate(now)
-  const stored = readStoredCounters(countersPath)
-  if (!stored || stored.date >= today) return false
-  moveToPending(stored, pendingDir)
-  atomicWriteJson(countersPath, freshCounters(today))
-  return true
+  return underCountersLock(opts, () => {
+    const now = (opts.now ?? (() => new Date()))()
+    const today = utcDate(now)
+    const stored = readStoredCounters(countersPath)
+    if (!stored || stored.date >= today) return false
+    moveToPending(stored, pendingDir)
+    atomicWriteJson(countersPath, freshCounters(today))
+    return true
+  }) ?? false
+}
+
+// ── Flush claims (core-retrieval#7) ────────────────────────────────────────
+//
+// `claimPending` renames `pending/<date>.json` to
+// `pending/<date>.json.sending.<host>.<pid>.<uuid>` under the counters lock.
+// The rename is the claim: listPendingDates no longer sees the file, so no
+// second flusher sends it, and a rollover merging into <date> meanwhile writes
+// a NEW pending file that the next flush ships. After the POST the claim is
+// either deleted (sent) or merged back (failed). A claim whose owner process
+// is dead (crashed mid-POST) is merged back by the next flush — at-least-once,
+// as a pending file left by a crash always was. A claim from another host, or
+// whose owner cannot be probed, is left alone (never guessed dead).
+
+export type PendingClaim = { date: string; path: string; counts: StoredCounters | null }
+
+const CLAIM_RE = /^(\d{4}-\d{2}-\d{2})\.json\.sending\.(.+)\.(\d+)\.([0-9a-f-]{36})$/
+
+export function claimPending(date: string, opts: CountersOpts = {}): PendingClaim | null {
+  const pendingDir = opts.pendingDir ?? defaultPendingDir()
+  return underCountersLock(opts, () => {
+    const from = join(pendingDir, `${date}.json`)
+    const to = join(
+      pendingDir,
+      `${date}.json.sending.${encodeURIComponent(hostname())}.${process.pid}.${randomUUID()}`,
+    )
+    try {
+      renameSync(from, to)
+    } catch {
+      return null // gone: another flusher claimed it, or it was never there
+    }
+    return { date, path: to, counts: readStoredCounters(to) }
+  }) ?? null
+}
+
+/** The claim was sent (or is unreadable): remove it. */
+export function completeClaim(claim: PendingClaim): void {
+  try {
+    unlinkSync(claim.path)
+  } catch {
+    /* already gone */
+  }
+}
+
+/** The POST failed: merge the claim back into pending/<date>.json. */
+export function releaseClaim(claim: PendingClaim, opts: CountersOpts = {}): boolean {
+  const pendingDir = opts.pendingDir ?? defaultPendingDir()
+  return underCountersLock(opts, () => {
+    if (claim.counts && claim.counts.date === claim.date) moveToPending(claim.counts, pendingDir)
+    completeClaim(claim)
+    return true
+  }) ?? false // lock busy: the claim stays and is recovered once this process exits
+}
+
+/** Merge back claims whose owning process is known to be dead. Returns how many. */
+export function recoverOrphanClaims(opts: CountersOpts = {}): number {
+  if (!isTelemetryEnabled(gateOpts(opts))) return 0
+  const pendingDir = opts.pendingDir ?? defaultPendingDir()
+  if (!existsSync(pendingDir)) return 0
+  let names: string[]
+  try {
+    names = readdirSync(pendingDir)
+  } catch {
+    return 0
+  }
+  const orphans = names.filter((f) => {
+    const m = CLAIM_RE.exec(f)
+    if (!m) return false
+    let host: string
+    try {
+      host = decodeURIComponent(m[2])
+    } catch {
+      return false
+    }
+    return holderIsAlive(`${host}:${m[3]}`) === false
+  })
+  if (orphans.length === 0) return 0
+  return underCountersLock(opts, () => {
+    let n = 0
+    for (const f of orphans) {
+      const date = CLAIM_RE.exec(f)![1]
+      const path = join(pendingDir, f)
+      if (!existsSync(path)) continue
+      const counts = readStoredCounters(path)
+      if (counts && counts.date === date) moveToPending(counts, pendingDir)
+      completeClaim({ date, path, counts })
+      n++
+    }
+    return n
+  }) ?? 0
 }
 
 export function getCounters(opts: CountersOpts = {}): CounterSnapshot | null {
@@ -259,19 +395,22 @@ export function getCounters(opts: CountersOpts = {}): CounterSnapshot | null {
 
   const countersPath = opts.countersPath ?? defaultCountersPath()
   const installIdPath = opts.installIdPath ?? defaultInstallIdPath()
-  const now = (opts.now ?? (() => new Date()))()
-  const today = utcDate(now)
 
-  const installId = readOrCreateInstallId(installIdPath)
-  const stored = viewAsToday(readStoredCounters(countersPath), today)
+  return underCountersLock(opts, () => {
+    const now = (opts.now ?? (() => new Date()))()
+    const today = utcDate(now)
 
-  return {
-    installId,
-    date: stored.date,
-    learn: stored.learn,
-    recall: stored.recall,
-    session: stored.session,
-  }
+    const installId = readOrCreateInstallId(installIdPath)
+    const stored = viewAsToday(readStoredCounters(countersPath), today)
+
+    return {
+      installId,
+      date: stored.date,
+      learn: stored.learn,
+      recall: stored.recall,
+      session: stored.session,
+    }
+  }) ?? null
 }
 
 export function resetCounters(opts: CountersOpts = {}): CounterSnapshot | null {
@@ -279,18 +418,21 @@ export function resetCounters(opts: CountersOpts = {}): CounterSnapshot | null {
 
   const countersPath = opts.countersPath ?? defaultCountersPath()
   const installIdPath = opts.installIdPath ?? defaultInstallIdPath()
-  const now = (opts.now ?? (() => new Date()))()
-  const today = utcDate(now)
 
-  const installId = readOrCreateInstallId(installIdPath)
-  const fresh = freshCounters(today)
-  atomicWriteJson(countersPath, fresh)
+  return underCountersLock(opts, () => {
+    const now = (opts.now ?? (() => new Date()))()
+    const today = utcDate(now)
 
-  return {
-    installId,
-    date: fresh.date,
-    learn: fresh.learn,
-    recall: fresh.recall,
-    session: fresh.session,
-  }
+    const installId = readOrCreateInstallId(installIdPath)
+    const fresh = freshCounters(today)
+    atomicWriteJson(countersPath, fresh)
+
+    return {
+      installId,
+      date: fresh.date,
+      learn: fresh.learn,
+      recall: fresh.recall,
+      session: fresh.session,
+    }
+  }) ?? null
 }

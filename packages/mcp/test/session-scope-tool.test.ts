@@ -269,6 +269,9 @@ describe('plur_session_scope — remote routing and dialing (#243 × #778)', () 
       .map(([u]) => String(u))
 
     // No session scope: recall without an explicit scope implicates no org.
+    // (Formal R2: a session must be open — with none, recall uses no session
+    // default and plur_session_scope set refuses.)
+    await callTool('plur_session_start', { task: 'dialing check' })
     await callTool('plur_recall', { query: 'anything at all', mode: 'keyword' })
     expect(recallUrls()).toEqual([])
 

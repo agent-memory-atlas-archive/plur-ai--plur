@@ -50,7 +50,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { createHash } from 'crypto'
 import * as yaml from 'js-yaml'
-import { EngramSchemaPassthrough } from './schemas/engram.js'
+import { parseEngramEntry } from './engrams.js'
 import { logger } from './logger.js'
 import { atomicWrite, withLock } from './sync.js'
 
@@ -179,7 +179,7 @@ export function sha256(content: string | Buffer): string {
  *   (c) count is not far below the last known-good — catches the F1 truncation
  *       case, and is the ONLY check that can, since a truncated file is
  *       perfectly valid YAML describing a smaller corpus
- *   (d) ids unique and non-empty
+ *   (d) ids non-empty (a repeated id is resolved by the loader, owner decision P1)
  *   (e) non-zero size, and the file ends with a newline as PLUR's writer always
  *       does — a cheap tell for a write cut short
  *
@@ -226,19 +226,21 @@ export function validateStore(filePath: string, lastGoodCount?: number): StoreVa
   const count = entries.length
 
   // (b) — every entry typechecks
+  // The loader's per-entry rule (formal round
+  // 2, core-persistence#11): the gate must not judge entries by a different rule
+  // from the one that loads them.
   let invalid = 0
-  const ids = new Set<string>()
-  let duplicateIds = 0
   let missingIds = 0
   for (const entry of entries) {
-    if (!EngramSchemaPassthrough.safeParse(entry).success) invalid++
-    // (d) — ids unique and non-empty. Checked on the raw entry so a
-    // schema-invalid record still contributes its id to the uniqueness check.
+    if (parseEngramEntry(entry) === null) invalid++
     const id = (entry as any)?.id
     if (typeof id !== 'string' || id.length === 0) missingIds++
-    else if (ids.has(id)) duplicateIds++
-    else ids.add(id)
   }
+  // (d) — ids non-empty. A REPEATED id is no longer a failure (owner decision
+  // P1, 2026-09-27, "keep both, rename one"): the loader resolves it without
+  // loss — the later, different copy is read under a fresh id, an exact copy
+  // once — so a snapshot of such a file restores to the same engrams. Refusing
+  // it only left the store without a daily backup until the next write.
   if (invalid > 0) {
     failures.push('invalid-entries')
     reasons.push(`${invalid} entry/entries fail schema validation`)
@@ -246,10 +248,6 @@ export function validateStore(filePath: string, lastGoodCount?: number): StoreVa
   if (missingIds > 0) {
     failures.push('missing-ids')
     reasons.push(`${missingIds} entry/entries have no id`)
-  }
-  if (duplicateIds > 0) {
-    failures.push('duplicate-ids')
-    reasons.push(`${duplicateIds} duplicate id(s)`)
   }
 
   // (c) — not materially smaller than the last known-good corpus

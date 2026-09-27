@@ -38,6 +38,10 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       scope = args[++i]; i++
     }
     else if (arg === '--search') { isSearch = true; i++ }
+    // `--` ends flag parsing: the next token is the target, verbatim, even when
+    // it starts with `-` (decision S4; formal r2 follow-up). Before, `--`
+    // itself became the target.
+    else if (arg === '--') { if (!target && i + 1 < args.length) target = args[i + 1]; break }
     else if (!target) { target = arg; i++ }
     else { i++ }
   }

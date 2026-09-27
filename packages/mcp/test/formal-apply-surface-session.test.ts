@@ -84,9 +84,11 @@ describe('ambiguous session → no session default (E7, MCP)', () => {
     expect(spyBm25.mock.calls.at(-1)?.[1]?.session_id).toBe(NO_SESSION)
   })
 
-  it('plur_session_scope set with no session open says it does not govern writes', async () => {
-    const r = await call('plur_session_scope', { op: 'set', scope: 'project:x' })
-    expect(String(r.warning)).toMatch(/No session is open/)
+  // Formal R2 follow-up: set with no session open now REFUSES (it used to be
+  // accepted with this warning); show still answers and still warns.
+  it('plur_session_scope set with no session open refuses; show says the slot governs nothing', async () => {
+    await expect(call('plur_session_scope', { op: 'set', scope: 'project:x' })).rejects.toThrow(/no session is open/i)
+    plur.setSessionScope('project:x')
     const shown = await call('plur_session_scope', { op: 'show' })
     expect(String(shown.warning)).toMatch(/No session is open/)
   })

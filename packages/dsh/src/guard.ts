@@ -99,6 +99,11 @@ export type WriteQueue = <T>(fn: () => Promise<T>) => Promise<T | undefined>
  * (`DEFAULT_STALE_THRESHOLD`): a write still running past it has lost the
  * lock's guarantee anyway, so waiting longer protects nothing. The plugin uses
  * `max(WRITE_HARD_CAP_MS, timeoutMs)`, so the hard cap is never below the soft.
+ *
+ * A CONSTANT on purpose, not a config key (formal R2 follow-up): it is tied to
+ * core's lock threshold, not to the host's patience, and a smaller value would
+ * reintroduce overlapping writes. The only way to raise it is a larger
+ * `timeoutMs`; there is no way to lower it.
  */
 export const WRITE_HARD_CAP_MS = 60_000
 

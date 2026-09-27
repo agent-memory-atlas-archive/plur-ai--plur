@@ -3,7 +3,9 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, unlinkS
 import { join, dirname, relative } from 'path'
 import * as yaml from 'js-yaml'
 import { isSharedScope } from './scope-util.js'
-import { DEFAULT_STALE_THRESHOLD, holderIsAlive, makeToken, startHeartbeat, heartbeatHeldLocks } from './store/async-lock.js'
+import { engramStoreEntries, freshDuplicateId, sameEngramContent, recordIdRenames, type IdRename } from './engrams.js'
+import { recordLastWritten } from './backup.js'
+import { DEFAULT_STALE_THRESHOLD, holderIsAlive, makeToken, startHeartbeat, heartbeatHeldLocks, stealGuardPath, judgeStealSlot, STEAL_GUARD_SLOTS, GIT_COMMAND_TIMEOUT_MS } from './store/async-lock.js'
 
 export interface SyncStatus {
   initialized: boolean
@@ -98,7 +100,7 @@ function git(args: string[], cwd: string): string {
   // held around sync (Plur.sync holds the store lock) cannot heartbeat from a
   // timer. Touch it here, before each command (decision P1).
   heartbeatHeldLocks()
-  return execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 30_000 }).trim()
+  return execFileSync('git', args, { cwd, encoding: 'utf8', timeout: GIT_COMMAND_TIMEOUT_MS }).trim()
 }
 
 function gitSafe(args: string[], cwd: string): string | null {
@@ -283,11 +285,6 @@ const SIBLING_DUMP_OPTS = { lineWidth: 120, noRefs: true }
 interface EngramRecord { id?: string; scope?: string; visibility?: string; [k: string]: unknown }
 
 /**
- * Read engrams.yaml and return the engram list, tolerating both the canonical
- * `{ engrams: [...] }` shape and a bare top-level array. Returns null when the
- * file is absent, unparseable, or not in a recognized engram shape.
- */
-/**
  * Error thrown when sync finds an engrams.yaml it cannot parse.
  *
  * Sync MUST fail loudly here rather than continue (audit #794, F5). The strip
@@ -321,19 +318,18 @@ export class SyncStoreUnreadableError extends Error {
 function readEngramList(root: string): { raw: unknown; list: EngramRecord[] } | null {
   const path = join(root, 'engrams.yaml')
   if (!existsSync(path)) return null
-  let raw: unknown
+  const content = readFileSync(path, 'utf8')
+  // The loader's shape rule, not a looser local copy (formal round 2,
+  // core-persistence#11): this used to accept a bare top-level array that
+  // `parseEngramFile` refuses, so sync would strip, commit and push a file PLUR
+  // itself cannot load. Anything the loader refuses, sync refuses.
+  let list: unknown[]
   try {
-    raw = yaml.load(readFileSync(path, 'utf8'))
+    list = engramStoreEntries(path, content, Buffer.byteLength(content))
   } catch {
     throw new SyncStoreUnreadableError(path)
   }
-  if (Array.isArray(raw)) return { raw, list: raw as EngramRecord[] }
-  if (raw && typeof raw === 'object' && Array.isArray((raw as any).engrams)) {
-    return { raw, list: (raw as any).engrams as EngramRecord[] }
-  }
-  // Parses, but is not a shape we recognise as an engram store — so we cannot
-  // derive the push set from it either. Same refusal, same reason.
-  throw new SyncStoreUnreadableError(path)
+  return { raw: yaml.load(content), list: list as EngramRecord[] }
 }
 
 /**
@@ -515,9 +511,7 @@ function stageStrippedEngrams(root: string, remoteType: SyncRemoteType): void {
   const keep = pushKeep(remoteType)
   const filtered = list.filter(keep)
   if (filtered.length === list.length) return
-  const out = Array.isArray(raw)
-    ? yaml.dump(filtered, YAML_DUMP_OPTS)
-    : yaml.dump({ ...(raw as object), engrams: filtered }, YAML_DUMP_OPTS)
+  const out = yaml.dump({ ...(raw as object), engrams: filtered }, YAML_DUMP_OPTS)
   stageBlob(root, 'engrams.yaml', out)
 }
 
@@ -628,21 +622,81 @@ function holdWithheld(root: string, remoteType: SyncRemoteType): WithheldFile[] 
 }
 
 /**
+ * Owner decision P1b: give each held record whose id the pull brought a fresh
+ * id (the loader's {@link freshDuplicateId}); a held record identical to the
+ * pulled one is not a clash and is not appended twice.
+ */
+function rekeyHeldAgainstPulled(pulled: unknown[], held: unknown[]): { held: unknown[]; renames: IdRename[] } {
+  const idOf = (r: unknown) => (r as { id?: unknown } | null)?.id
+  const pulledById = new Map<string, unknown[]>()
+  const taken = new Set<string>()
+  for (const r of [...pulled, ...held]) { const id = idOf(r); if (typeof id === 'string') taken.add(id) }
+  for (const r of pulled) {
+    const id = idOf(r)
+    if (typeof id === 'string') pulledById.set(id, [...(pulledById.get(id) ?? []), r])
+  }
+  const out: unknown[] = []
+  const renames: IdRename[] = []
+  for (const r of held) {
+    const id = idOf(r)
+    const same = typeof id === 'string' ? pulledById.get(id) : undefined
+    if (!same) { out.push(r); continue }
+    if (same.some(p => sameEngramContent(p, r))) continue
+    const to = freshDuplicateId(id as string, r, taken)
+    taken.add(to)
+    renames.push({ from: id as string, to })
+    out.push({ ...(r as object), id: to })
+  }
+  return { held: out, renames }
+}
+
+/** Replace engram-id tokens in a record by `map` (old id -> new id), everywhere in it. */
+function renameIdRefs(v: unknown, map: ReadonlyMap<string, string>): unknown {
+  if (typeof v === 'string') return v.replace(ENGRAM_ID_TOKEN, m => map.get(m) ?? m)
+  if (Array.isArray(v)) return v.map(x => renameIdRefs(x, map))
+  if (v !== null && typeof v === 'object') {
+    return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, renameIdRefs(x, map)]))
+  }
+  return v
+}
+
+/**
  * Put held records back after a pull (successful or not).
  *
  * - The pull did not change the file → write the saved bytes back verbatim.
  * - The pull changed it → the new file plus every held record, appended. Held
- *   records were never committed, so the pulled file cannot already carry them
- *   (a same-id record from another machine is a distinct engram; both are kept).
+ *   records were never committed, so the pulled file cannot already carry them.
+ *   A same-id record from another machine (both minted the same day) is a
+ *   DIFFERENT engram: owner decision P1b (2026-09-27) — the held LOCAL record is
+ *   re-id'd, since it was never pushed and nothing outside this machine refers
+ *   to it; the pulled record keeps the id; the rename is recorded in history,
+ *   and held sibling records that name the old id follow it. Before, both copies
+ *   were appended under one id and every lookup returned the remote record.
  * - The new file is unreadable (should not happen: conflicts abort) → saved bytes
  *   verbatim, so the only possible outcome of a bad pull is "not pulled", never
  *   "lost".
  */
-function restoreWithheld(root: string, files: WithheldFile[]): void {
-  for (const f of files) {
+function restoreWithheld(root: string, files: WithheldFile[]): { renames: IdRename[]; rewrote: string[] } {
+  // engrams.yaml first: its renames (P1b) are applied to held sibling records.
+  const ordered = [...files].sort((a, b) => Number(b.file === 'engrams.yaml') - Number(a.file === 'engrams.yaml'))
+  const renamed = new Map<string, string>()
+  const allRenames: IdRename[] = []
+  const rewrote: string[] = []
+  for (const f of ordered) {
     const path = join(root, f.file)
     const current = existsSync(path) ? readFileSync(path, 'utf8') : null
     if (current === null || current.trim() === f.staged) {
+      if (renamed.size > 0 && f.file !== 'engrams.yaml' && current !== null) {
+        // The pull left this sibling alone, but it holds records naming a held
+        // engram that was just re-id'd: put them back under the new id.
+        let base: unknown
+        try { base = yaml.load(current) } catch { base = null }
+        if (Array.isArray(base)) {
+          atomicWrite(path, yaml.dump([...base, ...f.held.map(r => renameIdRefs(r, renamed))], SIBLING_DUMP_OPTS))
+          rewrote.push(f.file)
+          continue
+        }
+      }
       atomicWrite(path, f.saved)
       continue
     }
@@ -654,28 +708,102 @@ function restoreWithheld(root: string, files: WithheldFile[]): void {
       continue
     }
     if (f.file === 'engrams.yaml') {
-      if (Array.isArray(raw)) {
-        atomicWrite(path, yaml.dump([...raw, ...f.held], YAML_DUMP_OPTS))
-      } else if (raw && typeof raw === 'object' && Array.isArray((raw as any).engrams)) {
-        atomicWrite(path, yaml.dump({ ...(raw as object), engrams: [...(raw as any).engrams, ...f.held] }, YAML_DUMP_OPTS))
+      // Same shape rule as every other reader: a pulled file the loader would
+      // refuse is not merged into — the saved bytes go back ("not pulled").
+      let pulledOk = true
+      try { engramStoreEntries(path, current, Buffer.byteLength(current)) } catch { pulledOk = false }
+      if (pulledOk && raw && typeof raw === 'object' && Array.isArray((raw as any).engrams)) {
+        const pulled = (raw as any).engrams as unknown[]
+        const { held, renames } = rekeyHeldAgainstPulled(pulled, f.held)
+        atomicWrite(path, yaml.dump({ ...(raw as object), engrams: [...pulled, ...held] }, YAML_DUMP_OPTS))
+        for (const r of renames) { renamed.set(r.from, r.to); allRenames.push(r) }
       } else {
         atomicWrite(path, f.saved)
       }
     } else if (Array.isArray(raw)) {
-      atomicWrite(path, yaml.dump([...raw, ...f.held], SIBLING_DUMP_OPTS))
+      const held = renamed.size > 0 ? f.held.map(r => renameIdRefs(r, renamed)) : f.held
+      if (renamed.size > 0 && JSON.stringify(held) !== JSON.stringify(f.held)) rewrote.push(f.file)
+      atomicWrite(path, yaml.dump([...raw, ...held], SIBLING_DUMP_OPTS))
     } else {
       atomicWrite(path, f.saved)
     }
   }
+  return { renames: allRenames, rewrote }
 }
 
-function pullRebase(root: string, remoteType: SyncRemoteType): boolean {
-  const held = holdWithheld(root, remoteType)
-  try {
-    return pullRebaseClean(root, remoteType)
-  } finally {
-    restoreWithheld(root, held)
+/**
+ * Sibling records as they were in the working tree BEFORE the pull, per file.
+ * After a P1b rename these are exactly the records whose references to the old
+ * id meant the local engram: the pulled engram with that id did not exist here
+ * yet. Unreadable or absent files are skipped (nothing to rewrite from).
+ */
+function readSiblingsBeforePull(root: string): Map<string, unknown[]> {
+  const out = new Map<string, unknown[]>()
+  for (const file of SIBLING_STRIP_FILES) {
+    try {
+      const records = readSiblingList(root, file)
+      if (records) out.set(file, records)
+    } catch { /* unreadable: sync refuses it elsewhere; nothing to rewrite from */ }
   }
+  return out
+}
+
+/**
+ * Follow-up to P1b (owner principle "keep both, rename one — nothing lost or
+ * hidden", 2026-09-27). On a PERSONAL remote sibling files are committed, not
+ * held, so the held-record rewrite in {@link restoreWithheld} never sees them:
+ * an episode or tension this machine wrote about its local engram kept naming
+ * the old id, which after the pull belongs to the other machine's engram — the
+ * reference silently changed meaning. Rewrite the references in every sibling
+ * record that was already here before the pull; records the pull brought are
+ * left alone (their references mean the pulled engram). Returns the files
+ * rewritten; the caller commits them, so the correction reaches the user's
+ * own remote.
+ */
+function rewriteLocalSiblingRefs(root: string, renamed: ReadonlyMap<string, string>, before: Map<string, unknown[]>): string[] {
+  const rewrote: string[] = []
+  const names = (r: unknown) => (JSON.stringify(r) ?? '').match(ENGRAM_ID_TOKEN)?.some(t => renamed.has(t)) ?? false
+  for (const [file, pre] of before) {
+    const local = pre.filter(names)
+    if (local.length === 0) continue
+    let current: unknown[] | null
+    try { current = readSiblingList(root, file) } catch { continue }
+    if (!current) continue
+    let changed = false
+    const next = current.map(r => {
+      if (!names(r) || !local.some(p => sameEngramContent(p, r))) return r
+      changed = true
+      return renameIdRefs(r, renamed)
+    })
+    if (changed) {
+      atomicWrite(join(root, file), yaml.dump(next, SIBLING_DUMP_OPTS))
+      rewrote.push(file)
+    }
+  }
+  return rewrote
+}
+
+/** @returns whether the pull integrated, and the sibling files rewritten after a P1b rename (to commit). */
+function pullRebase(root: string, remoteType: SyncRemoteType): { ok: boolean; rewroteSiblings: string[] } {
+  const before = readSiblingsBeforePull(root)
+  const held = holdWithheld(root, remoteType)
+  let ok = false
+  let restored: { renames: IdRename[]; rewrote: string[] } = { renames: [], rewrote: [] }
+  try {
+    ok = pullRebaseClean(root, remoteType)
+  } finally {
+    restored = restoreWithheld(root, held)
+  }
+  if (restored.renames.length === 0) return { ok, rewroteSiblings: [] }
+  const renamed = new Map(restored.renames.map(r => [r.from, r.to] as const))
+  const committed = rewriteLocalSiblingRefs(root, renamed, before)
+  const files = [...new Set([...restored.rewrote, ...committed])]
+  recordIdRenames(
+    root, restored.renames,
+    'sync: a pulled engram arrived with the id of a local engram that was never pushed; the local one was given a fresh id (P1b)',
+    { store: join(root, 'engrams.yaml'), cause: 'sync-pull', files },
+  )
+  return { ok, rewroteSiblings: committed }
 }
 
 function pullRebaseClean(root: string, remoteType: SyncRemoteType): boolean {
@@ -708,6 +836,28 @@ function pullRebaseClean(root: string, remoteType: SyncRemoteType): boolean {
   // are still behind the upstream, the pull did not happen.
   if (committed === null) return false
   return countDiff(root, 'behind') === 0
+}
+
+/**
+ * A pull that rewrote engrams.yaml is a PLUR write too: record the count that
+ * landed for the daily backup's shrink gate (owner decision P2; formal round 2,
+ * findings/r2-persist.md item 7). Without it a legitimate pulled shrink of more
+ * than 10% — another machine forgot or compacted — was refused as "shrunk" by
+ * the next day's backup, until PLUR's next local write recorded the new count.
+ * Only a file that passes the loader's shape rule is counted; anything else is
+ * left for the gate to refuse.
+ */
+function recordPulledCount(storePath: string, before: string | null): void {
+  if (!existsSync(storePath)) return
+  const after = readFileSync(storePath, 'utf8')
+  if (after === before) return
+  let count: number
+  try {
+    count = engramStoreEntries(storePath, after, Buffer.byteLength(after)).length
+  } catch {
+    return
+  }
+  recordLastWritten(storePath, count)
 }
 
 export function sync(root: string, remote?: string, options?: { remoteType?: SyncRemoteType }): SyncResult {
@@ -769,7 +919,14 @@ export function sync(root: string, remote?: string, options?: { remoteType?: Syn
   // meant to pull, not what we actually got.
   let pullFailed = false
   if (behind > 0) {
-    pullFailed = !pullRebase(root, remoteType)
+    const storePath = join(root, 'engrams.yaml')
+    const before = existsSync(storePath) ? readFileSync(storePath, 'utf8') : null
+    const pulledResult = pullRebase(root, remoteType)
+    pullFailed = !pulledResult.ok
+    recordPulledCount(storePath, before)
+    // Committed sibling records rewritten after a P1b rename: commit them now so
+    // this sync pushes the correction (it is the user's own remote).
+    if (pulledResult.ok && pulledResult.rewroteSiblings.length > 0) commitChanges(root, remoteType)
   }
   const behindAfter = behind > 0 ? countDiff(root, 'behind') : 0
   const pulled = behind - behindAfter
@@ -864,44 +1021,73 @@ export interface LockOptions {
  * O_EXCL path, which is what actually decides who holds the lock.
  */
 function stealLockSync(lockPath: string, expected: string, token: string): void {
-  // Serialized by a guard file and re-read under it — the same fix, for the same
+  // Serialized by a guard and re-read under it — the same fix, for the same
   // replayed double-holder interleaving, as `stealLock` in store/async-lock.ts
   // (formal-verification finding, spec/formal/findings/persistence.md candidate 3).
-  const guard = `${lockPath}.steal`
-  try {
-    writeFileSync(guard, token, { flag: 'wx' })
-  } catch (err: any) {
-    if (err?.code === 'EEXIST') {
-      try {
-        const g = readFileSync(guard, 'utf8').trim()
-        const alive = holderIsAlive(g)
-        if (alive === false || (alive === undefined && Date.now() - statSync(guard).mtimeMs > 10_000)) unlinkSync(guard)
-      } catch { /* gone already */ }
-    }
-    return
-  }
+  // Round 2 (findings/r2-persist.md item 1): the guard is the same ladder of slots
+  // keyed by the judged token, so an abandoned guard is never unlinked by anyone
+  // but its writer while the judged lock is still in place.
+  const slot = acquireStealSlotSync(lockPath, expected, token)
+  if (!slot) return
   try {
     let now: string | null = null
     try { now = readFileSync(lockPath, 'utf8').trim() } catch { now = null }
     if (now !== expected) return
-    claimAndRemoveSync(lockPath, expected, token)
+    if (claimAndRemoveSync(lockPath, expected, token)) {
+      for (let k = 0; k < STEAL_GUARD_SLOTS; k++) {
+        const other = stealGuardPath(lockPath, expected, k)
+        if (other !== slot) { try { unlinkSync(other) } catch { /* absent */ } }
+      }
+    }
   } finally {
-    try { if (readFileSync(guard, 'utf8').trim() === token) unlinkSync(guard) } catch { /* gone */ }
+    try { if (readFileSync(slot, 'utf8').trim() === token) unlinkSync(slot) } catch { /* gone */ }
   }
 }
 
-function claimAndRemoveSync(lockPath: string, expected: string, token: string): void {
+function stealSlotStateSync(slot: string): 'dead' | 'live' | 'gone' {
+  try {
+    const contents = readFileSync(slot, 'utf8')
+    return judgeStealSlot(contents, statSync(slot).mtimeMs)
+  } catch {
+    return 'gone'
+  }
+}
+
+/** Synchronous twin of `acquireStealSlot` (store/async-lock.ts). */
+function acquireStealSlotSync(lockPath: string, expected: string, token: string): string | null {
+  for (let k = 0; k < STEAL_GUARD_SLOTS; k++) {
+    const slot = stealGuardPath(lockPath, expected, k)
+    try {
+      writeFileSync(slot, token, { flag: 'wx' })
+    } catch (err: any) {
+      if (err?.code !== 'EEXIST') return null
+      if (stealSlotStateSync(slot) === 'dead') continue
+      return null
+    }
+    for (let i = 0; i < k; i++) {
+      if (stealSlotStateSync(stealGuardPath(lockPath, expected, i)) !== 'dead') {
+        try { if (readFileSync(slot, 'utf8').trim() === token) unlinkSync(slot) } catch { /* gone */ }
+        return null
+      }
+    }
+    return slot
+  }
+  return null
+}
+
+/** Returns true iff the file moved aside was the judged one (the claim is confirmed). */
+function claimAndRemoveSync(lockPath: string, expected: string, token: string): boolean {
   const claim = `${lockPath}.steal.${token.replace(/[^\w.-]/g, '_')}`
   try {
     renameSync(lockPath, claim)
   } catch {
-    return // another contender claimed it, or the holder released — re-evaluate
+    return false // another contender claimed it, or the holder released — re-evaluate
   }
   try {
     const current = readFileSync(claim, 'utf8').trim()
     if (current === expected) {
       unlinkSync(claim) // confirmed the one we judged stale
-      return
+      return true
     }
     // A live holder's lock, not the stale one. Put it back — but never over a
     // lock someone has since acquired, so create exclusively and accept EEXIST.
@@ -914,6 +1100,7 @@ function claimAndRemoveSync(lockPath: string, expected: string, token: string): 
     // The claim file is uniquely named; nothing else would ever clean it up.
     try { unlinkSync(claim) } catch { /* already gone */ }
   }
+  return false
 }
 
 export function withLock<T>(

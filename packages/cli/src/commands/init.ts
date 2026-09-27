@@ -290,7 +290,9 @@ function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
     PostToolUse: [
       // Session sentinel — creates marker file after plur_session_start succeeds
       {
-        matcher: 'mcp__plur__plur_session_start',
+        // Same rule as the guard's exemption (any `mcp__<server>__plur_session_start`),
+        // so a plugin-named server still marks the session started.
+        matcher: 'mcp__.*__plur_session_start',
         hooks: [
           { type: 'command', command: `${cmd} hook-session-mark`, timeout: 3 },
         ],
@@ -1625,3 +1627,5 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
 /** Test seams (formal Adapters #3). */
 export { mergeHooks as _mergeClaudeHooks }
 export { isPlurHookSpec as _isPlurClaudeHookSpec }
+
+export { buildEnforcementHooks as _buildEnforcementHooks }

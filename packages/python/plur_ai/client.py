@@ -78,9 +78,7 @@ class Plur:
         Use :meth:`recall_hybrid` for better quality at the cost of a slightly
         longer first call while the embedder model loads.
         """
-        args = ["recall", "--fast", query]
-        if limit is not None:
-            args += ["--limit", str(limit)]
+        args = _with_query(["recall", "--fast"], query, limit)
         res = self._run(args) or {}
         return res.get("results", [])
 
@@ -90,9 +88,7 @@ class Plur:
         Requires ``@plur-ai/cli`` >= 0.10.0. The first call may be slower while the
         BGE embedder model loads; subsequent calls are fast.
         """
-        args = ["recall", query]
-        if limit is not None:
-            args += ["--limit", str(limit)]
+        args = _with_query(["recall"], query, limit)
         res = self._run(args, timeout=max(self.timeout, 30)) or {}
         return res.get("results", [])
 
@@ -111,3 +107,13 @@ class Plur:
     def status(self) -> dict:
         """System health — engram/episode/pack counts and storage path."""
         return self._run(["status"]) or {}
+
+
+def _with_query(head: list[str], query: str, limit: int | None) -> list[str]:
+    """Recall argv. A query is data (formal R2 follow-up): one that begins with
+    ``-`` could be read as a flag, so it goes after ``--``, which ``plur recall``
+    honours. Every other query keeps its original position."""
+    tail = ["--limit", str(limit)] if limit is not None else []
+    if query.lstrip().startswith("-"):
+        return head + tail + ["--", query]
+    return head + [query] + tail

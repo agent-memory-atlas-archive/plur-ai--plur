@@ -24,11 +24,13 @@ import { fileURLToPath } from 'node:url'
 
 import { isTelemetryEnabled } from './telemetry.js'
 import {
-  deletePending,
+  claimPending,
+  completeClaim,
   getCounters,
   listPendingDates,
   migrateStaleCounters,
-  readPendingCounters,
+  recoverOrphanClaims,
+  releaseClaim,
   type CounterSnapshot,
   type CountersOpts,
 } from './telemetry-counters.js'
@@ -130,6 +132,9 @@ export async function flushIfNeeded(opts: FlushOpts = {}): Promise<void> {
   // pending-dir check below handles the empty case.
   if (countersPath && !existsSync(countersPath) && listPendingDates(opts).length === 0) return
 
+  // Claims left by a flusher that died mid-POST go back into pending first.
+  recoverOrphanClaims(opts)
+
   // Migrate any stale counters.json (e.g. upgrade from pre-#128, or beforeExit
   // firing after midnight on a process that never re-recorded). Adds an entry
   // to pending-dir; the drain loop below ships it.
@@ -141,10 +146,15 @@ export async function flushIfNeeded(opts: FlushOpts = {}): Promise<void> {
   if (!baseSnapshot) return
 
   for (const date of listPendingDates(opts)) {
-    const pending = readPendingCounters(date, opts)
+    // Claim before sending (core-retrieval#7): a concurrent flush cannot send
+    // the same day again, and counts merged into <date> during the POST land in
+    // a new pending file instead of being deleted with this one.
+    const claim = claimPending(date, opts)
+    if (!claim) continue
+    const pending = claim.counts
     if (!pending) {
-      // Malformed or already-removed; drop the file so we don't loop on it.
-      deletePending(date, opts)
+      // Malformed; drop the file so we don't loop on it.
+      completeClaim(claim)
       continue
     }
     const snapshot: CounterSnapshot = {
@@ -156,8 +166,9 @@ export async function flushIfNeeded(opts: FlushOpts = {}): Promise<void> {
     }
     const payload = buildHeartbeatPayload(snapshot, opts)
     const ok = await sendHeartbeat(payload, opts)
-    if (ok) deletePending(date, opts)
-    // On failure, file stays on disk and is retried on next flush.
+    if (ok) completeClaim(claim)
+    // On failure, the claim is merged back into pending and retried on next flush.
+    else releaseClaim(claim, opts)
   }
 }
 

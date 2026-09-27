@@ -121,8 +121,10 @@ const recallHandler: ToolDefinition['handler'] = async (args, plur) => {
       remote_timeout_ms: 2000, // MCP recall remote budget (#776)
       // #243: session default scope (incl. mid-session plur_session_scope
       // changes) establishes the remote dialing org context when no explicit
-      // scope filter is passed.
-      session: _resolveInjectionSession(args),
+      // scope filter is passed. Same rule as writes (E7, formal R2): not
+      // exactly one open session and no id → NO_SESSION, never the process
+      // slot the last-started session owns.
+      session: _resolveWriteSession(args),
     })
     const response: Record<string, unknown> = {
       results: results.map(e => {
@@ -176,8 +178,8 @@ const recallHandler: ToolDefinition['handler'] = async (args, plur) => {
     remote_timeout_ms: 2000, // MCP recall remote budget (#776)
     // #243: session default scope (incl. mid-session plur_session_scope
     // changes) establishes the remote dialing org context when no explicit
-    // scope filter is passed.
-    session: _resolveInjectionSession(args),
+    // scope filter is passed. Same rule as writes (E7, formal R2).
+    session: _resolveWriteSession(args),
   })
   // Opt-in, content-free engagement counter (default-off; no query text).
   recordTelemetry('recall')
@@ -736,6 +738,23 @@ export function readTrustedProjectConfig(
   return { warning }
 }
 
+/**
+ * Why an auto-route candidate was refused, in words (formal R2 follow-up).
+ * Core refuses two kinds alike (`refusedShared`): a SHARED scope (#1115), and a
+ * PERSONAL scope backed by a remote store that is not verifiably the user's own
+ * `/me` namespace (decision E1 "me-only"). Calling the second "shared" misled
+ * the caller about what the scope is and what passing it explicitly would do.
+ */
+function describeRefusedRoute(scope: string): { kind: 'shared' | 'remote-personal'; what: string; rule: string } {
+  return isSharedScope(scope)
+    ? { kind: 'shared', what: `the shared scope "${scope}"`, rule: 'unscoped writes are never auto-routed into a shared store' }
+    : {
+        kind: 'remote-personal',
+        what: `"${scope}", a personal scope on a remote store that is not verified as your own namespace (its /me identity is unknown or belongs to another user)`,
+        rule: 'unscoped writes are never auto-routed into a remote personal namespace that is not verifiably yours',
+      }
+}
+
 /** Resolve the session for an injection: explicit argument first, then implicit. */
 function _resolveInjectionSession(args: Record<string, unknown>): string | undefined {
   const explicit = args.session_id
@@ -745,9 +764,9 @@ function _resolveInjectionSession(args: Record<string, unknown>): string | undef
 
 /** plur_session_scope's note when no session is open (decision E7). */
 const NO_SESSION_SLOT_WARNING =
-  'No session is open, so this is the process-default slot. An id-less plur_learn / plur_inject uses NO session ' +
-  'default unless exactly one session is open, so this scope does not govern writes; it still sets the recall ' +
-  'dialing context. Call plur_session_start (then plur_session_scope with its session_id) to scope writes.'
+  'No session is open, so this is the process-default slot. An id-less plur_learn / plur_inject / plur_recall uses ' +
+  'NO session default unless exactly one session is open, so this slot governs neither writes nor the recall ' +
+  'dialing context. Call plur_session_start (then plur_session_scope with its session_id) to scope a session.'
 
 /**
  * The session a WRITE or INJECT passes to core (decision E7, 2026-09-26).
@@ -838,6 +857,15 @@ export type ToolProfile = 'full' | 'lean' | 'cursor'
 // `destructiveHint: true` and points at the direct tool. Two more core
 // tools (11 total) is still far under the ~40-tool cap, so there's no
 // budget reason to wrap them either.
+//
+// Owner decision I_tensions_resolve (formal R2, 2026-09-27): "every removal
+// needs an explicit, gated act". Every tool that can RETIRE or DELETE memory
+// is `destructiveHint: true` and therefore listed here: plur_forget,
+// plur_packs_uninstall, plur_tensions_purge, plur_tensions (action:"resolve"
+// retires the losing engram — exactly forget's effect) and plur_validate_meta
+// (a third failed validation retires a non-top meta-engram). 13 core tools +
+// plur_admin = 14 exposed. plur_rescope is deliberately NOT here: a rescope
+// always leaves a copy, so it is a move, not a removal (see its annotation).
 // Exported (audit fix — evaluator review, iteration 2, 2026-07-09) so
 // server.ts's plur://guide resource can build its cursor-profile redirect
 // note FROM this set instead of hardcoding a second, independent copy of
@@ -856,6 +884,8 @@ export const CURSOR_CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
   'plur_doctor',
   'plur_packs_uninstall',
   'plur_tensions_purge',
+  'plur_tensions',
+  'plur_validate_meta',
 ])
 
 /**
@@ -1018,7 +1048,7 @@ export function resolveToolProfile(env: NodeJS.ProcessEnv = process.env): ToolPr
  * `createServer` takes an explicit `profile` option, so the environment is not
  * the authority — `createServer(plur, { profile: 'full' })` with no env var set
  * exposes 41 tools while `resolveToolProfile()` still says `lean`. Reporting
- * the env-derived value would make plur_doctor describe a 12-tool surface to a
+ * the env-derived value would make plur_doctor describe a 14-tool surface to a
  * client looking at 41: confidently wrong, in the one field the client has no
  * way to check. Left unset it falls back to the environment, which is right for
  * anything that has not gone through `createServer`.
@@ -1081,7 +1111,7 @@ export function describeToolSurface(profile: ToolProfile = activeToolProfile()):
 export function getToolDefinitions(profile: ToolProfile = 'lean'): ToolDefinition[] {
   const all = getAllToolDefinitions()
   if (profile === 'full') return all
-  // 'lean' and 'cursor' are identical: 11 core tools + plur_admin dispatch (12 exposed)
+  // 'lean' and 'cursor' are identical: 13 core tools + plur_admin dispatch (14 exposed)
   const core = all.filter(t => CURSOR_CORE_TOOL_NAMES.has(t.name))
   return [...core, buildAdminDispatchTool(all)]
 }
@@ -1442,7 +1472,10 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // outcome proved easy to miss in a long session — and this one
             // changes what the caller should do next, rather than merely
             // reporting where the write went.
-            ...(routeRefused ? { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason }, warning: `No scope was provided. This content matched the shared scope "${routeRefused.scope}" (confidence ${routeRefused.confidence}), but unscoped writes are never auto-routed into a shared store — it was stored at "${engram.scope}" instead. If it belongs to the team, pass scope: "${routeRefused.scope}" explicitly, or move it with plur_rescope.` } : {}),
+            ...(routeRefused ? (() => {
+              const why = describeRefusedRoute(routeRefused.scope)
+              return { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason, kind: why.kind }, warning: `No scope was provided. This content matched ${why.what} (confidence ${routeRefused.confidence}), but ${why.rule} — it was stored at "${engram.scope}" instead. If it belongs there, pass scope: "${routeRefused.scope}" explicitly, or move it with plur_rescope.` }
+            })() : {}),
           }
         } catch (err) {
 // learnRouted now saves to outbox on remote failure, so this
@@ -1683,10 +1716,11 @@ function getAllToolDefinitions(): ToolDefinition[] {
         }
         if (refusedCount > 0) {
           warnings.push(
-            `${refusedCount} of ${raw.length} engram(s) had no scope and matched the shared scope(s) ` +
-            `${refusedScopes.join(', ')}, which unscoped writes are never auto-routed into — they were stored ` +
-            `in a personal scope instead. Pass an explicit scope on those items if they belong to the team, ` +
-            `or move them with plur_rescope.`)
+            `${refusedCount} of ${raw.length} engram(s) had no scope and matched ` +
+            `${refusedScopes.map(sc => describeRefusedRoute(sc).what).join('; ')} — unscoped writes are never ` +
+            `auto-routed into a shared store or into a remote personal namespace that is not verifiably yours, so ` +
+            `they were stored at the local default instead. Pass an explicit scope on those items if they belong ` +
+            `there, or move them with plur_rescope.`)
         }
 
         return {
@@ -1745,7 +1779,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
           budget: { type: 'object', description: 'Budget constraints for sub-agents. Hybrid mode only — ignored when mode:"keyword".', properties: { max_tokens: { type: 'number' }, max_results: { type: 'number' } } },
           caller_session_id: { type: 'string', description: 'Session ID of calling agent for budget enforcement. Hybrid mode only — ignored when mode:"keyword".' },
           include_episodes: { type: 'boolean', description: 'If true, include linked episode summaries for each engram (SP2 episodic anchoring). Hybrid mode only — ignored when mode:"keyword".' },
-          session_id: { type: 'string', description: 'Session this recall belongs to (from plur_session_start). Its default scope (incl. mid-session plur_session_scope changes) sets the remote dialing context when no explicit scope filter is passed. Optional when one session is open (#243).' },
+          session_id: { type: 'string', description: 'Session this recall belongs to (from plur_session_start). Its default scope (incl. mid-session plur_session_scope changes) sets the remote dialing context when no explicit scope filter is passed. Optional when one session is open (#243); with none or several open and no session_id, no session default applies.' },
         },
         required: ['query'],
       },
@@ -1766,7 +1800,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
           budget: { type: 'object', description: 'Budget constraints for sub-agents', properties: { max_tokens: { type: 'number' }, max_results: { type: 'number' } } },
           caller_session_id: { type: 'string', description: 'Session ID of calling agent for budget enforcement' },
           include_episodes: { type: 'boolean', description: 'If true, include linked episode summaries for each engram (SP2 episodic anchoring)' },
-          session_id: { type: 'string', description: 'Session this recall belongs to (from plur_session_start). Its default scope sets the remote dialing context when no explicit scope filter is passed (#243).' },
+          session_id: { type: 'string', description: 'Session this recall belongs to (from plur_session_start). Its default scope sets the remote dialing context when no explicit scope filter is passed (#243). Optional when one session is open; with none or several open and no session_id, no session default applies.' },
         },
         required: ['query'],
       },
@@ -2372,7 +2406,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
 
     {
       name: 'plur_outbox',
-      description: 'Inspect the remote-write outbox — team-scoped writes queued locally because their remote store was unreachable. Read-only by default; pass flush:true to retry them now. Entries never include the target URL or token.',
+      description: 'Inspect the remote-write outbox — team-scoped writes queued locally because their remote store was unreachable, plus any other queued remote operation core lists (e.g. a retirement still to be applied on the remote). Read-only by default; pass flush:true to retry them now. Entries never include the target URL or token.',
       annotations: { title: 'Outbox', readOnlyHint: false, idempotentHint: false },
       inputSchema: {
         type: 'object',
@@ -2392,7 +2426,10 @@ function getAllToolDefinitions(): ToolDefinition[] {
         }
         const result = await plur.flushOutbox()
         return {
-          pending: await plur.outboxCount(),
+          // Counted from the same list the entries come from (formal R2): a
+          // separate counter can miss an entry kind the list shows (e.g. a
+          // queued remote retirement), and report 0 while one is stuck.
+          pending: (await plur.listOutbox()).length,
           flushed: result.flushed,
           failed: result.failed,
           ...(result.expired_warnings.length > 0 ? { expired_warnings: result.expired_warnings } : {}),
@@ -2533,8 +2570,13 @@ function getAllToolDefinitions(): ToolDefinition[] {
 
     {
       name: 'plur_validate_meta',
-      description: 'Test a meta-engram template against engrams from a new domain — updates confidence and domain_coverage',
-      annotations: { title: 'Validate meta-engram', destructiveHint: false, idempotentHint: false },
+      description: 'Test a meta-engram template against engrams from a new domain — updates confidence and domain_coverage. A meta-engram that fails validation in a third domain is demoted (top → mop) or, below top level, RETIRED.',
+      // Destructive (owner decision I_tensions_resolve, formal R2): the third
+      // failed validation retires a non-top meta-engram (core
+      // meta/validation.ts) and the handler persists it. A removal needs an
+      // explicit, gated act, so plur_admin refuses this tool and it is a direct
+      // tool in every profile (CURSOR_CORE_TOOL_NAMES).
+      annotations: { title: 'Validate meta-engram', destructiveHint: true, idempotentHint: false },
       inputSchema: {
         type: 'object',
         properties: {
@@ -2562,12 +2604,21 @@ function getAllToolDefinitions(): ToolDefinition[] {
           args.llm_model as string | undefined,
         )
 
+        const wasRetired = meta.status === 'retired'
         const result = await validateMetaEngram(meta, testEngrams, testDomain, llm)
+        // validateMetaEngram can retire the meta-engram (a third failed domain
+        // below top level). Never silent: the response says so.
+        const retiredNow = !wasRetired && meta.status === 'retired'
 
         // validateMetaEngram mutates domain_coverage + confidence in-place — persist changes
         await plur.updateEngram(meta)
 
         return {
+          ...(retiredNow ? {
+            retired: true,
+            note: `Meta-engram ${result.meta_engram_id} was retired: its prediction failed in a third domain. ` +
+              'It no longer injects; its history records the retirement.',
+          } : {}),
           meta_engram_id: result.meta_engram_id,
           test_domain: result.test_domain,
           prediction_held: result.prediction_held,
@@ -3114,7 +3165,11 @@ function getAllToolDefinitions(): ToolDefinition[] {
     {
       name: 'plur_session_start',
       description: 'Start a session — inject relevant engrams for your task. Call at the beginning of every session.',
-      annotations: { title: 'Session Start', readOnlyHint: true, idempotentHint: false },
+      // Not read-only (formal R2, mcp-integrations#6): start registers the
+      // session's scope, flushes the remote-write outbox (pushes to remote
+      // stores) and writes telemetry. It only replays writes already asked for,
+      // so it is not destructive.
+      annotations: { title: 'Session Start', readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       inputSchema: {
         type: 'object',
         properties: {
@@ -3531,7 +3586,8 @@ function getAllToolDefinitions(): ToolDefinition[] {
       description:
         'Adjust or inspect the session default write scope MID-session — narrow, expand, or switch context without ' +
         'restarting the session (#243). op:"set" replaces the default scope used by unscoped plur_learn calls for the ' +
-        'rest of the session AND the org context that decides which enterprise hosts plur_recall dials; op:"show" ' +
+        'rest of the session AND the org context that decides which enterprise hosts plur_recall dials (it needs an open ' +
+        'session: with none open it refuses, since no id-less call reads a session-less slot); op:"show" ' +
         'reports the effective scope and how it was derived (project config, session_start default, or a mid-session ' +
         'set); op:"clear" reverts to the scope the session started with. Use when the conversation genuinely pivots — ' +
         'a focused bug fix surfacing a team-wide architecture insight, or switching to another org\'s project. Do NOT ' +
@@ -3614,6 +3670,17 @@ function getAllToolDefinitions(): ToolDefinition[] {
         }
 
         if (op === 'set') {
+          // Formal R2 follow-up: with NO session open, the process-default slot
+          // is read by no id-less call (learn, inject, recall all pass
+          // NO_SESSION), so a set would change nothing the caller can observe.
+          // Refuse plainly instead of accepting it with a warning.
+          if (noSessionSlot) {
+            throw new Error(
+              'plur_session_scope: no session is open, so there is no session scope to set — an id-less ' +
+              'plur_learn / plur_inject / plur_recall uses no session default unless exactly one session is open. ' +
+              'Call plur_session_start first (then pass its session_id here), or pass scope explicitly on each plur_learn.',
+            )
+          }
           const scope = args.scope
           if (typeof scope !== 'string' || scope.trim().length === 0) {
             throw new Error('plur_session_scope: op:"set" requires a non-empty string "scope" (use op:"clear" to revert to the session-start default)')
@@ -3633,9 +3700,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
                 ? `"${scope}" routes to the shared remote store at ${remoteEntry.url}: every unscoped plur_learn for the rest of this session defaults there, visible to everyone with read access to that scope. The per-write secrets/sensitivity guard still scans each write (offending content is demoted to local), but relevance is your call — clear or narrow the scope when the conversation leaves team context.`
                 : `"${scope}" is a shared-family scope but matches no configured remote store scope, so writes stay on this machine under that namespace. The write-time sensitivity guard treats it as shared (scans + demotes offending content). If you expected a team store, check the remote_scopes list.`)
             : undefined
-          const warning = noSessionSlot
-            ? [NO_SESSION_SLOT_WARNING, sharedWarning].filter(Boolean).join(' ')
-            : sharedWarning
+          const warning = sharedWarning
           return withCommon({
             previous_scope: previous,
             new_scope: next,
@@ -3811,7 +3876,9 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
 
         // Clean up session checkpoint (#215) — session ended cleanly
         try {
-          const plurDir = process.env.PLUR_PATH ?? join(homedir(), '.plur')
+          // `||`, not `??`: an EMPTY PLUR_PATH means unset, as in the CLI hooks
+          // (formal R2, on R2-CLI's behalf) — `??` looked in ./sessions.
+          const plurDir = process.env.PLUR_PATH || join(homedir(), '.plur')
           const sessionsDir = join(plurDir, 'sessions')
           // Try session_id first, then CLAUDE_SESSION_ID, then ppid
           const keys = [session_id, process.env.CLAUDE_SESSION_ID, String(process.ppid)]
@@ -3966,11 +4033,16 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
           decision.action === 'route' && decision.scope
             ? { scope: decision.scope, note: 'An unscoped write of these signals would be auto-routed here.' }
             : decision.action === 'refuse-shared' && decision.refusedShared
-              ? {
-                  scope: null,
-                  refused_shared: decision.refusedShared.scope,
-                  note: `"${decision.refusedShared.scope}" is the best match but is a SHARED scope, and unscoped writes are never auto-routed into one. An unscoped write would land at the local default instead. Pass that scope explicitly if the engram belongs to the team.`,
-                }
+              ? (() => {
+                  const why = describeRefusedRoute(decision.refusedShared!.scope)
+                  return {
+                    scope: null,
+                    // Field name kept for compatibility; `refused_kind` says which kind it is.
+                    refused_shared: decision.refusedShared!.scope,
+                    refused_kind: why.kind,
+                    note: `The best match is ${why.what}, and ${why.rule}. An unscoped write would land at the local default instead. Pass that scope explicitly if the engram belongs there.`,
+                  }
+                })()
               : { scope: null, note: 'An unscoped write of these signals would land at the local default — nothing matched confidently enough to route.' }
         return { candidates, count: candidates.length, min_confidence: minConfidence, would_route }
       },
@@ -4070,6 +4142,14 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
     {
       name: 'plur_rescope',
       description: 'Move existing engram(s) to a different scope (#676) — e.g. promote a personal/local engram into a team scope so it reaches the shared store. Bypasses the content-hash dedup that makes a plur_learn re-emit a silent no-op: rescope matches by id and moves the engram. Remote targets (a configured writable store scope): a copy is pushed via the routed write path (the server assigns the id, provenance is kept in the copy\'s source field) and the local original is soft-retired with a superseded_by link — set keep_local:true to keep it active. Local targets (local, global, project:*): the scope is rewritten in place, preserving id and activation. The target must be local/global/project:* or a scope with a configured writable store — anything else fails early (typo protection). Content is re-scanned for secrets/sensitive material before any shared/remote target and a hit blocks the move. Batch via ids; dry_run:true previews every decision without mutating anything. NOT candidate activation — that is plur_promote.',
+      // NOT destructive (owner decision I_tensions_resolve, formal R2): a
+      // rescope never removes content. A local target rewrites the scope in
+      // place (same id, same activation); a remote target retires the local
+      // original only after the copy was pushed, and links it to that copy
+      // with `superseded_by`. A copy always remains, so this is a move, not a
+      // removal — it stays dispatchable through plur_admin
+      // (rescope-tool.test.ts). Contrast plur_tensions resolve, which retires
+      // the loser with no copy and is therefore destructive.
       annotations: { title: 'Rescope', destructiveHint: false, idempotentHint: true },
       inputSchema: {
         type: 'object',
@@ -4100,7 +4180,14 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
     {
       name: 'plur_tensions',
       description: 'Tension lifecycle (#181). Default: list persisted tension records (unresolved first). scan:true runs an LLM contradiction scan, persists NEW detections as records, and skips already-recorded pairs. Lifecycle actions: action:"confirm" (real conflict), action:"dismiss" (false positive — pair suppressed from future scans), action:"resolve" + winner:<engram_id> (loser engram retired). Scan requires OPENAI_API_KEY or OPENROUTER_API_KEY env var, or explicit llm_base_url + llm_api_key args.',
-      annotations: { title: 'Tensions', readOnlyHint: false, idempotentHint: true },
+      // Not idempotent (formal R2, mcp-integrations#6): scan persists each NEW
+      // detection, and an LLM judge can find new pairs on a repeat call.
+      // Destructive (owner decision I_tensions_resolve, formal R2): action
+      // "resolve" retires the losing engram with no copy left — exactly
+      // plur_forget's effect. A removal needs an explicit, gated act, so
+      // plur_admin refuses this tool and it is a direct tool in every profile
+      // (CURSOR_CORE_TOOL_NAMES), where the client sees this annotation.
+      annotations: { title: 'Tensions', readOnlyHint: false, destructiveHint: true, idempotentHint: false },
       inputSchema: {
         type: 'object',
         properties: {
