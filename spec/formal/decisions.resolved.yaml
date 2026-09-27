@@ -33,3 +33,17 @@ rows:
   S2_engram_suggestions_string: single          # rest
   S3_dsh_timeout: hard-cap                      # rest
   S4_blocked_fixes: apply                       # rest
+
+# Round 2 — owner principles, 2026-09-27
+round2_principles:
+  your_writes: "A write is always stored in the writer's own scope; a hit in a pack, readonly store or remote cache only gets a recurrence note."
+  reruns: "Re-running the same operation (e.g. re-importing a file) changes nothing."
+  removal: "Every removal needs an explicit, gated act."
+  id_clashes: "Keep both copies; the later (or the not-yet-pushed local) copy gets a new id, recorded in history."
+round2_rows:
+  A_absorbed_write: store-new-row-log-recurrence       # your_writes; changes cross-scope-recurrence.test.ts (pinned)
+  R_reimport: true-skip                                # reruns
+  I_tensions_resolve: destructive-and-direct           # removal; rescope stays a move (a copy always remains) — documented
+  P2_shrink_ratchet: cumulative-tolerance              # removal; option (a), proved by base_bounds
+  P1_duplicate_ids: reid-later-copy-in-history         # id_clashes; changes pglite-duplicate-ids.test.ts (pinned last-wins)
+  P1b_sync_collision: reid-held-local-record           # id_clashes

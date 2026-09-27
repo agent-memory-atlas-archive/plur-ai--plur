@@ -779,8 +779,12 @@ theorem bothLegs_top_is_hit (count : Nat) (hc : count ≠ 0) :
   have hl : ¬ (contrib 60 0 + contrib 60 0 < floorNew) := by decide
   simp only [classify, hc, ↓reduceIte, hl]
 
-/-- PGLite recall reports `topScore: null` with results: every such recall is
-classified `no_results` (replayed). -/
+/-- **Pre-I4 counterexample (historical).** Before decision I4, PGLite recall
+reported `topScore: null` with results, and every such recall was classified
+`no_results` (replayed then). Since I4, `_pgliteHybridRecall` returns a real RRF
+score, so the PGLite path now reaches `classify count (some top) thr` like the
+other backends; this theorem only documents what a `null` top score still means
+(a caller that passes `none` with results gets `no_results`). -/
 theorem pglite_null_is_noResults (count thr : Nat) (hc : count ≠ 0) :
     classify count none thr = some .noResults := by
   simp [classify, hc]

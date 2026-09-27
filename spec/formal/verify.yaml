@@ -55,3 +55,55 @@ models:
       - packages/dsh/src/tools.ts
       - packages/dsh/src/learn.ts
       - packages/hermes/plur_hermes/bridge.py
+  - model: PlurSpec/R2CoreA.lean
+    covers:
+      - packages/core/src/index.ts
+      - packages/core/src/provenance.ts
+      - packages/core/src/importers/engine.ts
+  - model: PlurSpec/R2CoreB.lean
+    covers:
+      - packages/core/src/remote-recall.ts
+      - packages/core/src/store/remote-store.ts
+      - packages/core/src/tensions.ts
+  - model: PlurSpec/R2Retrieval.lean
+    covers:
+      - packages/core/src/telemetry-counters.ts
+      - packages/core/src/telemetry-flush.ts
+      - packages/core/src/intent/rewrite.ts
+      - packages/core/src/search-orchestrator.ts
+      - packages/core/src/query-expansion.ts
+      - packages/core/src/capsule.ts
+      - packages/core/src/embeddings.ts
+  - model: PlurSpec/R2Persist.lean
+    covers:
+      - packages/core/src/store/async-lock.ts
+      - packages/core/src/sync.ts
+      - packages/core/src/engrams.ts
+      - packages/core/src/backup.ts
+      - packages/core/src/storage-postgres.ts
+      - packages/core/src/storage-pglite.ts
+      - packages/core/src/migrations/runner.ts
+  - model: PlurSpec/R2CLI.lean
+    covers:
+      - packages/cli/src/lib/codex-hook-io.ts
+      - packages/cli/src/lib/cursor-hook-io.ts
+      - packages/cli/src/lib/agy-hook-io.ts
+      - packages/cli/src/commands/hook-inject.ts
+      - packages/cli/src/commands/hook-learn-check.ts
+      - packages/cli/src/commands/hook-session-end.ts
+      - packages/cli/src/commands/hook-session-guard.ts
+      - packages/cli/src/commands/hook-agy-pre-invocation.ts
+      - packages/cli/src/commands/doctor.ts
+  - model: PlurSpec/R2Integrations.lean
+    covers:
+      - packages/mcp/src/tools.ts
+      - packages/hermes/plur_hermes/bridge.py
+      - packages/migrate/src/scan.ts
+      - packages/claw/src/setup.ts
+      - packages/claw/src/context-engine.ts
+      - packages/opencode/src/index.ts
+      - packages/opencode/src/turn.ts
+      - packages/ui/src/server.ts
+  - model: PlurSpec/PacksV2.lean
+    covers:
+      - packages/core/src/packs.ts
