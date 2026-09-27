@@ -5,6 +5,10 @@ Models of the adapter layer (packages/mcp/src/tools.ts, packages/cli/src/…,
 packages/dsh, hermes/python bridges). Each section models one candidate branch
 for branch with the code, states the property, proves the fixed code has it and
 exhibits a counterexample for the original code. Core library only.
+
+Checked against commit 55d47099 (2026-09-27): hook-inject.ts changed only `acquireInjectLock`'s
+stale-takeover path (modelled and proved in R2CLI §InjectLock). None of this file's sections
+(`.plur.yaml` trust in §9 included) touches the lock, so every theorem still holds.
 -/
 
 namespace PlurSpec.Adapters
