@@ -394,6 +394,56 @@ theorem old_walk_patches_other_store :
     candidatesOld [1, 2] (fun s => s == 2) = [1, 2] ∧
     candidatesNew [1, 2] (fun s => s == 2) = [2] := by decide
 
+/-! ### 4c. Prefix collisions: disambiguate on the full store scope (audit of #1228)
+
+`storePrefix` is three letters, so two store scopes can share one
+(group:plur/eng, group:plur/ops → GPL) and a namespaced id then `named`s both.
+`owner s` = the row's `_storeScope` stamp is `s`, or (no stamp match) `s`'s
+scope contains the row's scope. Among several named stores only the owners are
+walked; an owner filter that matches nothing keeps the named set (never widens
+back to every store). The same stamp narrows `_findEngramStore` for a hit's
+holder / recurrence write (path stores), which also tries the unstripped id
+(finding 2: a store file that already holds the namespaced id). -/
+
+def candidatesDis (stores : List Nat) (named owner : Nat → Bool) : List Nat :=
+  let n := stores.filter named
+  if n.isEmpty then stores else
+    let o := n.filter owner
+    if o.isEmpty then n else o
+
+/-- Still only named stores for a namespaced id. -/
+theorem dis_only_named (stores : List Nat) (named owner : Nat → Bool) (s : Nat)
+    (hsome : (stores.filter named).isEmpty = false) (hs : s ∈ candidatesDis stores named owner) :
+    named s = true := by
+  unfold candidatesDis at hs
+  dsimp only at hs
+  simp only [hsome, Bool.false_eq_true, ↓reduceIte] at hs
+  split at hs
+  · exact (List.mem_filter.mp hs).2
+  · exact (List.mem_filter.mp (List.mem_filter.mp hs).1).2
+
+/-- When some named store owns the row, no other store is guarded or PATCHed. -/
+theorem dis_only_owner (stores : List Nat) (named owner : Nat → Bool) (s : Nat)
+    (hown : ((stores.filter named).filter owner).isEmpty = false)
+    (hs : s ∈ candidatesDis stores named owner) : owner s = true ∧ named s = true := by
+  have hsome : (stores.filter named).isEmpty = false := by
+    cases h : stores.filter named with
+    | nil => simp [h] at hown
+    | cons _ _ => rfl
+  unfold candidatesDis at hs
+  dsimp only at hs
+  simp only [hsome, hown, Bool.false_eq_true, ↓reduceIte] at hs
+  exact ⟨(List.mem_filter.mp hs).2, (List.mem_filter.mp (List.mem_filter.mp hs).1).2⟩
+
+/-- Counterexample (replayed in formal-audit-core-prefix-collision): with two
+stores named by one prefix, the #9c walk still guards and PATCHes store 1 for
+store 2's row; the owner filter does not. Non-vacuity: no owner → the named set. -/
+theorem collision_walk :
+    candidatesNew [1, 2] (fun _ => true) = [1, 2] ∧
+    candidatesDis [1, 2] (fun _ => true) (fun s => s == 2) = [2] ∧
+    candidatesDis [1, 2] (fun _ => true) (fun _ => false) = [1, 2] ∧
+    candidatesDis [1, 2, 3] (fun s => s != 3) (fun _ => false) = [1, 2] := by decide
+
 /-! ## 5. Dedup / cross-scope recurrence can swallow a write (core-index#10)
 
 Code: `learn()` — `_learnHashMatch` / `_crossScopeMatch` over the corpus incl.

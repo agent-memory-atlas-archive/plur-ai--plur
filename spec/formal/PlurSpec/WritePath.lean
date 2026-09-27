@@ -27,7 +27,10 @@ Checked against round 2 (2026-09-27): still holds because the merge-back (learn(
 hand-off and the flush's fresh-row re-check through `Plur._stillQueued`), forget()'s
 `_outbox` strip and rescope's local route are not in the round-2 diff of index.ts.
 Round 2 touched the flush only to reload the config first (core-index#9) and made
-`outboxCount` count `listOutbox()` (push AND retire entries); neither changes a merge. -/
+`outboxCount` count `listOutbox()` (push AND retire entries); neither changes a merge.
+Audit of #1228 (finding 1): the merge-back now checks `Plur._stillQueuedFor` (same
+target store) — §1a'' models it; on the cancellations modelled here it coincides with
+`stillQueued` (`retarget_agrees_on_cancel`), so these theorems are unchanged. -/
 
 structure Row where
   queued  : Bool   -- carries structured_data._outbox
@@ -189,6 +192,105 @@ theorem retire_retries_then_done (n k : Nat) (os : List DelOutcome) :
   induction k generalizing n with
   | zero => simp [retireRun, retireStep, retire_done_is_final]
   | succ k ih => simp [List.replicate_succ, retireRun, retireStep, ih]
+
+/-! ### 1a''. Retarget during the push (audit of #1228, finding 1)
+
+§1a abstracts `_outbox` to a Bool, so a D4 update (or a rescope to another
+store) that RETARGETS the queue entry while the POST to the old store is on the
+wire is invisible to it: the fresh row is still "queued". Here the entry carries
+its target store (`Nat` = url + scope). Code: `Plur._stillQueuedFor` in learn()'s
+hand-off and the flush merge-back filter, the survivor copy-back that no longer
+re-points a retargeted row, and the flush gate that delivers a row owing a
+`_retireRemote` only after that retire is done. -/
+
+structure TRow where
+  target  : Option Nat  -- `_outbox.target_url/target_scope`; none = not queued
+  retired : Bool
+  retire  : Bool        -- carries `_retireRemote` for a copy a remote accepted
+  deriving DecidableEq, Repr
+
+def tStillQueued (r : TRow) : Bool := r.target.isSome && !r.retired
+def tStillQueuedFor (r : TRow) (t : Nat) : Bool := r.target == some t && !r.retired
+
+inductive TConc where
+  | none | forget | rescopeLocal
+  | retarget (t : Nat)  -- D4 update / rescope to a scope with a writable url store
+  deriving DecidableEq, Repr
+
+def tApply : TConc → TRow → TRow
+  | .none, r => r
+  | .forget, r => { r with target := none, retired := true }
+  | .rescopeLocal, r => if r.retired then r else { r with target := none }
+  | .retarget t, r => if r.retired || r.target.isNone then r else { r with target := some t }
+
+/-- Merge-back BEFORE (the #1228 branch): "still queued" without the target;
+the failure arm copies the snapshot's entry back. -/
+def tMergeOld (_t : Nat) (snap fresh : TRow) (ok : Bool) : Option TRow :=
+  if tStillQueued fresh then
+    (if ok then none else some { fresh with target := snap.target })
+  else if ok then some { fresh with retire := true } else some fresh
+
+/-- Merge-back AFTER: hand off / copy back only while the fresh entry still
+names the store `t` the push went to; otherwise keep the fresh row and, when
+the push landed, queue the retire of the accepted copy. -/
+def tMergeNew (t : Nat) (snap fresh : TRow) (ok : Bool) : Option TRow :=
+  if tStillQueuedFor fresh t then
+    (if ok then none else some { fresh with target := snap.target })
+  else if ok then some { fresh with retire := true } else some fresh
+
+def tFlushOne (merge : Nat → TRow → TRow → Bool → Option TRow) (t : Nat) (snap : TRow)
+    (c : TConc) (ok : Bool) : Option TRow :=
+  merge t snap (tApply c snap) ok
+
+/-- No loss: a row queued for `t` is dropped only if the push to `t` landed AND
+the fresh row still wanted `t`; a kept row is exactly the fresh row (never
+re-pointed at the old store), plus a queued retire iff the push landed. -/
+theorem retarget_never_lost (t : Nat) (snap : TRow) (c : TConc) (ok : Bool)
+    (hsel : tStillQueuedFor snap t = true) (hr : snap.retire = false) :
+    (tFlushOne tMergeNew t snap c ok = none ↔ (ok = true ∧ (tApply c snap).target = some t)) ∧
+    (∀ r, tFlushOne tMergeNew t snap c ok = some r →
+      r.target = (tApply c snap).target ∧ r.retire = (ok && !tStillQueuedFor (tApply c snap) t)) := by
+  obtain ⟨tg, rt, re⟩ := snap
+  simp [tStillQueuedFor] at hsel hr
+  obtain ⟨hq, hrt⟩ := hsel
+  subst hq; subst hrt; subst hr
+  cases c with
+  | retarget t' =>
+    by_cases h : t' = t
+    · subst h; cases ok <;> simp [tFlushOne, tMergeNew, tApply, tStillQueuedFor]
+    · cases ok <;> simp [tFlushOne, tMergeNew, tApply, tStillQueuedFor, h]
+  | _ => cases ok <;> simp [tFlushOne, tMergeNew, tApply, tStillQueuedFor]
+
+/-- The target-free cancellations of §1a behave exactly as before. -/
+theorem retarget_agrees_on_cancel (t : Nat) (c : TConc) (ok : Bool)
+    (hc : c = .forget ∨ c = .rescopeLocal ∨ c = .none) :
+    tFlushOne tMergeNew t ⟨some t, false, false⟩ c ok = tFlushOne tMergeOld t ⟨some t, false, false⟩ c ok := by
+  rcases hc with h | h | h <;> subst h <;> cases ok <;> simp [tFlushOne, tMergeNew, tMergeOld, tApply, tStillQueued, tStillQueuedFor]
+
+/-- Counterexamples on the branch (replayed in formal-audit-core-retarget-inflight):
+a landed push to store 0 after a retarget to store 1 DROPS the row (store 1
+never receives it, no retire); a failed push re-points it at store 0. -/
+theorem old_retarget_loses :
+    tFlushOne tMergeOld 0 ⟨some 0, false, false⟩ (.retarget 1) true = none ∧
+    tFlushOne tMergeOld 0 ⟨some 0, false, false⟩ (.retarget 1) false = some ⟨some 0, false, false⟩ := by
+  decide
+
+/-- Non-vacuity of the fix on the same interleavings. -/
+theorem new_retarget_kept :
+    tFlushOne tMergeNew 0 ⟨some 0, false, false⟩ (.retarget 1) true = some ⟨some 1, false, true⟩ ∧
+    tFlushOne tMergeNew 0 ⟨some 0, false, false⟩ (.retarget 1) false = some ⟨some 1, false, false⟩ ∧
+    tFlushOne tMergeNew 0 ⟨some 0, false, false⟩ .none true = none := by
+  decide
+
+/-- The flush gate: a row owing a retire is pushed only once that retire is
+done in the same flush, so a hand-off (row dropped) never drops an owed retire. -/
+def tFlushGated (t : Nat) (snap : TRow) (c : TConc) (retireDone ok : Bool) : Option TRow :=
+  if snap.retire && !retireDone then some (tApply c snap)
+  else tFlushOne tMergeNew t { snap with retire := false } c ok
+
+theorem handoff_never_drops_owed_retire (t : Nat) (snap : TRow) (c : TConc) (retireDone ok : Bool)
+    (h : tFlushGated t snap c retireDone ok = none) : snap.retire = false ∨ retireDone = true := by
+  cases hs : snap.retire <;> cases retireDone <;> simp_all [tFlushGated]
 
 /-! ### 1b. Two pushers, one row: at most one successful delivery
 

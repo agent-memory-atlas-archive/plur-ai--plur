@@ -23,7 +23,9 @@ plur_learn_batch and plur_session_end still build their context with
 `_resolveWriteSession(args)` and `projectDomain`, and the batch still gates each
 pinned item on `pinnedQuota`. The round-2 edits of tools.ts in these handlers change
 only the refused-route WORDING (`describeRefusedRoute`, R2Integrations §3
-`refusal_kind_truthful`), not a context field. -/
+`refusal_kind_truthful`), not a context field. Audit 1228-c changed only WHICH `free`
+the batch gate sees (the room left after earlier admitted pinned items —
+`batchWalk` below), not the context. -/
 
 structure Registry where
   keyed : List (String × Option String)   -- session ↦ registered default scope
@@ -153,6 +155,89 @@ theorem gate_admits_good (free : Int) (a : LearnInput) (h : a.pinned = false ∨
   · simp [batchAdmits, pinGate, h]
   · have : ¬ free ≤ 0 := by omega
     simp [batchAdmits, pinGate, this]
+
+/-! #### The batch walks its items (audit 1228-c #2)
+
+`batchAdmits` is the per-item predicate; what the batch feeds it is the room LEFT.
+Round 2 read `pinnedQuota().free` once and judged every item against it, so five
+pinned items all passed a quota with room for one. Fixed (tools.ts plur_learn_batch):
+walk the items in order and subtract each admitted pinned item's (estimated) cost
+before judging the next. An item is `(pinned, cost)`. -/
+
+/-- FIXED walk: the admitted flags, in input order. -/
+def batchWalk : Int → List (Bool × Int) → List Bool
+  | _, [] => []
+  | free, (p, c) :: rest =>
+      pinGate free p :: batchWalk (if p && decide (0 < free) then free - c else free) rest
+
+/-- ROUND-2 walk: one `free` for the whole call. -/
+def batchWalkOnce (free : Int) (items : List (Bool × Int)) : List Bool :=
+  items.map (fun it => pinGate free it.1)
+
+/-- Total cost the walk admits into the pinned set. -/
+def admittedCost : Int → List (Bool × Int) → Int
+  | _, [] => 0
+  | free, (p, c) :: rest =>
+      if p && decide (0 < free) then c + admittedCost (free - c) rest else admittedCost free rest
+
+def admittedCostOnce (free : Int) (items : List (Bool × Int)) : Int :=
+  ((items.filter (fun it => it.1 && decide (0 < free))).map (·.2)).foldr (· + ·) 0
+
+/-- The first item is judged exactly as plur_learn judges it. -/
+theorem walk_head_is_learn_gate (free : Int) (a : LearnInput) (c : Int) (rest : List (Bool × Int)) :
+    (batchWalk free ((a.pinned, c) :: rest)).head? = some (learnAdmits free a) := rfl
+
+/-- Once the room is gone, nothing pinned is admitted. -/
+theorem full_admits_nothing (free : Int) (h : free ≤ 0) (items : List (Bool × Int)) :
+    admittedCost free items = 0 := by
+  induction items with
+  | nil => rfl
+  | cons it rest ih =>
+    obtain ⟨p, c⟩ := it
+    have : ¬ (0 < free) := by omega
+    simp [admittedCost, this, ih]
+
+/-- The walk overshoots the room it started with by less than one item: every
+admitted pinned item saw room left (`c ≤ M` bounds an item's cost). -/
+theorem walk_overshoot_lt_one_item (M : Int) (hM : 0 ≤ M) :
+    ∀ (items : List (Bool × Int)) (free : Int), (∀ it ∈ items, 0 ≤ it.2 ∧ it.2 ≤ M) →
+      admittedCost free items ≤ max (free - 1) 0 + M := by
+  intro items
+  induction items with
+  | nil => intro free _; simp [admittedCost]; omega
+  | cons it rest ih =>
+    intro free hc
+    obtain ⟨p, c⟩ := it
+    have hit := hc (p, c) (List.mem_cons_self ..)
+    have hrest : ∀ it ∈ rest, 0 ≤ it.2 ∧ it.2 ≤ M := fun it h => hc it (List.mem_cons_of_mem _ h)
+    by_cases hp : p = true
+    · subst hp
+      by_cases hf : 0 < free
+      · simp only [admittedCost, hf, decide_true, Bool.and_self, ↓reduceIte]
+        by_cases hr : 0 < free - c
+        · have := ih (free - c) hrest
+          have : max (free - c - 1) 0 = free - c - 1 := by omega
+          omega
+        · rw [full_admits_nothing (free - c) (by omega)]
+          simp at hit; omega
+      · rw [full_admits_nothing free (by omega)]; omega
+    · have hp' : p = false := by simpa using hp
+      subst hp'
+      simp only [admittedCost, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+      exact ih free hrest
+
+/-- Replayed (round 2): five pinned items of cost 50 into room for one (free 1) are
+all admitted — 250 tokens into a quota with 1 free. The walk admits one. -/
+def fivePinned : List (Bool × Int) := List.replicate 5 (true, 50)
+theorem once_admits_all_five :
+    batchWalkOnce 1 fivePinned = [true, true, true, true, true] ∧ admittedCostOnce 1 fivePinned = 250 := by
+  decide
+theorem walk_admits_one : batchWalk 1 fivePinned = [true, false, false, false, false] ∧
+    admittedCost 1 fivePinned = 50 := by decide
+
+/-- Non-vacuity: items that fit are all admitted, and unpinned items are never gated. -/
+theorem walk_admits_what_fits :
+    batchWalk 100 [(true, 10), (false, 500), (true, 10)] = [true, true, true] := by decide
 
 /-! ### Reported decision and warning
 
@@ -986,5 +1071,66 @@ theorem adapters_disagree_untrusted :
     adoptScopeOrig .mcp false (some "group:acme/eng") = some "group:acme/eng" ∧
     adoptScopeOrig .opencode false (some "group:acme/eng") = none := ⟨rfl, rfl⟩
 theorem orig_dsh_global : adoptScopeOrig .dsh true (some "global") = some "global" := rfl
+
+/-! ### 9b. The notice names a command that reaches the checked store (audit 1228-c #1)
+
+An adapter checks `<its store root>/trust.yaml`. The notice tells the user what to
+run; the CLI writes the grant to `--path`, else the SHELL's `PLUR_PATH`, else the
+default `~/.plur` (`createPlur`). The adapter's root comes from ITS environment (an
+MCP config's `env`, dsh's `path`, opencode's `PLUR_PATH`), which the user's shell
+need not share. ORIGINAL: every notice printed a bare `plur trust <dir>`. FIXED
+(`trustCommand` in cli/plur.ts, mcp/tools.ts, dsh/workspace-scope.ts,
+opencode/scope.ts; the CLI and opencode wrap core's remote-refusal line the same
+way): `--path <root>` whenever the root is not the default. -/
+
+/-- The store a printed command's grant lands in, run from a shell whose
+`PLUR_PATH` is `shellEnv`. -/
+def grantStore (dflt : String) (pathFlag : Option String) (shellEnv : Option String) : String :=
+  pathFlag.getD (shellEnv.getD dflt)
+
+def printedPathOrig (_dflt _root : String) : Option String := none
+def printedPath (dflt root : String) : Option String := if root = dflt then none else some root
+
+/-- Fixed: from ANY shell, the grant lands where the adapter looks — except a shell
+whose own `PLUR_PATH` points elsewhere when the root IS the default, where the bare
+command defers to that shell exactly as the CLI always did. -/
+theorem notice_reaches_checked_store (dflt root : String) (shellEnv : Option String)
+    (h : root ≠ dflt ∨ shellEnv = none) :
+    grantStore dflt (printedPath dflt root) shellEnv = root := by
+  unfold grantStore printedPath
+  by_cases hr : root = dflt
+  · subst hr; rcases h with h | h
+    · exact absurd rfl h
+    · simp [h]
+  · simp [hr]
+
+/-- Replayed (original): an MCP server on `/srv/plur` told a user whose shell has no
+`PLUR_PATH` to run `plur trust <dir>`; the grant went to `~/.plur` and the notice
+repeated forever. -/
+theorem orig_notice_misses_store :
+    grantStore "~/.plur" (printedPathOrig "~/.plur" "/srv/plur") none = "~/.plur" := rfl
+
+/-- Non-vacuity: the default store keeps the bare command. -/
+theorem default_store_bare (dflt : String) : printedPath dflt dflt = none := by simp [printedPath]
+
+/-- dsh (1228-c, unconfirmed item replayed): with an engine that cannot check trust
+the gate fails closed (`adoptScope` sees `false`), so NO grant changes the outcome.
+The remedy says so (`trustRemedy`), and offers a trust command only when the engine
+can read the grant. -/
+inductive TrustSupport | ok | noTrust | noEngine deriving DecidableEq
+
+/-- Whether the gate's answer can ever become `true` after a grant. -/
+def grantCanHelp : TrustSupport → Bool
+  | .ok => true
+  | _ => false
+
+/-- `true` = the notice's only advice is "run `plur trust`". -/
+def offersTrustAloneOrig (_s : TrustSupport) : Bool := true
+def offersTrustAlone (s : TrustSupport) : Bool := s == .ok
+
+theorem remedy_honest (s : TrustSupport) : offersTrustAlone s = grantCanHelp s := by
+  cases s <;> rfl
+theorem orig_remedy_promises_the_impossible :
+    offersTrustAloneOrig .noTrust = true ∧ grantCanHelp .noTrust = false := ⟨rfl, rfl⟩
 
 end PlurSpec.Adapters

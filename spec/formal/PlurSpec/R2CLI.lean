@@ -462,6 +462,81 @@ theorem fixed_after_dashdash_is_data (q : String) (rest : List String) :
 theorem fixed_even_a_flag_name :
     parseFixed ["--", "--limit"] = some "--limit" := by simp [parseFixed]
 
+/-! ### Dispatch (audit 1228-c #3): `--` for every command, and `plur -- <cmd>`
+
+index.ts passes `--` through to the command. Eight commands read it; every other
+one took `--` as its first positional (`plur trust -- <dir>` trusted a directory
+named `--`), and `plur -- learn x` failed with "Unknown command: --". FIXED
+(`separatedArgs`): for a command that does not read `--`, the separator is dropped
+and the values after it stay positional — refused if one begins with `-`, since
+those commands read any `-…` token as their own flag; a leading `--` is refused
+with a message naming the right order. -/
+
+def aware (c : String) : Bool :=
+  ["learn", "recall", "inject", "forget", "capture", "timeline", "similarity-search", "ingest"].contains c
+    || c.startsWith "hook-"
+
+def afterSep (rest : List String) : List String := (rest.dropWhile (· ≠ "--")).drop 1
+
+def separated (c : String) (rest : List String) : Option (List String) :=
+  if aware c || !rest.contains "--" then some rest
+  else if (afterSep rest).any (·.startsWith "-") then none
+  else some (rest.takeWhile (· ≠ "--") ++ afterSep rest)
+
+inductive Disp | run (cmd : String) (args : List String) | refuse deriving DecidableEq
+
+def dispatchOrig : List String → Disp
+  | [] => .refuse
+  | c :: rest => .run c rest
+
+def dispatch : List String → Disp
+  | [] => .refuse
+  | c :: rest => if c = "--" then .refuse else
+      match separated c rest with
+      | some a => .run c a
+      | none => .refuse
+
+/-- trust.ts: the directory is `args[0]` (after `--list` is checked). -/
+def trustDir (args : List String) : Option String := args.head?
+
+theorem leading_sep_refused (rest : List String) : dispatch ("--" :: rest) = .refuse := by
+  simp [dispatch]
+
+/-- A command that reads `--` itself gets its argv unchanged, as before. -/
+theorem aware_unchanged (c : String) (rest : List String) (hc : c ≠ "--") (ha : aware c = true) :
+    dispatch (c :: rest) = .run c rest := by
+  simp [dispatch, separated, hc, ha]
+
+/-- No value after `--` reaches a non-reading command looking like a flag. -/
+theorem no_flag_like_value_after_sep (c : String) (rest a : List String)
+    (hs : separated c rest = some a) (hna : aware c = false) (hsep : rest.contains "--" = true) :
+    ∀ v ∈ afterSep rest, v.startsWith "-" = false := by
+  intro v hv
+  unfold separated at hs
+  simp only [hna, hsep, Bool.false_or, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hs
+  split at hs
+  · cases hs
+  · rename_i h
+    simp only [List.any_eq_true, not_exists, not_and, Bool.not_eq_true] at h
+    exact h v hv
+
+/-- Replayed (original): `plur trust -- /repo` trusted `--`; fixed: `/repo`. -/
+theorem orig_trust_dashdash :
+    (match dispatchOrig ["trust", "--", "/repo"] with
+     | .run _ a => trustDir a | .refuse => none) = some "--" := by decide
+theorem fixed_trust_dashdash :
+    (match dispatch ["trust", "--", "/repo"] with
+     | .run _ a => trustDir a | .refuse => none) = some "/repo" := by
+  simp [dispatch, separated, aware, afterSep, trustDir]
+theorem fixed_dash_value_refused : dispatch ["trust", "--", "--list"] = .refuse := by
+  simp [dispatch, separated, aware, afterSep]
+/-- Non-vacuity: learn still sees its `--`, and a plain trust is untouched. -/
+theorem fixed_learn_keeps_sep :
+    dispatch ["learn", "--", "--dry-run"] = .run "learn" ["--", "--dry-run"] := by
+  simp [dispatch, separated, aware]
+theorem fixed_plain_trust : dispatch ["trust", "/repo"] = .run "trust" ["/repo"] := by
+  simp [dispatch, separated, aware]
+
 end DashDash
 
 

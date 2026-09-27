@@ -26,7 +26,14 @@ decision P1b, `rekeyHeldAgainstPulled`) and restores the saved bytes when the pu
 file fails the loader's shape rule; the current code is `pullR2` at the end of this
 section (`r2_pulls`, `r2_no_loss`, `r2_no_leak`, `r2_rekey_no_loss`,
 `r2_rekey_no_leak`), and id-level reachability after a collision is
-`R2Persist.Restore.restore_both_reachable`. -/
+`R2Persist.Restore.restore_both_reachable`.
+
+Checked against the #1228 audit fixes (2026-09-27): UPDATED again. `pullR2` is a single
+step, so it cannot see a sync killed half-way; the held records were in memory only and a
+signal during the pull deleted them. Round 3 (`phasesNew`, `crash_safe`, `recover_no_loss`)
+models the durable recovery file, and `pullR3` replaces `pullR2`'s unloadable branch, which
+put the pre-pull file back under a HEAD holding the pulled one (`old_unloadable_reverts`).
+The round-2 theorems stay true of the loadable branches, which round 3 did not change. -/
 namespace Sync
 
 variable {α : Type} (keep : α → Bool)
@@ -184,7 +191,8 @@ theorem r2_no_leak [DecidableEq α] (merge : List α → List α) (loadable : Li
       rw [List.filter_eq_nil_iff]; intro y hy; simp [hrk y hy]
     rw [h1, h2, List.append_nil]
 
-/-- Current code: a pulled file the loader refuses leaves the working tree as it was. -/
+/-- Round-2 code (superseded by `pullR3`): a pulled file the loader refuses left the working
+tree as it was — which is the revert `old_unloadable_reverts` exhibits. -/
 theorem r2_unloadable_keeps_work [DecidableEq α] (merge : List α → List α)
     (loadable : List α → Bool) (rk : List α → List α → List α) (w : List α)
     (hl : loadable (merge (strip keep w)) = false) :
@@ -252,6 +260,176 @@ theorem r2_rekey_example :
     (pullR2 (fun r : Nat × Nat => decide (r.2 < 10)) (fun _ => [(1, 5), (2, 8)]) (fun _ => true)
       (rekey (fun r => 100 + r.1)) [(1, 5), (2, 17)]).work = [(1, 5), (2, 8), (102, 17)] := by
   decide
+
+/-! ### Round 3 — audit of #1228 (2026-09-27): crash safety, and no revert of an unloadable pull
+
+`pullR2` is a function: it says nothing about a sync that stops half-way. The code runs
+it as a sequence of durable steps, and a signal can end the process after any of them
+(`finally` does not run on SIGINT/SIGTERM/SIGKILL). `D` is what survives a crash: the
+working file, HEAD, and the recovery file `.git/plur-held.json` (`hf`). What every
+reader sees (`loadEngrams`) is `view`: the file plus the held records `rk` adds to it
+(`mergeHeldRecords`: nothing already there, re-keyed on an id clash).
+
+Round 2 kept the held records in process memory (`hf` always `[]`), so a crash after
+the reset lost them (`old_crash_loses`). Round 3 writes `hf` before the reset and
+clears it only after the restore (`phasesNew`); every crash point keeps every record
+visible (`crash_safe`), and the recovery run (`recover`, which is the same restore)
+puts them back in the file (`recover_no_loss`).
+
+Also, `pullR2`'s unloadable branch put the PRE-pull working tree back while HEAD held
+the pulled file, so the next commit (`strip work`) reverted the remote's change
+(`old_unloadable_reverts`). Round 3 keeps the pulled file and leaves the held records in
+`hf` (`unloadable_no_revert`, `unloadable_keeps_held`). -/
+
+structure D (α : Type) where
+  work : List α
+  head : List α
+  hf   : List α
+
+/-- What every reader sees: the file plus the held records not already in it. -/
+def view (rk : List α → List α → List α) (s : D α) : List α := s.work ++ rk s.work s.hf
+
+/-- Round 2: durable states after each step of `pullRebase` (start, reset, pull,
+restore); the held records exist only in memory. -/
+def phasesOld (merge : List α → List α) (rk : List α → List α → List α) (w : List α) : List (D α) :=
+  [⟨w, strip keep w, []⟩,
+   ⟨strip keep w, strip keep w, []⟩,
+   ⟨merge (strip keep w), merge (strip keep w), []⟩,
+   ⟨merge (strip keep w) ++ rk (merge (strip keep w)) (held keep w), merge (strip keep w), []⟩]
+
+/-- Round 3: the recovery file is written BEFORE the reset and deleted LAST. -/
+def phasesNew (merge : List α → List α) (rk : List α → List α → List α) (w : List α) : List (D α) :=
+  [⟨w, strip keep w, []⟩,
+   ⟨w, strip keep w, held keep w⟩,
+   ⟨strip keep w, strip keep w, held keep w⟩,
+   ⟨merge (strip keep w), merge (strip keep w), held keep w⟩,
+   ⟨merge (strip keep w) ++ rk (merge (strip keep w)) (held keep w), merge (strip keep w), held keep w⟩,
+   ⟨merge (strip keep w) ++ rk (merge (strip keep w)) (held keep w), merge (strip keep w), []⟩]
+
+/-- `recoverHeld` (next sync) and the next store write: the restore, then an empty `hf`. -/
+def recover (rk : List α → List α → List α) (s : D α) : D α :=
+  ⟨s.work ++ rk s.work s.hf, s.head, []⟩
+
+/-- `x` is in `l`, or represented there by a record `same` as it. -/
+def Has (same : α → α → Prop) (l : List α) (x : α) : Prop := x ∈ l ∨ ∃ y, y ∈ l ∧ same x y
+
+/-- The re-keying covers the held records: each is already there, or added as a `same` copy. -/
+def Covers (rk : List α → List α → List α) (same : α → α → Prop) : Prop :=
+  ∀ cur h x, x ∈ h → x ∈ cur ∨ ∃ y, y ∈ rk cur h ∧ same x y
+
+theorem has_mono (same : α → α → Prop) (l l' : List α) (x : α) (hs : ∀ y, y ∈ l → y ∈ l')
+    (h : Has same l x) : Has same l' x := by
+  rcases h with h | ⟨y, hy, hxy⟩
+  · exact Or.inl (hs x h)
+  · exact Or.inr ⟨y, hs y hy, hxy⟩
+
+/-- A record of `w` survives in `cur ++ rk cur (held w)` whenever `cur` keeps the push set. -/
+theorem restored_has (rk : List α → List α → List α) (same : α → α → Prop) (hc : Covers rk same)
+    (w cur : List α) (hcur : ∀ y, y ∈ strip keep w → y ∈ cur) (x : α) (hx : x ∈ w) :
+    Has same (cur ++ rk cur (held keep w)) x := by
+  cases hk : keep x
+  · rcases hc cur (held keep w) x (List.mem_filter.mpr ⟨hx, by simp [hk]⟩) with h | ⟨y, hy, hxy⟩
+    · exact Or.inl (List.mem_append.mpr (Or.inl h))
+    · exact Or.inr ⟨y, List.mem_append.mpr (Or.inr hy), hxy⟩
+  · exact Or.inl (List.mem_append.mpr (Or.inl (hcur x (List.mem_filter.mpr ⟨hx, hk⟩))))
+
+/-- **Round 3, crash safety:** whichever step a sync is killed after, every record of the
+working tree is still visible to every reader — provided the merge keeps what HEAD had. -/
+theorem crash_safe [DecidableEq α] (merge : List α → List α) (rk : List α → List α → List α)
+    (same : α → α → Prop) (hc : Covers rk same) (w : List α)
+    (hm : ∀ y, y ∈ strip keep w → y ∈ merge (strip keep w)) :
+    ∀ s, s ∈ phasesNew keep merge rk w → ∀ x, x ∈ w → Has same (view rk s) x := by
+  intro s hs x hx
+  have sub : ∀ l r : List α, ∀ y, y ∈ l → y ∈ l ++ r := fun l r y h => List.mem_append.mpr (Or.inl h)
+  have hstrip : ∀ y, y ∈ strip keep w → y ∈ strip keep w := fun _ h => h
+  simp only [phasesNew, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with rfl | rfl | rfl | rfl | rfl | rfl <;> simp only [view]
+  · exact Or.inl (sub _ _ x hx)
+  · exact Or.inl (sub _ _ x hx)
+  · exact restored_has keep rk same hc w _ hstrip x hx
+  · exact restored_has keep rk same hc w _ hm x hx
+  · exact has_mono same _ _ x (sub _ _) (restored_has keep rk same hc w _ hm x hx)
+  · exact has_mono same _ _ x (sub _ _) (restored_has keep rk same hc w _ hm x hx)
+
+/-- **Round 3, recovery:** from any crash point, the recovery run leaves every record in
+the FILE itself, and the recovery file empty. -/
+theorem recover_no_loss [DecidableEq α] (merge : List α → List α) (rk : List α → List α → List α)
+    (same : α → α → Prop) (hc : Covers rk same) (w : List α)
+    (hm : ∀ y, y ∈ strip keep w → y ∈ merge (strip keep w)) :
+    ∀ s, s ∈ phasesNew keep merge rk w → (∀ x, x ∈ w → Has same (recover rk s).work x) ∧ (recover rk s).hf = [] :=
+  fun s hs => ⟨crash_safe keep merge rk same hc w hm s hs, rfl⟩
+
+/-- `mergeHeldRecords` without an id clash: the held records the file does not already hold. -/
+def rkPlain [DecidableEq α] (cur h : List α) : List α := h.filter (fun x => decide (x ∉ cur))
+
+theorem rkPlain_covers [DecidableEq α] : Covers (rkPlain (α := α)) (· = ·) := by
+  intro cur h x hx
+  by_cases hin : x ∈ cur
+  · exact Or.inl hin
+  · exact Or.inr ⟨x, List.mem_filter.mpr ⟨hx, by simp [hin]⟩, rfl⟩
+
+/-- **Counterexample (replayed: `formal-audit-persist-sync-crash.test.ts`, SIGINT/SIGTERM/
+SIGKILL mid-pull).** Records are numbers, `0` is scope:local. Round 2 killed after the reset:
+no reader sees the local record, and nothing on disk holds it. -/
+theorem old_crash_loses :
+    ∃ s, s ∈ phasesOld (fun x : Nat => decide (x ≠ 0)) id rkPlain [1, 0] ∧ 0 ∉ view rkPlain s := by
+  refine ⟨⟨[1], [1], []⟩, by simp [phasesOld, strip, held], by simp [view, rkPlain]⟩
+
+/-- Non-vacuity: the round-3 phases with the same input keep `0` visible at every step. -/
+theorem new_crash_example :
+    ∀ s, s ∈ phasesNew (fun x : Nat => decide (x ≠ 0)) id rkPlain [1, 0] → 0 ∈ view rkPlain s := by
+  intro s hs
+  simp only [phasesNew, strip, held, List.mem_cons, List.not_mem_nil, or_false] at hs
+  rcases hs with rfl | rfl | rfl | rfl | rfl | rfl <;> simp [view, rkPlain]
+
+/-- Round 3, unloadable pull: HEAD and the file keep the pulled version; the held records stay in `hf`. -/
+def pullR3 [DecidableEq α] (merge : List α → List α) (loadable : List α → Bool)
+    (rk : List α → List α → List α) (w : List α) : D α :=
+  if merge (strip keep w) = strip keep w then ⟨w, merge (strip keep w), []⟩
+  else if loadable (merge (strip keep w)) then
+    ⟨merge (strip keep w) ++ rk (merge (strip keep w)) (held keep w), merge (strip keep w), []⟩
+  else ⟨merge (strip keep w), merge (strip keep w), held keep w⟩
+
+/-- **Counterexample (replayed: the bare-array case in `formal-audit-persist-sync-crash.test.ts`).**
+Round 2 on an unloadable pull: the next commit's blob is the PRE-pull one while HEAD is
+the pulled one — a revert of the remote's change, pushed on the next sync. -/
+theorem old_unloadable_reverts :
+    let r := pullR2 (fun x : Nat => decide (x ≠ 0)) (fun _ => [1, 2]) (fun _ => false) rkPlain [1, 0]
+    strip (fun x : Nat => decide (x ≠ 0)) r.work ≠ r.head := by
+  decide
+
+set_option linter.deprecated false in
+/-- **Round 3:** an unloadable pull is not reverted — the next commit's blob is HEAD —
+provided the remote carries only push-set records. -/
+theorem unloadable_no_revert [DecidableEq α] (merge : List α → List α) (loadable : List α → Bool)
+    (rk : List α → List α → List α) (w : List α)
+    (hr : ∀ y, y ∈ merge (strip keep w) → keep y = true)
+    (hl : loadable (merge (strip keep w)) = false) :
+    strip keep (pullR3 keep merge loadable rk w).work = (pullR3 keep merge loadable rk w).head := by
+  unfold pullR3
+  by_cases h : merge (strip keep w) = strip keep w
+  · rw [if_pos h]; exact h.symm
+  · have hl' : ¬ (loadable (merge (strip keep w)) = true) := by simp [hl]
+    rw [if_neg h, if_neg hl']
+    exact List.filter_eq_self.mpr hr
+
+set_option linter.deprecated false in
+/-- **Round 3:** and nothing is lost: every record is visible to readers (the held ones
+through the recovery file), whatever the loader says. -/
+theorem unloadable_keeps_held [DecidableEq α] (merge : List α → List α) (loadable : List α → Bool)
+    (rk : List α → List α → List α) (same : α → α → Prop) (hc : Covers rk same) (w : List α)
+    (hm : ∀ y, y ∈ strip keep w → y ∈ merge (strip keep w)) :
+    ∀ x, x ∈ w → Has same (view rk (pullR3 keep merge loadable rk w)) x := by
+  intro x hx
+  have sub : ∀ l r : List α, ∀ y, y ∈ l → y ∈ l ++ r := fun l r y h => List.mem_append.mpr (Or.inl h)
+  unfold pullR3
+  by_cases h : merge (strip keep w) = strip keep w
+  · rw [if_pos h]; simp only [view]; exact Or.inl (sub _ _ x hx)
+  · rw [if_neg h]
+    by_cases hl : loadable (merge (strip keep w)) = true
+    · rw [if_pos hl]; simp only [view]
+      exact has_mono same _ _ x (sub _ _) (restored_has keep rk same hc w _ hm x hx)
+    · rw [if_neg hl]; simp only [view]; exact restored_has keep rk same hc w _ hm x hx
 
 end Sync
 

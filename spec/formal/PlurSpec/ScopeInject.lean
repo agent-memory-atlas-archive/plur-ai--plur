@@ -548,6 +548,39 @@ theorem old_whenever_is_never :
 
 theorem new_whenever_not_matched : extractNew [.whenever, .word, .word] = none := by decide
 
+/-! ### 4b. Which words the code tokenises as `neg` (audit of #1228, finding 3)
+
+`extract_preserves_polarity` holds for the `neg` TOKEN; it is sound for the code
+only if the regex's negation alternation turns every negation word into `neg`.
+It did not: only `don't` / `do not` / `not` were, so `cannot`, the contracted
+`\w+n't` forms (doesn't, can't, won't, shouldn't, isn't …) and their
+apostrophe-less spellings were `word` fillers, and the theorem's premise
+`filler* [neg] (always|never)` then matched with the negation in the FILLER —
+the extracted statement dropped it. -/
+
+inductive NegForm | dont | doNot | not | cannot | contracted | fused
+  deriving DecidableEq, Repr
+
+/-- Before: `(?:don['’]?t|do not|not)`. -/
+def tokOld : NegForm → Tok
+  | .dont | .doNot | .not => .neg
+  | _ => .word
+
+/-- After: `(?:\w+n['’]t|(?:do|does|…)nt|cannot|do not|not)` — every form. -/
+def tokNew : NegForm → Tok := fun _ => .neg
+
+/-- Every negation form before always/never keeps the sentence's polarity. -/
+theorem every_negform_keeps_polarity (f : NegForm) (d : Tok) (rest : List Tok)
+    (hd : d = .always ∨ d = .never) :
+    (extractNew (tokNew f :: d :: rest)).map pol = some (pol (.neg :: d :: rest)) := by
+  rcases hd with rfl | rfl <;> rfl
+
+/-- Counterexample (replayed in formal-audit-core-learner-negation):
+"You cannot always trust the cache" → "always trust the cache". -/
+theorem old_cannot_inverts :
+    extractNew [.word, tokOld .cannot, .always, .word] = some [.always, .word] ∧
+    pol [.always, .word] ≠ pol [.neg, .always, .word] := by decide
+
 /-! ## 5. Token budget: estimator vs formatter, section totals, renderMemoryBlock -/
 
 def ceil4 (n : Nat) : Nat := (n + 3) / 4

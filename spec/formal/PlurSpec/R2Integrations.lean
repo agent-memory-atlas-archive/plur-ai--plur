@@ -294,6 +294,88 @@ theorem orig_dash_query_refused :
     recallParse (recallArgsOrig "-x marks the spot" "3" false) = none := by
   simp [recallArgsOrig, recallParse]
 
+/-! ### inject / capture text, and where `--path` goes (audit 1228-c)
+
+The same rule for the other free text the bridges send. `bridge.inject(task)` /
+`Plur.inject(task)` passed a user message as the first positional, so
+"--path=/x …" reached the CLI's flag parser. FIXED: flag-like text goes after `--`
+(`plur inject` honours it); `capture` sends it on stdin, which `plur capture` reads
+when argv has no summary. Every other text keeps the old argv (so the npx-pinned
+0.20.1 CLI behaves as before). -/
+
+def injectParse : List String → Option String
+  | [] => none
+  | "--" :: rest => rest.head?
+  | "--budget" :: _ :: rest => injectParse rest
+  | "--fast" :: rest => injectParse rest
+  | a :: _ => if a.startsWith "-" then none else some a
+
+def injectArgsOrig (t b : String) (fast : Bool) : List String :=
+  t :: "--budget" :: b :: (if fast then ["--fast"] else [])
+
+def injectArgs (t b : String) (fast : Bool) : List String :=
+  if t.startsWith "-" then "--budget" :: b :: ((if fast then ["--fast"] else []) ++ ["--", t])
+  else t :: "--budget" :: b :: (if fast then ["--fast"] else [])
+
+theorem injectParse_head (t : String) (rest : List String) (h : t.startsWith "-" = false) :
+    injectParse (t :: rest) = some t := by
+  have h1 : t ≠ "--" := by intro e; subst e; simp at h
+  have h2 : t ≠ "--budget" := by intro e; subst e; simp at h
+  have h3 : t ≠ "--fast" := by intro e; subst e; simp at h
+  unfold injectParse
+  split <;> simp_all
+
+theorem inject_task_verbatim (t b : String) (fast : Bool) :
+    injectParse (injectArgs t b fast) = some t := by
+  unfold injectArgs
+  cases ht : t.startsWith "-"
+  · simp only [Bool.false_eq_true, ↓reduceIte]; exact injectParse_head t _ ht
+  · cases fast <;> simp [injectParse]
+
+theorem orig_dash_task_lost :
+    injectParse (injectArgsOrig "--path=/x deploy" "2000" true) = none := by
+  simp [injectArgsOrig, injectParse]
+
+/-- capture: the summary is argv's first non-flag token, else stdin. -/
+def captureSummary (argv : List String) (stdin : Option String) : Option String :=
+  match injectParse argv with
+  | some s => some s
+  | none => stdin
+
+def captureCall (t : String) : List String × Option String :=
+  if t.startsWith "-" then ([], some t) else ([t], none)
+
+theorem capture_summary_verbatim (t : String) :
+    captureSummary (captureCall t).1 (captureCall t).2 = some t := by
+  unfold captureCall
+  cases ht : t.startsWith "-"
+  · simp [captureSummary, injectParse_head t [] ht]
+  · simp [captureSummary, injectParse]
+
+/-- `bridge.call`: ORIGINAL inserted `--path P` before the FIRST "--" in the argv —
+possibly a flag's VALUE. FIXED: right after `--json`, before every argument, so the
+caller's argv survives intact as a suffix. -/
+def insertAtSep (xs ins : List String) : List String :=
+  xs.takeWhile (· ≠ "--") ++ ins ++ xs.dropWhile (· ≠ "--")
+
+def callCmdOrig (c : String) (path : Option String) (args : List String) : List String :=
+  match path with
+  | none => c :: "--json" :: args
+  | some p => insertAtSep (c :: "--json" :: args) ["--path", p]
+
+def callCmd (c : String) (path : Option String) (args : List String) : List String :=
+  c :: "--json" :: ((match path with | none => [] | some p => ["--path", p]) ++ args)
+
+theorem call_args_intact (c : String) (path : Option String) (args : List String) :
+    ∃ pre, callCmd c path args = pre ++ args := by
+  cases path with
+  | none => exact ⟨[c, "--json"], by simp [callCmd]⟩
+  | some p => exact ⟨[c, "--json", "--path", p], by simp [callCmd]⟩
+
+theorem orig_splits_flag_value :
+    callCmdOrig "forget" (some "/s") ["--search", "--"] =
+      ["forget", "--json", "--search", "--path", "/s", "--"] := by decide
+
 /-! ## 3. MCP follow-ups: recall session rule, zero-session scope set, refusal wording, outbox count
 (packages/mcp/src/tools.ts) -/
 
