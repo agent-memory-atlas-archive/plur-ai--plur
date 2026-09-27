@@ -359,6 +359,35 @@ function isSupersededEngram(engram: ScoredEngram): boolean {
   return (engram.relations?.superseded_by?.length ?? 0) > 0
 }
 
+/**
+ * Replaced by an engram that is active here. Such an engram is not current:
+ * the correction that replaced it is, so it is not injected (outside a
+ * historical prompt). When the replacement is NOT active locally — retired,
+ * or living only in a remote store — dropping the only local copy would lose
+ * the memory, so the ×0.3 re-rank still applies instead.
+ */
+function isReplacedByActive(engram: Engram, activeIds: ReadonlySet<string>): boolean {
+  return (engram.relations?.superseded_by ?? []).some(id => activeIds.has(id))
+}
+
+/**
+ * Does the engram pass the session's scope filter? The one visibility rule
+ * scoreEngram applies, split out so selectAndSpread can drop an out-of-scope
+ * engram BEFORE an embedding boost or an association can score it: a 0 from
+ * scoreEngram means "no keyword overlap" as well as "not in scope", and the
+ * boost path turned any 0 back into a positive score.
+ */
+function passesScopeFilter(
+  engram: Engram,
+  scopeFilter: string | undefined,
+  grantedScopes?: readonly string[],
+): boolean {
+  if (!scopeFilter) return true
+  // INJECT_GLOBAL_IS_TARGETED: see the JSDoc at the top of this file.
+  if (scopeFilter === 'global') return engram.scope === 'global'
+  return makeVisibilityPredicate(scopeFilter, grantedScopes)(engram.scope)
+}
+
 // --- Strip pipeline ---
 
 function stripAssociations(engram: ScoredEngram): AgentEngram {
@@ -645,12 +674,22 @@ export function selectAndSpread(
   // "locally known but inactive" from "absent entirely (remote-only or missing)".
   const engramMap = new Map<string, Engram>()
   const nonActiveIds = new Set<string>()
+  // Out of the session's scope: never scored, never a spread target, and not
+  // counted as a spread drop either — it is filtered, not missing.
+  const outOfScopeIds = new Set<string>()
+  // Every active engram, in scope or not, for the "replaced by an active
+  // engram" test: a correction stored in another scope still replaces.
+  const activeIds = new Set<string>()
+  for (const e of personalEngrams) if (e.status === 'active') activeIds.add(e.id)
+  for (const p of packs) for (const e of p.engrams) if (e.status === 'active') activeIds.add(e.id)
+  const historical = hasHistoricalIntent(ctx.prompt)
 
   // Step 1-2: Score all active engrams
   const scored: ScoredEngram[] = []
 
   for (const engram of personalEngrams) {
     if (engram.status !== 'active') { nonActiveIds.add(engram.id); continue }
+    if (!passesScopeFilter(engram, ctx.scope, ctx.grantedScopes)) { outOfScopeIds.add(engram.id); continue }
     // NOT added to nonActiveIds: a draft is active, it is simply ungated for
     // delivery (#1141). That set feeds spread_drops accounting for retired or
     // unresolvable targets, and a pending-review engram is neither.
@@ -694,6 +733,7 @@ export function selectAndSpread(
     const matchTerms = packMeta.match_terms
     for (const engram of pack.engrams) {
       if (engram.status !== 'active') continue
+      if (!passesScopeFilter(engram, ctx.scope, ctx.grantedScopes)) { outOfScopeIds.add(engram.id); continue }
       if (skipForApproval(engram)) continue
       if (skipForValidity(engram, nowMs, expiryMode, graceDays)) continue
       engramMap.set(engram.id, engram)
@@ -737,13 +777,19 @@ export function selectAndSpread(
   // pinning. Without this exemption, a session with strong personal-engram
   // matches normalizes pinned scores below DEFAULT_MIN_RELEVANCE (0.3) and
   // the pinned engram is silently dropped before fillTokenBudget sees it.
-  const filtered = scored.filter(s => (s as any).pinned === true || s.score >= minRelevance)
+  // A superseded engram whose replacement is active is not current, so it is
+  // not a candidate at all — not in directives, constraints or consider.
+  // A historical prompt ("previously", "used to") still reaches it.
+  const filtered = scored.filter(s =>
+    ((s as any).pinned === true || s.score >= minRelevance)
+    && (historical || !isReplacedByActive(s, activeIds)))
 
   // Sort by score descending
   filtered.sort((a, b) => b.score - a.score)
 
-  // Supersedes chain preference: under budget pressure, tip beats older members
-  if (!hasHistoricalIntent(ctx.prompt)) {
+  // Supersedes chain preference: under budget pressure, tip beats older members.
+  // Only a superseded engram whose replacement is not active here reaches this.
+  if (!historical) {
     for (const e of filtered) {
       if (isSupersededEngram(e)) {
         e.score *= 0.3
@@ -848,6 +894,7 @@ export function selectAndSpread(
     for (const assoc of assocs) {
       if (assoc.target_type !== 'engram') continue
       if (visited.has(assoc.target)) continue
+      if (outOfScopeIds.has(assoc.target)) continue
 
       const target = engramMap.get(assoc.target)
       if (!target) {
@@ -856,6 +903,7 @@ export function selectAndSpread(
         continue
       }
       if (target.status !== 'active') { droppedRetired++; continue }
+      if (!historical && isReplacedByActive(target, activeIds)) continue
 
       // Apply decay to co_accessed associations at read time
       const effectiveStrength = assoc.type === 'co_accessed' && assoc.updated_at

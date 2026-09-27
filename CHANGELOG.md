@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### A corrected memory stops being injected, and a project's memories stay in that project
+
+**A correction no longer arrives beside the advice it corrected.** When an
+engram is superseded (`plur learn --supersedes`, `plur_learn` with
+`supersedes`) and the engram that replaced it is active, injection now leaves
+the old one out entirely. Before, it was only ranked lower (×0.3), so whenever
+the budget had room — which is most of the time — the model saw both the old
+and the corrected claim, unmarked. A prompt that asks about the past
+("previously", "used to", …) still reaches the old engram, and if the
+replacement is not active on this machine (retired, or only in a remote store)
+the old one is kept, re-ranked as before, rather than lost. Recall is
+unchanged (#997 keeps that question open).
+
+**Another project's engrams no longer reach a scoped session.** The prompt
+hook reads the directory's `.plur.yaml` scope and passes it on, and the
+keyword-only `inject()` honoured it — but `injectHybrid()`, which the hook
+uses, let an out-of-scope engram back in whenever its embedding similarity was
+high, and spreading activation could reach one through a co-access link. Both
+now respect the scope; global and personal engrams still pass as before.
+
 ### An unscoped write can no longer land in a team store
 
 **If you wrote an engram without a scope, it could be auto-routed into a shared
