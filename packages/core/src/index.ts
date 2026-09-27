@@ -32,7 +32,7 @@ import { autoSummary } from './summary.js'
 import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack, containsEmail } from './packs.js'
 import type { ExportOptions } from './packs.js'
 import { learnContextContent, engramContentFields } from './content-fields.js'
-import { newLeaseHolder, makeLease, leaseFree, canStartPush, dropOwnLease, OUTBOX_LEASE_KEY, OUTBOX_LEASE_TTL_MS } from './outbox-lease.js'
+import { newLeaseHolder, makeLease, leaseFree, readLease, canStartPush, dropOwnLease, OUTBOX_LEASE_KEY, OUTBOX_LEASE_TTL_MS } from './outbox-lease.js'
 export { LEARN_CONTEXT_FIELD_ROLES, LEARN_CONTENT_FIELDS, learnContextContent, engramContentFields } from './content-fields.js'
 // SP5 imports (deferred — vault-export, registry not yet merged)
 // import { exportVault, type VaultExportOptions, type VaultExportResult } from './vault-export.js'
@@ -8420,6 +8420,10 @@ export class Plur {
     attempt_count: number
     last_error?: string
     age_days: number
+    /** Set while another flush holds a live lease on the row (decision D2):
+     *  the row is not stuck, it is being delivered, until this time. Only the
+     *  expiry is reported — the holder id names a process. */
+    leased_until?: string
   }>> {
     const engrams = await this._loadCached(this.paths.engrams)
     const now = Date.now()
@@ -8443,9 +8447,12 @@ export class Plur {
     }
     for (const e of engrams) {
       const sd = (e as any).structured_data as { _outbox?: Entry; _retireRemote?: Entry } | undefined
-      if (sd?._outbox && e.status !== 'retired') out.push(toEntry(e.id, 'push', sd._outbox))
+      // A lease no flush could take right now is live; '' is nobody's holder id.
+      const lease = sd && !leaseFree(sd, '', now) ? readLease(sd) : undefined
+      const leased = lease ? { leased_until: lease.expires_at } : {}
+      if (sd?._outbox && e.status !== 'retired') out.push({ ...toEntry(e.id, 'push', sd._outbox), ...leased })
       // Selected exactly as flushOutbox selects them (any status).
-      if (sd?._retireRemote) out.push(toEntry(e.id, 'retire', sd._retireRemote))
+      if (sd?._retireRemote) out.push({ ...toEntry(e.id, 'retire', sd._retireRemote), ...leased })
     }
     return out
   }

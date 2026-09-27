@@ -14,7 +14,7 @@ rows:
   E6_provenance_withheld: keep                  # rest — suggested "leaves" proved unsafe at apply (pack provenance would forbid distribution); reverted, follow-up issue
   E7_multi_session_no_id: ignore                # principle: egress — an ambiguous session default may be a team scope
   D1_remote_copy_after_forget: queue-retire     # rest
-  D2_two_process_flush: accept                  # principle: formats (lease deferred to an issue)
+  D2_two_process_flush: lease-implemented       # principle: formats — on-disk outbox lease shipped in PR #1231 (stacked on #1228)
   D3_recurrence_on_queued: no-widen             # rest
   D4_update_scope_queued: like-rescope          # rest
   I1_injection_budget: cap-sum                  # rest
