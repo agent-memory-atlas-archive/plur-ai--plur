@@ -12,7 +12,14 @@ namespace PlurSpec.Adapters
 /-! ## 1. MCP learn entry points (tools.ts plur_learn / plur_learn_batch / plur_session_end)
 
 `SessionScopeRegistry` (core/src/session-scopes.ts): keyed registrations plus a
-process-default slot that the LAST `plur_session_start` overwrites. -/
+process-default slot that the LAST `plur_session_start` overwrites.
+
+Checked against round 2 (2026-09-27): still holds because plur_learn,
+plur_learn_batch and plur_session_end still build their context with
+`_resolveWriteSession(args)` and `projectDomain`, and the batch still gates each
+pinned item on `pinnedQuota`. The round-2 edits of tools.ts in these handlers change
+only the refused-route WORDING (`describeRefusedRoute`, R2Integrations §3
+`refusal_kind_truthful`), not a context field. -/
 
 structure Registry where
   keyed : List (String × Option String)   -- session ↦ registered default scope
@@ -143,7 +150,13 @@ theorem gate_admits_good (free : Int) (a : LearnInput) (h : a.pinned = false ∨
   · have : ¬ free ≤ 0 := by omega
     simp [batchAdmits, pinGate, this]
 
-/-! ### Reported decision and warning -/
+/-! ### Reported decision and warning
+
+Checked against round 2 (2026-09-27): still holds because the handler still reports
+`noop` exactly when core returned an existing engram and the queued warning only when
+it was queued. Round 2's Decision A changes WHEN core absorbs a write (never into a
+pack / readonly / other-scope remote row) — that is `Outcome.absorbed` itself, so the
+report stays truthful. -/
 
 inductive Decision | add | noop deriving DecidableEq
 
@@ -171,7 +184,12 @@ theorem orig_warning_lies : claimsQueuedOrig ⟨false, false⟩ = true := rfl
 /-! ## 2. MCP session lifecycle (tools.ts `_cleanExpiredSessions`, session_end)
 
 State: open sessions (telemetry), keyed registrations, and (fixed code only) the
-set of ids an id-only sweep expired but could not clear. -/
+set of ids an id-only sweep expired but could not clear.
+
+Checked against round 2 (2026-09-27): still holds because `_cleanExpiredSessions`
+(pending set, cleared by a plur-bearing sweep) and the id-less session_end resolution
+are not in the round-2 diff of tools.ts; session_end's only change is the checkpoint
+directory (`PLUR_PATH ||`, not `??`), which the model does not read. -/
 
 structure LState where
   open_   : List String
@@ -262,7 +280,13 @@ theorem ambiguous_learn_takes_last_started :
 `NO_SESSION` when no session resolves (no id, and zero or several open), and
 `SessionScopeRegistry.get(NO_SESSION)` is `null` — neither a keyed registration
 nor the process slot. Modelled as: an unresolved session contributes no
-default. Writes (learn, batch, session_end) and injects all use it. -/
+default. Writes (learn, batch, session_end) and injects all use it.
+
+Checked against round 2 (2026-09-27): still holds because `_resolveWriteSession` is
+unchanged. Round 2 EXTENDED the rule to plur_recall (both handlers now pass
+`_resolveWriteSession`, R2Integrations §3 `recall_same_rule_as_write`) and made
+plur_session_scope `set` refuse when no session is open
+(`set_accepted_is_observable`); neither changes a theorem here. -/
 
 def effScopeW (r : Registry) (c : Ctx) : Option String :=
   c.scope <|> (match c.session with
@@ -298,7 +322,12 @@ theorem named_session_with_several_open :
 /-! ## 3. Claude settings.json hook merge (cli/src/commands/init.ts mergeHooks)
 
 One event's entry list (events are merged independently). A hook spec is
-abstracted to the features the classifier reads. -/
+abstracted to the features the classifier reads.
+
+Checked against round 2 (2026-09-27): still holds because `mergeHooks`,
+`stripPlurHooks` and `isPlurHookSpec` are not in the round-2 diff of init.ts; round 2
+only widened the PostToolUse session-mark MATCHER to `mcp__.*__plur_session_start`,
+which is a field of an installed spec, not the classifier. -/
 
 structure Spec where
   hasCommand : Bool   -- `command` is a string (false for `type: "prompt"`)
@@ -443,7 +472,11 @@ theorem fixed_cases :
 
 Doctor asks "is a PLUR hook installed?" (any subcommand). ORIGINAL: the literal
 `.plur/bin/plur-hook` test missed the backslash shim path. FIXED: string command
-and the binary check after `\ → /`. -/
+and the binary check after `\ → /`.
+
+Checked against round 2 (2026-09-27): still holds because `hasAnyPlurHook` is
+unchanged; round 2 only made the HEALTHY line name the harnesses that carry hooks
+(`hookHarnesses`/`readyLine`, R2CLI §5 `fixed_claim_sound`). -/
 
 def doctorDetectsOrig (h : Spec) : Bool := h.hasCommand && h.plurBinary && !h.winPath
 def doctorDetects (h : Spec) : Bool := h.hasCommand && h.plurBinary
@@ -461,7 +494,10 @@ theorem orig_doctor_misses_windows :
 /-! ## 4. Cursor installer merges (cli/src/cursor-hooks.ts, mcp-config.ts)
 
 (a) hooks.json top level: `version`, `hooks`, and keys PLUR does not own.
-(b) the healed MCP entry's env: `{...existing, ...caller}` versus replace. -/
+(b) the healed MCP entry's env: `{...existing, ...caller}` versus replace.
+
+Checked against round 2 (2026-09-27): still holds because cursor-hooks.ts and
+mcp-config.ts have no round-2 change. -/
 
 structure CursorCfg where
   version : Nat
@@ -513,7 +549,12 @@ theorem fixed_heal_keeps_plur_path :
 /-! ## 5. CLI exit codes (cli/src/commands/feedback.ts, forget.ts, scopes.ts)
 
 Property: exit 0 ⇔ the requested mutation succeeded, and the code does not
-depend on the output mode (JSON when piped / --json, text on a TTY). -/
+depend on the output mode (JSON when piped / --json, text on a TTY).
+
+Checked against round 2 (2026-09-27): still holds because feedback.ts and scopes.ts
+have no round-2 change and forget.ts changed only its argument parse (`--` ends flag
+parsing and the next token is the target); the exit paths after the search are
+untouched. -/
 
 inductive Mode | json | text deriving DecidableEq
 
@@ -583,7 +624,10 @@ theorem fixed_success_exit0 (m : Mode) : exitFixed m (.forgetSearch 1) = 0 ∧ e
 
 A client is either absent, the engine facade (always has every method; a
 write resolves to a no-op when core did not load), or an injected client with
-or without the method. -/
+or without the method.
+
+Checked against round 2 (2026-09-27): still holds because dsh tools.ts and learn.ts
+have no round-2 change. -/
 
 inductive Client
   | none
@@ -621,7 +665,10 @@ theorem dsh_good_case_reachable : reportsStored (.facade true) = true := rfl
 A write takes `d` ms (`none` = never settles). The slot is held for `hold`;
 the next write starts then. ORIGINAL (auto-learn/capture): `queue(guard(write,
 soft))`, so the slot was held `min d soft`. FIXED: the queue holds it until the
-write settles or `hard` elapses. The tool caller still waits `min d soft`. -/
+write settles or `hard` elapses. The tool caller still waits `min d soft`.
+
+Checked against round 2 (2026-09-27): still holds because guard.ts changed only a
+comment (the hard cap stays the constant `WRITE_HARD_CAP_MS`, by design). -/
 
 def holdFor (cap : Nat) : Option Nat → Nat
   | some d => min d cap
@@ -664,7 +711,14 @@ theorem hung_released_at_cap : holdFixed 60000 none = 60000 := rfl
 The CLI's parser is abstracted as `readsAsFlag : String → Bool` (an oracle:
 `--json`, `--path`, `--x=…`, the learn flags). The only fact used about it is
 that every token it reads as a flag starts with `-` (`hDash`). `plur learn`
-takes the first non-flag positional as the statement, else stdin. -/
+takes the first non-flag positional as the statement, else stdin.
+
+Checked against round 2 (2026-09-27): still holds because both bridges' `learn` still
+send a statement starting with `-` on stdin with no positional (hermes tests
+`statement.lstrip()`, a superset of `startsDash`). Round 2 moved the flags the bridges
+append (`--json` in python `run_json`, `--path` in hermes `call`) BEFORE a `--` when
+one is present — learn argv carries none — and routed recall queries through `--`
+(R2Integrations §2 `recall_query_verbatim`). -/
 
 structure Delivery where
   argv  : List String
@@ -713,7 +767,11 @@ theorem ordinary_statement_in_argv : (deliver "Use pnpm, not npm").argv = ["Use 
 consumption abstracted into the oracle), `--` ends parsing and the NEXT token is
 the statement. The original parser had no `--` case, so `--` itself — not a
 known flag — became the statement. Global flags (`--path`) are only read from
-the tokens before `--`. -/
+the tokens before `--`.
+
+Checked against round 2 (2026-09-27): still holds because plur.ts `parseGlobalFlags`
+and learn.ts have no round-2 change; the same `--` rule now also governs `plur recall`
+(R2CLI §7 `fixed_after_dashdash_is_data`) and `plur forget`. -/
 
 def learnParse (rf : String → Bool) : List String → Option String
   | [] => none
@@ -778,7 +836,10 @@ ORIGINAL: split on commas whenever the items accept strings, which for
 `engram_suggestions` (union items, free-text statements) turned one statement
 into several engrams. Decision S2 applied: union items (`anyOf`/`oneOf` with a
 string variant) take the string as ONE item; `items: {type: string}` (tags)
-keep the comma split. -/
+keep the comma split.
+
+Checked against round 2 (2026-09-27): still holds because `jsonSchemaPropToZod` is
+not in the round-2 diff of tools.ts. -/
 
 /-- A statement as a token list (words and commas); the coercion splits on commas. -/
 inductive Tok | word (w : String) | comma deriving DecidableEq
@@ -822,7 +883,10 @@ theorem fixed_coercion_cases :
 /-! (b) `stripRemoteKeys` / `buildConfigBody`, at line granularity. A line is
 PLUR-owned if it is a top-level remote key (or a list item under one — the
 list-skip is abstracted into the classifier) or, after the fix, one of the two
-header comment lines. Trailing-blank trimming is left out. -/
+header comment lines. Trailing-blank trimming is left out.
+
+Checked against round 2 (2026-09-27): still holds because init-remote.ts has no
+round-2 change. -/
 
 structure Line where
   topRemoteKey : Bool   -- `remote_url:` etc. at column 0 (or its list items)
@@ -869,7 +933,13 @@ Decision function per adapter: given whether the file's directory is trusted
 ORIGINAL: only opencode checked trust. Decision E3 applied: every adapter
 follows opencode (MCP `readTrustedProjectConfig`, dsh `trustedWorkspaceScope`,
 CLI hooks `trustedProjectScope`); dsh additionally never adopts `global`
-("the ambient global store is never a fallback"). -/
+("the ambient global store is never a fallback").
+
+Checked against round 2 (2026-09-27): still holds because `readTrustedProjectConfig`,
+dsh `trustedWorkspaceScope` and the hooks' `trustedProjectScope` calls (hook-inject,
+hook-agy-pre-invocation and the cursor/codex hooks) are unchanged; round 2's
+hook-inject/agy edits are session identity, locking and turn caching (R2CLI §2–§3,
+§6). -/
 
 inductive Adapter | opencode | mcp | dsh | cliHook deriving DecidableEq
 

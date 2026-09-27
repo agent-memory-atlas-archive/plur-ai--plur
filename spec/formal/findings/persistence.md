@@ -471,3 +471,43 @@ formal-apply-core-queued-scope.test.ts (D3/D4, not touched here).
 Limits: a synchronous `withLock` holder that blocks for longer than the threshold WITHOUT passing a
 touch point (e.g. a very long migration) is still unprotected — no such hold is known; the
 migration runner does not call git.
+
+## Round-2 drift review (2026-09-27)
+
+Drift check flagged `Persistence.lean` after round 2 changed engrams.ts, sync.ts,
+migrations/runner.ts, store/async-lock.ts, storage-postgres.ts and backup.ts. Each section
+re-read against the current code; verdicts: (a) still holds, (b) superseded and relabelled,
+(c) updated and re-proved. Every section got a "Checked against round 2" line. All
+counterexamples kept.
+
+| § | Verdict | Why |
+|---|---------|-----|
+| 1 git sync (`pullFixed`) | c | `restoreWithheld` now re-keys held records whose id the pull brought (P1b) and restores saved bytes when the pulled file fails the loader's shape rule. `pullFixed` relabelled as the round-1 code; new `pullR2` (re-keying and loader verdict as oracles) with `r2_generalises` (`pullFixed` is `rk = id`), `r2_pulls`, `r2_no_loss` (up to a same-content re-keyed copy), `r2_no_leak`, `r2_unloadable_keeps_work`, and the concrete `rekey` (`rekey_cover`, `rekey_keep`, `r2_rekey_no_loss`, `r2_rekey_no_leak`, `r2_rekey_example`). Id-level reachability: `R2Persist.Restore.restore_both_reachable` |
+| 2 migration runner | a | steps still run in memory, a throw writes nothing; the stamp-failure restore (`saveAndStamp`) is R2Persist §4 |
+| 3 lock steal | b | round-1 single-guard model (no crash inside the guard) relabelled; the current slot ladder, crashes included, is `R2Persist.Guard.ladder_mutex` / `ladder_guard_excl` / `ladder_recovers`. `fixed_mutex` docstring now says it is about the single-guard protocol only |
+| 3b heartbeat | a | same interval and git touch points; timeout now the shared `GIT_COMMAND_TIMEOUT_MS`; round 2 only warns when `T/3 + 30 s ≥ T` (R2Persist §7 `warns_iff`) |
+| 4 Postgres advisory lock | a | `withExclusiveAccess` is not in the round-2 diff |
+| 5 daily backup gate (P2, P3) | a | gate and `idsCreatedAfter` unchanged; new last-written recorders (sync pull `recordPulledCount`, migration restore) turn `ext` events into `write`s (R2Persist §7 `pull_then_snap`); `validateStore` now accepts repeated ids (P1), which the model never checked |
+| 6 outbox order | a | outbox-order.ts unchanged |
+| 7 learn-async locked re-check | a | learn-async.ts unchanged; round 2 only filters its candidates to persistable rows (R2CoreA §8) |
+| 8 packs v1 hash / registry | a | packs.ts unchanged on this branch (still v1); the fixes are PRs #1229/#1230, modelled by `PacksV2` |
+
+Mutation checks on the new §1 theorems (scratch copies): (1) `rekey` drops a held record whose
+id collides instead of re-keying it ⇒ `rekey_cover` and `r2_rekey_example` fail; (2) `pullR2`
+appends nothing after the pull (held records lost) ⇒ `r2_generalises`, `r2_no_loss`,
+`r2_no_leak` fail. Restored: clean.
+
+Lead found while re-reading §4, outside the model and NOT replayed (pre-existing at a831872b,
+not a round-2 regression): storage-postgres.ts `initSchema` takes `pg_advisory_lock` on
+`plur:init:<schema>` from the MAIN pool, unlocks best-effort (`catch { /* released with the
+session */ }`) and then calls bare `client.release()` — the pattern round 1 fixed in
+`withExclusiveAccess`: without an argument pg returns the session to the pool, so a failed
+unlock would leave a pooled session holding the init lock and another instance's
+`initSchema` waiting on it. Question for the owner: replay it with the mock pool from
+`formal-persistence-pg-unlock.test.ts` and apply `release(err)` when the unlock throws (A), or
+accept it as unreachable in practice (B)?
+
+`lake env lean PlurSpec/Persistence.lean`: clean.
+
+### Round-2 drift review lead — applied (coordinator, 2026-09-27)
+`initSchema` repeated the round-1 unlock pattern (best-effort unlock, bare `client.release()`). Replayed with the mock pool: after a failed init unlock the session went back to the pool still holding the init lock. Fixed as in `withExclusiveAccess`: a failed unlock destroys the session (`release(err)`). Test `packages/core/test/formal-gaps-pg-init-unlock.test.ts` (failed before, 2/2 after); Postgres suites 120/120 against pg16. The property is the same as candidate 5 (`PgLock.fixed_pool_never_locked`), now also for the init lock.

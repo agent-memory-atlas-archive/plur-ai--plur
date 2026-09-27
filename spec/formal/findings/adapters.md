@@ -643,3 +643,32 @@ Lean §2: `effScopeW` (unresolved session ⇒ no default);
 the original-code counterexample. Mutation (unresolved → process slot) breaks
 `unresolved_session_no_default`, `fixed_ambiguous_no_default`,
 `fixed_no_session_ignores_slot`.
+
+## Round-2 drift review (2026-09-27)
+
+Drift check flagged `Adapters.lean` after round 2 changed python `client.py`/`bridge.py`,
+hermes `bridge.py`, cli `hook-agy-pre-invocation.ts`, `hook-inject.ts`, `doctor.ts`,
+`init.ts`, `forget.ts`, mcp `tools.ts` and dsh `guard.ts`. Each section re-read against the
+current code; verdicts: (a) still holds, (b) superseded and relabelled, (c) updated and
+re-proved. Every section got a "Checked against round 2" line. No theorem changed; all
+counterexamples kept.
+
+| § | Verdict | Why |
+|---|---------|-----|
+| 1 MCP learn entry points, pinned gate | a | learn/batch/session_end still use `_resolveWriteSession` + `projectDomain`; batch still gates pinned items; round 2 changed only the refused-route wording (R2Integrations §3) |
+| 1 reported decision / warning | a | `noop` iff absorbed, queued warning iff queued; Decision A changes when core absorbs, which is `Outcome.absorbed` itself |
+| 2 session sweep, id-less end | a | `_cleanExpiredSessions` and session_end resolution not in the diff (only the checkpoint dir `PLUR_PATH ||`) |
+| 2 E7 NO_SESSION | a | `_resolveWriteSession` unchanged; round 2 extended it to plur_recall and made zero-session `plur_session_scope set` refuse (R2Integrations §3 `recall_same_rule_as_write`, `set_accepted_is_observable`) |
+| 3 hook merge | a | `mergeHooks` / `stripPlurHooks` / `isPlurHookSpec` unchanged; only the session-mark matcher widened |
+| 3 S4(2) doctor detection | a | `hasAnyPlurHook` unchanged; the healthy line now names harnesses (R2CLI §5) |
+| 4 Cursor merges | a | cursor-hooks.ts, mcp-config.ts unchanged |
+| 5 exit codes | a | feedback.ts, scopes.ts unchanged; forget.ts changed only its `--` parse |
+| 6 dsh write report | a | dsh tools.ts, learn.ts unchanged |
+| 6 S3 hard cap | a | guard.ts changed only a comment |
+| 7 bridge argv | a | both bridges still send a `-`-leading statement on stdin; `--json`/`--path` now go before a `--` (none in learn argv); recall `--` is R2Integrations §2 |
+| 7 S4(1) CLI `--` | a | plur.ts `parseGlobalFlags` and learn.ts unchanged; `--` now also in recall (R2CLI §7) and forget |
+| 8a array coercion | a | `jsonSchemaPropToZod` not in the diff |
+| 8b init-remote rewrite | a | init-remote.ts unchanged |
+| 9 `.plur.yaml` trust | a | `readTrustedProjectConfig`, `trustedWorkspaceScope`, `trustedProjectScope` calls unchanged; the hook edits are session identity/lock/turn cache (R2CLI) |
+
+`lake env lean PlurSpec/Adapters.lean`: clean.

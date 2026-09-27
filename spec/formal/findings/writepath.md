@@ -249,3 +249,25 @@ Mutation: model — `.landed, .throws => none` ⇒ `rescopeOneNew_total`/`batch_
 - Code (index.ts `_updateEngramReturning` local branch → new `_reconcileQueuedScope(stored, toWrite)`): when the STORED row carries `_outbox`, is not retired, and the update changes the scope — new scope local-family (`isLocalOnlyScope(scope, stores)`, E4-aware) → `_outbox` dropped (warning); a writable url store for the new scope → `_outbox` retargeted (`target_url`, `target_scope`, attempts reset); otherwise (no store / readonly only) → dropped with a warning. The leak guard (`_guardExplicitUpdate` against the new scope) runs first; a demotion lands on `local` and so cancels. The queue entry and the D1 `_retireRemote` entry are taken from the STORED row, never from the caller's object (a caller-set `_retireRemote` would direct a remote DELETE).
 - Model: same §2b (`update` case of `applyScopeOpD`). Mutations: retarget keeping the old target ⇒ `applyScopeOpD_inv` + `retarget_delivers` fail; local-family keeping the entry ⇒ `applyScopeOpD_inv` fails.
 - Tests: `formal-apply-core-queued-scope.test.ts` D4 cases (local-family cancel, retarget to a second url store delivered there under the new scope, leak-guard demotion cancels, readonly-only scope cancels, same-scope edit keeps the entry) — 4 failed before. Changed: `formal-writepath-outbox-scope.test.ts` "updateEngram moving a queued row to another scope…" — its precondition pinned "still queued for the team" (pre-D4); now asserts the entry is cancelled at update time; the "never POSTed to the team store" assertion is unchanged.
+
+## Round-2 drift review (2026-09-27)
+
+Drift check flagged `WritePath.lean` after round 2 changed `packages/core/src/index.ts` and
+`store/remote-store.ts` (`git diff a831872b..HEAD`). Each section re-read against the current
+code; verdicts: (a) still holds, (b) superseded and relabelled, (c) updated and re-proved.
+Every section got a "Checked against round 2" line in its docstring. No theorem changed; all
+counterexamples kept.
+
+| § | Verdict | Why |
+|---|---------|-----|
+| 1a merge-back | a | merge-back, forget's `_outbox` strip and rescope's local route are not in the round-2 diff; the flush only reloads config first and `outboxCount` = `listOutbox().length` |
+| 1a' D1 retire queue | a | `_queueRetireRemote` and the DELETE loop are unchanged; round 2 only lists these entries (`kind: 'retire'`) |
+| 1b two pushers | a | `_outboxInFlight` claim unchanged; the cross-process lease (D2/F3) is not on this branch |
+| 2 / 2b `_outbox ⇒ scope = target` | a | flush hold-back, `_reconcileQueuedScope` and D3 are unchanged; Decision A and the core-index#8 secondary-store persistence do not write a queued row's scope |
+| 3 auto-route + leak guard | a | scope-routing.ts unchanged; E1 me-only was already in the model; `_guardSensitiveScope` now reloads config on every path, which is the model's one-`Env` assumption (current-config property: R2CoreA §4 `egress_current_policy`) |
+| 3b `scope_source` on the wire | a | remote-store.ts round-2 changes (loader-marker strip, load-page errors) do not touch `appendAndGetServerId` |
+| 4 private stays local | a | the learn()/learnRouted() visibility tests and `pushKeep('shared')` are unchanged |
+| 5 tension gate, readonly | a | `hasUnresolvedTension` still fails closed; mutators still `_assertWritable()`; tensions.ts changed only `engramOrigin` |
+| 6 rescope per-id reporting | a | `_rescopeOne` / `_retireRescopedSource` unchanged (only a comment added in `rescope`) |
+
+`lake env lean PlurSpec/WritePath.lean`: clean.

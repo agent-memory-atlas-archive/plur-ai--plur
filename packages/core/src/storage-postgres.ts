@@ -552,17 +552,23 @@ export class PostgresAdapter implements StorageAdapter, AsyncPrimaryStore {
     const client = await this.acquire(this.pool)
     const key = `plur:init:${this.schema}`
     let locked = false
+    let poisoned: Error | undefined
     try {
       await client.query('SELECT pg_advisory_lock(hashtext($1))', [key])
       locked = true
       await this.initSchemaLocked(client)
     } finally {
       if (locked) {
-        // Best-effort: the session ends on release anyway, and Postgres drops
-        // session advisory locks with the session.
-        try { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]) } catch { /* released with the session */ }
+        // Same rule as withExclusiveAccess (formal verification, round-2 drift
+        // review): a bare release() returns the session to the pool, and a
+        // session advisory lock lives as long as the SESSION — so a failed
+        // unlock must destroy the session, or every later initSchema waits on
+        // the lock forever.
+        try { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]) } catch (err) {
+          poisoned = err instanceof Error ? err : new Error(String(err))
+        }
       }
-      client.release()
+      client.release(poisoned)
     }
   }
 

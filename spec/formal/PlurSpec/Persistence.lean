@@ -17,7 +17,16 @@ namespace PlurSpec.Persistence
 Three snapshots of `engrams.yaml`: the working tree `W`, `HEAD`, and the remote.
 `commitChanges` makes `HEAD = strip W` (the push-set filter, #396/#640). `git pull`
 refuses when a file it must update is dirty (`W ≠ HEAD`). The remote merge is an
-oracle `merge : List α → List α` (HEAD ↦ new HEAD). -/
+oracle `merge : List α → List α` (HEAD ↦ new HEAD).
+
+Checked against round 2 (2026-09-27): UPDATED (verdict c). `pullFixed` and its
+theorems below are the ROUND-1 model of `restoreWithheld`, which appended the held
+records verbatim. Round 2 re-keys held records whose id the pull brought (owner
+decision P1b, `rekeyHeldAgainstPulled`) and restores the saved bytes when the pulled
+file fails the loader's shape rule; the current code is `pullR2` at the end of this
+section (`r2_pulls`, `r2_no_loss`, `r2_no_leak`, `r2_rekey_no_loss`,
+`r2_rekey_no_leak`), and id-level reachability after a collision is
+`R2Persist.Restore.restore_both_reachable`. -/
 namespace Sync
 
 variable {α : Type} (keep : α → Bool)
@@ -37,7 +46,7 @@ structure Tree (α : Type) where
 def pullOld [DecidableEq α] (merge : List α → List α) (t : Tree α) : Option (Tree α) :=
   if t.work = t.head then some ⟨merge t.head, merge t.head⟩ else none
 
-/-- The fix: hold the withheld records in memory, reset the file to HEAD (clean
+/-- The round-1 fix (superseded by `pullR2`): hold the withheld records in memory, reset the file to HEAD (clean
 tree), pull, then restore — verbatim when the pull left the file alone, otherwise
 the pulled file with the held records appended. -/
 def pullFixed [DecidableEq α] (merge : List α → List α) (w : List α) : Tree α :=
@@ -64,12 +73,12 @@ theorem old_pulls_when_nothing_withheld [DecidableEq α] (merge : List α → Li
   have : strip keep w = w := List.filter_eq_self.mpr hall
   simp [pullOld, this]
 
-/-- Fixed: the pull always happens (HEAD is the merged remote). -/
+/-- Round-1 code: the pull always happens (HEAD is the merged remote). Current code: `r2_pulls`. -/
 theorem fixed_pulls [DecidableEq α] (merge : List α → List α) (w : List α) :
     (pullFixed keep merge w).head = merge (strip keep w) := by
   unfold pullFixed; split <;> rfl
 
-/-- Fixed: no record of the working tree is lost, provided the merge keeps what
+/-- Round-1 code (current code: `r2_no_loss`): no record of the working tree is lost, provided the merge keeps what
 HEAD had (a merge that deletes a committed record is the remote's decision). -/
 theorem fixed_no_loss [DecidableEq α] (merge : List α → List α) (w : List α)
     (hm : ∀ y, y ∈ strip keep w → y ∈ merge (strip keep w)) :
@@ -83,7 +92,7 @@ theorem fixed_no_loss [DecidableEq α] (merge : List α → List α) (w : List �
     · right; exact List.mem_filter.mpr ⟨hx, by simp [hk]⟩
     · left; exact hm x (List.mem_filter.mpr ⟨hx, hk⟩)
 
-/-- Fixed: nothing withheld leaks — the next commit's stripped blob is exactly the
+/-- Round-1 code (current code: `r2_no_leak`): nothing withheld leaks — the next commit's stripped blob is exactly the
 pulled HEAD (no spurious commit, no withheld record in it), provided the remote only
 ever carries push-set records. -/
 theorem fixed_no_leak [DecidableEq α] (merge : List α → List α) (w : List α)
@@ -99,13 +108,163 @@ theorem fixed_no_leak [DecidableEq α] (merge : List α → List α) (w : List �
       simp
     rw [h1, h2, List.append_nil]
 
+/-! ### Round 2 — owner decision P1b (2026-09-27): held records re-keyed against the pull
+
+Current `restoreWithheld` (sync.ts after round 2) differs from `pullFixed` in two ways:
+(1) in the changed-file branch the held records first pass through
+`rekeyHeldAgainstPulled` — a held record whose id the pull brought gets a fresh id, an
+exact copy of a pulled record is not appended twice; (2) a pulled file the loader
+refuses (`engramStoreEntries` throws) gets the saved bytes back ("not pulled"). `rk` is
+the re-keying as an oracle (pulled, held ↦ records appended), `loadable` the loader's
+verdict on the pulled file. `pullFixed` above is the special case `rk = id`,
+`loadable = true` (`r2_generalises`). The id-level reachability of both records after a
+collision is `R2Persist.Restore.restore_both_reachable`; this section keeps the
+round-1 guarantees (pull happens, nothing lost, nothing leaks) true of the current code. -/
+
+def pullR2 [DecidableEq α] (merge : List α → List α) (loadable : List α → Bool)
+    (rk : List α → List α → List α) (w : List α) : Tree α :=
+  if merge (strip keep w) = strip keep w then ⟨w, merge (strip keep w)⟩
+  else if loadable (merge (strip keep w)) then
+    ⟨merge (strip keep w) ++ rk (merge (strip keep w)) (held keep w), merge (strip keep w)⟩
+  else ⟨w, merge (strip keep w)⟩
+
+theorem r2_generalises [DecidableEq α] (merge : List α → List α) (w : List α) :
+    pullR2 keep merge (fun _ => true) (fun _ h => h) w = pullFixed keep merge w := by
+  unfold pullR2 pullFixed; split <;> rfl
+
+/-- Current code: the pull always happens. -/
+theorem r2_pulls [DecidableEq α] (merge : List α → List α) (loadable : List α → Bool)
+    (rk : List α → List α → List α) (w : List α) :
+    (pullR2 keep merge loadable rk w).head = merge (strip keep w) := by
+  unfold pullR2; split
+  · rfl
+  · split <;> rfl
+
+/-- Current code: no record of the working tree is lost — each is in the result, or
+represented there by a record `same` as it (the re-keyed copy: same engram, new id),
+provided the re-keying covers every held record the pull did not bring. -/
+theorem r2_no_loss [DecidableEq α] (merge : List α → List α) (loadable : List α → Bool)
+    (rk : List α → List α → List α) (same : α → α → Prop) (w : List α)
+    (hm : ∀ y, y ∈ strip keep w → y ∈ merge (strip keep w))
+    (hcover : ∀ x, x ∈ held keep w → x ∈ merge (strip keep w) ∨
+      ∃ y, y ∈ rk (merge (strip keep w)) (held keep w) ∧ same x y) :
+    ∀ x, x ∈ w → x ∈ (pullR2 keep merge loadable rk w).work ∨
+      ∃ y, y ∈ (pullR2 keep merge loadable rk w).work ∧ same x y := by
+  intro x hx
+  unfold pullR2
+  split
+  · exact Or.inl hx
+  · split
+    · simp only [List.mem_append]
+      cases hk : keep x
+      · rcases hcover x (List.mem_filter.mpr ⟨hx, by simp [hk]⟩) with h | ⟨y, hy, hs⟩
+        · exact Or.inl (Or.inl h)
+        · exact Or.inr ⟨y, Or.inr hy, hs⟩
+      · exact Or.inl (Or.inl (hm x (List.mem_filter.mpr ⟨hx, hk⟩)))
+    · exact Or.inl hx
+
+set_option linter.deprecated false in
+/-- Current code: nothing withheld leaks, provided the remote carries only push-set
+records and the re-keying keeps held records held (it changes ids, never scope or
+visibility). -/
+theorem r2_no_leak [DecidableEq α] (merge : List α → List α) (loadable : List α → Bool)
+    (rk : List α → List α → List α) (w : List α)
+    (hr : ∀ y, y ∈ merge (strip keep w) → keep y = true)
+    (hrk : ∀ y, y ∈ rk (merge (strip keep w)) (held keep w) → keep y = false)
+    (hl : loadable (merge (strip keep w)) = true) :
+    strip keep (pullR2 keep merge loadable rk w).work = (pullR2 keep merge loadable rk w).head := by
+  unfold pullR2
+  by_cases h : merge (strip keep w) = strip keep w
+  · rw [if_pos h]; exact h.symm
+  · rw [if_neg h, if_pos hl]
+    simp only [strip, List.filter_append]
+    have h1 : List.filter keep (merge (List.filter keep w)) = merge (List.filter keep w) :=
+      List.filter_eq_self.mpr hr
+    have h2 : List.filter keep (rk (merge (List.filter keep w)) (held keep w)) = [] := by
+      rw [List.filter_eq_nil_iff]; intro y hy; simp [hrk y hy]
+    rw [h1, h2, List.append_nil]
+
+/-- Current code: a pulled file the loader refuses leaves the working tree as it was. -/
+theorem r2_unloadable_keeps_work [DecidableEq α] (merge : List α → List α)
+    (loadable : List α → Bool) (rk : List α → List α → List α) (w : List α)
+    (hl : loadable (merge (strip keep w)) = false) :
+    (pullR2 keep merge loadable rk w).work = w := by
+  unfold pullR2; split
+  · rfl
+  · simp [hl]
+
+/-- `rekeyHeldAgainstPulled` on records `(id, content)`: an exact copy of a pulled
+record is dropped, a held record whose id the pull brought gets `fr r`, the rest are
+kept. (`R2Persist.Restore.restoreNew` is `pulled ++ rekey`.) -/
+def rekey (fr : Nat × Nat → Nat) (pulled held : List (Nat × Nat)) : List (Nat × Nat) :=
+  held.filterMap (fun r =>
+    if r ∈ pulled then none else if r.1 ∈ pulled.map (·.1) then some (fr r, r.2) else some r)
+
+/-- The re-keying covers every held record the pull did not bring: same content. -/
+theorem rekey_cover (fr : Nat × Nat → Nat) (pulled held : List (Nat × Nat)) :
+    ∀ x, x ∈ held → x ∈ pulled ∨ ∃ y, y ∈ rekey fr pulled held ∧ y.2 = x.2 := by
+  intro x hx
+  by_cases hp : x ∈ pulled
+  · exact Or.inl hp
+  · right
+    by_cases hi : x.1 ∈ pulled.map (·.1)
+    · exact ⟨(fr x, x.2), List.mem_filterMap.mpr ⟨x, hx, by simp [hp, hi]⟩, rfl⟩
+    · exact ⟨x, List.mem_filterMap.mpr ⟨x, hx, by simp [hp, hi]⟩, rfl⟩
+
+/-- The re-keying keeps held records held, when the push-set predicate ignores ids. -/
+theorem rekey_keep (kp : Nat × Nat → Bool) (hk : ∀ a b : Nat × Nat, a.2 = b.2 → kp a = kp b)
+    (fr : Nat × Nat → Nat) (pulled held : List (Nat × Nat)) (hh : ∀ x, x ∈ held → kp x = false) :
+    ∀ y, y ∈ rekey fr pulled held → kp y = false := by
+  intro y hy
+  obtain ⟨x, hx, hmap⟩ := List.mem_filterMap.mp hy
+  by_cases hp : x ∈ pulled
+  · simp [hp] at hmap
+  · by_cases hi : x.1 ∈ pulled.map (·.1)
+    · simp only [hp, hi, ↓reduceIte, Option.some.injEq] at hmap
+      subst hmap; rw [hk (fr x, x.2) x rfl]; exact hh x hx
+    · simp only [hp, hi, ↓reduceIte, Option.some.injEq] at hmap
+      subst hmap; exact hh x hx
+
+/-- **Current code (P1b), no loss:** with the real re-keying, every working-tree record
+survives the pull, or a record with its content does (under a fresh id). -/
+theorem r2_rekey_no_loss (kp : Nat × Nat → Bool) (merge : List (Nat × Nat) → List (Nat × Nat))
+    (loadable : List (Nat × Nat) → Bool) (fr : Nat × Nat → Nat) (w : List (Nat × Nat))
+    (hm : ∀ y, y ∈ strip kp w → y ∈ merge (strip kp w)) :
+    ∀ x, x ∈ w → x ∈ (pullR2 kp merge loadable (rekey fr) w).work ∨
+      ∃ y, y ∈ (pullR2 kp merge loadable (rekey fr) w).work ∧ y.2 = x.2 :=
+  r2_no_loss kp merge loadable (rekey fr) (fun x y => y.2 = x.2) w hm
+    (fun x hx => rekey_cover fr _ _ x hx)
+
+/-- **Current code (P1b), no leak:** with the real re-keying, the next commit's stripped
+blob is exactly the pulled HEAD. -/
+theorem r2_rekey_no_leak (kp : Nat × Nat → Bool) (hk : ∀ a b : Nat × Nat, a.2 = b.2 → kp a = kp b)
+    (merge : List (Nat × Nat) → List (Nat × Nat)) (loadable : List (Nat × Nat) → Bool)
+    (fr : Nat × Nat → Nat) (w : List (Nat × Nat))
+    (hr : ∀ y, y ∈ merge (strip kp w) → kp y = true)
+    (hl : loadable (merge (strip kp w)) = true) :
+    strip kp (pullR2 kp merge loadable (rekey fr) w).work = (pullR2 kp merge loadable (rekey fr) w).head :=
+  r2_no_leak kp merge loadable (rekey fr) w hr
+    (rekey_keep kp hk fr _ _ (fun x hx => by simpa [held] using (List.mem_filter.mp hx).2)) hl
+
+/-- Non-vacuity: records `(id, content)`, content ≥ 10 withheld. Local held `(2, 17)`;
+the pull brings a different `(2, 8)`. The held record comes back as `(102, 17)`. -/
+theorem r2_rekey_example :
+    (pullR2 (fun r : Nat × Nat => decide (r.2 < 10)) (fun _ => [(1, 5), (2, 8)]) (fun _ => true)
+      (rekey (fun r => 100 + r.1)) [(1, 5), (2, 17)]).work = [(1, 5), (2, 8), (102, 17)] := by
+  decide
+
 end Sync
 
 /-! ## 2. Migration runner (migrations/runner.ts `runMigrations`, `rollbackMigrations`)
 
 `createBackup` is no-clobber: an existing `.bak.<v>` is kept, whatever the live file
 now holds. Each step is an oracle `σ → Option σ` (`none` = the step threw). Steps run
-on an in-memory copy; the live file is written only after all succeed. -/
+on an in-memory copy; the live file is written only after all succeed.
+
+Checked against round 2 (2026-09-27): still holds because runner.ts still runs every
+step in memory and writes nothing when one throws; round 2 only replaced the final
+`saveEngrams` + `setSchemaVersion` pair with `saveAndStamp`, which restores the corpus
+if the stamp fails — that later step is `R2Persist` §4 (`fixed_consistent`). -/
 namespace Migration
 
 variable {σ : Type}
@@ -167,7 +326,19 @@ end Migration
 Processes are `Nat`s. `lock` is the token in `<file>.lock` (the holder's id). A
 process is `dead` (liveness probe = false) forever and never acts. `hold p` = p is in
 the critical section. `claim p = some (h, x)`: p renamed the lock aside, having judged
-`h` stale; the moved file actually carried `x`. -/
+`h` stale; the moved file actually carried `x`.
+
+Checked against round 2 (2026-09-27): SUPERSEDED (verdict b). This is the ROUND-1
+model of the ROUND-1 code: ONE steal guard file (`<lock>.steal`), in a model where a
+process holding the guard never dies (`gAcq` needs `dead p = false` and nothing ever
+removes a guard it does not own). The round-1 code did remove a guard abandoned by a
+crashed stealer, by an unguarded read-then-unlink, and that double fault reopened the
+two-holder race — outside this model. Round 2 replaced the guard with a ladder of
+slots keyed by the judged token (`acquireStealSlot`, `clearStealSlots`, sync twin
+`stealLockSync`); the current code, crashes included, is
+`R2Persist.Guard.ladder_mutex` / `ladder_guard_excl` / `ladder_recovers`.
+`fixed_mutex` below is a claim about the single-guard protocol only; `old_two_holders`
+stays as the record of the pre-guard race. -/
 namespace Lock
 
 def upd {β : Type} (f : Nat → β) (p : Nat) (v : β) : Nat → β :=
@@ -225,7 +396,8 @@ theorem old_two_holders :
       [.judge 1 9, .judge 2 9, .rename 1, .finish 1, .acq 1, .rename 2, .acq 3, .finish 2]).map
       (fun s => (s.hold 1, s.hold 3)) = some (true, true) := by decide
 
-/-! ### The fix: a guard serializes stealers, and the lock is re-read under it. -/
+/-! ### The round-1 fix (single guard, no crash inside it): a guard serializes stealers,
+and the lock is re-read under it. Superseded by the round-2 ladder, `R2Persist` §1. -/
 
 inductive FStep (dead : Nat → Bool) : LS → LS → Prop
   | acq (p : Nat) (s : LS) : dead p = false → s.lock = none →
@@ -352,9 +524,10 @@ theorem reach_inv (dead : Nat → Bool) (s0 s : LS) (h0 : Inv dead s0) (hr : Rea
   | refl => exact h0
   | step s s' _ hs ih => exact inv_step dead s s' ih hs
 
-/-- **Mutual exclusion (fixed protocol):** from any state satisfying the invariant —
-in particular a dead holder's lock and nobody inside — at most one process is ever in
-the critical section. -/
+/-- **Mutual exclusion (round-1 single-guard protocol, no crash inside the guard):**
+from any state satisfying the invariant — in particular a dead holder's lock and nobody
+inside — at most one process is ever in the critical section. Not a claim about the
+current code; see `R2Persist.Guard.ladder_mutex`. -/
 theorem fixed_mutex (dead : Nat → Bool) (s0 s : LS) (h0 : Inv dead s0) (hr : Reach dead s0 s)
     (p q : Nat) (hp : s.hold p = true) (hq : s.hold q = true) : p = q := by
   have hi := reach_inv dead s0 s h0 hr
@@ -368,7 +541,7 @@ theorem init0_inv : Inv dead9 init0 := by
   · intro p h hh; exact absurd hh (by simp [init0])
   · intro p h x hc; exact absurd hc (by simp [init0])
 
-/-- Non-vacuity: under the fixed protocol the dead holder's lock IS stolen and a live
+/-- Non-vacuity (round-1 protocol): the dead holder's lock IS stolen and a live
 process gets in. -/
 theorem fixed_steal_reachable :
     ∃ s, Reach dead9 init0 s ∧ s.hold 1 = true := by
@@ -394,7 +567,14 @@ end Lock
 
 A contender that cannot probe the holder (another host) steals iff the lock's
 age exceeds `T` (staleThreshold). Time in whole units; `age` = time since the
-lock file was last touched. -/
+lock file was last touched.
+
+Checked against round 2 (2026-09-27): still holds because `startHeartbeat` still
+touches every `max(1, floor(T/3))` ms and sync.ts `git()` still calls
+`heartbeatHeldLocks()` before each command, now with the timeout from the shared
+`GIT_COMMAND_TIMEOUT_MS` (30 s, = `B` here). Round 2 only added a one-time warning when
+`T/3 + 30 s ≥ T` (`R2Persist` §7 `warns_iff`), i.e. when `sync_age_bound`'s bound is
+not below the threshold. -/
 namespace Heartbeat
 
 /-- Pre-fix: the file is touched only at acquisition (time 0). -/
@@ -452,7 +632,14 @@ end Heartbeat
 
 A checkout ends in `release()` (back to idle) or `release(err)` (destroyed). The
 advisory lock belongs to the session. `unlockOk` is the oracle outcome of
-`pg_advisory_unlock`. -/
+`pg_advisory_unlock`.
+
+Checked against round 2 (2026-09-27): still holds because `withExclusiveAccess` is not
+in the round-2 diff of storage-postgres.ts (which changed `save`/`updateMany` duplicate
+handling, `R2Persist` §2/§3b): the lock session is still destroyed with
+`release(poisoned)` whenever the unlock may not have happened. (Outside this model:
+`initSchema` still ends with a bare `client.release()` after a best-effort unlock whose
+comment says the session ends on release — see findings/persistence.md.) -/
 namespace PgLock
 
 /-- Where the session ends up: `some locked?` = back in the pool (with its lock
@@ -480,7 +667,15 @@ end PgLock
 
 The shrink gate refuses a snapshot when `count < 0.9 · last_good_count`
 (`count * 10 < last * 9` in ℕ); `last_good_count` is written ONLY by a successful
-snapshot. -/
+snapshot.
+
+Checked against round 2 (2026-09-27): still holds because the gate and
+`idsCreatedAfter` are not in the round-2 diff of backup.ts, and `saveEngrams` still
+records the last-written count (P2, `write` below). Round 2 added two more PLUR writes
+that record it — a sync pull that rewrote the file (`recordPulledCount`, `R2Persist`
+§7 `pull_then_snap`) and the migration runner's restore — which only move events from
+`ext` to `write`, and made `validateStore` accept repeated ids (P1, resolved by the
+loader, `R2Persist` §3b), which the model never checked. -/
 namespace Backup
 
 structure BState where
@@ -607,7 +802,10 @@ end Backup
 
 Modelled: the permutation property (nothing vanishes, nothing doubles). Left out: the
 edge-order and stability properties of the Kahn loop — covered by the randomized
-property test `formal-persistence-outbox-order.test.ts` (300 random DAGs), not proved. -/
+property test `formal-persistence-outbox-order.test.ts` (300 random DAGs), not proved.
+
+Checked against round 2 (2026-09-27): still holds because outbox-order.ts has no
+round-2 change; `_flushOutboxClaimed` still orders the pending rows through it. -/
 namespace Outbox
 
 /-- Old shape, keyed by id: the emitted ids are looked up in a last-wins map. -/
@@ -655,7 +853,12 @@ end Outbox
 /-! ## 7. Dedup UPDATE/MERGE vs `commitment: locked` (learn-async.ts `executeDedupDecision`)
 
 `pre` is the snapshot read before the store lock (`getById`), `cur` the row re-read
-under it. A write is allowed only on an unlocked row. -/
+under it. A write is allowed only on an unlocked row.
+
+Checked against round 2 (2026-09-27): still holds because learn-async.ts has no
+round-2 change; round 2 only narrowed the candidates index.ts hands it to rows the
+writer can persist (Decision A follow-up, `R2CoreA` §8 `async_target_persistable`),
+which does not touch the locked re-check. -/
 namespace LearnAsync
 
 structure Row where
@@ -691,7 +894,12 @@ end LearnAsync
 The hash is `H(SKILL.md ‖ engrams.yaml)` for ANY hash oracle `H` — so it can only be
 as injective as the unframed concatenation, which is not. A missing file hashes as an
 empty one. The registry is keyed by manifest name; pack directories by source
-basename. -/
+basename.
+
+Checked against round 2 (2026-09-27): still holds because packs.ts has no change on
+this branch since a831872b — it still hashes v1 and keys the registry by name. The
+fixes (hash v2, directory-keyed registry) are in separate PRs #1229/#1230, modelled by
+`PacksV2`; these theorems stay as the record of v1. -/
 namespace Packs
 
 /-- `computePackHash` for an arbitrary hash oracle; `none` = file absent. -/

@@ -21,7 +21,13 @@ Code: `learn()` remote branch (fire-and-forget push, hand-off on success),
 
 A row is abstracted to the two facts the protocol reads: does it carry
 `_outbox`, and is it retired. `stillQueued` is exactly flushOutbox's
-selection predicate (`_outbox && status !== 'retired'`). -/
+selection predicate (`_outbox && status !== 'retired'`).
+
+Checked against round 2 (2026-09-27): still holds because the merge-back (learn()'s
+hand-off and the flush's fresh-row re-check through `Plur._stillQueued`), forget()'s
+`_outbox` strip and rescope's local route are not in the round-2 diff of index.ts.
+Round 2 touched the flush only to reload the config first (core-index#9) and made
+`outboxCount` count `listOutbox()` (push AND retire entries); neither changes a merge. -/
 
 structure Row where
   queued  : Bool   -- carries structured_data._outbox
@@ -113,7 +119,13 @@ When the push LANDED and the fresh row is no longer queued (forget/rescope
 cancelled it during the push), the kept row now also carries a durable
 "retire on remote" entry (`structured_data._retireRemote`, server id + target):
 the second component below. Same code sites as `mergeNew` (learn()'s hand-off
-and the flush merge-back filter). -/
+and the flush merge-back filter).
+
+Checked against round 2 (2026-09-27): still holds because `_queueRetireRemote` and the
+flush's retire loop (DELETE; 2xx/404-410 finish, failure keeps the entry with one more
+attempt) are unchanged; round 2 only made `listOutbox`/`outboxCount` (and MCP
+plur_outbox) show these entries as `kind: 'retire'` (R2Integrations §3
+`pending_counts_every_listed`). -/
 
 def mergeD1 (snap fresh : Row) (pushOk : Bool) : Option (Row × Bool) :=
   if stillQueued fresh then
@@ -184,7 +196,12 @@ Pushers: `L` = learn()'s fire-and-forget push (in flight from the moment the
 row is written), `F` = a flushOutbox() that snapshots while L may be active.
 `guarded` = the fix: F selects only rows not in `_outboxInFlight`, and claims
 what it selects. A finished push that succeeds is one delivery to the remote
-(the POST was on the wire whatever the local state) and hands the row off. -/
+(the POST was on the wire whatever the local state) and hands the row off.
+
+Checked against round 2 (2026-09-27): still holds because the `_outboxInFlight` claim
+is unchanged (learn() adds before its push and deletes in `finally`; the flush selects
+only unclaimed rows and claims them). The cross-process outbox lease (D2/F3) is NOT on
+this branch, so the in-process scope of this theorem is still the whole guarantee. -/
 
 inductive Pusher where
   | L | F
@@ -277,7 +294,10 @@ Code: `updateEngram()` local branch (writes the caller's row, `scope`
 included, leaves `_outbox`), `applyMutation` in cross-scope recurrence
 (`isSharedScope(e.scope) ⇒ e.scope := 'global'`), `rescope()` local route
 (drops `_outbox`), and the flush push (POST body `scope: engram.scope` to the
-store of `_outbox.target_scope`). Scopes are an abstract type. -/
+store of `_outbox.target_scope`). Scopes are an abstract type.
+
+Checked against round 2 (2026-09-27): still holds because the flush's scope/target
+hold-back (`engram.scope !== outbox.target_scope` → NOT pushed) is unchanged. -/
 
 structure QRow (Scope : Type) where
   scope  : Scope
@@ -345,7 +365,14 @@ whose scope changes (`_reconcileQueuedScope`): local-family new scope → cancel
 a writable url store for it → retarget; otherwise → cancel (the leak guard has
 already run; a demotion lands on `local`, a local-family scope). Cross-scope
 recurrence leaves a queued row's scope alone. `localFam`/`writable` are config
-oracles. -/
+oracles.
+
+Checked against round 2 (2026-09-27): still holds because `_reconcileQueuedScope` and
+`_recordCrossScopeRecurrence`'s D3 skip for queued rows are unchanged. Round 2's new
+scope-adjacent writes do not change a queued row's scope: Decision A only decides
+WHICH hit may absorb a write (and none into a writable-remote scope,
+`_crossScopeRecurrenceApplies`, R2CoreA §5b), and the secondary-store duplicate
+persistence (core-index#8) writes `write_count`/`sources` only. -/
 
 def applyScopeOpD {Scope : Type} [DecidableEq Scope] (localFam writable : Scope → Bool) :
     ScopeOp Scope → QRow Scope → QRow Scope
@@ -421,7 +448,16 @@ REMOTE-backed one skipped unless it is the user's own `/me` namespace —
 same `decideAutoRoute`), then the guard: a scope that leaves the machine
 (`isSharedScope ∨ _isRemoteBackedScope`) with an offending hit → `local`.
 `unscoped_default` is `z.enum(['local','global'])` (schemas/config.ts).
-Classification predicates and the scanner are oracles. -/
+Classification predicates and the scanner are oracles.
+
+Checked against round 2 (2026-09-27): still holds because scope-routing.ts has no
+round-2 change and `_guardSensitiveScope`'s resolve → route → guard order,
+`_refuseRemotePersonalAutoRoute` (E1 me-only, already modelled here) and
+`_isRemoteBackedScope` (= `leaves` for URL stores; readonly ones included, which can
+only demote more) are unchanged. Round 2 made the function reload the config at its
+top on EVERY path (core-index#9), so one `Env` snapshot now really governs resolve
+and guard for explicit writes too — the model's assumption; the current-config
+property itself is R2CoreA §4 `egress_current_policy`. -/
 
 inductive Src where
   | explicit | session | default | routed
@@ -647,7 +683,11 @@ theorem old_routed_into_remote_personal :
 /-! ### 3b. `scope_source` on the wire (core-policy#11)
 
 store/remote-store.ts `appendAndGetServerId`: the body carries `scope_source`
-from `structured_data._scopeSource`, which `updateEngram` lets a caller set. -/
+from `structured_data._scopeSource`, which `updateEngram` lets a caller set.
+
+Checked against round 2 (2026-09-27): still holds because the round-2 diff of
+remote-store.ts (loader-marker strip in `salvageRemoteRow`, load-page error handling)
+does not touch `appendAndGetServerId`'s `SCOPE_SOURCES` filter. -/
 
 def validSources : List String := ["explicit", "session", "default", "routed"]
 
@@ -678,7 +718,12 @@ Code: learn() remote branch (`remoteDriver && context?.visibility === 'private'`
 → local, #90); learnRouted() remote route (no visibility check on main;
 fixed: `!remoteDriver || context?.visibility === 'private'` → local route);
 sync.ts `pushKeep('shared')` (`isSharedScope ∧ (visibility ?? 'private') ≠ 'private'`).
-Resolved visibility defaults to private (#401, schema default). -/
+Resolved visibility defaults to private (#401, schema default).
+
+Checked against round 2 (2026-09-27): still holds because learn()'s
+`remoteDriver && context?.visibility === 'private'` and learnRouted()'s
+`!remoteDriver || context?.visibility === 'private'` local-route tests and sync.ts
+`pushKeep('shared')` are unchanged. -/
 
 inductive Vis where
   | priv | pub | template
@@ -726,7 +771,13 @@ theorem default_private_diverges :
 Code: `hasUnresolvedTension` (try `loadTensions` … catch), consumed by
 `applyMutation`'s commitment ladder (`decided → locked` unless blocked);
 `loadTensions` returns [] for a missing file and THROWS for an unreadable one
-(#794 F1). Readonly: `_assertWritable()` at the top of each public mutator. -/
+(#794 F1). Readonly: `_assertWritable()` at the top of each public mutator.
+
+Checked against round 2 (2026-09-27): still holds because `hasUnresolvedTension`
+still returns true from its catch (fail closed) and the tension mutators still start
+with `_assertWritable()`. tensions.ts changed only `engramOrigin` /
+`measuredUnderGateApplies` (R2CoreB §1), not `loadTensions`' missing-vs-unreadable
+split. -/
 
 inductive TRead where
   | missing
@@ -790,7 +841,12 @@ theorem old_readonly_writes (file newFile : Nat) :
 Code: `rescope` loops `_rescopeOne` over the ids; the remote route pushes
 (`appendAndGetServerId`), then `_retireRescopedSource` (unless keep_local).
 Environment outcomes per id: the push fails or lands; the local retire
-succeeds, throws (store unwritable), or finds the row gone/already retired. -/
+succeeds, throws (store unwritable), or finds the row gone/already retired.
+
+Checked against round 2 (2026-09-27): still holds because `_rescopeOne`'s remote route
+(per-id error result carrying the server id when the retire throws) and
+`_retireRescopedSource` are unchanged; the only round-2 edit in `rescope` is a comment
+on the case-sensitive local-family test. -/
 
 inductive PushR where
   | fail | landed
