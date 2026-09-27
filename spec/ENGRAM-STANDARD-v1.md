@@ -1075,9 +1075,14 @@ uninstalling either leaves the other with none. (Found by the formal
 verification of the reference, plur-ai/plur#1228.)
 
 > **Reference note.** The reference keys entries by install directory, in an
-> additive `dir` field. An entry written before `dir` existed is matched by
-> `name`, and is claimed or removed on behalf of a directory only when no other
-> installed directory carries the same manifest name.
+> additive `dir` field, using the directory's name as the filesystem lists it
+> (so a case-insensitive filesystem cannot split a directory from its entry).
+> An entry written before `dir` existed is matched by `name`, and is claimed or
+> removed on behalf of a directory only when no other installed directory could
+> own it — one that carries the same manifest name and does not already own a
+> `dir` entry (install staging directories are not candidates). An entry that
+> two directories could own is left alone and reported as unverified for both,
+> since nothing records which pack it belongs to.
 
 A registry entry SHOULD carry `integrity_installed` (§5.5.1), `creator`, the
 resolved target scope (§5.6.3), and a pointer to the engram membership required

@@ -2115,6 +2115,9 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // without re-verification (§5.5): `ok` then means "unchanged since
             // the migration", not "matches what was installed".
             ...(p.baseline ? { baseline: p.baseline } : {}),
+            // true when the pack's only registry row is a legacy row another
+            // same-name pack could own; integrity_status is then 'unverified'.
+            ...(p.registry_ambiguous ? { registry_ambiguous: true } : {}),
             installed_at: p.installed_at,
             source: p.source,
           })),

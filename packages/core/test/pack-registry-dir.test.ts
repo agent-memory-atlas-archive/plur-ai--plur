@@ -10,7 +10,7 @@
  * leaving the other `unverified` — tamper detection silently lost.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import yaml from 'js-yaml'
@@ -159,5 +159,124 @@ describe('integrity migration follows the directory key (stacked on sha256:v2)',
     expect(after['pack-one']).toMatch(/^sha256:v2:/)
     expect(after['pack-two']).toMatch(/^sha256:[0-9a-f]{64}$/)
     expect(status()).toEqual({ 'pack-one': 'ok', 'pack-two': 'modified' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Audit of #1230.
+
+/** Strip `dir` from the row for `dir`: the row an older version wrote. */
+function makeRowLegacy(dir: string): void {
+  const regPath = join(packs, 'registry.yaml')
+  const reg = yaml.load(readFileSync(regPath, 'utf8')) as { packs: Row[] }
+  for (const r of reg.packs) if (r.dir === dir) delete r.dir
+  writeFileSync(regPath, yaml.dump(reg))
+}
+
+describe('a legacy row next to a new same-name dir row is not ambiguous (finding 1)', () => {
+  // pack-one was installed by an older version (legacy row, no `dir`); pack-two,
+  // same manifest name, was installed since and owns a `dir` row. pack-two
+  // cannot own the legacy row, so it is pack-one's and nobody else's.
+  beforeEach(async () => {
+    await installPack(packs, source('pack-one', 'shared-name', 'First.'))
+    makeRowLegacy('pack-one')
+    await installPack(packs, source('pack-two', 'shared-name', 'Second.'))
+    expect(rows().map(r => r.dir ?? '(legacy)').sort()).toEqual(['(legacy)', 'pack-two'])
+  })
+
+  it('reinstall upgrades the legacy row in place (2 rows, not 3)', async () => {
+    await installPack(packs, join(tmp, 'src', 'pack-one'))
+    expect(rows().map(r => r.dir).sort()).toEqual(['pack-one', 'pack-two'])
+    expect(status()).toEqual({ 'pack-one': 'ok', 'pack-two': 'ok' })
+  })
+
+  it('migrate treats the legacy row as pack-one\'s', async () => {
+    const { computePackHash, migratePackIntegrity } = await import('../src/packs.js')
+    const regPath = join(packs, 'registry.yaml')
+    const reg = yaml.load(readFileSync(regPath, 'utf8')) as { packs: Row[] }
+    const legacy = reg.packs.find(r => r.dir === undefined)!
+    legacy.integrity = `sha256:${computePackHash(join(packs, 'pack-one'))}`
+    writeFileSync(regPath, yaml.dump(reg))
+    const by = Object.fromEntries(migratePackIntegrity(packs).packs.map(p => [p.dir, p.action]))
+    expect(by['pack-one']).toBe('migrated')
+  })
+
+  it('uninstall removes the legacy row and leaves pack-two\'s', () => {
+    uninstallPack(packs, 'pack-one')
+    expect(rows().map(r => r.dir)).toEqual(['pack-two'])
+    expect(status()).toEqual({ 'pack-two': 'ok' })
+  })
+
+  it('a leftover staging copy does not make the legacy row ambiguous', async () => {
+    const { cpSync } = await import('node:fs')
+    rmSync(join(packs, 'pack-two'), { recursive: true, force: true })
+    cpSync(join(packs, 'pack-one'), join(packs, 'pack-one.installing-1-2'), { recursive: true })
+    cpSync(join(packs, 'pack-one'), join(packs, 'pack-x.replacing-1-2'), { recursive: true })
+    uninstallPack(packs, 'pack-one')
+    expect(rows().map(r => r.dir)).toEqual(['pack-two'])
+  })
+})
+
+describe('a legacy row shared by two directories (findings 3 and 4)', () => {
+  // The state the original defect left: one legacy row, two directories. It
+  // belongs to one of them and nothing says which.
+  beforeEach(async () => {
+    await installPack(packs, source('pack-one', 'shared-name', 'First.'))
+    await installPack(packs, source('pack-two', 'shared-name', 'Second.'))
+    const regPath = join(packs, 'registry.yaml')
+    const reg = yaml.load(readFileSync(regPath, 'utf8')) as { packs: Row[] }
+    reg.packs = [reg.packs.find(r => r.dir === 'pack-two')!]
+    delete reg.packs[0].dir
+    writeFileSync(regPath, yaml.dump(reg))
+  })
+
+  it('listPacks reports both unverified, not one of them modified', () => {
+    expect(status()).toEqual({ 'pack-one': 'unverified', 'pack-two': 'unverified' })
+    for (const p of listPacks(packs)) expect(p.registry_ambiguous).toBe(true)
+  })
+
+  it('migrate skips both as skipped-ambiguous-legacy-row and leaves the row alone', async () => {
+    const { migratePackIntegrity } = await import('../src/packs.js')
+    const before = readFileSync(join(packs, 'registry.yaml'))
+    const by = Object.fromEntries(migratePackIntegrity(packs).packs.map(p => [p.dir, p.action]))
+    expect(by).toEqual({ 'pack-one': 'skipped-ambiguous-legacy-row', 'pack-two': 'skipped-ambiguous-legacy-row' })
+    expect(readFileSync(join(packs, 'registry.yaml')).equals(before)).toBe(true)
+  })
+
+  it('reinstalling each pack resolves it: both get their own rows', async () => {
+    await installPack(packs, join(tmp, 'src', 'pack-one'))
+    await installPack(packs, join(tmp, 'src', 'pack-two'))
+    const dirs = rows().map(r => r.dir ?? '(legacy)').sort()
+    expect(dirs).toContain('pack-one')
+    expect(dirs).toContain('pack-two')
+    expect(status()).toEqual({ 'pack-one': 'ok', 'pack-two': 'ok' })
+  })
+})
+
+describe('case-insensitive filesystems: the row follows the directory (finding 2)', () => {
+  const caseInsensitive = (() => {
+    const d = mkdtempSync(join(tmpdir(), 'plur-case-probe-'))
+    try {
+      writeFileSync(join(d, 'CaseProbe'), '')
+      return existsSync(join(d, 'caseprobe'))
+    } finally {
+      rmSync(d, { recursive: true, force: true })
+    }
+  })()
+
+  it.skipIf(!caseInsensitive)('uninstall spelled in another case removes the directory AND its row', async () => {
+    await installPack(packs, source('pack-one', 'n1'))
+    await installPack(packs, source('other', 'n2'))
+    uninstallPack(packs, 'PACK-ONE')
+    expect(existsSync(join(packs, 'pack-one'))).toBe(false)
+    expect(rows().map(r => r.dir)).toEqual(['other'])
+  })
+
+  it.skipIf(!caseInsensitive)('install from a case-variant source over an existing pack replaces its row', async () => {
+    await installPack(packs, source('pack-one', 'n1'))
+    await installPack(packs, source('Pack-One', 'n1'))
+    expect(rows().map(r => r.dir)).toEqual(['pack-one'])
+    expect(readdirSync(packs).filter(e => e.toLowerCase() === 'pack-one')).toEqual(['pack-one'])
+    expect(status()).toEqual({ 'pack-one': 'ok' })
   })
 })

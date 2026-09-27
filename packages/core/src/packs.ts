@@ -296,14 +296,23 @@ function findRegistryRowIndex(entries: RegistryEntry[], dir: string, name: strin
 }
 
 /**
- * Other install directories whose manifest carries `name`. A legacy row (no
- * `dir`) with that name could belong to any of them, so it is only claimed or
- * removed on behalf of `dir` when this is empty.
+ * Other install directories whose manifest carries `name` and that could own a
+ * legacy row (no `dir`) with that name. A legacy row is claimed or removed on
+ * behalf of `dir` only when this is empty.
+ *
+ * Two kinds of directory are NOT candidates (audit of #1230, finding 1):
+ *   - one that already owns a `dir` row: its baseline is that row, so a legacy
+ *     row cannot be its. Counting it made a legacy row next to a newer
+ *     same-name install "ambiguous", so the legacy pack could never be
+ *     reinstalled in place, migrated, or uninstalled cleanly.
+ *   - a transient staging (`*.installing-*`) or displaced (`*.replacing-*`)
+ *     directory, which is not a pack at all.
  */
-function otherDirsNamed(packsDir: string, dir: string, name: string): string[] {
+function otherDirsNamed(packsDir: string, dir: string, name: string, entries: RegistryEntry[]): string[] {
   if (!fs.existsSync(packsDir)) return []
+  const owned = new Set(entries.map(e => e.dir).filter((d): d is string => d !== undefined))
   return fs.readdirSync(packsDir).filter(e => {
-    if (e === dir) return false
+    if (e === dir || owned.has(e) || isTransientPackDir(e)) return false
     const d = path.join(packsDir, e)
     try {
       if (!fs.statSync(d).isDirectory()) return false
@@ -317,7 +326,31 @@ function ownedRegistryRowIndex(packsDir: string, entries: RegistryEntry[], dir: 
   const idx = findRegistryRowIndex(entries, dir, name)
   if (idx < 0 || entries[idx].dir === dir) return idx
   // A legacy row matched by name: only if no other installed directory could own it.
-  return otherDirsNamed(packsDir, dir, name!).length === 0 ? idx : -1
+  return otherDirsNamed(packsDir, dir, name!, entries).length === 0 ? idx : -1
+}
+
+/**
+ * The name `name` has in the packs directory's own listing. On a
+ * case-insensitive filesystem `PACK-ONE` opens `pack-one`, but a row keyed by
+ * `dir` must carry the name the directory actually has, or the row and the
+ * directory part ways: uninstall removed the directory and kept its row, and a
+ * reinstall from a case-variant source added a second row (audit of #1230,
+ * finding 2). Returns `name` unchanged when nothing on disk answers to it.
+ */
+function onDiskEntryName(packsDir: string, name: string): string {
+  if (!fs.existsSync(packsDir)) return name
+  const listing = fs.readdirSync(packsDir)
+  if (listing.includes(name)) return name
+  let target: fs.Stats
+  try { target = fs.statSync(path.join(packsDir, name)) } catch { return name }
+  for (const e of listing) {
+    if (e.toLowerCase() !== name.toLowerCase()) continue
+    try {
+      const st = fs.statSync(path.join(packsDir, e))
+      if (st.ino === target.ino && st.dev === target.dev) return e
+    } catch { /* vanished */ }
+  }
+  return name
 }
 
 function addToRegistry(packsDir: string, entry: RegistryEntry & { dir: string }): void {
@@ -1351,7 +1384,10 @@ function _installPackDir(
   const sourceName = rawName === FLAT_ARCHIVE_DIRNAME && manifestName && /^[A-Za-z0-9._-]+$/.test(manifestName)
     ? manifestName
     : rawName
-  const destDir = resolveInside(packsDir, sourceName, 'install')
+  // The name the directory already has, if a case-variant of it is installed
+  // on a case-insensitive filesystem: the swap below then keeps that name and
+  // the registry row follows the directory (audit of #1230, finding 2).
+  const destDir = resolveInside(packsDir, onDiskEntryName(packsDir, sourceName), 'install')
 
   // STAGE the whole install, then swap it in (#813, audit finding 12).
   //
@@ -1600,8 +1636,11 @@ export interface UninstallResult {
 }
 
 export function uninstallPack(packsDir: string, name: string): UninstallResult {
-  // Find the pack — try exact name, then case-insensitive
-  let packDir = resolveInside(packsDir, name, 'uninstall')
+  // Find the pack — try exact name, then case-insensitive. Either way the
+  // directory is addressed by the name it has ON DISK, so the registry row
+  // keyed by it is found (audit of #1230, finding 2).
+  resolveInside(packsDir, name, 'uninstall')
+  let packDir = resolveInside(packsDir, onDiskEntryName(packsDir, name), 'uninstall')
   if (!fs.existsSync(packDir)) {
     // Try case-insensitive scan
     const entries = fs.existsSync(packsDir) ? fs.readdirSync(packsDir) : []
@@ -1676,6 +1715,15 @@ export interface PackInfo {
    */
   baseline?: 'carried-from-v1'
   /**
+   * `true` when the only registry row for this pack is a legacy row (no
+   * `dir`) that another installed directory with the same manifest name could
+   * equally own — the state the pre-`dir` registry left when two same-name
+   * packs were installed. `integrity_status` is then `'unverified'`: which pack
+   * the recorded value belongs to cannot be told. Reinstalling the pack gives
+   * it a row of its own.
+   */
+  registry_ambiguous?: true
+  /**
    * Why this pack could not be read, when it could not (audit 2026-08-03,
    * finding 13). A damaged pack is listed with what is known about it rather
    * than aborting the listing or appearing as a healthy pack with 0 engrams.
@@ -1692,6 +1740,13 @@ export function listPacks(packsDir: string): PackInfo[] {
     const idx = findRegistryRowIndex(registry, dir, name)
     return idx >= 0 ? registry[idx] : undefined
   }
+  // A legacy row that another installed directory could equally own is not
+  // this pack's baseline to verify against: comparing an untouched pack with
+  // its same-name neighbour's hash reported a false `modified`, while migrate
+  // called the same row ambiguous (audit of #1230, finding 3). Report it as
+  // unanswerable, the same verdict migration reaches.
+  const ambiguous = (dir: string, name: string, reg: RegistryEntry | undefined): boolean =>
+    reg !== undefined && reg.dir === undefined && otherDirsNamed(packsDir, dir, name, registry).length > 0
 
   const result: PackInfo[] = []
   for (const entry of fs.readdirSync(packsDir)) {
@@ -1701,7 +1756,9 @@ export function listPacks(packsDir: string): PackInfo[] {
 
     try {
       const pack = loadPack(packDir)
-      const reg = rowFor(entry, pack.manifest.name)
+      const matched = rowFor(entry, pack.manifest.name)
+      const registryAmbiguous = ambiguous(entry, pack.manifest.name, matched)
+      const reg = registryAmbiguous ? undefined : matched
       // Compared in the version the registry recorded: a v1 row from before
       // `sha256:v2:` still verifies as it did (§5.5). The reported value is
       // always v2, the current form.
@@ -1719,6 +1776,7 @@ export function listPacks(packsDir: string): PackInfo[] {
         ...(reg?.integrity_carried_from === 'v1' && INTEGRITY_V2_RE.test(reg.integrity)
           ? { baseline: 'carried-from-v1' as const }
           : {}),
+        ...(registryAmbiguous ? { registry_ambiguous: true as const } : {}),
       })
     } catch (manifestErr) {
       // Per-pack fallback: the manifest would not load, so report what can
@@ -2638,7 +2696,7 @@ export function migratePackIntegrity(
     // either pack's baseline: leave it alone rather than guess.
     const idx = findRegistryRowIndex(entries, dir, name)
     const row = idx >= 0 ? entries[idx] : undefined
-    if (row && row.dir === undefined && otherDirsNamed(packsDir, dir, name).length > 0) {
+    if (row && row.dir === undefined && otherDirsNamed(packsDir, dir, name, entries).length > 0) {
       report.packs.push({ dir, name, action: 'skipped-ambiguous-legacy-row' })
       continue
     }
