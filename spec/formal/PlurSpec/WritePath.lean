@@ -292,7 +292,12 @@ theorem handoff_never_drops_owed_retire (t : Nat) (snap : TRow) (c : TConc) (ret
     (h : tFlushGated t snap c retireDone ok = none) : snap.retire = false ∨ retireDone = true := by
   cases hs : snap.retire <;> cases retireDone <;> simp_all [tFlushGated]
 
-/-! ### 1b. Two pushers, one row: at most one successful delivery
+/-! ### 1b. Two pushers, one row: at most one successful delivery (per process)
+
+Scope: ONE process. `_outboxInFlight` is in-memory, so this section says
+nothing about two processes flushing one store; that gap was a real
+counterexample before decision D2 (`pre_lease_cross_process_double_delivery`)
+and is closed by the on-disk lease, §1c (`leased_at_most_once_across_processes`).
 
 Pushers: `L` = learn()'s fire-and-forget push (in flight from the moment the
 row is written), `F` = a flushOutbox() that snapshots while L may be active.
@@ -369,7 +374,8 @@ theorem inv_run (s : PState) (evs : List Ev) (h : Inv s) : Inv (run true s evs) 
     exact ih _ (inv_step s e h)
 
 /-- With the in-flight claim, every interleaving of learn()'s push and a
-flush delivers the engram to the remote at most once. -/
+flush IN ONE PROCESS delivers the engram to the remote at most once. Across
+processes see §1c. -/
 theorem guarded_at_most_once (evs : List Ev) : (run true init evs).delivered ≤ 1 := by
   have h := inv_run init evs inv_init
   obtain ⟨_, h2, h3⟩ := h
@@ -389,6 +395,338 @@ while learn()'s push is in flight POSTs the engram a second time. -/
 theorem unguarded_double_delivery :
     (run false init [.startF, .finish .L true, .finish .F true]).delivered = 2 := by
   decide
+
+/-! ### 1c. Decision D2: an on-disk lease — at most once ACROSS processes
+
+`guarded_at_most_once` (§1b) is per process: `_outboxInFlight` is an in-memory
+set. Two processes flushing one store (an MCP server and a CLI hook) share only
+the store file, so before the lease both selected the same queued row and both
+POSTed it (`pre_lease_cross_process_double_delivery`, replayed in
+`formal-outbox-lease.test.ts`).
+
+Code (`outbox-lease.ts`, `_flushOutboxClaimed`, learn()'s remote branch):
+- `take p` — under the store lock, p selects the row only when it is queued and
+  `leaseFree` (unleased, its own lease, or an expired one), and records
+  `_outboxLease = (p, now + T)`. learn() writes the row born leased.
+- `start p` — the network call, only while `now + M ≤ until` (`canStartPush`).
+- `finish p ok` — POST outcome plus merge-back: a success is one delivery and
+  hands the row off; either way p's own lease is dropped (`dropOwnLease`).
+- `abandon p` — the lease ran short before the row's turn: released, not pushed.
+- `crash p` — the process dies; its lease stays on disk until it expires.
+- `tick d` — time passes. A push still unanswered `M` after it started has
+  failed (the request is bounded, 30 s ≪ `M`); the process is back to holding
+  its lease, to abandon or retry.
+
+Processes are any type with decidable equality (any number of them). Retire
+DELETEs (`_retireRemote`) use the same lease and the same selection, so
+`delivered` stands for either network effect. Stated assumptions: one clock
+(skew within `M`, see `outbox-lease.ts`), and `finish` is atomic — a process
+killed after the remote accepted but before its merge-back is the
+at-least-once edge the single-process path already has. -/
+
+inductive Phase where
+  | idle
+  | leased (expiry : Nat)
+  | pushing (start expiry : Nat)
+  deriving DecidableEq, Repr
+
+structure LState (P : Type) where
+  now       : Nat
+  queued    : Bool
+  lease     : Option (P × Nat)
+  phase     : P → Phase
+  delivered : Nat
+
+inductive LEv (P : Type) where
+  | take (p : P)
+  | start (p : P)
+  | finish (p : P) (ok : Bool)
+  | abandon (p : P)
+  | crash (p : P)
+  | tick (d : Nat)
+
+section Lease
+variable {P : Type} [DecidableEq P]
+
+def upd (f : P → Phase) (p : P) (v : Phase) : P → Phase := fun q => if q = p then v else f q
+
+/-- `leaseFree` in `outbox-lease.ts`. `leased = false` is the pre-lease code. -/
+def leaseFree (leased : Bool) (l : Option (P × Nat)) (p : P) (now : Nat) : Bool :=
+  !leased || match l with
+    | none => true
+    | some (q, e) => decide (q = p) || decide (e ≤ now)
+
+/-- `dropOwnLease`: only the holder's own lease is released. -/
+def dropOwn (l : Option (P × Nat)) (p : P) : Option (P × Nat) :=
+  match l with
+  | some (q, e) => if q = p then none else some (q, e)
+  | none => none
+
+def lstep (leased : Bool) (T M : Nat) (s : LState P) : LEv P → LState P
+  | .take p =>
+      if s.phase p = .idle ∧ s.queued = true ∧ leaseFree leased s.lease p s.now = true then
+        { s with lease := some (p, s.now + T), phase := upd s.phase p (.leased (s.now + T)) }
+      else s
+  | .start p =>
+      match s.phase p with
+      | .leased u => if s.now + M ≤ u then { s with phase := upd s.phase p (.pushing s.now u) } else s
+      | _ => s
+  | .finish p ok =>
+      match s.phase p with
+      | .pushing _ _ =>
+          { s with phase := upd s.phase p .idle, lease := dropOwn s.lease p,
+                   queued := if ok then false else s.queued,
+                   delivered := if ok then s.delivered + 1 else s.delivered }
+      | _ => s
+  | .abandon p =>
+      match s.phase p with
+      | .leased _ => { s with phase := upd s.phase p .idle, lease := dropOwn s.lease p }
+      | _ => s
+  | .crash p => { s with phase := upd s.phase p .idle }
+  | .tick d =>
+      { s with now := s.now + d,
+               phase := fun q => match s.phase q with
+                 | .pushing st u => if s.now + d < st + M then .pushing st u else .leased u
+                 | ph => ph }
+
+def lrun (leased : Bool) (T M : Nat) (s : LState P) (evs : List (LEv P)) : LState P :=
+  evs.foldl (lstep leased T M) s
+
+/-- A queued row, nobody holding it, at time 0. -/
+def linit : LState P := { now := 0, queued := true, lease := none, phase := fun _ => .idle, delivered := 0 }
+
+def LInv (M : Nat) (s : LState P) : Prop :=
+  (s.lease.isSome = true → s.queued = true) ∧
+  (s.queued = true → s.delivered = 0) ∧
+  (s.queued = false → s.delivered = 1) ∧
+  (∀ p u, s.phase p = .leased u → s.lease = some (p, u) ∨ u ≤ s.now) ∧
+  (∀ p st u, s.phase p = .pushing st u → s.lease = some (p, u) ∧ st + M ≤ u ∧ s.now < st + M)
+
+omit [DecidableEq P] in
+theorem linv_init (M : Nat) : LInv M (linit : LState P) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp [linit]
+
+omit [DecidableEq P] in
+/-- At most one process is mid-push: both would hold the one lease. -/
+theorem pushing_unique (M : Nat) (s : LState P) (h : LInv M s) (p q : P) (a b c d : Nat)
+    (hp : s.phase p = .pushing a b) (hq : s.phase q = .pushing c d) : p = q := by
+  have h1 := (h.2.2.2.2 p a b hp).1
+  have h2 := (h.2.2.2.2 q c d hq).1
+  rw [h1] at h2
+  cases h2; rfl
+
+theorem linv_step (T M : Nat) (hM : 0 < M) (s : LState P) (e : LEv P) (h : LInv M s) :
+    LInv M (lstep true T M s e) := by
+  obtain ⟨hL, hQ, hN, hLe, hPu⟩ := h
+  cases e with
+  | take p =>
+    simp only [lstep]
+    split
+    · rename_i hg
+      obtain ⟨hidle, hq, hfree⟩ := hg
+      refine ⟨fun _ => hq, fun h => hQ h, fun h => by simp_all, ?_, ?_⟩
+      · intro q u hqu
+        simp only [upd] at hqu
+        by_cases hqp : q = p
+        · subst hqp; simp at hqu; subst hqu; left; rfl
+        · simp [hqp] at hqu
+          rcases hLe q u hqu with h1 | h1
+          · right
+            rw [h1] at hfree
+            simp [leaseFree, hqp] at hfree
+            exact hfree
+          · right; exact h1
+      · intro q st u hqu
+        simp only [upd] at hqu
+        by_cases hqp : q = p
+        · subst hqp; simp at hqu
+        · simp [hqp] at hqu
+          obtain ⟨h1, h2, h3⟩ := hPu q st u hqu
+          rw [h1] at hfree
+          simp [leaseFree, hqp] at hfree
+          omega
+    · exact ⟨hL, hQ, hN, hLe, hPu⟩
+  | start p =>
+    simp only [lstep]
+    split
+    · rename_i u hpu
+      split
+      · rename_i hle
+        have hlp : s.lease = some (p, u) := by
+          rcases hLe p u hpu with h1 | h1
+          · exact h1
+          · omega
+        refine ⟨hL, hQ, hN, ?_, ?_⟩
+        · intro q v hqv
+          simp only [upd] at hqv
+          by_cases hqp : q = p
+          · subst hqp; simp at hqv
+          · simp [hqp] at hqv; exact hLe q v hqv
+        · intro q st v hqv
+          simp only [upd] at hqv
+          by_cases hqp : q = p
+          · subst hqp; simp at hqv; obtain ⟨h1, h2⟩ := hqv; subst h1; subst h2
+            exact ⟨hlp, hle, by simp; omega⟩
+          · simp [hqp] at hqv; exact hPu q st v hqv
+      · exact ⟨hL, hQ, hN, hLe, hPu⟩
+    · exact ⟨hL, hQ, hN, hLe, hPu⟩
+  | finish p ok =>
+    simp only [lstep]
+    split
+    · rename_i a b hpu
+      obtain ⟨hlp, _, _⟩ := hPu p a b hpu
+      have hq : s.queued = true := hL (by simp [hlp])
+      have hd : s.delivered = 0 := hQ hq
+      have hdrop : dropOwn s.lease p = none := by simp [hlp, dropOwn]
+      refine ⟨?_, ?_, ?_, ?_, ?_⟩
+      · simp [hdrop]
+      · cases ok <;> simp_all
+      · cases ok <;> simp_all
+      · intro q u hqu
+        simp only [upd] at hqu
+        by_cases hqp : q = p
+        · subst hqp; simp at hqu
+        · simp [hqp] at hqu
+          rcases hLe q u hqu with h1 | h1
+          · rw [hlp] at h1; cases h1; exact absurd rfl hqp
+          · right; exact h1
+      · intro q st u hqu
+        simp only [upd] at hqu
+        by_cases hqp : q = p
+        · subst hqp; simp at hqu
+        · simp [hqp] at hqu
+          have := (hPu q st u hqu).1
+          rw [hlp] at this; cases this; exact absurd rfl hqp
+    · exact ⟨hL, hQ, hN, hLe, hPu⟩
+  | abandon p =>
+    simp only [lstep]
+    split
+    · rename_i u hpu
+      refine ⟨?_, hQ, hN, ?_, ?_⟩
+      · intro hs; apply hL
+        cases hl : s.lease with
+        | none => simp [hl, dropOwn] at hs
+        | some x => rfl
+      · intro q v hqv
+        simp only [upd] at hqv
+        by_cases hqp : q = p
+        · subst hqp; simp at hqv
+        · simp [hqp] at hqv
+          rcases hLe q v hqv with h1 | h1
+          · left; simp [h1, dropOwn, hqp]
+          · right; exact h1
+      · intro q st v hqv
+        simp only [upd] at hqv
+        by_cases hqp : q = p
+        · subst hqp; simp at hqv
+        · simp [hqp] at hqv
+          obtain ⟨h1, h2, h3⟩ := hPu q st v hqv
+          exact ⟨by simp [h1, dropOwn, hqp], h2, h3⟩
+    · exact ⟨hL, hQ, hN, hLe, hPu⟩
+  | crash p =>
+    simp only [lstep]
+    refine ⟨hL, hQ, hN, ?_, ?_⟩
+    · intro q v hqv
+      simp only [upd] at hqv
+      by_cases hqp : q = p
+      · subst hqp; simp at hqv
+      · simp [hqp] at hqv; exact hLe q v hqv
+    · intro q st v hqv
+      simp only [upd] at hqv
+      by_cases hqp : q = p
+      · subst hqp; simp at hqv
+      · simp [hqp] at hqv; exact hPu q st v hqv
+  | tick d =>
+    simp only [lstep]
+    refine ⟨hL, hQ, hN, ?_, ?_⟩
+    · intro q v hqv
+      simp only at hqv
+      split at hqv
+      · rename_i st u hpu
+        split at hqv
+        · simp at hqv
+        · simp at hqv; subst hqv
+          left; exact (hPu q st u hpu).1
+      · rename_i hnp
+        rcases hLe q v hqv with h1 | h1
+        · left; exact h1
+        · right; simp; omega
+    · intro q st v hqv
+      simp only at hqv
+      split at hqv
+      · rename_i st' u hpu
+        split at hqv
+        · rename_i hlt
+          simp at hqv; obtain ⟨h1, h2⟩ := hqv; subst h1; subst h2
+          obtain ⟨h1, h2, _⟩ := hPu q st' u hpu
+          exact ⟨h1, h2, by simp; omega⟩
+        · simp at hqv
+      · simp_all
+
+theorem linv_run (T M : Nat) (hM : 0 < M) (s : LState P) (evs : List (LEv P)) (h : LInv M s) :
+    LInv M (lrun true T M s evs) := by
+  induction evs generalizing s with
+  | nil => simpa [lrun] using h
+  | cons e es ih =>
+    simp only [lrun, List.foldl_cons]
+    exact ih _ (linv_step T M hM s e h)
+
+/-- Decision D2: with the lease, for ANY number of processes, any lease length
+`T`, any margin `M > 0`, and EVERY interleaving of takes, pushes, failures,
+abandons, crashes and clock ticks, the remote receives the engram at most once. -/
+theorem leased_at_most_once_across_processes (T M : Nat) (hM : 0 < M) (evs : List (LEv P)) :
+    (lrun true T M (linit : LState P) evs).delivered ≤ 1 := by
+  obtain ⟨_, hQ, hN, _, _⟩ := linv_run T M hM linit evs (linv_init M)
+  cases hq : (lrun true T M (linit : LState P) evs).queued
+  · have := hN hq; omega
+  · have := hQ hq; omega
+
+/-- A live foreign lease is honoured: while `q` holds an unexpired lease, `take`
+by anyone else changes nothing. -/
+theorem live_foreign_lease_blocks (T M : Nat) (s : LState P) (p q : P) (e : Nat)
+    (hpq : p ≠ q) (hl : s.lease = some (q, e)) (hlive : s.now < e) :
+    lstep true T M s (.take p) = s := by
+  have : leaseFree true s.lease p s.now = false := by
+    simp [leaseFree, hl, Ne.symm hpq]; omega
+  simp [lstep, this]
+
+/-- A crashed holder does not block forever: once its lease has expired, an
+idle process takes the queued row. -/
+theorem expired_lease_taken_over (T M : Nat) (s : LState P) (p q : P) (e : Nat)
+    (hq : s.queued = true) (hidle : s.phase p = .idle) (hl : s.lease = some (q, e)) (hexp : e ≤ s.now) :
+    (lstep true T M s (.take p)).lease = some (p, s.now + T) ∧
+    (lstep true T M s (.take p)).phase p = .leased (s.now + T) := by
+  have : leaseFree true s.lease p s.now = true := by simp [leaseFree, hl, hexp]
+  simp [lstep, hidle, hq, this, upd]
+
+/-- The lease is released on merge-back, success or failure: after `finish`, the
+finisher holds no lease on the row. -/
+theorem finish_releases_lease (T M : Nat) (s : LState P) (h : LInv M s) (p : P) (ok : Bool)
+    (a b : Nat) (hpu : s.phase p = .pushing a b) :
+    (lstep true T M s (.finish p ok)).lease = none := by
+  have hlp := (h.2.2.2.2 p a b hpu).1
+  simp [lstep, hpu, hlp, dropOwn]
+
+/-- Non-vacuity (two processes, `Bool` as ids, T = 10, M = 2): the leased
+protocol delivers; a holder that crashed before pushing is taken over after its
+lease expires and the row is delivered once; a failed push is retried. -/
+theorem leased_delivers :
+    (lrun true 10 2 (linit : LState Bool) [.take true, .start true, .finish true true]).delivered = 1 ∧
+    (lrun true 10 2 (linit : LState Bool)
+      [.take true, .crash true, .take false, .tick 10, .take false, .start false, .finish false true]).delivered = 1 ∧
+    (lrun true 10 2 (linit : LState Bool)
+      [.take true, .start true, .finish true false, .take false, .start false, .finish false true]).delivered = 1 := by
+  decide
+
+/-- Counterexample on the PRE-LEASE code (the cross-process gap left open by
+`guarded_at_most_once`, replayed as the first test of
+`formal-outbox-lease.test.ts`): two processes each select the row and each POST it. -/
+theorem pre_lease_cross_process_double_delivery :
+    (lrun false 10 2 (linit : LState Bool)
+      [.take true, .take false, .start true, .start false, .finish true true, .finish false true]).delivered = 2 := by
+  decide
+
+end Lease
 
 /-! ## 2. Invariant `_outbox ⇒ scope = _outbox.target_scope` (core-index#3)
 

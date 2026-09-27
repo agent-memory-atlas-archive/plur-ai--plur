@@ -32,6 +32,7 @@ import { autoSummary } from './summary.js'
 import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack, containsEmail } from './packs.js'
 import type { ExportOptions } from './packs.js'
 import { learnContextContent, engramContentFields } from './content-fields.js'
+import { newLeaseHolder, makeLease, leaseFree, canStartPush, dropOwnLease, OUTBOX_LEASE_KEY, OUTBOX_LEASE_TTL_MS } from './outbox-lease.js'
 export { LEARN_CONTEXT_FIELD_ROLES, LEARN_CONTENT_FIELDS, learnContextContent, engramContentFields } from './content-fields.js'
 // SP5 imports (deferred — vault-export, registry not yet merged)
 // import { exportVault, type VaultExportOptions, type VaultExportResult } from './vault-export.js'
@@ -1510,9 +1511,18 @@ export class Plur {
    * skips them: without this, a flush that started while learn()'s immediate
    * push was in flight selected the same row (attempt_count 0) and POSTed it
    * again, so the remote got the engram twice (formal WritePath, candidate 1).
-   * In-process only: two PROCESSES flushing one store can still both push.
+   * In-process only; across processes the on-disk lease below does the same
+   * job (decision D2).
    */
   private _outboxInFlight = new Set<string>()
+  /**
+   * This instance's holder id for on-disk outbox leases (`_outboxLease`,
+   * decision D2, `outbox-lease.ts`). A pusher records a lease on each row
+   * before its network call, under the store lock; a pusher in ANOTHER process
+   * skips a row with a live foreign lease. Per instance, so two `Plur`s on one
+   * store exclude each other exactly as two processes do.
+   */
+  private readonly _outboxLeaseHolder = newLeaseHolder()
   /**
    * What the ambiguity guards (#831 forget, #850 feedback) may conclude from a
    * store's cache WITHOUT a network call (core-index#7, round 2).
@@ -3553,6 +3563,9 @@ export class Plur {
               attempt_count: 0,
               last_error: '',
             },
+            // Decision D2: the push below starts at once, so the row is born
+            // leased — a flush in another process never sees it unleased.
+            [OUTBOX_LEASE_KEY]: makeLease(this._outboxLeaseHolder, Date.now()),
           }
         }
         // Incremental write (#740): append the new engram; on a store without
@@ -3600,9 +3613,14 @@ export class Plur {
               // Targeted read (#827): only this engram's outbox bookkeeping.
               const fresh = await this._loadTargeted([engram.id])
               const target = fresh.find(e => e.id === engram.id) as any
+              // Decision D2: release this push's lease with the outcome.
+              const leaseDropped = !!target?.structured_data
+                && dropOwnLease(target.structured_data, this._outboxLeaseHolder)
               if (target?.structured_data?._outbox) {
                 target.structured_data._outbox.last_error = (err as Error).message
                 target.structured_data._outbox.attempt_count = 1
+              }
+              if (target && (leaseDropped || target.structured_data?._outbox)) {
                 // Incremental write (#740): only the outbox bookkeeping changed.
                 await this._updateEngrams(fresh, [target as Engram])
               }
@@ -3642,7 +3660,10 @@ export class Plur {
                       server_id: serverId,
                     }, new Date().toISOString())
                   : false
-                if (queuedRetire) await this._updateEngrams(fresh, [fresh[idx]])
+                // Decision D2: the push is over — release its lease.
+                const sdKept = (fresh[idx] as any).structured_data as Record<string, unknown> | undefined
+                const leaseDropped = !!sdKept && dropOwnLease(sdKept, this._outboxLeaseHolder)
+                if (queuedRetire || leaseDropped) await this._updateEngrams(fresh, [fresh[idx]])
                 logger.warning(
                   `[plur:outbox] ${engram.id} reached the remote${serverId ? ` as ${serverId}` : ''} after its delivery `
                   + (retargeted
@@ -6733,7 +6754,9 @@ export class Plur {
    *   - otherwise (no store, or only a readonly one) → cancelled, with a warning.
    * The queue entry is read from the STORED row, never the caller's object,
    * and so is `_retireRemote` (decision D1) — a caller-set value of either
-   * would otherwise direct a push or a remote DELETE. Mutates `toWrite`.
+   * would otherwise direct a push or a remote DELETE. Likewise the outbox
+   * lease `_outboxLease` (decision D2): a caller-set one could park a row or
+   * release another process's claim. Mutates `toWrite`.
    */
   private _reconcileQueuedScope(stored: Engram, toWrite: Engram): void {
     const storedSd = (stored as any).structured_data as Record<string, unknown> | undefined
@@ -6741,6 +6764,9 @@ export class Plur {
     let changed = false
     if (storedSd && '_retireRemote' in storedSd) { sd._retireRemote = storedSd._retireRemote; changed = true }
     else if ('_retireRemote' in sd) { delete sd._retireRemote; changed = true }
+    // Decision D2: the outbox lease is the pusher's, never the caller's.
+    if (storedSd && OUTBOX_LEASE_KEY in storedSd) { sd[OUTBOX_LEASE_KEY] = storedSd[OUTBOX_LEASE_KEY]; changed = true }
+    else if (OUTBOX_LEASE_KEY in sd) { delete sd[OUTBOX_LEASE_KEY]; changed = true }
     const pending = storedSd?._outbox as { target_url?: string; target_scope?: string } | undefined
     if (pending && stored.status !== 'retired' && toWrite.scope !== stored.scope) {
       changed = true
@@ -8501,31 +8527,60 @@ export class Plur {
     // without this a long-running process flushed against the config it
     // started with (core-index#9, round 2).
     this.reloadConfigIfChanged()
-    const engrams = await this._primaryStore.load()
-    // #766: skip retired engrams — a retired engram must not be pushed to the
-    // remote and resurrected. The cancel-outbox path in forget() strips _outbox
-    // on retirement; this guard is belt-and-suspenders for any path that retires
-    // without explicitly cancelling (e.g. direct YAML edits, older client versions).
-    // Also skip rows another pusher in this process is delivering right now
-    // (learn()'s immediate push, a concurrent flush) — pushing them again is a
-    // duplicate on the remote.
-    const pending = engrams.filter(e =>
-      Plur._stillQueued(e) && !this._outboxInFlight.has(e.id)
-    )
-    for (const e of pending) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
-    // Decision D1: queued "retire on remote" entries — retired or rescoped
-    // rows whose remote copy was accepted after the delivery was cancelled.
-    // A row can carry both (audit of #1228, finding 1: retargeted to another
-    // store while the push to the old one was in flight) — it is claimed by
-    // THIS flush through `pending`, so it is not skipped as in flight: the old
-    // copy is retired here, before the push to the new store below.
-    const pendingClaimed = new Set(pending.map(e => e.id))
-    const retiring = engrams.filter(e =>
-      !!(e as any).structured_data?._retireRemote
-      && (!this._outboxInFlight.has(e.id) || pendingClaimed.has(e.id))
-    )
-    for (const e of retiring) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
+    // Decision D2: select AND lease under the store lock, so of two processes
+    // flushing this store the second to take the lock sees the first's leases.
+    const holder = this._outboxLeaseHolder
+    const leaseTakenAt = Date.now()
+    const leaseUntil = leaseTakenAt + OUTBOX_LEASE_TTL_MS
+    let engrams: Engram[] = []
+    let pending: Engram[] = []
+    let retiring: Engram[] = []
+    await this._withStoreLock(this.paths.engrams, async () => {
+      engrams = await this._primaryStore.load()
+      // A row another pusher is delivering right now is not ours to push: in
+      // this process (`_outboxInFlight`: learn()'s immediate push, a
+      // concurrent flush) or in another one (a live foreign lease). Pushing it
+      // again is a duplicate on the remote.
+      const free = (e: Engram) =>
+        !this._outboxInFlight.has(e.id) && leaseFree((e as any).structured_data, holder, leaseTakenAt)
+      // #766: skip retired engrams — a retired engram must not be pushed to the
+      // remote and resurrected. The cancel-outbox path in forget() strips _outbox
+      // on retirement; this guard is belt-and-suspenders for any path that retires
+      // without explicitly cancelling (e.g. direct YAML edits, older client versions).
+      pending = engrams.filter(e => Plur._stillQueued(e) && free(e))
+      for (const e of pending) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
+      // Decision D1: queued "retire on remote" entries — retired or rescoped
+      // rows whose remote copy was accepted after the delivery was cancelled.
+      // A row can carry both (audit of #1228, finding 1: retargeted to another
+      // store while the push to the old one was in flight) — it is claimed by
+      // THIS flush through `pending`, so it is not skipped as in flight: the
+      // old copy is retired here, before the push to the new store below.
+      const pendingClaimed = new Set(pending.map(e => e.id))
+      retiring = engrams.filter(e =>
+        !!(e as any).structured_data?._retireRemote && (pendingClaimed.has(e.id) || free(e))
+      )
+      for (const e of retiring) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
+      const leased = [...pending, ...retiring]
+      for (const e of leased) {
+        ;(e as any).structured_data = { ...(e as any).structured_data, [OUTBOX_LEASE_KEY]: makeLease(holder, leaseTakenAt) }
+      }
+      // Incremental write (#740): only the lease changed on these rows.
+      await this._updateEngrams(engrams, leased)
+    })
     if (pending.length === 0 && retiring.length === 0) return { flushed: 0, failed: 0, expired_warnings: [] }
+    /** Ids this flush leased — each one's lease is released in the merge-back. */
+    const leasedIds = new Set([...pending, ...retiring].map(e => e.id))
+    /**
+     * Decision D2: start a push/retire only while enough of the lease remains
+     * for it and the merge-back to finish inside it. A row left over stays
+     * queued, unpushed, for the next flush.
+     */
+    let leaseRanOut = 0
+    const leaseStillCovers = (): boolean => {
+      if (canStartPush(leaseUntil, Date.now())) return true
+      leaseRanOut++
+      return false
+    }
 
     // #863: push supersedes TARGETS before the engrams that supersede them.
     //
@@ -8592,6 +8647,7 @@ export class Plur {
     type RetireEntry = { target_url: string; target_scope: string; server_id: string; queued_at: string; last_attempt: string; attempt_count: number; last_error: string }
     const retireOutcome = new Map<string, { serverId: string; next: RetireEntry | undefined }>()
     for (const row of retiring) {
+      if (!leaseStillCovers()) continue
       const entry = (row as any).structured_data._retireRemote as RetireEntry
       const storeEntry = (this.config.stores ?? []).find(
         s => s.url && s.scope === entry.target_scope && normalizeEndpointUrl(s.url) === normalizeEndpointUrl(entry.target_url),
@@ -8730,6 +8786,7 @@ export class Plur {
       const cleanEngram = { ...engram } as any
       const sd = { ...(cleanEngram.structured_data ?? {}) }
       delete sd._outbox
+      delete sd[OUTBOX_LEASE_KEY]
       if (Object.keys(sd).length === 0) {
         delete cleanEngram.structured_data
       } else {
@@ -8816,6 +8873,8 @@ export class Plur {
         ;(cleanEngram as any).relations = { ...sd, supersedes: remapped }
       }
 
+      // Decision D2: the last check before the network call.
+      if (!leaseStillCovers()) continue
       try {
         const pushed = await driver.appendAndGetServerId(cleanEngram)
         // #863: remember the mapping so a later engram in this same flush can
@@ -8872,7 +8931,15 @@ export class Plur {
     // a pin, a local rescope. The flush only ever mutates outbox metadata, the
     // demotion marker, and (for a demotion) scope/visibility — so those are
     // what it writes back, and nothing else.
-    if (flushed > 0 || failed > 0) {
+    if (leaseRanOut > 0) {
+      expired_warnings.push(
+        `${leaseRanOut} queued ${leaseRanOut === 1 ? 'entry was' : 'entries were'} not attempted: this flush's lease `
+        + `ran short before ${leaseRanOut === 1 ? 'its' : 'their'} turn. Still queued; the next flush retries.`,
+      )
+    }
+    // Always merge when anything was leased: the leases are released here even
+    // when nothing was attempted (cooldown, lease ran short).
+    if (flushed > 0 || failed > 0 || leasedIds.size > 0) {
       const consideredIds = new Set(pending.map(e => e.id))
       const retiredAt = new Date().toISOString()
       const survivorsById = new Map(
@@ -8948,6 +9015,15 @@ export class Plur {
             const fSd = { ...((e as any).structured_data as Record<string, unknown>) }
             if (r.next) fSd._retireRemote = r.next
             else delete fSd._retireRemote
+            return { ...e, structured_data: Object.keys(fSd).length > 0 ? fSd : undefined } as Engram
+          })
+          // Decision D2: release this flush's leases — success, failure or not
+          // attempted alike. Only our own: a row whose lease meanwhile passed
+          // to another holder (ours expired) keeps theirs.
+          .map(e => {
+            if (!leasedIds.has(e.id)) return e
+            const fSd = { ...((e as any).structured_data as Record<string, unknown> | undefined ?? {}) }
+            if (!dropOwnLease(fSd, holder)) return e
             return { ...e, structured_data: Object.keys(fSd).length > 0 ? fSd : undefined } as Engram
           })
         // The dropped engrams are the ones the remote accepted — a deliberate

@@ -271,3 +271,37 @@ counterexamples kept.
 | 6 rescope per-id reporting | a | `_rescopeOne` / `_retireRescopedSource` unchanged (only a comment added in `rescope`) |
 
 `lake env lean PlurSpec/WritePath.lean`: clean.
+
+## Decision D2 applied (2026-09-27, branch `formal/outbox-lease`) — on-disk outbox lease
+
+The owner first accepted the cross-process gap of candidate 1 (2026-09-26, "a full fix changes the outbox row's persisted format"), then chose to ship format changes as separate PRs. This is that PR (`spec/formal/issues/outbox-lease.md`).
+
+- Format (additive): `structured_data._outboxLease = { holder, expires_at }`. New module `packages/core/src/outbox-lease.ts` (`leaseFree`, `canStartPush`, `dropOwnLease`, TTL 10 min, margin 2 min). Rows without the field are unleased; older clients ignore it.
+- `_flushOutboxClaimed` (index.ts): selection now happens UNDER the store lock and records a lease on every row it will push or retire (`_retireRemote` too); rows with a live foreign lease are skipped; a push/retire starts only while `canStartPush`; the merge-back releases this flush's own leases (success, failure, or not attempted) and runs whenever anything was leased. The pushed copy never carries the lease.
+- `learn()` remote branch: the row is written already leased (the push starts at once); the failure bookkeeping and the cancelled-during-push hand-off release it.
+- `content-fields.ts`: `_outboxLease` added to `PLUR_BOOKKEEPING_KEYS` (never scanned as content, stripped from pack exports). `_reconcileQueuedScope` keeps the stored lease and drops a caller-supplied one.
+
+Model (§1c of `PlurSpec/WritePath.lean`): processes of any type with decidable equality; events take / start / finish ok|fail / abandon / crash / tick. Invariant `LInv` (`linv_init`, `linv_step`, `linv_run`), `pushing_unique`.
+- `leased_at_most_once_across_processes` — for any number of processes, any TTL, any margin > 0 and every interleaving, the remote receives the engram at most once.
+- `live_foreign_lease_blocks`, `expired_lease_taken_over` (a crashed holder does not block forever), `finish_releases_lease`.
+- `leased_delivers` (non-vacuity: delivery; takeover after a crash; retry after a failed push).
+- `pre_lease_cross_process_double_delivery` — the pre-lease counterexample (two processes, two deliveries). `guarded_at_most_once` (§1b) is kept and now says "per process".
+- Assumptions, stated in the model and in `outbox-lease.ts`: one clock (skew within the margin); a push unanswered for the margin has failed (requests are bounded at 30 s); `finish` (remote accept + merge-back) is atomic — a kill between the two re-delivers after the TTL, the at-least-once edge the single-process path already had.
+
+Replay: `npx vitest run packages/core/test/formal-outbox-lease.test.ts` — two `Plur` instances on one directory (separate in-memory claims, one store file), the in-process HTTP stub counting POSTs/DELETEs, one POST held open on the stub while the other instance runs.
+```
+# before (base verify/formal-lean):
+#  × two processes flushing concurrently push a queued row at most once — B pushed a row A holds a live lease on: expected 1 to be +0
+#  × a flush in another process skips a row whose learn() push is in flight — expected undefined to be truthy
+#  × a crashed holder does not block forever … — expected 1 to be +0
+#  × retire-on-remote entries honour a live foreign lease … — expected 1 to be +0
+#  × the lease is bookkeeping, never content … — expected false to be true
+#  Tests 5 failed | 3 passed (8)
+# after: Tests 8 passed (8)
+```
+
+Mutation checks:
+- Model (scratch copies): `leaseFree` ignoring the lease ⇒ `linv_step`, `live_foreign_lease_blocks`, `leased_delivers` fail; no expiry takeover ⇒ `expired_lease_taken_over` (and `linv_step`, `leased_delivers`) fail; no margin check on `start` ⇒ `linv_step` fails; an overdue push not timed out ⇒ `linv_step` fails; `finish` keeping the lease ⇒ `finish_releases_lease`, `linv_step`, `leased_delivers` fail.
+- Code: the flush's lease filter disabled (`true || leaseFree(…)`) ⇒ 4 of 8 lease tests fail; restored ⇒ 8 passed.
+
+Not done: an older client that does not know the lease still pushes a leased row (the lease protects between clients that know it). `listOutbox()` does not show who holds a lease.

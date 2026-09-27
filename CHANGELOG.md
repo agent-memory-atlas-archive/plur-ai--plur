@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Two processes flushing one store no longer both push the same engram
+
+The outbox claim that stops a write being delivered twice was in-memory, so two
+processes sharing a store (say the MCP server and a CLI hook) could each flush
+the same queued write and the team store received it twice. A flush now takes
+an on-disk lease on each row before it pushes (`structured_data._outboxLease`:
+holder id and expiry, recorded under the store lock); another process skips a
+row with a live lease, the lease is released when the flush records its
+outcome, and an expired lease is taken over, so a crashed process holds its
+rows for at most ten minutes. The same applies to queued remote retirements.
+The field is additive: rows without it behave as before, and an older client
+ignores it. (Decision D2.)
+
 ### PGLite recall reports its fusion score
 
 With `PLUR_BACKEND=pglite`, hybrid recall returned no top score, and the opt-in
