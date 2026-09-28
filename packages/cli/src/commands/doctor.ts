@@ -17,6 +17,7 @@ import {
   readConfig,
 } from '../mcp-config.js'
 import { hasPlurCursorHooks, readCursorHooksConfig } from '../cursor-hooks.js'
+import { isPlurHookCommand } from '../lib/hook-command.js'
 import { hasPlurCodexHooks, readCodexHooksConfig } from '../codex-hooks.js'
 import { hasPlurAgyHooks, readAgyHooksConfig } from '../antigravity-hooks.js'
 import { codexHome } from '../mcp-config.js'
@@ -214,7 +215,8 @@ function hasAnyPlurHook(config: Record<string, unknown>): boolean {
   for (const entries of Object.values(hooks)) {
     for (const entry of entries) {
       for (const h of entry.hooks ?? []) {
-        if (h.command && (h.command.includes('@plur-ai/cli') || h.command.includes('.plur/bin/plur-hook'))) return true
+        // Both slash styles, quoted or not — the same matcher init uses (#1267).
+        if (h.command && isPlurHookCommand(h.command)) return true
       }
     }
   }

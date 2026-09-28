@@ -33,7 +33,7 @@ function allCommands(settings: Settings): string[] {
   return Object.values(settings.hooks ?? {}).flatMap((entries) => entries.flatMap((e) => e.hooks.map((h) => h.command)))
 }
 
-describe('plur init on win32 with a home dir containing a space (#1267)', () => {
+describe('plur init on win32 with a home dir containing a space (#1267)', { timeout: 60000 }, () => {
   let home: string
 
   beforeEach(() => {
@@ -131,7 +131,32 @@ describe('plur init on win32 with a home dir containing a space (#1267)', () => 
   })
 })
 
-describe('plur init on darwin/linux output is unchanged (#1267)', () => {
+describe('plur doctor sees Windows hooks (#1267)', { timeout: 60000 }, () => {
+  let home: string
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'Test User-')) })
+  afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+
+  it.each([
+    ['unquoted backslash (older init)', 'C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd hook-inject'],
+    ['quoted backslash (this init)', '"C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd" hook-inject'],
+  ])('reports hooksInstalled for a %s hook', (_label, command) => {
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command }] }] },
+    }, null, 2))
+    let stdout: string
+    try {
+      stdout = execFileSync(process.execPath, ['--import', WIN32_PRELOAD, CLI, 'doctor', '--no-handshake', '--json'], {
+        encoding: 'utf-8', timeout: 30000, env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home,
+      })
+    } catch (err: any) {
+      stdout = err.stdout?.toString() ?? ''
+    }
+    expect(JSON.parse(stdout).hooksInstalled).toBe(true)
+  })
+})
+
+describe('plur init on darwin/linux output is unchanged (#1267)', { timeout: 60000 }, () => {
   let home: string
   beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'plur-init-posix-')) })
   afterEach(() => { rmSync(home, { recursive: true, force: true }) })

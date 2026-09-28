@@ -17,6 +17,8 @@ twice** (#1267). Three separate faults:
   appended another hook set. It now normalises slashes, quotes and case. Re-run
   `plur init` once: it removes the duplicated, unquoted hooks older versions
   wrote and leaves exactly one set per event. Your own hooks are untouched.
+  `plur doctor` uses the same matcher, so it no longer reports Windows hooks
+  as missing.
 - **The MCP entry launched a `.cmd`.** Current Node refuses to spawn a `.cmd`
   directly (`spawn EINVAL`). On Windows the entry is now
   `{ command: <node.exe>, args: [<@plur-ai/mcp js entry>] }`, for Claude Code,
