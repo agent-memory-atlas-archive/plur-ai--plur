@@ -266,6 +266,14 @@ export const PlurConfigSchema = z.object({
      * actually works.
      */
     pinned_ratio: z.number().min(0).max(1).default(0.5),
+    /**
+     * Share of the pinned quota the HARD pinned tier may occupy (pinned
+     * two-tier model). The hard tier is a sub-cap inside the pinned quota, so
+     * it is bounded to [0, 1] and can never exceed it; soft pins get what the
+     * hard tier leaves. Default 0.5 — at the default `injection_budget` of
+     * 2000 and `pinned_ratio` of 0.5, a 500-token hard tier.
+     */
+    pinned_hard_ratio: z.number().min(0).max(1).default(0.5),
   }).default({}),
   dedup: DedupConfigSchema.default({}),
   /**

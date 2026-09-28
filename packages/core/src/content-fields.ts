@@ -50,6 +50,7 @@ export const LEARN_CONTEXT_FIELD_ROLES = {
   commitment: 'control',
   memory_class: 'control',
   pinned: 'control',
+  // Pinned two-tier model: an enum and a validated integer, not text.
   pin_tier: 'control',
   pinned_priority: 'control',
   valid_from: 'control',

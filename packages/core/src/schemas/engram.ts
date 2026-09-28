@@ -518,32 +518,35 @@ export const EngramSchema = z.object({
     ),
 
   /**
-   * Tier within the always-on budget.
-   * "hard": write-rejected if adding this engram would exceed PINNED_HARD_TOKEN_CAP
-   *         (2,000 tokens). Guaranteed to inject every session if within cap.
-   * "soft": priority-ordered; evicted lowest-priority-first when the soft-tier
-   *         budget (30% of maxTokens) is exceeded.
-   * Default when omitted: "soft".
+   * Tier within the pinned budget (pinned two-tier model). Only meaningful
+   * with `pinned: true`; cleared on unpin.
+   * "hard": a sub-cap inside the pinned quota (`injection.pinned_hard_ratio`
+   *         of it, default 0.5). Filled first within each origin. A write that
+   *         would grow the hard tier past its cap is rejected.
+   * "soft": gets what the hard tier leaves of the pinned share, ordered by
+   *         pinned_priority, then relevance score.
+   * Default when omitted: "soft". Pins never outrank the origin order
+   * (primary store, then stores/remote, then packs).
    */
   pinned_tier: z.enum(['hard', 'soft']).optional()
     .describe(
-      'Tier within the always-on budget. "hard": write-rejected if adding this ' +
-      'engram would exceed PINNED_HARD_TOKEN_CAP (2,000 tokens). Guaranteed to ' +
-      'inject every session if within cap. "soft": priority-ordered; evicted ' +
-      'lowest-priority-first when the soft-tier budget (30% of maxTokens) is ' +
-      'exceeded. Default when omitted: "soft".'
+      'Tier within the pinned budget. "hard": a sub-cap inside the pinned quota ' +
+      '(injection.pinned_hard_ratio of it, default 0.5), filled first within each ' +
+      'origin; a write that would grow the hard tier past its cap is rejected. ' +
+      '"soft": gets what the hard tier leaves, ordered by pinned_priority then ' +
+      'relevance score. Default when omitted: "soft".'
     ),
 
   /**
-   * Soft-tier eviction priority. 1 (lowest) to 100 (highest). Default 50.
-   * Higher value survives eviction longer. Ignored for pinned_tier="hard".
-   * Tie-break by temporal.learned_at ascending (FIFO — oldest survives first).
+   * Soft-tier priority. 1 (lowest) to 100 (highest). Default 50. Higher is
+   * selected first within an origin; ties fall back to relevance score.
+   * Ignored for pinned_tier="hard". Cleared on unpin.
    */
   pinned_priority: z.number().int().min(1).max(100).optional()
     .describe(
-      'Soft-tier eviction priority. 1 (lowest) to 100 (highest). Default 50. ' +
-      'Higher value survives eviction longer. Ignored for pinned_tier="hard". ' +
-      'Tie-break by temporal.learned_at ascending (FIFO — oldest survives first).'
+      'Soft-tier priority. 1 (lowest) to 100 (highest). Default 50. Higher is ' +
+      'selected first within an origin; ties fall back to relevance score. ' +
+      'Ignored for pinned_tier="hard".'
     ),
 
   /** Measurement context for numeric or benchmark-derived claims (#869).

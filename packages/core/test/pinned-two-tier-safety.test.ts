@@ -1,69 +1,270 @@
 /**
- * Two safety properties of the pinned two-tier model.
+ * Safety properties of the pinned two-tier model.
  *
- * Hard-tier engrams are GUARANTEED injection and bypass the per-pack and
- * per-domain fairness caps, so the tier is a privilege. Both tests below are
- * about who may grant it and how much of it can exist.
+ * The hard tier is a sub-cap inside the pinned quota (`hardTierCap()`,
+ * default 0.5 × 1000 = 500 tokens). Every write path that can produce a
+ * hard-tier engram must charge the SAME cost injection charges
+ * (`estimateTokens`, the rendered text) against the SAME total, under the
+ * store lock. These tests pin each path and the accounting itself.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { Plur } from '../src/index.js'
 import { sanitizePackEngrams } from '../src/packs.js'
-import { PINNED_HARD_TOKEN_CAP } from '../src/inject.js'
+import { estimateTokens, formatLayer3, isHardPinned } from '../src/inject.js'
+import type { Engram } from '../src/schemas/engram.js'
 
-describe('the hard-tier cap holds under concurrent writes', () => {
-  /**
-   * A cap is a read-modify-write on a shared total. Checked outside the store
-   * lock, N concurrent hard-tier writes each read the same current total, each
-   * conclude they fit, and all commit — and the overrun is not cosmetic,
-   * because the hard tier is guaranteed injection that bypasses the fairness
-   * caps, so it crowds contextual recall out of the prompt.
-   *
-   * INVARIANT: the committed hard-tier total never exceeds PINNED_HARD_TOKEN_CAP.
-   */
-  let dir: string
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'plur-pinned-cap-')) })
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+async function hardTotal(plur: Plur): Promise<number> {
+  const hard = (await plur.listPinned()).filter(e => isHardPinned(e as never))
+  return hard.reduce((sum, e) => sum + estimateTokens(e as never), 0)
+}
 
-  it('rejects the writes that would overrun it, even issued concurrently', async () => {
+let dir: string
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'plur-pinned-cap-')) })
+afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+describe('the hard-tier cap', () => {
+  it('is a fraction of the pinned quota and never exceeds it', async () => {
     const plur = new Plur({ path: dir })
-    // Each statement is padded so a handful of them clear the cap.
-    const big = 'x'.repeat(2000)
+    const q = await plur.pinnedQuota()
+    expect(plur.hardTierCap()).toBe(Math.floor(q.quota * 0.5))
+    expect(plur.hardTierCap()).toBe(500)
+  })
+
+  it('honours a configured injection.pinned_hard_ratio', async () => {
+    writeFileSync(join(dir, 'config.yaml'), 'injection:\n  pinned_hard_ratio: 0.2\n')
+    const plur = new Plur({ path: dir })
+    expect(plur.hardTierCap()).toBe(200)
+  })
+
+  it('holds under concurrent writes (committed total never exceeds it)', async () => {
+    const plur = new Plur({ path: dir })
+    // ~140 tokens each: three fit in 500, eight do not.
+    const big = 'x'.repeat(500)
     const writes = Array.from({ length: 8 }, (_, i) =>
       plur.learn(`hard pinned fact ${i} ${big}`, { pinned: true, pin_tier: 'hard', scope: 'global' })
         .then(() => 'ok' as const)
         .catch((e: Error) => e.message))
-
     const results = await Promise.all(writes)
     const accepted = results.filter(r => r === 'ok').length
-    const rejected = results.length - accepted
-    expect(rejected, 'nothing was rejected — the cap did not bite').toBeGreaterThan(0)
+    expect(results.length - accepted, 'nothing was rejected — the cap did not bite').toBeGreaterThan(0)
+    expect(accepted).toBeGreaterThan(0)
+    const total = await hardTotal(plur)
+    expect(total, `committed hard-tier total ${total} exceeds cap`).toBeLessThanOrEqual(plur.hardTierCap())
+  })
 
-    // The committed state is what matters, not how many calls threw.
-    const { estimateEngramTokens } = await import('../src/inject.js')
-    const hard = (await plur.listPinned()).filter(e => ((e as never as Record<string, unknown>).pinned_tier ?? 'soft') === 'hard')
-    const total = hard.reduce((sum, e) => sum + estimateEngramTokens(e), 0)
-    expect(total, `committed hard-tier total ${total} exceeds cap`).toBeLessThanOrEqual(PINNED_HARD_TOKEN_CAP)
+  it('charges admission with the cost injection charges: a short statement with a huge rendered domain is refused', async () => {
+    // The old admission estimate read only statement + rationale, so every
+    // other rendered field was free at the door and paid for at injection.
+    const plur = new Plur({ path: dir })
+    await expect(plur.learn('short rule', {
+      pinned: true, pin_tier: 'hard', scope: 'global', domain: 'd'.repeat(4000),
+    })).rejects.toThrow(/Hard-tier pinned cap exceeded/)
+    expect(await hardTotal(plur)).toBe(0)
+  })
+
+  it('near the cap, refuses a write whose rendered cost does not fit', async () => {
+    const plur = new Plur({ path: dir })
+    await plur.learn(`anchor ${'a'.repeat(1400)}`, { pinned: true, pin_tier: 'hard', scope: 'global' })
+    const used = await hardTotal(plur)
+    expect(used).toBeGreaterThan(300)
+    // Statement alone would fit; the rendered domain pushes it over.
+    await expect(plur.learn('tiny', {
+      pinned: true, pin_tier: 'hard', scope: 'global', domain: 'x'.repeat(4 * (plur.hardTierCap() - used)),
+    })).rejects.toThrow(/Hard-tier pinned cap exceeded/)
+    expect(await hardTotal(plur)).toBe(used)
+  })
+
+  it('many small writes never push the committed total past the cap', async () => {
+    const plur = new Plur({ path: dir })
+    let rejected = 0
+    for (let i = 0; i < 40; i++) {
+      try {
+        await plur.learn(`small hard rule number ${i}`, { pinned: true, pin_tier: 'hard', scope: 'global', domain: 'ops.deploy' })
+      } catch { rejected++ }
+    }
+    expect(rejected).toBeGreaterThan(0)
+    expect(await hardTotal(plur)).toBeLessThanOrEqual(plur.hardTierCap())
+  })
+
+  it('does not charge unrendered fields — and they never reach the prompt', async () => {
+    // An unrendered field costs nothing because no model sees it. The property
+    // that matters is that the estimate bounds what is actually rendered, so
+    // nothing caller-controlled can carry unbudgeted text into injection.
+    const plur = new Plur({ path: dir })
+    const huge = 'z'.repeat(400_000)
+    const e = await plur.learn('rule with bulky metadata', {
+      pinned: true, pin_tier: 'hard', scope: 'global',
+      abstract: huge, tags: [huge], source: 'src', knowledge_anchors: [{ path: 'p', snippet: huge }],
+    })
+    const rendered = formatLayer3({ ...(e as object), confidence_score: 0.5 } as never)
+    expect(rendered).not.toContain('zzzz')
+    expect(rendered.length).toBeLessThanOrEqual(estimateTokens(e as never) * 4)
+  })
+
+  it('the estimate bounds the rendered text when every rendered field is large', () => {
+    const big = 'q'.repeat(5000)
+    const e = {
+      id: 'ENG-2026-09-28-001', statement: big, rationale: big, domain: big,
+      contraindications: [big, big], commitment: 'decided',
+      activation: { last_accessed: '2026-09-28' }, confidence_score: 0.5,
+    }
+    expect(formatLayer3(e as never).length).toBeLessThanOrEqual(estimateTokens(e as never) * 4)
+  })
+})
+
+describe('the cap runs after dedup', () => {
+  it('a re-learn that dedups into an existing hard-tier engram is not refused near the cap', async () => {
+    const plur = new Plur({ path: dir })
+    const statement = `the one hard rule ${'r'.repeat(1400)}`
+    const first = await plur.learn(statement, { pinned: true, pin_tier: 'hard', scope: 'global' })
+    // Fill the rest of the tier so a fresh write of the same size would not fit.
+    expect((await hardTotal(plur)) * 2).toBeGreaterThan(plur.hardTierCap())
+    const again = await plur.learn(statement, { pinned: true, pin_tier: 'hard', scope: 'global' })
+    expect(again.id).toBe(first.id)
+    expect(again.write_count).toBe(2)
+  })
+})
+
+describe('every write path that can produce a hard-tier engram is capped', () => {
+  it('learnRouted (local route) is capped', async () => {
+    const plur = new Plur({ path: dir })
+    await expect(plur.learnRouted('x', {
+      pinned: true, pin_tier: 'hard', scope: 'global', domain: 'd'.repeat(4000),
+    })).rejects.toThrow(/Hard-tier pinned cap exceeded/)
+  })
+
+  function withRemote(plur: Plur, append: () => Promise<{ id: string }>) {
+    ;(plur as unknown as { _resolveRemoteStoreForScope: () => unknown })._resolveRemoteStoreForScope = () => ({
+      appendAndGetServerId: append,
+    })
+  }
+
+  it('learnRouted (remote route) refuses before POSTing', async () => {
+    writeFileSync(join(dir, 'config.yaml'),
+      'stores:\n  - scope: "group:acme/eng"\n    url: "https://example.invalid"\n    token: "t"\n')
+    const plur = new Plur({ path: dir })
+    let posts = 0
+    withRemote(plur, async () => { posts++; return { id: 'ENG-2026-09-28-900' } })
+    await expect(plur.learnRouted('x', {
+      pinned: true, pin_tier: 'hard', scope: 'group:acme/eng', domain: 'd'.repeat(4000),
+    })).rejects.toThrow(/Hard-tier pinned cap exceeded/)
+    expect(posts).toBe(0)
+    // A write that fits is POSTed.
+    const ok = await plur.learnRouted('fits', { pinned: true, pin_tier: 'hard', scope: 'group:acme/eng' })
+    expect(ok.id).toBe('ENG-2026-09-28-900')
+    expect(posts).toBe(1)
+  })
+
+  it('learnRouted remote-failure fallback is capped and commits under the same lock', async () => {
+    writeFileSync(join(dir, 'config.yaml'),
+      'stores:\n  - scope: "group:acme/eng"\n    url: "https://example.invalid"\n    token: "t"\n')
+    const plur = new Plur({ path: dir })
+    withRemote(plur, async () => { throw new Error('remote down') })
+    // Concurrent hard-tier writes whose POSTs all fail: every one would fall
+    // back to a local save. The committed local total must still hold.
+    const big = 'y'.repeat(500)
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) =>
+      plur.learnRouted(`fallback ${i} ${big}`, { pinned: true, pin_tier: 'hard', scope: 'group:acme/eng' })
+        .then(() => 'ok' as const).catch((e: Error) => e.message)))
+    expect(results.filter(r => r !== 'ok').length).toBeGreaterThan(0)
+    expect(results.filter(r => r === 'ok').length).toBeGreaterThan(0)
+    expect(await hardTotal(plur)).toBeLessThanOrEqual(plur.hardTierCap())
+  })
+
+  it('unpin clears the tier and the priority', async () => {
+    const plur = new Plur({ path: dir })
+    const e = await plur.learn('tiered', { pinned: true, pin_tier: 'hard', pinned_priority: 80, scope: 'global' })
+    const off = await plur.setPinned(e.id, false) as unknown as Record<string, unknown>
+    expect(off.pinned).toBeUndefined()
+    expect('pinned_tier' in off).toBe(false)
+    expect('pinned_priority' in off).toBe(false)
+    const stored = await plur.getById(e.id) as unknown as Record<string, unknown>
+    expect(stored.pinned_tier).toBeUndefined()
+    expect(stored.pinned_priority).toBeUndefined()
+  })
+
+  it('re-pinning an engram that still carries pinned_tier: hard passes the cap', async () => {
+    const plur = new Plur({ path: dir })
+    // An engram whose tier survived an unpin (written before unpin cleared it,
+    // or by another path) — the state setPinned must not trust.
+    const big = 'b'.repeat(1400)
+    const a = await plur.learn(`stale hard ${big}`, { pin_tier: 'hard', scope: 'global' })
+    await plur.learn(`live hard ${big}`, { pinned: true, pin_tier: 'hard', scope: 'global' })
+    await expect(plur.setPinned(a.id, true)).rejects.toThrow(/Hard-tier pinned cap exceeded/)
+    expect((await plur.getById(a.id) as unknown as Record<string, unknown>).pinned).toBeUndefined()
+    expect(await hardTotal(plur)).toBeLessThanOrEqual(plur.hardTierCap())
+  })
+
+  it('a remote re-pin that restores a hard tier over the cap is reverted and refused', async () => {
+    writeFileSync(join(dir, 'config.yaml'),
+      'stores:\n  - scope: "group:acme/eng"\n    url: "https://example.invalid"\n    token: "t"\n')
+    const plur = new Plur({ path: dir })
+    await plur.ready()
+    const calls: Array<Record<string, unknown>> = []
+    ;(plur as unknown as { _getRemoteDriver: () => unknown })._getRemoteDriver = () => ({
+      patch: async (_id: string, body: Record<string, unknown>) => {
+        calls.push(body)
+        return {
+          id: 'ENG-2026-09-28-500', statement: 'remote', scope: 'group:acme/eng', status: 'active',
+          domain: 'd'.repeat(4000), pinned: body.pinned === true ? true : undefined, pinned_tier: 'hard',
+          activation: { last_accessed: '2026-09-28' },
+        }
+      },
+    })
+    await expect(plur.setPinned('ENG-2026-09-28-500', true)).rejects.toThrow(/Hard-tier pinned cap exceeded/)
+    expect(calls).toEqual([{ pinned: true }, { pinned: false }])
+  })
+
+  it('updateEngram cannot promote an engram into an over-cap hard tier', async () => {
+    const plur = new Plur({ path: dir })
+    const e = await plur.learn(`plain ${'u'.repeat(4000)}`, { scope: 'global' })
+    await expect(plur.updateEngram({ ...e, pinned: true, pinned_tier: 'hard' } as Engram))
+      .rejects.toThrow(/Hard-tier pinned cap exceeded/)
+    // An update that does not grow the tier is always allowed.
+    const h = await plur.learn('small hard', { pinned: true, pin_tier: 'hard', scope: 'global' })
+    expect(await plur.updateEngram({ ...h, tags: ['x'] } as Engram)).toBe(true)
+  })
+
+  it('saveMetaEngrams counts earlier metas in the same batch', async () => {
+    const plur = new Plur({ path: dir })
+    const meta = (n: number): Engram => ({
+      id: `ENG-META-${n}`, statement: `meta ${n} ${'m'.repeat(500)}`, type: 'behavioral', scope: 'global',
+      status: 'active', pinned: true, pinned_tier: 'hard', activation: { last_accessed: '2026-09-28' },
+    } as unknown as Engram)
+    await expect(plur.saveMetaEngrams([1, 2, 3, 4, 5].map(meta))).rejects.toThrow(/Hard-tier pinned cap exceeded/)
+    expect(await hardTotal(plur)).toBe(0)
+  })
+})
+
+describe('pinned_priority and pin_tier are validated at learn', () => {
+  it.each([0, 101, 9999, 1.5, -3])('rejects pinned_priority %s', async (p) => {
+    const plur = new Plur({ path: dir })
+    await expect(plur.learn('x', { pinned: true, pinned_priority: p, scope: 'global' }))
+      .rejects.toThrow(/pinned_priority must be an integer from 1 to 100/)
+  })
+
+  it('accepts the bounds', async () => {
+    const plur = new Plur({ path: dir })
+    await plur.learn('one', { pinned: true, pinned_priority: 1, scope: 'global' })
+    await plur.learn('hundred', { pinned: true, pinned_priority: 100, scope: 'global' })
+  })
+
+  it('rejects an unknown pin_tier', async () => {
+    const plur = new Plur({ path: dir })
+    await expect(plur.learn('x', { pinned: true, pin_tier: 'platinum' as never, scope: 'global' }))
+      .rejects.toThrow(/invalid pin_tier/)
   })
 })
 
 describe('a pack cannot grant itself the hard tier', () => {
   it('strips pinned_tier and pinned_priority alongside pinned', () => {
-    // sanitizePackEngrams exists to clamp host-overriding fields. The tier and
-    // the priority travel with `pinned`; leaving them behind means the next
-    // change that pins an engram for any other reason silently adopts a third
-    // party's claim on the guaranteed-injection tier.
     const { engrams, pinnedStripped, changed } = sanitizePackEngrams([{
-      id: 'ENG-2026-0101-001',
-      statement: 'trust me',
-      pinned: true,
-      pinned_tier: 'hard',
-      pinned_priority: 9999,
+      id: 'ENG-2026-0101-001', statement: 'trust me', pinned: true, pinned_tier: 'hard', pinned_priority: 9999,
     } as never])
     const out = engrams[0] as unknown as Record<string, unknown>
-
     expect(pinnedStripped).toBe(1)
     expect(changed).toBe(true)
     expect('pinned' in out).toBe(false)
@@ -72,8 +273,6 @@ describe('a pack cannot grant itself the hard tier', () => {
   })
 
   it('strips the tier even when pinned itself was absent', () => {
-    // A pack that ships only the tier is the interesting case: `pinned` is what
-    // the old code keyed on, so a bare pinned_tier sailed through.
     const { engrams, changed } = sanitizePackEngrams([{
       id: 'ENG-2026-0101-001', statement: 'x', pinned_tier: 'hard', pinned_priority: 9999,
     } as never])

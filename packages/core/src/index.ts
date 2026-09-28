@@ -11,7 +11,7 @@ import { generateEngramId, engramIdDatePrefix, loadAllPacks, storePrefix, namesp
 import { maybeDailyBackup } from './backup.js'
 import { logger } from './logger.js'
 import { searchEngrams, ftsTokenize, extendCorpusStats, searchTextFrom } from './fts.js'
-import { selectAndSpread, scoreEngramsPublic, formatWithLayer, assignLayer, estimateTokens } from './inject.js'
+import { selectAndSpread, scoreEngramsPublic, formatWithLayer, assignLayer, estimateTokens, pinnedHardCap, isHardPinned, DEFAULT_PINNED_HARD_RATIO } from './inject.js'
 import { reactivate } from './decay.js'
 import { captureEpisode, queryTimeline } from './episodes.js'
 import { agenticSearch } from './agentic-search.js'
@@ -2907,6 +2907,18 @@ export class Plur {
         `plur.${fn}: invalid type '${context.type}'. Must be one of: behavioral, terminological, procedural, architectural`
       )
     }
+    // Pinned two-tier fields. Nothing Zod-validates an engram before save, so
+    // an out-of-range priority written here would be stored verbatim — and a
+    // 9999 sorts ahead of every legitimately prioritised pin.
+    if (context?.pin_tier !== undefined && context.pin_tier !== 'hard' && context.pin_tier !== 'soft') {
+      throw new TypeError(`plur.${fn}: invalid pin_tier '${String(context.pin_tier)}'. Must be "hard" or "soft"`)
+    }
+    if (context?.pinned_priority !== undefined) {
+      const p = context.pinned_priority
+      if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 100) {
+        throw new TypeError(`plur.${fn}: pinned_priority must be an integer from 1 to 100, got ${String(p)}`)
+      }
+    }
     if (!this.config.allow_secrets) {
       // Scan the statement AND every caller-supplied content field (#381,
       // #389, #1002 review). The field set comes from ONE table,
@@ -3053,6 +3065,10 @@ export class Plur {
         ...this._buildEngramShape(statement, scope, context, now, validity, id => this._ancestorsOf(engrams, id), guarded.scopeSource),
         id,
       }
+      // Hard-tier cap: AFTER dedup (a re-learn that folds into an existing
+      // engram creates no row and must not be charged), on the engram as it
+      // will be committed, and inside the lock the write commits under.
+      await this._assertHardTierFits(engram)
 
       // #240: supersedes is a graph edge, not a temporality enum — write the
       // reverse superseded_by edge on each target found in the local primary
@@ -3435,6 +3451,37 @@ export class Plur {
         _routeRefused: guarded.refusedShared,
       }
     }
+    // Hard-tier cap on the remote route. The engram is built here and POSTed,
+    // so this is a write path that produces a hard-tier engram exactly like
+    // learn() — and so is the local fallback below. Both run under ONE hold of
+    // the store lock, taken only for a hard-tier write so ordinary remote
+    // writes keep their lock-free POST. The cost is estimated with an id of
+    // the longest shape either outcome can carry (the server's id, or a local
+    // one), since neither is known until after the POST.
+    if (isHardPinned(localPlaceholder as never)) {
+      return await this._withStoreLock(this.paths.engrams, async () => {
+        await this._assertHardTierFits({ ...localPlaceholder, id: 'ENG-XXXXXX-0000-00-00-000' })
+        return await this._commitRemoteRouted(localPlaceholder, remoteDriver, scope, now, allEngrams, true)
+      })
+    }
+    return await this._commitRemoteRouted(localPlaceholder, remoteDriver, scope, now, allEngrams, false)
+  }
+
+  /**
+   * The commit half of `learnRouted`'s remote route: POST, or on failure save
+   * locally with an outbox marker. `lockHeld` says whether the caller already
+   * holds the primary store lock (a hard-tier write does, so its admission
+   * check and its fallback save observe one state); the lock is not reentrant,
+   * so the fallback takes it only when the caller does not.
+   */
+  private async _commitRemoteRouted(
+    localPlaceholder: Engram,
+    remoteDriver: RemoteStore,
+    scope: string,
+    now: string,
+    allEngrams: Engram[],
+    lockHeld: boolean,
+  ): Promise<Engram> {
     let serverEngram: Engram
     try {
       const { id: serverId } = await remoteDriver.appendAndGetServerId(localPlaceholder)
@@ -3446,7 +3493,7 @@ export class Plur {
       // matches the scope (e.g. readonly remote), we still save the local
       // engram but omit the outbox marker — the retry path will skip it.
       const storeEntry = (this.config.stores ?? []).find(s => s.url && s.scope === scope && !s.readonly)
-      return await this._withStoreLock(this.paths.engrams, async () => {
+      const saveFallback = async () => {
         const engrams = await this._primaryStore.load()
         // Replace placeholder ID with a real local ID
         localPlaceholder.id = generateEngramId([...engrams, ...allEngrams], this._mintedTodayIds())
@@ -3483,7 +3530,8 @@ export class Plur {
         this._maybeWriteProvenance(localPlaceholder.id)
         logger.warning(`[plur:outbox] remote write failed for ${localPlaceholder.id}, queued for retry: ${(err as Error).message}`)
         return localPlaceholder
-      })
+      }
+      return lockHeld ? await saveFallback() : await this._withStoreLock(this.paths.engrams, saveFallback)
     }
 
     // History is appended OUTSIDE the try that guards the remote write (#813,
@@ -5377,6 +5425,7 @@ export class Plur {
         spread_cap: this.config.injection?.spread_cap,
         spread_budget: this.config.injection?.spread_budget,
         expiry: this.config.expiry,
+        pinned_hard_ratio: this.config.injection?.pinned_hard_ratio,
       },
       embeddingBoosts,
     )
@@ -5974,11 +6023,15 @@ export class Plur {
       const existingIds = new Set(engrams.map(e => e.id))
       let saved = 0
       let skipped = 0
+      // Hard-tier tokens accepted earlier in this batch; listPinned cannot see
+      // them until the batch is written.
+      let pendingHard = 0
       for (const meta of metas) {
         if (existingIds.has(meta.id)) {
           skipped++
           continue
         }
+        pendingHard += await this._assertHardTierFits(meta, pendingHard)
         // LOW-1: guard each meta on the FULL content (statement + context
         // fields) at its scope before persist. Do NOT call _guardExplicitUpdate
         // (its warning text is the EXPLICIT-update path); inline the demotion
@@ -6067,6 +6120,9 @@ export class Plur {
       // statement, scope, commitment, relations and retirement as the tracked
       // mutations, and this is where four of the five actually happen.
       const toWrite = { ...(demote ? { ...updated, ...demote } : updated), updated_at: new Date().toISOString() }
+      // A whole-engram update can set `pinned` and `pinned_tier` — a write path
+      // that can produce a hard-tier engram, so it passes the same cap.
+      await this._assertHardTierFits(toWrite)
       engrams[idx] = toWrite
       // Incremental write (#740): only the updated engram row changed.
       await this._updateEngrams(engrams, [toWrite])
@@ -6148,6 +6204,17 @@ export class Plur {
         pinned: pinned === true ? true : undefined,
         updated_at: new Date().toISOString(),
       }
+      // Pinned two-tier model: an unpin clears the tier and the priority with
+      // the flag. They describe a pin; left behind, a later re-pin would
+      // silently restore hard-tier membership without the cap ever being
+      // consulted.
+      if (pinned !== true) {
+        delete (updated as { pinned_tier?: unknown }).pinned_tier
+        delete (updated as { pinned_priority?: unknown }).pinned_priority
+      }
+      // A re-pin of an engram that still carries `pinned_tier: 'hard'` (written
+      // before unpin cleared it, or by another path) is a hard-tier write.
+      await this._assertHardTierFits(updated)
       engrams[idx] = updated
       // Incremental write (#740): only the (un)pinned engram row changed.
       await this._updateEngrams(engrams, [updated])
@@ -6156,6 +6223,7 @@ export class Plur {
     })
     if (localResult) return localResult
 
+    let remotePatched: { patched: Engram; driver: RemoteStore; serverId: string; scope: string } | null = null
     // Remote routing (closes #86 pin remainder). Strip the namespace prefix
     // before sending the server the unprefixed ID it knows about. Same
     // refusal rule as `_updateEngramReturning`: a namespaced id names ONE
@@ -6195,13 +6263,34 @@ export class Plur {
         // machine — and with the pinned set now quota-enforced at pin time,
         // it also held budget nobody could reclaim.
         const patched = await driver.patch(serverId, { pinned })
-        if (patched) return patched
+        if (!patched) continue
+        remotePatched = { patched, driver, serverId, scope: entry.scope }
+        break
       } catch (err) {
         if (serverId !== id) throw err
         continue
       }
     }
-    return null
+    if (!remotePatched) return null
+    // Pinned two-tier model: a remote re-pin can restore a hard tier the
+    // engram still carries (a partial PATCH cannot clear it on unpin). Only
+    // the server's answer says which tier the engram is in, so the cap is
+    // checked on it — under the store lock, like every other hard-tier write
+    // — and a pin that would overrun the cap is reverted and refused. The
+    // window between the PATCH and the revert is the price of not adding a
+    // GET to every remote pin.
+    const { patched, driver, serverId, scope } = remotePatched
+    if (pinned === true && isHardPinned(patched as never)) {
+      try {
+        await this._withStoreLock(this.paths.engrams, async () => {
+          await this._assertHardTierFits({ ...patched, id: namespaceEngramId(serverId, scope) })
+        })
+      } catch (err) {
+        await driver.patch(serverId, { pinned: false }).catch(() => null)
+        throw err
+      }
+    }
+    return patched
   }
 
   /**
@@ -6217,6 +6306,76 @@ export class Plur {
   async listPinned(): Promise<Engram[]> {
     const all = await this._loadAllEngrams()
     return all.filter(e => (e as any).pinned === true && e.status === 'active')
+  }
+
+  /**
+   * Token cap of the HARD pinned tier at write time (pinned two-tier model):
+   * `injection.pinned_hard_ratio` of the same quota {@link pinnedQuota}
+   * enforces. The ratio is bounded to [0, 1], so the hard tier can never
+   * exceed the pinned quota. Default: 0.5 × 1000 = 500 tokens.
+   */
+  hardTierCap(): number {
+    return pinnedHardCap(
+      this.config.injection_budget ?? 2000,
+      this.config.injection?.pinned_hard_ratio ?? DEFAULT_PINNED_HARD_RATIO,
+      this.config.injection?.pinned_ratio ?? 0.5,
+    )
+  }
+
+  /**
+   * Refuse a write that would grow the hard pinned tier past
+   * {@link hardTierCap}. The ONE check every write path that can produce a
+   * hard-tier engram goes through: `learn()`, both halves of `learnRouted()`'s
+   * remote route, `setPinned()`, `updateEngram()` and `saveMetaEngrams()`.
+   *
+   * MUST be called while holding the primary store lock. A cap is a
+   * read-modify-write on a shared total: checked outside the lock, N
+   * concurrent hard-tier writes each read the same total, each conclude they
+   * fit, and all commit. `listPinned` takes no lock of its own, so calling it
+   * here does not re-enter.
+   *
+   * Cost is `estimateTokens` — the function injection charges the budget
+   * with — over the engram AS IT WILL BE COMMITTED, so admission, accounting
+   * and injection agree. It counts only what is rendered into the prompt; an
+   * unrendered field (`abstract`, `structured_data`, `tags`, …) costs nothing
+   * because it reaches no model.
+   *
+   * What the total counts: every hard-tier engram this client can see —
+   * the primary store, file-backed stores, and remote stores as far as their
+   * read cache holds them (`_loadRemoteCached` is a synchronous peek and may be
+   * cold). A remote store's hard tier can also be written by other clients,
+   * which no local check can serialise against. That is why injection enforces
+   * the same cap again (`fillTokenBudget`) and reports any overflow in
+   * `omitted_pinned` as `hard-tier-cap`: this check keeps the local tier honest,
+   * the injection-time cap is the one that cannot be bypassed.
+   *
+   * A write that does not GROW the tier is always allowed — an unrelated update
+   * to a hard-tier engram must not fail because the tier is (already) full.
+   *
+   * @param pendingTokens hard-tier tokens accepted earlier in the same locked
+   *   batch that `listPinned` cannot see yet.
+   * @returns the candidate's cost if it counts toward the tier, else 0.
+   */
+  private async _assertHardTierFits(candidate: Engram, pendingTokens = 0): Promise<number> {
+    if (!isHardPinned(candidate as never)) return 0
+    const cost = estimateTokens(candidate as never)
+    const hard = (await this.listPinned()).filter(e => isHardPinned(e as never))
+    const previous = hard.find(e => e.id === candidate.id)
+    if (previous && cost <= estimateTokens(previous as never)) return cost
+    const others = hard.filter(e => e.id !== candidate.id)
+    const current = others.reduce((n, e) => n + estimateTokens(e as never), 0) + pendingTokens
+    const cap = this.hardTierCap()
+    if (current + cost > cap) {
+      const list = others.map(e => `${e.id} (${estimateTokens(e as never)} tokens)`).join(', ')
+      throw new Error(
+        `Hard-tier pinned cap exceeded: the hard tier holds ${current} tokens, ` +
+        `this engram costs ${cost}, and the cap is ${cap} ` +
+        `(injection.pinned_hard_ratio of the pinned quota). ` +
+        `Existing hard-tier engrams: [${list}]. ` +
+        `Pin it in the soft tier instead, or unpin a hard-tier engram first.`,
+      )
+    }
+    return cost
   }
 
   /**

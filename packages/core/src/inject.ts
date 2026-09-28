@@ -86,6 +86,47 @@ const MAX_PER_DOMAIN = 10
 // every relevance-scored engram. Cap at 50% of maxTokens so contextual recall
 // still gets at least half the budget. Tuned for default 8000 → 4000 pinned.
 const PINNED_TOKEN_BUDGET_RATIO = 0.5
+/**
+ * Default share of the pinned budget the HARD tier may occupy (pinned
+ * two-tier model). The hard tier is a sub-cap INSIDE the pinned share, not a
+ * budget of its own: soft pins get whatever the hard tier leaves, so a store
+ * with no hard-tier engrams sees exactly the pinned share it always had.
+ * Configurable as `injection.pinned_hard_ratio`; bounded to [0, 1], so the
+ * hard tier can never exceed the pinned quota.
+ */
+export const DEFAULT_PINNED_HARD_RATIO = 0.5
+
+/**
+ * Token cap for the hard tier, given the base the pinned share is taken from.
+ *
+ * ONE formula for both ends: the write path passes `injection_budget` (the
+ * same base `pinnedQuota()` uses), the injection path passes the injection
+ * budget. With default config both give floor(floor(2000 × 0.5) × 0.5) = 500.
+ */
+export function pinnedHardCap(
+  pinnedBudgetBase: number,
+  hardRatio: number = DEFAULT_PINNED_HARD_RATIO,
+  pinnedRatio: number = PINNED_TOKEN_BUDGET_RATIO,
+): number {
+  const ratio = Math.min(1, Math.max(0, hardRatio))
+  return Math.floor(Math.floor(pinnedBudgetBase * pinnedRatio) * ratio)
+}
+
+/** True when an engram is in the hard pinned tier. Anything else pinned is soft. */
+export function isHardPinned(e: { pinned?: unknown; pinned_tier?: unknown }): boolean {
+  return e.pinned === true && e.pinned_tier === 'hard'
+}
+
+/**
+ * Soft-tier eviction priority, validated (schema: integer 1–100, default 50).
+ * A value outside the range is clamped rather than trusted, so a stored
+ * `9999` cannot sort ahead of every legitimately prioritised engram.
+ */
+export function effectivePinnedPriority(e: { pinned_priority?: unknown }): number {
+  const p = e.pinned_priority
+  if (typeof p !== 'number' || !Number.isFinite(p)) return 50
+  return Math.min(100, Math.max(1, Math.round(p)))
+}
 
 // --- Section budgets (2026-09-07) ---
 //
@@ -483,8 +524,29 @@ export interface OmittedPinned {
   /** Estimated token cost of the engram that was skipped. */
   cost: number
   /** `pinned-sub-budget`: the 50% pinned share was exhausted while overall
-   *  budget remained. `total-budget`: no room left at all. */
-  reason: 'pinned-sub-budget' | 'total-budget'
+   *  budget remained. `total-budget`: no room left at all.
+   *  `hard-tier-cap`: a hard-tier engram did not fit the hard tier's sub-cap.
+   *  `soft-tier-budget`: an engram with an explicit soft tier or priority did
+   *  not fit what the hard tier left of the pinned share. An engram with no
+   *  tier fields keeps reporting `pinned-sub-budget`, as it always has. */
+  reason: 'pinned-sub-budget' | 'total-budget' | 'hard-tier-cap' | 'soft-tier-budget'
+}
+
+/**
+ * Tokens the hard tier holds back from the soft tier in one injection: what the
+ * hard-pinned candidates cost, up to the hard cap.
+ *
+ * Computed ONCE over every candidate and shared through the ledger, because
+ * selection runs in several section passes (#1138). Without the reservation a
+ * soft pin in the constraints pass could spend the pinned share before a hard
+ * pin in the directives pass is even looked at — inverting the tiers.
+ */
+export function hardPinnedReserve(scored: Array<ScoredEngram>, hardCap: number): number {
+  let sum = 0
+  for (const e of scored) {
+    if (isHardPinned(e as never)) sum += estimateTokens(e)
+  }
+  return Math.min(hardCap, sum)
 }
 
 /**
@@ -535,7 +597,12 @@ export function fillTokenBudget(
    * eaten the entire injection and no relevance-scored engram reached the
    * agent, which is the exact failure the sub-budget exists to prevent.
    */
-  pinnedLedger: { spent: number } = { spent: 0 },
+  pinnedLedger: { spent: number; hardSpent?: number; hardReserve?: number } = { spent: 0 },
+  /**
+   * Share of the pinned budget the hard tier may occupy (pinned two-tier
+   * model). See {@link DEFAULT_PINNED_HARD_RATIO}.
+   */
+  pinnedHardRatio: number = DEFAULT_PINNED_HARD_RATIO,
 ): { selected: ScoredEngram[]; tokens_used: number; omitted_pinned: OmittedPinned[] } {
   const result: ScoredEngram[] = []
   const omittedPinned: OmittedPinned[] = []
@@ -551,10 +618,30 @@ export function fillTokenBudget(
   // Primary-store pins first, then `stores:`/remote, then packs; score orders
   // within an origin. Sorted before selection so budget pressure can never let
   // a pack pin in ahead of one of the user's own.
+  //
+  // Pinned two-tier model: WITHIN an origin, hard-tier pins come first, then
+  // soft pins by `pinned_priority` (higher first), then score. Origin stays the
+  // outer key — the tiers must not reopen the trust boundary it enforces. An
+  // engram with no tier fields is soft at the default priority, so for a store
+  // that never sets them the order is exactly origin, then score.
   const pinned = scored.filter(e => (e as any).pinned === true).sort((a, b) =>
-    pinnedOriginRank(a as never) - pinnedOriginRank(b as never) || b.score - a.score)
+    pinnedOriginRank(a as never) - pinnedOriginRank(b as never)
+    || (isHardPinned(a as never) ? 0 : 1) - (isHardPinned(b as never) ? 0 : 1)
+    || (isHardPinned(a as never) ? 0 : effectivePinnedPriority(b as never) - effectivePinnedPriority(a as never))
+    || b.score - a.score)
   const unpinned = scored.filter(e => (e as any).pinned !== true)
   const pinnedBudget = Math.floor(pinnedBudgetBase * PINNED_TOKEN_BUDGET_RATIO)
+  // The hard tier is a sub-cap inside the pinned share; the soft tier gets
+  // what the hard tier holds back. With no hard-tier candidates the reserve is
+  // 0 and the soft tier has the whole pinned share, as before the tiers.
+  const hardCap = pinnedHardCap(pinnedBudgetBase, pinnedHardRatio)
+  if (pinnedLedger.hardSpent === undefined) pinnedLedger.hardSpent = 0
+  if (pinnedLedger.hardReserve === undefined) pinnedLedger.hardReserve = hardPinnedReserve(scored, hardCap)
+  const softBudget = pinnedBudget - pinnedLedger.hardReserve
+  const softReason = (e: ScoredEngram): OmittedPinned['reason'] => {
+    const r = e as unknown as { pinned_tier?: unknown; pinned_priority?: unknown }
+    return r.pinned_tier === 'soft' || r.pinned_priority != null ? 'soft-tier-budget' : 'pinned-sub-budget'
+  }
 
   // Omissions are REPORTED, not silent (#1142). `pinned: true` reads as a
   // promise of always-load, but pinning is priority-subject-to-capacity: a
@@ -569,29 +656,52 @@ export function fillTokenBudget(
   // it (plur-ai/plur#1124: selection was greedy, so a large primary pin could be
   // skipped while smaller pack pins still got in). Within one origin, greedy is
   // fine and wastes less budget.
-  let skippedRank: number | null = null
+  //
+  // The rule is kept per tier: the hard tier draws on its own reserve, which
+  // no soft pin can spend, so a soft skip must not block a lower-origin hard
+  // pin and vice versa. A total-budget skip means no room at all and blocks
+  // both. With no hard-tier engrams only the soft rank is ever set, which is
+  // the single rank this loop always had.
+  let skippedRankSoft: number | null = null
+  let skippedRankHard: number | null = null
+  const lower = (cur: number | null, rank: number) => cur === null ? rank : Math.min(cur, rank)
   for (const engram of pinned) {
     const rank = pinnedOriginRank(engram as never)
-    if (skippedRank !== null && rank > skippedRank) {
-      omittedPinned.push({ id: engram.id, cost: estimateTokens(engram), reason: 'pinned-sub-budget' })
+    const hard = isHardPinned(engram as never)
+    const blockedAt = hard ? skippedRankHard : skippedRankSoft
+    if (blockedAt !== null && rank > blockedAt) {
+      omittedPinned.push({ id: engram.id, cost: estimateTokens(engram), reason: hard ? 'hard-tier-cap' : softReason(engram) })
       continue
     }
     const cost = estimateTokens(engram)
     if (tokensUsed + cost > maxTokens) {
       omittedPinned.push({ id: engram.id, cost, reason: 'total-budget' })
-      skippedRank = skippedRank === null ? rank : Math.min(skippedRank, rank)
+      skippedRankSoft = lower(skippedRankSoft, rank)
+      skippedRankHard = lower(skippedRankHard, rank)
       continue
     }
     // Against the SHARED spend, so the cap binds across passes rather than
     // once per pass.
-    if (pinnedLedger.spent + cost > pinnedBudget) {
-      omittedPinned.push({ id: engram.id, cost, reason: 'pinned-sub-budget' })
-      skippedRank = skippedRank === null ? rank : Math.min(skippedRank, rank)
+    if (hard) {
+      // Hard-tier overflow is REPORTED like any other omission. The write
+      // path refuses a hard-tier engram that would overrun the cap, but it can
+      // only count what this client sees (a remote store's hard tier may be
+      // written elsewhere), so this is the enforcement point that cannot be
+      // bypassed — and a tier sold as guaranteed must not vanish silently.
+      if (pinnedLedger.hardSpent + cost > hardCap || pinnedLedger.spent + cost > pinnedBudget) {
+        omittedPinned.push({ id: engram.id, cost, reason: 'hard-tier-cap' })
+        skippedRankHard = lower(skippedRankHard, rank)
+        continue
+      }
+    } else if (pinnedLedger.spent - pinnedLedger.hardSpent + cost > softBudget) {
+      omittedPinned.push({ id: engram.id, cost, reason: softReason(engram) })
+      skippedRankSoft = lower(skippedRankSoft, rank)
       continue
     }
     result.push(engram)
     tokensUsed += cost
     pinnedLedger.spent += cost
+    if (hard) pinnedLedger.hardSpent += cost
     const pack = engram.pack ?? '__personal__'
     packCounts.set(pack, (packCounts.get(pack) ?? 0) + 1)
     const topDomain = (engram.domain ?? '__none__').split('.')[0]
@@ -625,7 +735,7 @@ export function selectAndSpread(
   ctx: InjectionContext,
   personalEngrams: Engram[],
   packs: LoadedPack[],
-  config?: { spread_cap?: number; spread_budget?: number; expiry?: ExpiryConfig },
+  config?: { spread_cap?: number; spread_budget?: number; expiry?: ExpiryConfig; pinned_hard_ratio?: number },
   embeddingBoosts?: Map<string, number>,
 ): InternalInjectionResult {
   const spreadCap = config?.spread_cap ?? 3
@@ -766,19 +876,28 @@ export function selectAndSpread(
   // sub-budget is a share of the injection; granting it per pass multiplied it
   // by the number of passes and let pinned starve contextual recall entirely.
   // The DIP-19 consider pass below draws on its own budget and so keeps its own.
-  const pinnedLedger = { spent: 0 }
-  const firstPass = fillTokenBudget(constraintCandidates, constraintsFloor, maxTokens, pinnedLedger)
+  //
+  // The hard-tier reserve is computed over ALL candidates, before the passes
+  // split them, so a soft pin in an earlier pass cannot spend the share a
+  // hard pin in a later pass is entitled to.
+  const hardRatio = config?.pinned_hard_ratio ?? DEFAULT_PINNED_HARD_RATIO
+  const pinnedLedger = {
+    spent: 0,
+    hardSpent: 0,
+    hardReserve: hardPinnedReserve(filtered, pinnedHardCap(maxTokens, hardRatio)),
+  }
+  const firstPass = fillTokenBudget(constraintCandidates, constraintsFloor, maxTokens, pinnedLedger, hardRatio)
 
   // Directives get everything the constraints floor did not use.
   const directivesBudget = Math.max(0, maxTokens - firstPass.tokens_used)
-  const dirPass = fillTokenBudget(otherCandidates, directivesBudget, maxTokens, pinnedLedger)
+  const dirPass = fillTokenBudget(otherCandidates, directivesBudget, maxTokens, pinnedLedger, hardRatio)
 
   // Any budget the directives left over flows BACK to constraints, so a
   // session with few directives carries more of its rules, not fewer.
   const slack = Math.max(0, maxTokens - firstPass.tokens_used - dirPass.tokens_used)
   const chosen = new Set(firstPass.selected.map(e => e.id))
   const secondPass = slack > 0
-    ? fillTokenBudget(constraintCandidates.filter(e => !chosen.has(e.id)), slack, maxTokens, pinnedLedger)
+    ? fillTokenBudget(constraintCandidates.filter(e => !chosen.has(e.id)), slack, maxTokens, pinnedLedger, hardRatio)
     : { selected: [] as ScoredEngram[], tokens_used: 0, omitted_pinned: [] as OmittedPinned[] }
 
   const selectedConstraints = [...firstPass.selected, ...secondPass.selected]
