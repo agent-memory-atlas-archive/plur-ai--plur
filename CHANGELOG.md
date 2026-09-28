@@ -11,9 +11,11 @@ the old one out entirely. Before, it was only ranked lower (×0.3), so whenever
 the budget had room — which is most of the time — the model saw both the old
 and the corrected claim, unmarked. A prompt that asks about the past
 ("previously", "used to", …) still reaches the old engram, and if the
-replacement is not active on this machine (retired, or only in a remote store)
-the old one is kept, re-ranked as before, rather than lost. Recall is
-unchanged (#997 keeps that question open).
+replacement could not be injected here — retired, only in a remote store, a
+draft awaiting approval, expired, or in an `on_request` pack — the old one is
+kept, re-ranked as before, rather than lost. Engrams that supersede themselves
+or each other in a loop are also kept at the old re-rank instead of all
+disappearing. Recall is unchanged (#997 keeps that question open).
 
 **Another project's engrams no longer reach a scoped session.** The prompt
 hook reads the directory's `.plur.yaml` scope and passes it on, and the

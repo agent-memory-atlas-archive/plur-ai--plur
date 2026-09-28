@@ -54,4 +54,39 @@ describe('scope filter survives embedding boosts and spreading activation', () =
     expect(ids).toContain('ENG-2026-0103-003')
     expect(ids).not.toContain('ENG-2026-0103-001')
   })
+
+  it('an embedding boost does not admit a pack engram from another project scope', () => {
+    // The pack loop has its own scope filter; the personal-loop tests above do
+    // not reach it.
+    const boosts = new Map([['ENG-2026-0103-001', 0.9], ['ENG-2026-0103-003', 0.9]])
+    const pack = {
+      manifest: { name: 'p', version: '1.0.0', metadata: { injection_policy: 'on_match', match_terms: [] } },
+      engrams: [other(), shared()],
+    } as never
+    const result = selectAndSpread(
+      { prompt: 'how do payments clear', scope: 'project:a', maxTokens: 5000 },
+      [], [pack], undefined, boosts,
+    )
+    const ids = allIds(result)
+    expect(ids).toContain('ENG-2026-0103-003')
+    expect(ids).not.toContain('ENG-2026-0103-001')
+  })
+
+  it('an out-of-scope association target is filtered, not counted as a spread drop', () => {
+    // The target exists locally but is out of scope: it is not missing and not
+    // retired, so spread_drops must not report it. A genuinely missing target
+    // on the same engram is still counted, which proves the accounting runs.
+    const g = shared()
+    const today = new Date().toISOString().slice(0, 10)
+    g.associations = [
+      { target_type: 'engram', target: 'ENG-2026-0103-001', type: 'co_accessed', strength: 0.9, updated_at: today },
+      { target_type: 'engram', target: 'ENG-2026-0103-999', type: 'co_accessed', strength: 0.9, updated_at: today },
+    ] as any
+    const result = selectAndSpread(
+      { prompt: 'commit messages imperative mood', scope: 'project:a', maxTokens: 5000 },
+      [other(), g], [],
+    )
+    expect(allIds(result)).not.toContain('ENG-2026-0103-001')
+    expect(result.spread_drops).toEqual({ dropped_unresolvable: 1, dropped_retired: 0 })
+  })
 })
