@@ -46,7 +46,7 @@ const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd,
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 describe('audit #1228 finding 1: an interrupted sync loses no scope:local engram', { timeout: 120_000 }, () => {
-  isolateGitConfig()
+  isolateGitConfig({ defaultBranch: 'main' }) // the fixture names `main`
   let base: string, bare: string, A: string, B: string
 
   beforeEach(() => {

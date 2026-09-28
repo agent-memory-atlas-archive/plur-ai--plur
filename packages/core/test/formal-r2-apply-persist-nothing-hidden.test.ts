@@ -38,7 +38,7 @@ function e(id: string, statement: string, scope = 'global'): Engram {
 }
 
 describe('follow-up 1: P1b on a personal remote rewrites committed sibling references', { timeout: 120_000 }, () => {
-  isolateGitConfig()
+  isolateGitConfig({ defaultBranch: 'main' }) // the fixture names `main`
   let base: string, bare: string, A: string, B: string
   beforeEach(() => {
     base = mkdtempSync(join(tmpdir(), 'plur-fu1-'))
