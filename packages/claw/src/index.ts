@@ -205,7 +205,7 @@ const plugin = {
           if (sub === 'list') {
             const packs = e.plur.listPacks()
             if (!packs.length) return { text: 'No packs installed.' }
-            return { text: packs.map((p: any) => `${p.name} v${p.manifest?.version ?? '?'} (${p.engram_count} engrams)${p.integrity ? ` [${shortPackIntegrity(p.integrity)}]` : ''}${p.baseline === 'carried-from-v1' ? ' (baseline carried from v1, not re-verified)' : ''}`).join('\n') }
+            return { text: packs.map((p: any) => `${p.name} v${p.manifest?.version ?? '?'} (${p.engram_count} engrams)${p.integrity ? ` [${shortPackIntegrity(p.integrity)}]` : ''}${p.baseline === 'carried-from-v1' ? ' (baseline carried from v1, not checked again against its source)' : ''}`).join('\n') }
           }
           if (sub === 'install' && args[1]) {
             const result = await e.plur.installPack(args[1])

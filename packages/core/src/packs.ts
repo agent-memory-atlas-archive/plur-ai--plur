@@ -4,7 +4,7 @@ import * as crypto from 'crypto'
 import * as os from 'os'
 import { execFileSync } from 'child_process'
 import yaml from 'js-yaml'
-import { loadPack, loadEngrams, saveEngrams } from './engrams.js'
+import { loadPack, loadEngrams, saveEngrams, isTransientPackDir } from './engrams.js'
 import { atomicWrite, fsyncDir, withLock } from './sync.js'
 import { detectSecrets, detectSensitive, detectPromptInjection, truncateToScanLimit } from './secrets.js'
 import { userStructuredData } from './content-fields.js'
@@ -145,16 +145,9 @@ export interface RegistryEntry {
   integrity_carried_from?: 'v1'
 }
 
-/**
- * A directory an install creates next to the live pack and removes again
- * (`<dest>.installing-<pid>-<ms>` while staging, `<dest>.replacing-<pid>-<ms>`
- * during the swap). A crash can leave one behind. It is never a pack in its
- * own right — it carries the same manifest name as the pack it shadows — so
- * nothing that walks the packs directory may treat it as one.
- */
-export function isTransientPackDir(entry: string): boolean {
-  return /\.(installing|replacing)-\d+-\d+$/.test(entry)
-}
+// `isTransientPackDir` lives in engrams.ts so `loadAllPacks` can use it
+// without importing this module back (#1236); re-exported here.
+export { isTransientPackDir }
 
 /**
  * Is `p` a directory right now? `false` when it is not, or when it vanished
@@ -2489,25 +2482,54 @@ export function verifyPackIntegrity(packDir: string): IntegrityCheck {
  * `computePackIntegrity`.
  */
 export function computePackHash(packDir: string): string {
-  const hash = crypto.createHash('sha256')
-
-  // Hash the SKILL.md manifest. No manifest.yaml fallback.
-  const skillMd = path.join(packDir, 'SKILL.md')
-  if (fs.existsSync(skillMd)) {
-    hash.update(fs.readFileSync(skillMd))
-  }
-
-  // Hash engrams
-  const engramsPath = path.join(packDir, 'engrams.yaml')
-  if (fs.existsSync(engramsPath)) {
-    hash.update(fs.readFileSync(engramsPath))
-  }
-
-  return hash.digest('hex')
+  return packHashV1FromParts(readPackIntegrityParts(packDir, ['SKILL.md', 'engrams.yaml']))
 }
 
 /** The parts the v2 hash covers, in the order it covers them (§5.5). */
 export const PACK_INTEGRITY_V2_PARTS = ['SKILL.md', 'manifest.yaml', 'engrams.yaml'] as const
+
+/**
+ * The raw bytes of each part a pack hash covers (`PACK_INTEGRITY_V2_PARTS`, a
+ * superset of the v1 parts), or `null` for a part that does not exist. Read
+ * once, so a v1 check and a v2 value can be computed from the same bytes.
+ */
+type PackIntegrityParts = Record<(typeof PACK_INTEGRITY_V2_PARTS)[number], Buffer | null>
+
+function readPackIntegrityParts(
+  packDir: string,
+  only: ReadonlyArray<(typeof PACK_INTEGRITY_V2_PARTS)[number]> = PACK_INTEGRITY_V2_PARTS,
+): PackIntegrityParts {
+  const parts = {} as PackIntegrityParts
+  for (const name of PACK_INTEGRITY_V2_PARTS) {
+    const p = path.join(packDir, name)
+    parts[name] = only.includes(name) && fs.existsSync(p) ? fs.readFileSync(p) : null
+  }
+  return parts
+}
+
+/** v1 over already-read parts: SKILL.md then engrams.yaml, unframed. Bare hex. */
+function packHashV1FromParts(parts: PackIntegrityParts): string {
+  const hash = crypto.createHash('sha256')
+  // No manifest.yaml fallback.
+  if (parts['SKILL.md']) hash.update(parts['SKILL.md'])
+  if (parts['engrams.yaml']) hash.update(parts['engrams.yaml'])
+  return hash.digest('hex')
+}
+
+/** v2 over already-read parts, as recorded: `sha256:v2:<hex>`. */
+function packIntegrityV2FromParts(parts: PackIntegrityParts): string {
+  const hash = crypto.createHash('sha256')
+  for (const name of PACK_INTEGRITY_V2_PARTS) {
+    const bytes = parts[name]
+    if (bytes) {
+      hash.update(`${name}\0${bytes.length}\0`)
+      hash.update(bytes)
+    } else {
+      hash.update(`${name}\0-\0`)
+    }
+  }
+  return `sha256:v2:${hash.digest('hex')}`
+}
 
 /**
  * The v2 pack integrity value (ENGRAM-STANDARD-v1.md §5.5), as the string it is
@@ -2527,18 +2549,7 @@ export const PACK_INTEGRITY_V2_PARTS = ['SKILL.md', 'manifest.yaml', 'engrams.ya
  * re-serialize before hashing.
  */
 export function computePackIntegrity(packDir: string): string {
-  const hash = crypto.createHash('sha256')
-  for (const name of PACK_INTEGRITY_V2_PARTS) {
-    const p = path.join(packDir, name)
-    if (fs.existsSync(p)) {
-      const bytes = fs.readFileSync(p)
-      hash.update(`${name}\0${bytes.length}\0`)
-      hash.update(bytes)
-    } else {
-      hash.update(`${name}\0-\0`)
-    }
-  }
-  return `sha256:v2:${hash.digest('hex')}`
+  return packIntegrityV2FromParts(readPackIntegrityParts(packDir))
 }
 
 const INTEGRITY_V1_RE = /^sha256:[0-9a-f]{64}$/
@@ -2706,11 +2717,15 @@ export function migratePackIntegrity(
       report.packs.push({ dir, name, action: 'skipped-unknown-format', from: row.integrity })
       continue
     }
-    if (!packIntegrityMatches(row.integrity, packDir)) {
+    // One read serves both the v1 check and the new v2 value. Reading twice
+    // would let an edit made between the reads become the new baseline of a
+    // row carried forward from v1, unreported (#1234).
+    const parts = readPackIntegrityParts(packDir)
+    if (`sha256:${packHashV1FromParts(parts)}` !== row.integrity) {
       report.packs.push({ dir, name, action: 'skipped-modified', reason: 'differs-from-v1', from: row.integrity })
       continue
     }
-    const to = computePackIntegrity(packDir)
+    const to = packIntegrityV2FromParts(parts)
     const expected = expectedInstalledIntegrity(row.source, packDir)
     if (expected !== null && expected !== to) {
       report.packs.push({ dir, name, action: 'skipped-modified', reason: 'differs-from-source', from: row.integrity })

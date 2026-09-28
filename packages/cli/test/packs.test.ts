@@ -338,7 +338,7 @@ describe('plur packs — text surface', () => {
     out.length = 0
     await packs(['migrate-integrity', '--yes'])
     expect(stdout()).toMatch(/carried from v1/i)
-    expect(stdout()).toMatch(/not re-verified/i)
+    expect(stdout()).toMatch(/not checked again against (its|their) source/i)
     out.length = 0
     await packs(['list'])
     expect(stdout()).toMatch(/baseline carried from v1/i)

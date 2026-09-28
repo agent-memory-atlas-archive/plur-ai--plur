@@ -442,7 +442,7 @@ Use 'plur packs list' to see installed packs.`)
     } else {
       for (const p of report.packs) {
         const detail = p.baseline === 'carried-from-v1'
-          ? ' (carried from v1 — not re-verified: its recorded source is not a local pack directory)'
+          ? ' (carried from v1, not checked again against its source: its recorded source is not a local pack directory)'
           : p.baseline === 'source-verified'
             ? ' (re-verified against its recorded source)'
             : p.reason === 'differs-from-source'
@@ -456,7 +456,7 @@ Use 'plur packs list' to see installed packs.`)
         ? `Dry run: ${report.migrated} pack(s) would be re-baselined to sha256:v2:. Re-run with --yes to apply.`
         : `${report.migrated} pack(s) re-baselined to sha256:v2:.`)
       if (report.carried > 0) {
-        outputText(`${report.carried} of them ${report.dry_run ? 'would be' : 'were'} carried from v1, not re-verified: `
+        outputText(`${report.carried} of them ${report.dry_run ? 'would be' : 'were'} carried from v1 and not checked again against their source: `
           + 'a v1 match cannot see bytes moved between SKILL.md and engrams.yaml, or an added manifest.yaml, '
           + 'so the new value inherits v1\'s trust and certifies nothing. `plur packs list` marks them. '
           + 'Reinstall them from a trusted source to get a verified baseline.')
