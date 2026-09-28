@@ -120,14 +120,24 @@ function atomicWriteString(path: string, data: string): void {
   renameSync(tmp, path)
 }
 
-// Held for a few file operations only, so retry fast: ~1 s of backoff in all.
+// Held for a few file operations only, so retry fast: ~0.5 s of backoff in all.
 const COUNTERS_LOCK = { maxRetries: 8, baseDelay: 2 }
+
+// recordEvent runs on the learn and recall path, and `withLock` waits by
+// spinning the CPU, so a contended retry ladder blocked the MCP server's event
+// loop for up to ~510 ms per event (#1240). A contended event loses nothing by
+// spilling (the next lock holder folds it in), so recordEvent makes ONE attempt.
+const RECORD_EVENT_LOCK = { maxRetries: 0, baseDelay: 2 }
 
 /**
  * Run `fn` holding the counters lock. `undefined` when the lock could not be
  * taken (fn never ran); an error thrown BY fn propagates as before.
  */
-function underCountersLock<T>(opts: CountersOpts, fn: () => T): T | undefined {
+function underCountersLock<T>(
+  opts: CountersOpts,
+  fn: () => T,
+  lockOpts: { maxRetries: number; baseDelay: number } = COUNTERS_LOCK,
+): T | undefined {
   const target = opts.countersPath ?? defaultCountersPath()
   let ran = false
   try {
@@ -135,7 +145,7 @@ function underCountersLock<T>(opts: CountersOpts, fn: () => T): T | undefined {
     return withLock(target, () => {
       ran = true
       return fn()
-    }, COUNTERS_LOCK)
+    }, lockOpts)
   } catch (err) {
     if (!ran) return undefined
     throw err
@@ -361,7 +371,7 @@ export function recordEvent(event: CounterEvent, opts: CountersOpts = {}): boole
     // Only now are the claimed events durable in counters/pending.
     for (const c of claims) { try { unlinkSync(c) } catch { /* already gone */ } }
     return rolledOver
-  })
+  }, RECORD_EVENT_LOCK)
   if (result === undefined) {
     const now = (opts.now ?? (() => new Date()))()
     spillEvent(countersPath, event, utcDate(now))
