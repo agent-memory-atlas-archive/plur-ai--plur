@@ -133,3 +133,61 @@ it('aborts a download that stalls past the timeout, without echoing the URL', as
     await pending.catch(err => expect(String(err)).not.toContain('private'))
   } finally { vi.useRealTimers() }
 })
+
+// A body streamed in 1 MiB chunks, with whatever Content-Length the server
+// chooses to claim (or none), so only the running byte count can stop it.
+function streamedBody(totalBytes: number, contentLength?: number): Response {
+  const chunk = new Uint8Array(1024 * 1024)
+  let sent = 0
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent >= totalBytes) { controller.close(); return }
+      const size = Math.min(chunk.length, totalBytes - sent)
+      sent += size
+      controller.enqueue(chunk.subarray(0, size))
+    },
+  })
+  const headers = contentLength === undefined ? undefined : { 'content-length': String(contentLength) }
+  return new Response(body, { headers })
+}
+
+it.each([
+  ['no Content-Length', undefined],
+  ['a small, false Content-Length', 1024],
+])('stops a streamed body over the download cap with %s, and cleans up', async (_label, declared) => {
+  const before = tmpRootsNow()
+  vi.stubGlobal('fetch', vi.fn(async () => streamedBody(MAX_PACK_DOWNLOAD_BYTES + 1024 * 1024, declared)))
+  await expect(downloadAndExtractPack('https://audit.example/p.tgz')).rejects.toThrow(/size limit/)
+  expect(tmpRootsNow()).toEqual(before)
+})
+
+it.each([
+  ['credentials in the URL', 'https://user:signed-secret@audit.example/p.tgz?token=private'],
+  ['an unparseable URL', 'https://audit.example:99999/signed-secret?token=private'],
+])('never echoes a URL that fetch rejects before a response: %s', async (_label, url) => {
+  // Real fetch, not a stub: these are the messages undici itself produces.
+  let failure: unknown
+  try { await downloadAndExtractPack(url) } catch (error) { failure = error }
+  expect(String(failure)).toMatch(/Failed to fetch or extract pack/)
+  expect(String(failure)).not.toContain('signed-secret')
+  expect(String(failure)).not.toContain('private')
+  expect(String(failure)).not.toContain('audit.example')
+})
+
+it.each([
+  ['three dots', 'pack/.../x.md'],
+  ['dots then a space', 'pack/.. /x.md'],
+  ['a trailing dot', 'pack/dir./x.md'],
+  ['a trailing space', 'pack/dir /x.md'],
+])('rejects a path segment Windows would rewrite: %s', async (_label, name) => {
+  serve(rawTar([{ path: 'pack/SKILL.md', body: Buffer.from('# ok\n') }, { path: name, body: Buffer.from('x') }]))
+  await expect(downloadAndExtractPack('https://audit.example/p.tgz')).rejects.toThrow(/escapes extraction directory/)
+})
+
+it('still accepts the ./-prefixed names that `tar -czf pack.tgz .` writes', async () => {
+  serve(rawTar([{ path: './', type: 'Directory' }, { path: './SKILL.md', body: Buffer.from('# dot\n') }]))
+  const { packDir, tmpRoot } = await downloadAndExtractPack('https://audit.example/p.tgz')
+  try {
+    expect(readFileSync(join(packDir, 'SKILL.md'), 'utf8')).toBe('# dot\n')
+  } finally { rmSync(tmpRoot, { recursive: true, force: true }) }
+})

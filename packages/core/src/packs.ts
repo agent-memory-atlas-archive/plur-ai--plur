@@ -54,10 +54,19 @@ export const PACK_DOWNLOAD_TIMEOUT_MS = 30_000
 export async function downloadAndExtractPack(url: string): Promise<{ packDir: string; tmpRoot: string }> {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'plur-pack-dl-'))
   const controller = new AbortController()
+  // A TOTAL deadline for the request and the body, not an idle timeout.
+  // Extraction below is synchronous and runs after the body is in memory.
   const timeout = setTimeout(() => controller.abort(), PACK_DOWNLOAD_TIMEOUT_MS)
   // Signed URLs carry credentials in their path/query; errors must not echo them.
   try {
-    const response = await fetch(url, { signal: controller.signal })
+    let response: Response
+    try {
+      response = await fetch(url, { signal: controller.signal })
+    } catch {
+      // fetch() quotes the URL in its own messages ("Failed to parse URL
+      // from <url>", "…includes credentials: <url>"). Never pass them on.
+      throw new Error(controller.signal.aborted ? 'download timed out' : 'request failed before a response')
+    }
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const declared = Number(response.headers.get('content-length'))
     if (declared > MAX_PACK_DOWNLOAD_BYTES) {
@@ -70,7 +79,11 @@ export async function downloadAndExtractPack(url: string): Promise<{ packDir: st
     let total = 0
     try {
       for (;;) {
-        const { done, value } = await reader.read()
+        let next: Awaited<ReturnType<typeof reader.read>>
+        try { next = await reader.read() } catch {
+          throw new Error(controller.signal.aborted ? 'download timed out' : 'connection failed while downloading')
+        }
+        const { done, value } = next
         if (done) break
         total += value.byteLength
         if (total > MAX_PACK_DOWNLOAD_BYTES) throw new Error('pack download exceeds size limit')
@@ -92,7 +105,7 @@ export async function downloadAndExtractPack(url: string): Promise<{ packDir: st
         throw new Error('pack archive contains a symbolic link, hard link, or special file')
       }
       const name = entry.path
-      if (name.startsWith('/') || /^[a-z]:/i.test(name) || name.includes('\\') || name.split('/').includes('..')) {
+      if (name.startsWith('/') || /^[a-z]:/i.test(name) || name.includes('\\') || name.split('/').some(unsafeSegment)) {
         throw new Error('pack archive path escapes extraction directory')
       }
       if (name.split('/').length > 64 || entry.size > MAX_PACK_FILE_BYTES) {
@@ -102,7 +115,7 @@ export async function downloadAndExtractPack(url: string): Promise<{ packDir: st
     const extractDir = path.join(tmpRoot, FLAT_ARCHIVE_DIRNAME)
     fs.mkdirSync(extractDir)
     tar.extract({ file: archivePath, cwd: extractDir, sync: true, strict: true,
-      preservePaths: false, noChmod: true, maxDepth: 64 })
+      preservePaths: false, preserveOwner: false, noChmod: true, maxDepth: 64 })
     const names = fs.readdirSync(extractDir)
     const subdirs = names.filter(e => fs.lstatSync(path.join(extractDir, e)).isDirectory())
     const hasPackFiles = names.some(e => ['SKILL.md', 'engrams.yaml', 'manifest.yaml'].includes(e))
@@ -117,6 +130,17 @@ export async function downloadAndExtractPack(url: string): Promise<{ packDir: st
   } finally {
     clearTimeout(timeout)
   }
+}
+
+/**
+ * A path segment that is, or on some platform becomes, a parent reference.
+ * Windows strips trailing dots and spaces, so `.. `, `...` and `name.` are
+ * not what they look like. A lone `.` is a no-op (`tar -czf p.tgz .` writes
+ * `./SKILL.md`) and stays allowed.
+ */
+function unsafeSegment(segment: string): boolean {
+  if (segment === '.') return false
+  return /^\.+\s*$/.test(segment) || /[. ]$/.test(segment)
 }
 
 /** Remove the temp directory created by downloadAndExtractPack. Safe to call even if the path no longer exists. */
