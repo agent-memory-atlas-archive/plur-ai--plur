@@ -559,13 +559,24 @@ export function loadPack(packDir: string): LoadedPack {
   return { manifest, engrams }
 }
 
+/**
+ * A directory an install creates next to the live pack and removes again
+ * (`<dest>.installing-<pid>-<ms>` while staging, `<dest>.replacing-<pid>-<ms>`
+ * during the swap). A crash can leave one behind. It is never a pack in its
+ * own right — it carries the same manifest name as the pack it shadows — so
+ * nothing that walks the packs directory may treat it as one.
+ */
+export function isTransientPackDir(entry: string): boolean {
+  return /\.(installing|replacing)-\d+-\d+$/.test(entry)
+}
+
 export function loadAllPacks(packsDir: string): LoadedPack[] {
   if (!fs.existsSync(packsDir)) return []
   const packs: LoadedPack[] = []
   for (const entry of fs.readdirSync(packsDir)) {
     // An install's staging / displaced copy is not a pack: it shares the live
     // pack's manifest name and would load its engrams twice.
-    if (/\.(installing|replacing)-\d+-\d+$/.test(entry)) continue
+    if (isTransientPackDir(entry)) continue
     const packDir = `${packsDir}/${entry}`
     // An entry can vanish between readdir and stat — the registry lock file
     // released by a concurrent install or migration, or a staging directory
