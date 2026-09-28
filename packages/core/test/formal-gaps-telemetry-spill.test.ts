@@ -48,6 +48,20 @@ describe('a contended telemetry event is kept, not dropped', () => {
     expect(c.session).toBe(1) // the spilled learn does not open a second session
   })
 
+  it('a contended event spills at once instead of spinning through a retry ladder (#1240)', () => {
+    recordEvent('learn', base)
+    let waited = Infinity
+    withLock(base.countersPath, () => {
+      const t0 = Date.now()
+      expect(recordEvent('learn', base)).toBe(false) // spilled, not counted yet
+      waited = Date.now() - t0
+    })
+    // The old ladder (8 retries from 2 ms) spun for ~510 ms before spilling.
+    expect(waited).toBeLessThan(100)
+    recordEvent('recall', base)
+    expect(counters().learn).toBe(2)
+  })
+
   it('good case: without contention nothing is spilled', () => {
     recordEvent('learn', base)
     recordEvent('learn', base)

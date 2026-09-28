@@ -8,13 +8,13 @@ import { ftsTokenize } from '../src/fts.js'
 
 describe('formal R2 core-retrieval#8 — rewrite keeps non-ASCII content words', () => {
   it('keeps a CJK word in a question (replayed: 部署 was dropped)', () => {
-    expect(rewriteLexicalQuery('What is the 部署 process for kubernetes?', 'factual')).toBe(
+    expect(rewriteLexicalQuery('What is the 部署 process for kubernetes?', 'general')).toBe(
       'is the process for kubernetes'.replace('the', 'the 部署'),
     )
   })
 
   it('keeps a CJK name next to accented Latin', () => {
-    expect(rewriteLexicalQuery('what did 田中 say about déploiement?', 'factual')).toBe('田中 say about déploiement')
+    expect(rewriteLexicalQuery('what did 田中 say about déploiement?', 'general')).toBe('田中 say about déploiement')
   })
 
   it('every fts token of the original, minus scaffolding, survives the rewrite', () => {
@@ -25,13 +25,13 @@ describe('formal R2 core-retrieval#8 — rewrite keeps non-ASCII content words',
       'Which ข้อมูล table did we pick?',
     ]
     for (const q of qs) {
-      const kept = new Set(ftsTokenize(rewriteLexicalQuery(q, 'factual')))
+      const kept = new Set(ftsTokenize(rewriteLexicalQuery(q, 'general')))
       const expected = ftsTokenize(q).filter((t) => !['what', 'which', 'how', 'do', 'did', 'does'].includes(t))
       for (const t of expected) expect(kept.has(t), `${q}: ${t}`).toBe(true)
     }
   })
 
   it('still strips ASCII scaffolding (non-vacuity)', () => {
-    expect(rewriteLexicalQuery("What's the deploy process?", 'factual')).toBe('the deploy process')
+    expect(rewriteLexicalQuery("What's the deploy process?", 'general')).toBe('the deploy process')
   })
 })

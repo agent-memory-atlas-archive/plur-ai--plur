@@ -22,7 +22,11 @@ Checks, in order:
 With --if-touched (needs --base), nothing runs unless the project or a covered
 file changed since REF — how the local pre-push gate keeps unrelated pushes free.
 
-Exit codes: 0 all checks pass, 1 a check failed, 2 configuration error.
+Without `lake` on PATH (or in ~/.elan/bin) the build and axiom checks are
+reported as `skip` and the gap and drift checks still run; the proofs are then
+NOT checked, and the output says so.
+
+Exit codes: 0 all checks that ran pass, 1 a check failed, 2 configuration error.
 
 verify.yaml (in the project directory):
 
@@ -106,6 +110,13 @@ def lake() -> str:
     import shutil
     elan = Path.home() / ".elan" / "bin" / "lake"
     return str(elan) if elan.exists() else (shutil.which("lake") or "lake")
+
+
+def have_lake() -> bool:
+    """Is the Lean build tool installed? Without it the build and axiom checks
+    cannot run; the gap and drift checks still can."""
+    import shutil
+    return (Path.home() / ".elan" / "bin" / "lake").exists() or shutil.which("lake") is not None
 
 
 def check_build(project: Path) -> tuple[bool, str]:
@@ -245,10 +256,19 @@ def main(argv: list[str] | None = None) -> int:
         failed |= not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name:7} {detail}")
 
+    # Without `lake` the build and axiom checks cannot run. Say so and run the
+    # checks that need only the files (gaps, drift), instead of a traceback.
+    lean = have_lake()
     if not args.no_build:
-        report("build", *check_build(project))
+        if lean:
+            report("build", *check_build(project))
+        else:
+            print(f"skip {'build':7} lake not found (install the Lean toolchain to check the proofs)")
     report("gaps", *check_gaps(project, libraries))
-    report("axioms", *check_axioms(project, libraries, allowed))
+    if lean:
+        report("axioms", *check_axioms(project, libraries, allowed))
+    else:
+        print(f"skip {'axioms':7} lake not found (install the Lean toolchain to check the proofs)")
     ok, detail, drift = check_drift(project, cfg, args.base)
     strict = args.strict_drift or bool(cfg.get("strict_drift"))
     if drift:

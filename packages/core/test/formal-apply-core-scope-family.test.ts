@@ -43,7 +43,8 @@ describe('Decision E4 — project:* is local-only only without a covering url st
     expect(isLocalOnlyScope('project:plurx', [URL_STORE])).toBe(true)
   })
   it('a path (local file) store keeps the scope local', () => {
-    expect(isLocalOnlyScope('project:plur', [{ path: '/tmp/x.yaml', scope: 'project:plur' }])).toBe(true)
+    const pathStore = { path: '/tmp/x.yaml', scope: 'project:plur' }
+    expect(isLocalOnlyScope('project:plur', [pathStore])).toBe(true)
   })
   it('the named local targets never depend on stores', () => {
     expect(isLocalOnlyScope('global', [{ url: 'https://x', scope: 'global' }])).toBe(true)

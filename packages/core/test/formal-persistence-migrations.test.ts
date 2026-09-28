@@ -23,7 +23,7 @@ function makeEngram(id: string): Engram {
     feedback_signals: { positive: 0, negative: 0, neutral: 0 },
     knowledge_anchors: [], associations: [], derivation_count: 1, tags: [], pack: null,
     abstract: null, derived_from: null, polarity: null,
-  } as Engram
+  } as unknown as Engram
 }
 
 describe('formal-persistence: failed migration leaves the live store untouched', () => {

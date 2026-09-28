@@ -151,7 +151,7 @@ describe('learn() — remote routing (issue #25)', () => {
       // Decision E1 "me-only" (2026-09-26): a url-backed personal scope is an
       // auto-route target only when `/me` says it is the user's own namespace,
       // so the remote must have answered `/me` for this token first.
-      const append = fetchMock.getMockImplementation()!
+      const append = fetchMock.getMockImplementation()! as (url: string, init?: { method?: string }) => Promise<Response>
       fetchMock.mockImplementation((async (url: string, init?: { method?: string }) =>
         String(url).endsWith('/me')
           ? { ok: true, status: 200, json: async () => ({ username: 'plur-me', org_id: '', role: 'developer', scopes: [] }), text: async () => '' } as Response

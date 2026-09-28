@@ -54,9 +54,12 @@ describe('Claude settings.json hook merge (formal Adapters #3)', () => {
   })
 
   it('still recognises every PLUR spec shape it installed', () => {
-    expect(isPlurHookSpec({ type: 'command', command: `${WIN_SHIM} hook-inject` })).toBe(true)
-    expect(isPlurHookSpec({ type: 'command', command: `${POSIX_SHIM} hook-inject --rehydrate` })).toBe(true)
-    expect(isPlurHookSpec({ type: 'command', command: 'npx @plur-ai/cli hook-session-guard' })).toBe(true)
-    expect(isPlurHookSpec({ type: 'command', command: './scripts/hook-inject.sh' })).toBe(false)
+    // Built through a helper so the full hook shape (with `type`) is passed as
+    // a non-fresh object; the predicate reads only `command`.
+    const spec = (command: string) => ({ type: 'command', command })
+    expect(isPlurHookSpec(spec(`${WIN_SHIM} hook-inject`))).toBe(true)
+    expect(isPlurHookSpec(spec(`${POSIX_SHIM} hook-inject --rehydrate`))).toBe(true)
+    expect(isPlurHookSpec(spec('npx @plur-ai/cli hook-session-guard'))).toBe(true)
+    expect(isPlurHookSpec(spec('./scripts/hook-inject.sh'))).toBe(false)
   })
 })
