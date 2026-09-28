@@ -67,11 +67,13 @@ jobs:
             const review = context.payload.review || {};
             const reviewId = review.id;
 
-            // A dismissed review cannot be dismissed again, so every failure
-            // below points at the two things that actually clear it.
+            // A dismissed review cannot be dismissed again, and this workflow runs
+            // only on `dismissed`: a fresh review never re-runs it, and "Re-run
+            // jobs" replays the same payload and fails the same way. Only a push
+            // moves the head past this check.
             const remedy =
-              'A dismissed review cannot be dismissed again. To clear this, ask the ' +
-              'reviewer to re-review, or push a commit.';
+              'A dismissed review cannot be dismissed again. To clear this check, push a ' +
+              'commit. A re-review restores the record but does not re-run this check.';
 
             // Match the review that TRIGGERED this run, not the newest dismissal
             // on the pull request. Taking the last one let a message-less
@@ -169,11 +171,13 @@ jobs:
             // Invisible characters are not a message. `trim()` leaves zero-width
             // spaces, byte-order marks and directional-control characters in
             // place, so a dismissal consisting of one U+200B would otherwise pass
-            // as a one-character message. The class below is written with
-            // backslash-u escapes on purpose: a literal U+2028 or U+2029 is a line
-            // terminator, and breaks both this script and the YAML around it.
+            // as a one-character message. `\s` covers whitespace including U+2028
+            // and U+2029; the Default_Ignorable_Code_Point property covers the
+            // zero-width, directional-control and BOM characters as well as the
+            // Hangul filler (U+3164) and soft hyphen (U+00AD), while keeping
+            // ordinary text, accented letters and emoji.
             const raw = found.dismissed_review.dismissal_message || '';
-            const visible = raw.replace(/[\s\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060\u2066-\u2069\uFEFF]/g, '');
+            const visible = raw.replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, '');
             if (!visible) {
               core.setFailed(
                 `@${who} dismissed a changes-requested review without a message.\n\n` +
