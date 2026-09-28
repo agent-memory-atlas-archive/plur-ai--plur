@@ -239,6 +239,118 @@ describe('every write path that can produce a hard-tier engram is capped', () =>
   })
 })
 
+/**
+ * An over-cap tier — reachable by LOWERING injection.pinned_hard_ratio after the
+ * tier was filled — must not freeze the engrams already in it.
+ */
+describe('an over-cap tier does not block writes that cannot grow it', () => {
+  async function overCapTier(): Promise<{ plur: Plur; a: Engram; b: Engram }> {
+    const first = new Plur({ path: dir })
+    const a = await first.learn(`hard rule A ${'a'.repeat(700)}`, { pinned: true, pin_tier: 'hard', scope: 'global' })
+    const b = await first.learn(`hard rule B ${'b'.repeat(700)}`, { pinned: true, pin_tier: 'hard', scope: 'global' })
+    writeFileSync(join(dir, 'config.yaml'), 'injection:\n  pinned_hard_ratio: 0.2\n')
+    const plur = new Plur({ path: dir })
+    expect(plur.hardTierCap()).toBe(200)
+    expect(await hardTotal(plur)).toBeGreaterThan(plur.hardTierCap())
+    return { plur, a, b }
+  }
+
+  it('changing an unrendered field (tags) on a hard engram succeeds', async () => {
+    const { plur, b } = await overCapTier()
+    expect(await plur.updateEngram({ ...b, tags: ['still-hard'] } as Engram)).toBe(true)
+    expect((await plur.getById(b.id))!.tags).toEqual(['still-hard'])
+  })
+
+  it('retiring a hard engram via updateEngram succeeds even when the statement grows', async () => {
+    const { plur, a } = await overCapTier()
+    const grown = `${a.statement} ${'g'.repeat(800)}`
+    expect(await plur.updateEngram({ ...a, statement: grown, status: 'retired' } as Engram)).toBe(true)
+    expect((await plur.getById(a.id))!.status).toBe('retired')
+  })
+
+  it('editing an already-retired hard engram succeeds', async () => {
+    const { plur, a } = await overCapTier()
+    await plur.updateEngram({ ...a, status: 'retired' } as Engram)
+    const retired = (await plur.getById(a.id))!
+    expect(await plur.updateEngram({ ...retired, statement: `${retired.statement} ${'e'.repeat(900)}` } as Engram)).toBe(true)
+  })
+})
+
+describe('admission and injection use the same pinned_ratio', () => {
+  it('pinned_ratio 0.3 shrinks the injection pinned share to the quota', async () => {
+    writeFileSync(join(dir, 'config.yaml'), 'injection:\n  pinned_ratio: 0.3\n')
+    const plur = new Plur({ path: dir })
+    const q = await plur.pinnedQuota()
+    expect(q.quota).toBe(600)
+    expect(plur.hardTierCap()).toBe(300)
+    // ~900 tokens of soft pins: fits a 1000-token share, not a 600-token one.
+    for (let i = 0; i < 6; i++) await plur.learn(`soft pinned rule ${i} ${'s'.repeat(560)}`, { pinned: true, scope: 'global' })
+    const res = await plur.inject('anything at all')
+    expect(res.omitted_pinned?.length ?? 0).toBeGreaterThan(0)
+    const pinned = await plur.listPinned()
+    const loaded = pinned.filter(e => res.injected_ids.includes(e.id))
+    expect(loaded.reduce((n, e) => n + estimateTokens(e as never), 0)).toBeLessThanOrEqual(600)
+  })
+
+  it('with a larger pinned_ratio, every hard engram admitted at write time is injected', async () => {
+    writeFileSync(join(dir, 'config.yaml'), 'injection:\n  pinned_ratio: 0.8\n')
+    const plur = new Plur({ path: dir })
+    expect(plur.hardTierCap()).toBe(800)
+    const admitted: string[] = []
+    for (let i = 0; i < 6; i++) {
+      try {
+        admitted.push((await plur.learn(`hard rule ${i} ${'h'.repeat(380)}`, { pinned: true, pin_tier: 'hard', scope: 'global' })).id)
+      } catch { /* over the cap */ }
+    }
+    expect(await hardTotal(plur)).toBeGreaterThan(500) // more than the default-ratio hard cap would inject
+    const res = await plur.inject('anything at all')
+    expect((res.omitted_pinned ?? []).filter(o => o.reason === 'hard-tier-cap')).toEqual([])
+    for (const id of admitted) expect(res.injected_ids).toContain(id)
+  })
+})
+
+describe('remote re-pin records the prior state', () => {
+  function remotePlur(driver: Record<string, unknown>): Plur {
+    writeFileSync(join(dir, 'config.yaml'),
+      'stores:\n  - scope: "group:acme/eng"\n    url: "https://example.invalid"\n    token: "t"\n')
+    const plur = new Plur({ path: dir })
+    ;(plur as unknown as { _getRemoteDriver: () => unknown })._getRemoteDriver = () => driver
+    return plur
+  }
+  const overCapRow = (pinned: boolean) => ({
+    id: 'ENG-2026-09-28-500', statement: 'remote', scope: 'group:acme/eng', status: 'active',
+    domain: 'd'.repeat(4000), pinned: pinned || undefined, pinned_tier: 'hard',
+    activation: { last_accessed: '2026-09-28' },
+  })
+
+  it('re-pinning an engram that was already pinned is not refused and not reverted', async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const plur = remotePlur({
+      getById: async () => overCapRow(true),
+      patch: async (_id: string, body: Record<string, unknown>) => { calls.push(body); return overCapRow(body.pinned === true) },
+    })
+    await plur.ready()
+    const res = await plur.setPinned('ENG-2026-09-28-500', true)
+    expect(res?.pinned).toBe(true)
+    expect(calls).toEqual([{ pinned: true }])
+  })
+
+  it('a failed revert is surfaced, not swallowed', async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const plur = remotePlur({
+      getById: async () => overCapRow(false),
+      patch: async (_id: string, body: Record<string, unknown>) => {
+        calls.push(body)
+        if (body.pinned === false) throw new Error('Remote patch failed: 503')
+        return overCapRow(true)
+      },
+    })
+    await plur.ready()
+    await expect(plur.setPinned('ENG-2026-09-28-500', true)).rejects.toThrow(/could NOT be reverted \(Remote patch failed: 503\)/)
+    expect(calls).toEqual([{ pinned: true }, { pinned: false }])
+  })
+})
+
 describe('pinned_priority and pin_tier are validated at learn', () => {
   it.each([0, 101, 9999, 1.5, -3])('rejects pinned_priority %s', async (p) => {
     const plur = new Plur({ path: dir })

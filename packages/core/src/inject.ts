@@ -108,8 +108,20 @@ export function pinnedHardCap(
   hardRatio: number = DEFAULT_PINNED_HARD_RATIO,
   pinnedRatio: number = PINNED_TOKEN_BUDGET_RATIO,
 ): number {
-  const ratio = Math.min(1, Math.max(0, hardRatio))
-  return Math.floor(Math.floor(pinnedBudgetBase * pinnedRatio) * ratio)
+  // A non-finite ratio (NaN from a bad direct call) falls back to the
+  // default: Math.min/Math.max pass NaN through, which would disable the cap.
+  const hard = Number.isFinite(hardRatio) ? Math.min(1, Math.max(0, hardRatio)) : DEFAULT_PINNED_HARD_RATIO
+  return Math.floor(Math.floor(pinnedBudgetBase * pinnedShareRatio(pinnedRatio)) * hard)
+}
+
+/**
+ * The share of the injection budget reserved for pinned engrams —
+ * `injection.pinned_ratio`, the same ratio `pinnedQuota()` enforces at pin
+ * time, so admission and injection agree. Non-finite falls back to the
+ * default 0.5; out-of-range values are clamped to [0, 1].
+ */
+export function pinnedShareRatio(pinnedRatio: number = PINNED_TOKEN_BUDGET_RATIO): number {
+  return Number.isFinite(pinnedRatio) ? Math.min(1, Math.max(0, pinnedRatio)) : PINNED_TOKEN_BUDGET_RATIO
 }
 
 /** True when an engram is in the hard pinned tier. Anything else pinned is soft. */
@@ -529,7 +541,8 @@ export interface OmittedPinned {
   id: string
   /** Estimated token cost of the engram that was skipped. */
   cost: number
-  /** `pinned-sub-budget`: the 50% pinned share was exhausted while overall
+  /** `pinned-sub-budget`: the pinned share (`injection.pinned_ratio`, default
+   *  50%) was exhausted while overall
    *  budget remained. `total-budget`: no room left at all.
    *  `hard-tier-cap`: a hard-tier engram did not fit the hard tier's sub-cap.
    *  `soft-tier-budget`: an engram with an explicit soft tier or priority did
@@ -547,6 +560,11 @@ export interface OmittedPinned {
  * soft pin in the constraints pass could spend the pinned share before a hard
  * pin in the directives pass is even looked at — inverting the tiers.
  */
+//
+// Known limitation: a hard pin that can never fit (larger than the cap, or than
+// what the section passes leave) still counts toward the reserve, so the soft
+// tier can be held back by up to the cap for a pin that is then reported as
+// omitted. The write-time cap makes that state rare; it is not corrected here.
 export function hardPinnedReserve(scored: Array<ScoredEngram>, hardCap: number): number {
   let sum = 0
   for (const e of scored) {
@@ -609,6 +627,12 @@ export function fillTokenBudget(
    * model). See {@link DEFAULT_PINNED_HARD_RATIO}.
    */
   pinnedHardRatio: number = DEFAULT_PINNED_HARD_RATIO,
+  /**
+   * Share of `pinnedBudgetBase` reserved for pinned engrams
+   * (`injection.pinned_ratio`, default 0.5) — the ratio the pin-time quota
+   * uses, passed through so the two cannot disagree.
+   */
+  pinnedRatio: number = PINNED_TOKEN_BUDGET_RATIO,
 ): { selected: ScoredEngram[]; tokens_used: number; omitted_pinned: OmittedPinned[] } {
   const result: ScoredEngram[] = []
   const omittedPinned: OmittedPinned[] = []
@@ -636,11 +660,11 @@ export function fillTokenBudget(
     || (isHardPinned(a as never) ? 0 : effectivePinnedPriority(b as never) - effectivePinnedPriority(a as never))
     || b.score - a.score)
   const unpinned = scored.filter(e => (e as any).pinned !== true)
-  const pinnedBudget = Math.floor(pinnedBudgetBase * PINNED_TOKEN_BUDGET_RATIO)
+  const pinnedBudget = Math.floor(pinnedBudgetBase * pinnedShareRatio(pinnedRatio))
   // The hard tier is a sub-cap inside the pinned share; the soft tier gets
   // what the hard tier holds back. With no hard-tier candidates the reserve is
   // 0 and the soft tier has the whole pinned share, as before the tiers.
-  const hardCap = pinnedHardCap(pinnedBudgetBase, pinnedHardRatio)
+  const hardCap = pinnedHardCap(pinnedBudgetBase, pinnedHardRatio, pinnedRatio)
   if (pinnedLedger.hardSpent === undefined) pinnedLedger.hardSpent = 0
   if (pinnedLedger.hardReserve === undefined) pinnedLedger.hardReserve = hardPinnedReserve(scored, hardCap)
   const softBudget = pinnedBudget - pinnedLedger.hardReserve
@@ -741,7 +765,7 @@ export function selectAndSpread(
   ctx: InjectionContext,
   personalEngrams: Engram[],
   packs: LoadedPack[],
-  config?: { spread_cap?: number; spread_budget?: number; expiry?: ExpiryConfig; pinned_hard_ratio?: number },
+  config?: { spread_cap?: number; spread_budget?: number; expiry?: ExpiryConfig; pinned_hard_ratio?: number; pinned_ratio?: number },
   embeddingBoosts?: Map<string, number>,
 ): InternalInjectionResult {
   const spreadCap = config?.spread_cap ?? 3
@@ -887,23 +911,24 @@ export function selectAndSpread(
   // split them, so a soft pin in an earlier pass cannot spend the share a
   // hard pin in a later pass is entitled to.
   const hardRatio = config?.pinned_hard_ratio ?? DEFAULT_PINNED_HARD_RATIO
+  const pinnedRatio = config?.pinned_ratio ?? PINNED_TOKEN_BUDGET_RATIO
   const pinnedLedger = {
     spent: 0,
     hardSpent: 0,
-    hardReserve: hardPinnedReserve(filtered, pinnedHardCap(maxTokens, hardRatio)),
+    hardReserve: hardPinnedReserve(filtered, pinnedHardCap(maxTokens, hardRatio, pinnedRatio)),
   }
-  const firstPass = fillTokenBudget(constraintCandidates, constraintsFloor, maxTokens, pinnedLedger, hardRatio)
+  const firstPass = fillTokenBudget(constraintCandidates, constraintsFloor, maxTokens, pinnedLedger, hardRatio, pinnedRatio)
 
   // Directives get everything the constraints floor did not use.
   const directivesBudget = Math.max(0, maxTokens - firstPass.tokens_used)
-  const dirPass = fillTokenBudget(otherCandidates, directivesBudget, maxTokens, pinnedLedger, hardRatio)
+  const dirPass = fillTokenBudget(otherCandidates, directivesBudget, maxTokens, pinnedLedger, hardRatio, pinnedRatio)
 
   // Any budget the directives left over flows BACK to constraints, so a
   // session with few directives carries more of its rules, not fewer.
   const slack = Math.max(0, maxTokens - firstPass.tokens_used - dirPass.tokens_used)
   const chosen = new Set(firstPass.selected.map(e => e.id))
   const secondPass = slack > 0
-    ? fillTokenBudget(constraintCandidates.filter(e => !chosen.has(e.id)), slack, maxTokens, pinnedLedger, hardRatio)
+    ? fillTokenBudget(constraintCandidates.filter(e => !chosen.has(e.id)), slack, maxTokens, pinnedLedger, hardRatio, pinnedRatio)
     : { selected: [] as ScoredEngram[], tokens_used: 0, omitted_pinned: [] as OmittedPinned[] }
 
   const selectedConstraints = [...firstPass.selected, ...secondPass.selected]

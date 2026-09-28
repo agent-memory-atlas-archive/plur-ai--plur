@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import {
-  fillTokenBudget, selectAndSpread, estimateTokens, pinnedOriginRank, pinnedHardCap,
+  fillTokenBudget, selectAndSpread, estimateTokens, pinnedOriginRank, pinnedHardCap, pinnedShareRatio,
   type OmittedPinned,
 } from '../src/inject.js'
 import { EngramSchema } from '../src/schemas/engram.js'
@@ -176,5 +176,29 @@ describe('budgets and reporting', () => {
     const out = fillTokenBudget(hard as never, 2000, 2000, { spent: 0 }, 0.1) // hard cap 100
     const used = out.selected.reduce((n, e) => n + estimateTokens(e), 0)
     expect(used).toBeLessThanOrEqual(100)
+  })
+})
+
+describe('ratio guards', () => {
+  it('a non-finite hard ratio falls back to the default instead of disabling the cap', () => {
+    expect(pinnedHardCap(2000, NaN)).toBe(500)
+    expect(pinnedHardCap(2000, Infinity)).toBe(500)
+    const hard = Array.from({ length: 10 }, (_, i) => mk(`ENG-H-${i}`, { tier: 'hard', statement: 'h'.repeat(400) }))
+    const out = fillTokenBudget(hard as never, 2000, 2000, { spent: 0 }, NaN)
+    expect(out.selected.reduce((n, e) => n + estimateTokens(e), 0)).toBeLessThanOrEqual(500)
+  })
+
+  it('a non-finite pinned ratio falls back to the default', () => {
+    expect(pinnedShareRatio(NaN)).toBe(0.5)
+    expect(pinnedHardCap(2000, 0.5, NaN)).toBe(500)
+  })
+
+  it('selectAndSpread honours pinned_ratio', () => {
+    const soft = Array.from({ length: 8 }, (_, i) => mk(`ENG-S-${i}`, { statement: `deploy rule ${i} ${'s'.repeat(300)}` }))
+    const res = selectAndSpread({ prompt: 'deploy', maxTokens: 2000 }, soft as never, [], { pinned_ratio: 0.3 })
+    const loaded = [...res.directives, ...res.constraints].map(e => e.id)
+    const used = soft.filter(e => loaded.includes(e.id)).reduce((n, e) => n + estimateTokens(e as never), 0)
+    expect(used).toBeLessThanOrEqual(600)
+    expect(res.omitted_pinned.length).toBeGreaterThan(0)
   })
 })

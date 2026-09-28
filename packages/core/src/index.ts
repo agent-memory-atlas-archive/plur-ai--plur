@@ -5426,6 +5426,7 @@ export class Plur {
         spread_budget: this.config.injection?.spread_budget,
         expiry: this.config.expiry,
         pinned_hard_ratio: this.config.injection?.pinned_hard_ratio,
+        pinned_ratio: this.config.injection?.pinned_ratio,
       },
       embeddingBoosts,
     )
@@ -6223,7 +6224,11 @@ export class Plur {
     })
     if (localResult) return localResult
 
-    let remotePatched: { patched: Engram; driver: RemoteStore; serverId: string; scope: string } | null = null
+    let remotePatched: {
+      patched: Engram; driver: RemoteStore; serverId: string; scope: string
+      /** Whether the engram was pinned BEFORE this call; null when unknown. */
+      priorPinned: boolean | null
+    } | null = null
     // Remote routing (closes #86 pin remainder). Strip the namespace prefix
     // before sending the server the unprefixed ID it knows about. Same
     // refusal rule as `_updateEngramReturning`: a namespaced id names ONE
@@ -6262,9 +6267,21 @@ export class Plur {
         // unpin the user was told had worked had not happened on any other
         // machine — and with the pinned set now quota-enforced at pin time,
         // it also held budget nobody could reclaim.
+        // Record the prior pin state BEFORE the PATCH, so a refused hard-tier
+        // pin can be reverted to what it was rather than to a forced unpin —
+        // and so re-pinning an engram that was already pinned (which cannot
+        // grow the tier) is never refused. Read from the driver's cache when
+        // it holds the row, else one GET; only for a pin, never an unpin.
+        let priorPinned: boolean | null = null
+        if (pinned === true) {
+          const cachedRow = ((driver as unknown as { cache?: { engrams?: Engram[] } | null }).cache?.engrams ?? [])
+            .find(e => e.id === serverId)
+          const prior = cachedRow ?? (typeof driver.getById === 'function' ? await driver.getById(serverId) : null)
+          priorPinned = prior ? (prior as { pinned?: boolean }).pinned === true : null
+        }
         const patched = await driver.patch(serverId, { pinned })
         if (!patched) continue
-        remotePatched = { patched, driver, serverId, scope: entry.scope }
+        remotePatched = { patched, driver, serverId, scope: entry.scope, priorPinned }
         break
       } catch (err) {
         if (serverId !== id) throw err
@@ -6276,17 +6293,35 @@ export class Plur {
     // engram still carries (a partial PATCH cannot clear it on unpin). Only
     // the server's answer says which tier the engram is in, so the cap is
     // checked on it — under the store lock, like every other hard-tier write
-    // — and a pin that would overrun the cap is reverted and refused. The
-    // window between the PATCH and the revert is the price of not adding a
-    // GET to every remote pin.
-    const { patched, driver, serverId, scope } = remotePatched
-    if (pinned === true && isHardPinned(patched as never)) {
+    // — and a pin that would overrun the cap is reverted to the state recorded
+    // before the PATCH and refused. There is a window between the PATCH and
+    // the revert. An engram that was already pinned is not checked: re-pinning
+    // it cannot grow the tier. When the prior state is unknown (no cached row,
+    // GET failed) the engram is treated as previously unpinned.
+    const { patched, driver, serverId, scope, priorPinned } = remotePatched
+    if (pinned === true && priorPinned !== true && isHardPinned(patched as never)) {
       try {
         await this._withStoreLock(this.paths.engrams, async () => {
           await this._assertHardTierFits({ ...patched, id: namespaceEngramId(serverId, scope) })
         })
       } catch (err) {
-        await driver.patch(serverId, { pinned: false }).catch(() => null)
+        // Surface a failed revert: swallowing it would report "refused" while
+        // the engram stays pinned over the cap on the server.
+        let revertError: string | null = null
+        try {
+          // Back to the recorded prior state. It is "not pinned" here: an
+          // engram that was pinned before the call never reaches this check.
+          const reverted = await driver.patch(serverId, { pinned: false })
+          if (!reverted) revertError = 'the server no longer holds the engram (404)'
+        } catch (e) {
+          revertError = (e as Error).message
+        }
+        if (revertError) {
+          throw new Error(
+            `${(err as Error).message} The pin was applied on the remote store and could NOT be reverted ` +
+            `(${revertError}); the engram ${serverId} is still pinned there. Unpin it explicitly.`,
+          )
+        }
         throw err
       }
     }
@@ -6358,6 +6393,10 @@ export class Plur {
    */
   private async _assertHardTierFits(candidate: Engram, pendingTokens = 0): Promise<number> {
     if (!isHardPinned(candidate as never)) return 0
+    // A retired (or otherwise non-active) engram is not injected, so it is
+    // outside the tier: editing or retiring it must never be refused because
+    // the tier is full. listPinned() already excludes such rows from the total.
+    if (candidate.status !== undefined && candidate.status !== 'active') return 0
     const cost = estimateTokens(candidate as never)
     const hard = (await this.listPinned()).filter(e => isHardPinned(e as never))
     const previous = hard.find(e => e.id === candidate.id)
