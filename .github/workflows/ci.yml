@@ -37,6 +37,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # Uses the runner's system python3 and its python3-yaml; the checker
+      # fails closed if PyYAML is missing rather than passing unchecked.
+      - run: python3 scripts/test_check_workflow_pins.py
       - run: python3 scripts/check-workflow-pins.py
 
   test:
