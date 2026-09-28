@@ -507,8 +507,12 @@ export const EngramSchema = z.object({
   /**
    * Always-load flag. Pinned engrams bypass the term-hits gate in scoreEngram
    * and are eligible for injection on every session start, regardless of
-   * keyword overlap with the user's task. Tier is controlled by pinned_tier.
-   * Use sparingly — see pinned_tier and pinned_priority for budget semantics.
+   * keyword overlap with the user's task. Use sparingly: meta-rules,
+   * cross-cutting safety conventions, and core operating principles only.
+   * Pinned engrams still respect the token budget — they bypass per-pack and
+   * per-domain fairness caps in fillTokenBudget so always-load behavior is
+   * honored even if a single pack contributes many. Tier is controlled by
+   * pinned_tier; see pinned_tier and pinned_priority for budget semantics.
    */
   pinned: z.boolean().optional()
     .describe(

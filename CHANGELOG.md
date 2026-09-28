@@ -76,6 +76,10 @@ as `hard-tier-cap` or `soft-tier-budget` rather than dropped silently.
 The tier is not yet sent to remote stores: a tiered write to a remote scope
 lands there as an ordinary pin until the server accepts the two fields.
 
+**`injection.pinned_ratio` now sets the pinned share at injection too.** It
+already set the quota enforced when pinning, but injection used a fixed 0.5, so
+with any other value the two disagreed. With the default of 0.5 nothing changes.
+
 **The injection cost estimate now counts `claim_class`.** It is rendered as
 `Kind: …` in the meta line and was not charged, which let a rendered field
 carry unbudgeted text into the prompt. Engrams with a `claim_class` cost a few
