@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync, renameSync, openSync, closeSync, linkSync } from 'fs'
+import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync, renameSync, openSync, closeSync, linkSync, writeSync, fstatSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { tmpdir, homedir } from 'os'
 import { randomUUID, randomBytes } from 'crypto'
@@ -193,6 +193,13 @@ function touchReminder(path: string | null): void {
 }
 
 /**
+ * What a hook holds after taking the inject lock: the file's inode and the
+ * token written into it. `releaseInjectLock` deletes the lock only when the
+ * file at `path` still has both — see there.
+ */
+export interface InjectLockHold { path: string; ino: number; token: string }
+
+/**
  * Take the per-session inject lock (#519) with O_EXCL (formal r2, cli#7).
  *
  * The previous stat-then-write let two hooks that fired together both see
@@ -200,11 +207,74 @@ function touchReminder(path: string | null): void {
  * exists to prevent. `wx` makes creation the test. A lock older than
  * LOCK_STALE_MS belongs to a crashed run and is taken over (one retry).
  *
- *   'acquired'    — ours; the caller MUST release it (in a finally)
+ *   'acquired'    — ours; the caller MUST release it (in a finally) with
+ *                   `releaseInjectLock(hold)`
  *   'busy'        — a live run holds it; bail
  *   'unavailable' — cannot lock at all (no trustworthy dir, I/O error);
  *                   proceed unlocked, the pre-#519 behaviour (fail open)
  */
+export function takeInjectLock(
+  path: string | null,
+  opts: {
+    staleMs?: number
+    now?: () => number
+    /** Test seam: runs between the staleness check and the takeover. */
+    _beforeTakeover?: () => void
+    /** Test seam: runs after the takeover moved the lock aside, before the put-back. */
+    _afterMoveAside?: () => void
+  } = {},
+): { status: 'acquired' | 'busy' | 'unavailable'; hold?: InjectLockHold } {
+  const staleMs = opts.staleMs ?? LOCK_STALE_MS
+  const now = opts.now ?? Date.now
+  if (!path) return { status: 'unavailable' }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd: number
+    try {
+      fd = openSync(path, 'wx', 0o600)
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return { status: 'unavailable' }
+      try {
+        const seen = statSync(path)
+        if (now() - seen.mtimeMs < staleMs) return { status: 'busy' }
+        opts._beforeTakeover?.()
+        // Stale: the holder crashed — take it over. A plain unlink here let two
+        // hooks that both saw it stale delete each other's fresh lock and both
+        // inject (formal verification, R2-CLI item 3). Move whatever is at
+        // `path` aside atomically, then check it is the stale file we judged
+        // (inode AND mtime, so a filesystem that reuses inode numbers cannot
+        // pass a fresh lock off as the stale one).
+        const aside = `${path}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
+        renameSync(path, aside)
+        opts._afterMoveAside?.()
+        const moved = statSync(aside)
+        if (moved.ino === seen.ino && moved.mtimeMs === seen.mtimeMs) {
+          unlinkSync(aside)
+        } else {
+          // A live lock arrived in between: put it back (link fails if yet
+          // another holder already exists — either way someone holds it). If
+          // the put-back fails, the moved lock's owner no longer holds `path`;
+          // `releaseInjectLock` checks ownership, so it will not delete the
+          // newer holder's lock (#1238).
+          try { linkSync(aside, path) } catch { /* a newer holder exists */ }
+          unlinkSync(aside)
+          return { status: 'busy' }
+        }
+      } catch { /* vanished between open and stat — retry */ }
+      continue
+    }
+    // Ours. Record what makes it ours: its inode and a token in its body.
+    const token = `${process.pid}-${randomBytes(8).toString('hex')}`
+    let written = token
+    try { writeSync(fd, token) } catch { written = '' /* the inode still identifies it */ }
+    let ino = -1
+    try { ino = fstatSync(fd).ino } catch { /* ino -1: release then leaves it to go stale */ }
+    try { closeSync(fd) } catch { /* ignore */ }
+    return { status: 'acquired', hold: { path, ino, token: written } }
+  }
+  return { status: 'busy' }
+}
+
+/** `takeInjectLock` without the hold — the status only. */
 export function acquireInjectLock(
   path: string | null,
   staleMs: number = LOCK_STALE_MS,
@@ -212,36 +282,23 @@ export function acquireInjectLock(
   /** Test seam: runs between the staleness check and the takeover. */
   _beforeTakeover?: () => void,
 ): 'acquired' | 'busy' | 'unavailable' {
-  if (!path) return 'unavailable'
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      closeSync(openSync(path, 'wx', 0o600))
-      return 'acquired'
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return 'unavailable'
-      try {
-        const seen = statSync(path)
-        if (now() - seen.mtimeMs < staleMs) return 'busy'
-        _beforeTakeover?.()
-        // Stale: the holder crashed — take it over. A plain unlink here let two
-        // hooks that both saw it stale delete each other's fresh lock and both
-        // inject (formal verification, R2-CLI item 3). Move whatever is at
-        // `path` aside atomically, then check it is the stale file we judged.
-        const aside = `${path}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
-        renameSync(path, aside)
-        if (statSync(aside).ino === seen.ino) {
-          unlinkSync(aside)
-        } else {
-          // A live lock arrived in between: put it back (link fails if yet
-          // another holder already exists — either way someone holds it).
-          try { linkSync(aside, path) } catch { /* a newer holder exists */ }
-          unlinkSync(aside)
-          return 'busy'
-        }
-      } catch { /* vanished between open and stat — retry */ }
-    }
-  }
-  return 'busy'
+  return takeInjectLock(path, { staleMs, now, _beforeTakeover }).status
+}
+
+/**
+ * Release an inject lock this hook took — only if it is still this hook's
+ * lock (#1238). A takeover that raced a third hook can leave `path` holding
+ * ANOTHER hook's live lock; an unconditional unlink here deleted it, and a
+ * fourth hook could then inject beside the third. The file is deleted only
+ * when it has the inode and the token recorded at acquire time.
+ */
+export function releaseInjectLock(hold: InjectLockHold | undefined): void {
+  if (!hold) return
+  try {
+    if (statSync(hold.path).ino !== hold.ino) return
+    if (readFileSync(hold.path, 'utf8') !== hold.token) return
+    unlinkSync(hold.path)
+  } catch { /* already gone */ }
 }
 
 function extractEventTask(input: Record<string, unknown>, event: string): string {
@@ -488,16 +545,15 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Multiple rapid async firings (datacore#33) otherwise pile up at ~160 MB
   // RSS each and trigger an OOM cascade. Lock is stale after HOOK_CEILING_MS
   // so a crashed process never permanently blocks subsequent invocations.
-  const lock = acquireInjectLock(statePath(stateDir, key, 'injecting'))
-  if (lock === 'busy') return
-  const lockPath = lock === 'acquired' ? statePath(stateDir, key, 'injecting') : null
+  const lock = takeInjectLock(statePath(stateDir, key, 'injecting'))
+  if (lock.status === 'busy') return
   // Released on EVERY exit from here on, including a throw (cli#7): the
   // BM25 fallback, createPlur and the project-config reads can all throw,
   // and a lock left behind silenced injection for LOCK_STALE_MS (55 s).
   try {
     await injectAndReport(isRehydrate, input, marker, reminderPath, stateDir, flags)
   } finally {
-    if (lockPath) try { unlinkSync(lockPath) } catch { /* already gone */ }
+    releaseInjectLock(lock.hold)
   }
 }
 
