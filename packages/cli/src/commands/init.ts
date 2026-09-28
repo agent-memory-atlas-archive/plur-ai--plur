@@ -323,9 +323,12 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
     ],
 
     // Re-inject after context compaction so engrams survive long conversations.
-    PostCompact: [
+    // SessionStart with matcher "compact" fires right after compaction and can
+    // carry context; PostCompact cannot (#1274). Re-running init strips the
+    // old PostCompact entry with the rest of the plur hooks.
+    SessionStart: [
       {
-        matcher: 'auto|manual',
+        matcher: 'compact',
         hooks: [
           { type: 'command', command: `${cmd} hook-inject --rehydrate`, timeout: 90, async: true },
         ],
@@ -1494,7 +1497,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo('', flags)
   outputInfo(`Injection hooks (9): ${injectionHooksStatus}`, flags)
   outputInfo('  UserPromptSubmit  — inject engrams + auto-start session', flags)
-  outputInfo('  PostCompact       — re-inject engrams after context compaction', flags)
+  outputInfo('  SessionStart      — re-inject engrams after context compaction', flags)
   outputInfo('  PreToolUse        — contextual injection (plan mode, skills, agents)', flags)
   outputInfo('  PreToolUse        — observation capture for pattern learning', flags)
   outputInfo('  PostToolUse       — observation results capture', flags)

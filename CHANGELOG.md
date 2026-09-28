@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Claude Code now actually receives injected memory
+
+**In Claude Code, automatic memory never reached the model** (#1274). An
+enterprise deployment reported that most folders had no automatic memory.
+`plur hook-inject` printed `{"additionalContext": ...}` at the top level.
+Claude Code records that as plain hook output and does not show it to the
+model. The same bug hit the Stop nudge (#1266).
+
+Every Claude Code event that `hook-inject` serves now prints
+`{"hookSpecificOutput":{"hookEventName":<event>,"additionalContext":...}}`,
+named after the event that fired: `UserPromptSubmit` (the first-message
+injection and the 10-minute reminder), `PreToolUse` (plan mode, skills,
+agents) and `SubagentStart`. The name comes from the payload's
+`hook_event_name`, or from how the hook was invoked when the payload has none.
+
+**Re-injection after compaction moved from `PostCompact` to `SessionStart`
+(matcher `compact`).** `PostCompact` cannot carry context at all. Claude Code
+rejects `hookEventName: "PostCompact"` with a visible validation error and
+ignores the top-level field. **Re-run `plur init`** to move the hook. Until you
+do, the old `PostCompact` entry prints nothing. The `SessionStart` payload has
+no compaction summary, so the rehydrate query now comes from the session's
+last prompt, stored per Claude Code `session_id`.
+
+`UserPromptSubmit` stays `async: true`. Async context does arrive, but at the
+next safe point (after a tool result, or before the next prompt), not on the
+turn that triggered it. A first message that needs no tools is answered
+without memory. In a one-shot `claude -p` run, that means no memory at all.
+
+An unknown `--event` no longer echoes the hook payload back to stdout.
+
 ### An unscoped write can no longer land in a team store
 
 **If you wrote an engram without a scope, it could be auto-routed into a shared
