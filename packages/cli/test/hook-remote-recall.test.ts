@@ -17,12 +17,14 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs'
+import { trustDirectory } from '@plur-ai/core'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { spawn } from 'child_process'
 import { StubServer } from '../../core/test/helpers/stub-server.js'
+import { builtCliPath } from './helpers/built-cli.js'
 
-const CLI = join(__dirname, '..', 'dist', 'index.js')
+const CLI = builtCliPath(join(__dirname, '..'))
 const TOKEN = 'hook-recall-token'
 const SCOPE = 'group:test'
 
@@ -71,6 +73,12 @@ describe('hook-inject × remote recall (#776)', () => {
       join(dir, '.plur.yaml'),
       `scope: project:test/app\nremote_url: ${baseUrl}\nremote_token: ${TOKEN}\n`,
     )
+    // #1196: hook-inject now refuses a project's remote_url/remote_token unless
+    // the directory carrying the `.plur.yaml` is explicitly trusted, because a
+    // cloned repo could otherwise name its own host AND supply its own token.
+    // This suite exercises remote recall, not the gate, so grant trust the way
+    // `plur trust` does — against the same store root the hook is given below.
+    trustDirectory(dir, join(dir, '.plur'))
   })
 
   afterEach(() => {

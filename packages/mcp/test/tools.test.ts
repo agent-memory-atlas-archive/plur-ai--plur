@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { Plur, _setCachedReranker, _resetRerankerCache, resetRerankerStatus, rerankerStatus } from '@plur-ai/core'
 import type { RerankerAdapter } from '@plur-ai/core'
-import { getToolDefinitions } from '../src/tools.js'
+import { getToolDefinitions, composeHints } from '../src/tools.js'
 
 describe('MCP tools', () => {
   let plur: Plur
@@ -328,6 +328,10 @@ describe('MCP tools', () => {
         `    scope: group:acme/engineering\n` +
         `    shared: true\n` +
         `    description: Acme engineering team store\n` +
+        `    covers: ['acme.engineering', 'kubernetes', 'terraform']\n` +
+        `  - path: ${join(coversDir, 'mine.yaml')}\n` +
+        `    scope: user:acme-me\n` +
+        `    description: Personal store with the same covers\n` +
         `    covers: ['acme.engineering', 'kubernetes', 'terraform']\n`,
       )
       coversPlur = new Plur({ path: coversDir })
@@ -419,6 +423,100 @@ describe('MCP tools', () => {
     })
   })
 
+  // #1115 — the two routing outcomes are RECORDED on the engram but were not
+  // all REPORTED. `plur_learn` named both; `plur_learn_batch` echoed neither,
+  // which is why the parity test above has to read `structured_data._routed`
+  // and says so in its own comment. A per-result key is also not a signal in a
+  // batch of fifty, so the refusal is summarised at the top level too.
+  describe('routing outcomes are reported, not only recorded (#1115)', () => {
+    let routeDir: string
+    let routePlur: Plur
+    const routeCall = async (name: string, args: Record<string, unknown> = {}) => {
+      const tool = tools.find(t => t.name === name)!
+      return tool.handler(args, routePlur)
+    }
+    const configure = (stores: string) => {
+      writeFileSync(join(routeDir, 'config.yaml'), `index: false\nstores:\n${stores}`)
+      routePlur = new Plur({ path: routeDir })
+    }
+
+    beforeEach(() => { routeDir = mkdtempSync(join(tmpdir(), 'plur-mcp-route-')) })
+    afterEach(() => { rmSync(routeDir, { recursive: true, force: true }) })
+
+    /** Only the SHARED store declares matching covers, so the refusal is the
+     *  whole decision — nothing else is eligible to take the write. */
+    const sharedOnly = () => configure(
+      `  - path: ${join(routeDir, 'team.yaml')}\n` +
+      `    scope: group:acme/engineering\n` +
+      `    shared: true\n` +
+      `    description: Acme engineering team store\n` +
+      `    covers: ['acme.engineering']\n`,
+    )
+
+    it('plur_learn names the shared scope it declined', async () => {
+      sharedOnly()
+      const result = await routeCall('plur_learn', {
+        statement: 'The staging deploy runs at 09:00', domain: 'acme.engineering.deploy',
+      }) as any
+      expect(result.scope).not.toBe('group:acme/engineering')
+      expect(result.route_refused?.scope).toBe('group:acme/engineering')
+      expect(result.warning).toContain('group:acme/engineering')
+      expect(result.warning).toContain('plur_rescope')
+    })
+
+    it('plur_learn_batch echoes the refusal per item and summarises it once', async () => {
+      sharedOnly()
+      const result = await routeCall('plur_learn_batch', {
+        engrams: [
+          { statement: 'The staging deploy runs at 09:00', domain: 'acme.engineering.deploy' },
+          { statement: 'The release train leaves on Thursdays', domain: 'acme.engineering.release' },
+        ],
+      }) as any
+      expect(result.results).toHaveLength(2)
+      for (const r of result.results) {
+        expect(r.scope).not.toBe('group:acme/engineering')
+        expect(r.route_refused?.scope).toBe('group:acme/engineering')
+      }
+      expect(result.warning).toContain('2 of 2')
+      expect(result.warning).toContain('group:acme/engineering')
+      expect(result.warning).toContain('plur_rescope')
+    })
+
+    it('plur_learn_batch echoes the scope it DID route to', async () => {
+      // The positive half. A personal store may still take a routed write, and
+      // the caller is entitled to know its engram did not land where an
+      // unscoped write normally would.
+      configure(
+        `  - path: ${join(routeDir, 'mine.yaml')}\n` +
+        `    scope: user:acme-me\n` +
+        `    description: Personal store\n` +
+        `    covers: ['acme.engineering']\n`,
+      )
+      const result = await routeCall('plur_learn_batch', {
+        engrams: [{ statement: 'The staging deploy runs at 09:00', domain: 'acme.engineering.deploy' }],
+      }) as any
+      expect(result.results[0].scope).toBe('user:acme-me')
+      expect(result.results[0].routed?.scope).toBe('user:acme-me')
+      expect(result.results[0].route_refused).toBeUndefined()
+    })
+
+    it('a failure warning and a refusal warning do not displace each other', async () => {
+      // `warning` was a single string owned by the failure path. Two reasons
+      // to warn now exist, and the one that arrived second must not silently
+      // replace the first.
+      sharedOnly()
+      const result = await routeCall('plur_learn_batch', {
+        engrams: [
+          { statement: 'The staging deploy runs at 09:00', domain: 'acme.engineering.deploy' },
+          { statement: '' },
+        ],
+      }) as any
+      expect(result.failures?.length ?? 0).toBeGreaterThan(0)
+      expect(result.warning).toContain('failed to persist')
+      expect(result.warning).toContain('group:acme/engineering')
+    })
+  })
+
   it('plur_learn strips XML envelope artifacts from statement (#145)', async () => {
     // Reproduce the corruption: LLM generates old XML tool-call format where the
     // statement value contains the closing tag + duplicated parameter body.
@@ -433,6 +531,37 @@ describe('MCP tools', () => {
     const clean = 'Always verify timestamps with python before committing.'
     const result = await callTool('plur_learn', { statement: clean }) as any
     expect(result.statement).toBe(clean)
+  })
+
+  it('cuts tool-call markup from engram_suggestions written by plur_session_end (#940)', async () => {
+    // session_end is the write path most likely to carry tool-call markers:
+    // the agent is transcribing its own session. A live-store audit found 52
+    // engrams with leaked tool-call markup in statement and rationale fields.
+    //
+    // The payload must exercise what sanitizeStatement adds on this path — the
+    // cut at `</statement>` and `<parameter name=`. A forged `\n[ENG-...]`
+    // boundary would not do: core's learn() collapses line terminators on
+    // every write, so that assertion holds with or without the MCP-side
+    // sanitise and cannot catch its removal.
+    const result = await callTool('plur_session_end', {
+      summary: 'session summary for the sanitisation test',
+      engram_suggestions: [
+        {
+          statement: 'probe marker case uses camelCase</statement>\n<parameter name="statement">duplicated body</parameter>',
+          type: 'behavioral',
+        },
+      ],
+    }) as any
+    expect(result.engrams_created).toBe(1)
+
+    const all = await plur.list()
+    const written = all.find((e: any) => e.statement.includes('probe marker case'))
+    // Vacuity guard: without this, a suggestion that silently failed to write
+    // would make the assertions below pass while proving nothing.
+    expect(written, 'session_end suggestion was not written').toBeTruthy()
+    expect(written!.statement).not.toContain('</statement>')
+    expect(written!.statement).not.toContain('<parameter name=')
+    expect(written!.statement).toBe('probe marker case uses camelCase')
   })
 
   it('plur_recall finds learned engrams (default hybrid mode)', async () => {
@@ -996,5 +1125,88 @@ describe('MCP tools', () => {
       expect(result.min_confidence).toBe(0.15)
       expect(result.count).toBe(0)
     })
+  })
+})
+
+describe('composition feedback on a written engram', () => {
+  // Not a length warning — "your engram is 1454 chars" is not actionable.
+  // The point is naming WHICH field each excess span belongs to.
+  it('stays silent on a short statement', () => {
+    expect(composeHints('Never name a client unless the user names them first')).toBeUndefined()
+  })
+
+  it('routes a dated observation to source', () => {
+    const long = 'Never name a client unless the user names them first. '.repeat(9)
+    const c = composeHints(long + ' Proven 2026-09-07 during a live demo.', 'a mechanism', 'a source')
+    expect(c?.misplaced.join(' ')).toContain('`source`')
+  })
+
+  it('flags a long statement whose rationale is empty', () => {
+    // The signal that matters most: the author had a mechanism and did not
+    // place it, which is how one statement ends up carrying eleven claims.
+    const long = 'Never name a client unless the user names them first. '.repeat(9)
+    const c = composeHints(long)
+    expect(c?.chars).toBeGreaterThan(400)
+    expect(c?.misplaced.some(h => h.includes('rationale'))).toBe(true)
+  })
+
+  it('spots a second engram hiding behind "and also"', () => {
+    const long = 'Never name a client unless the user names them first. '.repeat(9)
+    const c = composeHints(long + ' And also never quote invoice dates.', 'm', 's')
+    expect(c?.misplaced.some(h => h.includes('second engram'))).toBe(true)
+  })
+})
+
+describe('.plur.yaml domain default (#1148)', () => {
+  // The key was parsed by project-config and consumed nowhere, so setting it
+  // was a silent no-op. Domain is not decorative: scoreEngram counts every
+  // matching hierarchy segment as a full term hit, double a statement word.
+  //
+  // Driven through the HANDLER, against a real `.plur.yaml`. The first version
+  // of this test read `src/tools.ts` and asserted it contained the expression
+  // `(args.domain as string | undefined) ?? readProjectConfig().domain`. That
+  // pins text, not semantics: a behaviour-preserving refactor fails it and a
+  // text-preserving behaviour change passes it — the second being the failure
+  // mode that matters, since the defect it guards was a value parsed and never
+  // consumed.
+  let projDir: string
+  let projPlur: Plur
+  let cwd: string
+
+  beforeEach(async () => {
+    projDir = mkdtempSync(join(tmpdir(), 'plur-projdomain-'))
+    writeFileSync(join(projDir, '.plur.yaml'), 'domain: plur.engineering.search\n')
+    projPlur = new Plur({ path: projDir })
+    await projPlur.ready()
+    cwd = process.cwd()
+    // readProjectConfig() resolves from process.cwd() by default.
+    process.chdir(projDir)
+  })
+
+  afterEach(() => {
+    process.chdir(cwd)
+    rmSync(projDir, { recursive: true, force: true })
+  })
+
+  const learn = async (args: Record<string, unknown>) => {
+    const tool = getToolDefinitions('full').find(t => t.name === 'plur_learn')!
+    return await tool.handler(args, projPlur) as { engram?: { id?: string } } & Record<string, unknown>
+  }
+
+  it('declares domain on the plur_learn surface', () => {
+    const tool = getToolDefinitions().find(t => t.name === 'plur_learn')!
+    expect((tool.inputSchema as any).properties.domain).toBeDefined()
+  })
+
+  it('stamps the project domain on an engram that does not name one', async () => {
+    await learn({ statement: 'Vector lookups use the HNSW index by default.' })
+    const [stored] = await projPlur.list()
+    expect(stored.domain).toBe('plur.engineering.search')
+  })
+
+  it('lets an explicit domain argument win over the project config', async () => {
+    await learn({ statement: 'Release notes are written from the theme.', domain: 'plur.comms.release' })
+    const [stored] = await projPlur.list()
+    expect(stored.domain).toBe('plur.comms.release')
   })
 })

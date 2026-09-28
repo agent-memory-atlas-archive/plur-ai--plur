@@ -1,6 +1,6 @@
 {
   "name": "@plur-ai/cli",
-  "version": "0.19.4",
+  "version": "0.20.1",
   "type": "module",
   "bin": {
     "plur": "dist/index.js"
@@ -10,8 +10,9 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
-    "test": "vitest run"
+    "build": "tsup && node scripts/copy-skills.mjs",
+    "test": "vitest run",
+    "pretest": "npm run build"
   },
   "dependencies": {
     "@plur-ai/core": "workspace:*"

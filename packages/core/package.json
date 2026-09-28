@@ -1,6 +1,6 @@
 {
   "name": "@plur-ai/core",
-  "version": "0.19.4",
+  "version": "0.20.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,7 +10,9 @@
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
-    "gen:schemas": "tsx scripts/gen-spec-schemas.ts"
+    "gen:schemas": "tsx scripts/gen-spec-schemas.ts",
+    "try:provenance": "tsx scripts/try-provenance.ts",
+    "build:spec-examples": "tsx scripts/build-spec-examples.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.4.6",

@@ -1,10 +1,15 @@
 # The Open Engram Standard
 
-**Version:** 1.0 (draft)
+**Version:** 1.7 (draft)
 **Status:** Working Draft
-**Date:** 2026-06-14
+**Date:** 2026-09-08
 **Editors:** PLUR.ai (plur-ai)
 **License:** This specification is licensed under CC-BY-4.0. Reference code is Apache-2.0.
+**Companion profiles:** [Recording where an engram came from](./ENGRAM-PROVENANCE-PROFILE.md)
+— profiles §9. A profile refines one part of this document; it never replaces it,
+and this document remains authoritative wherever the two overlap.
+
+Revision history is §10.5.
 
 > An **engram** is a small, self-describing, portable assertion of learned
 > knowledge for AI agents. The Open Engram Standard defines the engram object,
@@ -29,6 +34,7 @@ Every normative section carries a maturity label:
 | **STABLE** | Implemented in the reference and frozen for v1. Implementers MUST follow it to be conformant. Breaking changes require a major version. |
 | **RESERVED** | Wire space, flags, or fields are allocated and validated, but the *behavior* is not yet specified. Implementers MUST preserve the reserved space (e.g. round-trip the bytes/fields) but MUST NOT assign their own meaning to it. |
 | **PROPOSED** | A planned extension or profile. Non-normative for v1. Provided so the design space is documented and the fundable remainder is explicit. Implementers MAY ignore it. |
+| **SPECIFIED** | Normative and frozen for v1, but **not yet fully implemented in the reference**. Implementers MUST follow it to be conformant, exactly as for STABLE. The distinction exists because "implemented in the reference" and "binding on implementers" are different claims, and a document that conflates them cannot describe a rule written before its own implementation catches up. Where the reference falls short, this document says so and names the tracking issue. |
 
 The maturity label of a whole section applies to everything in it unless an
 inner item is labelled otherwise.
@@ -40,11 +46,13 @@ inner item is labelled otherwise.
 ### 1.1 What this standard covers
 
 1. **The Engram object** (§4) — the field set, types, value ranges, and
-   invariants of a single unit of knowledge.
+   invariants of a single unit of knowledge, and how one may change over time
+   (§4.7.1).
 2. **The ID grammar** (§3) — how engram identifiers are formed and what their
    prefixes mean.
-3. **The Pack format** (§5) — the on-disk directory layout (`SKILL.md` +
-   `engrams.yaml` + `INTEGRITY`) and the manifest fields.
+3. **The Pack format and lifecycle** (§5) — the on-disk directory layout
+   (`SKILL.md` + `engrams.yaml` + `INTEGRITY`), the manifest fields, and what a
+   consumer does when it installs, updates or removes one (§5.6–§5.8).
 4. **The `.plur` capsule** (§6) — the binary single-file envelope: header,
    format version, flags, payload, checksum.
 5. **The integrity model** (§6, §8) — how a receiver verifies that a pack or
@@ -275,6 +283,27 @@ destroying any.
 | `type` | string | **R** | `behavioral` \| `terminological` \| `procedural` \| `architectural` | Top-level knowledge class. |
 | `scope` | string | **R** | free-form | Hierarchical namespace. Convention: `kind:path`, e.g. `global`, `project:my-app`, `group:plur/test`. |
 | `visibility` | string | | `private` \| `public` \| `template`, default `private` | Sharing posture. `private` engrams MUST NOT be exported (§5.4). `template` = shippable skeleton. |
+| `created_at` | string | | RFC 3339 instant | Timestamp of first mint. Immutable. |
+| `updated_at` | string | | RFC 3339 instant | Timestamp of the last mutation to content or lifecycle. |
+
+Both timestamps are OPTIONAL and deliberately **not** defaulted. An
+implementation MUST NOT synthesise `created_at` at load time for an engram that
+lacks it: a default stamps the load date onto every legacy record and destroys
+the provenance the field exists to carry. Absent means genuinely unknown.
+
+`updated_at` tracks mutation of the engram's *content or lifecycle* — statement,
+scope, commitment, relations, retirement. It MUST NOT be moved by reads, decay,
+injection, or feedback; those change `activation` and `usage`, which are
+separate state carrying their own timestamps. An implementation that bumps
+`updated_at` on read makes it indistinguishable from `activation.last_accessed`
+and useless for provenance.
+
+> **Added 2026-09-07.** Before this the object had no canonical creation time.
+> `sources[].stored_at` records a timestamp per write but is optional: a real
+> 5,477-engram store carried one on 2,765 of them, and `temporal.learned_at` on
+> 12. Consumers were left parsing the mint date out of the identifier — which is
+> date-only, is absent for any id not in the canonical form of §3.3, and is
+> wrong for a migrated or store-namespaced engram.
 
 ### 4.3 Content
 
@@ -291,7 +320,7 @@ destroying any.
 | `source` | string | | | Free-text origin (session, document). |
 | `source_patterns` | string[] | | | Pattern IDs that contributed. |
 | `derivation_count` | integer | | ≥0, default `1` | Number of derivation steps. |
-| `pack` | string \| null | | default `null` | Owning pack name, or null. |
+| `pack` | string \| null | | default `null` | Owning pack name, or null. A consumer satisfying §5.6.2 by writing this SHOULD do so; absence does NOT mean an engram is not from a pack. |
 | `abstract` | string \| null | | default `null` | ID of an `ABS-` abstraction this instantiates. |
 | `derived_from` | string \| null | | default `null` | ID of the parent engram. |
 
@@ -330,6 +359,151 @@ required when `knowledge_type` is present.
 | `knowledge_anchors` | object[] | each: `path` (R), `relevance` (`primary`\|`supporting`\|`example`, default `supporting`), `snippet?` (≤200 chars), `snippet_extracted_at?` | Links to grounding documents. |
 | `dual_coding` | object | `{ example?, analogy? }` — **at least one required** | Verbal + analogical encoding. Invariant: `example OR analogy` MUST be present if the object is present. |
 
+`relations.supersedes` and `relations.superseded_by` are specified in §4.7.1,
+which governs when they are used at all.
+
+#### 4.7.1 Changing an engram — SPECIFIED
+
+An engram can change in two ways, and this standard previously defined both
+without ever saying which applies when:
+
+- **In place.** The engram keeps its `id`, its content changes, and
+  `engram_version` (§4.12) increments.
+- **By supersession.** A new engram is created with a new `id`, carrying
+  `relations.supersedes` naming the old one, and the old one is retired.
+
+The choice is not stylistic. **An in-place edit destroys the previous
+statement** — afterwards nothing anywhere holds what the engram used to say.
+A supersession keeps both and links them. So the choice decides whether these
+are answerable at all:
+
+- what did this engram say when somebody acted on it last week
+- was it corrected, or has it always said this
+- somebody relied on the earlier claim — do they need telling
+
+##### What this section governs
+
+**A live store — engrams a producer holds and edits.** It does not govern a pack,
+where an engram `id` means something different: §3.3.2 gives packs a dateless id
+form precisely so ids stay stable across releases, which makes a pack id a
+**name for a slot** rather than the identity of one claim. §5.7.2 says how a
+consumer compares two releases, and the two rules are complementary rather than
+in tension — see the note at the end of §5.7.2.
+
+##### The rule
+
+**An edit to `statement` that moves `content_hash` MUST be a supersession.
+Anything else is in place.**
+
+`content_hash` is `sha256` over the normalized `statement` (§4.3). Normalization
+lowercases, strips non-word characters and collapses whitespace, so the hash is
+already invariant under capitalisation, punctuation and spacing — the changes
+that genuinely alter nothing.
+
+`content_hash` is the right authority for the question this section asks, because
+the producer computing `content_hash` is the party being asked. `content_hash` is
+**not** an integrity check against a party who does not want a change seen — see
+§4.12.1 before relying on `content_hash` for anything other than the test above.
+
+| Change | How | Why |
+|---|---|---|
+| Capitalisation, punctuation, whitespace in `statement` | **In place.** | The hash does not move. Nothing a reader could have relied on has changed. |
+| `rationale`, `tags`, `domain`, `summary`, `dual_coding`, `knowledge_anchors` | **In place.** `engram_version` increments. | Context around the claim, not the claim. |
+| `scope`, `visibility`, `pinned`, `commitment` | **In place.** | How the engram is treated, not what it asserts. |
+| `activation`, `feedback_signals`, `usage` | **In place**, and does **not** increment `engram_version`. | Derived state, rewritten on every read. |
+| **Any change that moves `content_hash`** | **A new engram superseding the old — MUST.** | The previous statement would otherwise be destroyed. |
+
+An earlier draft of this section made the test *whether the meaning changed*. That
+was wrong, and this is the correction. Meaning-change is a judgement, it is
+frequently subjective, and three implementations applying it independently will
+disagree — which defeats the purpose of specifying it at all. `content_hash` is
+mechanical, already computed on every write, and needs no interpretation.
+
+**"An edit that moves the hash" — not "a hash that moved".** The normalization
+itself is versioned, and the reference is already on its second version. When a
+normalizer changes, every stored hash in every store moves at once, with nobody
+having edited anything. **Renormalizing or backfilling hashes is not an edit and
+MUST NOT mint supersessions.** Read literally, the alternative would turn a
+maintenance migration into thousands of spurious corrections.
+
+**One blind spot, stated rather than discovered.** A statement that normalizes to
+the empty string — all punctuation, all emoji — hashes to the same value as every
+other such statement. Editing one into another does not move the hash, so this
+rule calls it an in-place edit. The same is true of a change confined to
+punctuation: `"…is idempotent."` becoming `"…is idempotent?"` keeps its hash and
+is therefore in place, even though a reader might take the second to be asking
+rather than asserting. Both follow from choosing a mechanical test, and they are
+the price of not asking implementations to judge meaning.
+
+The cost is accepted deliberately: **fixing a genuine typo mints a new engram**,
+because "teh" and "the" hash differently. That is a small amount of churn in
+exchange for a rule with no judgement in it, and the retired engram is filtered
+from recall by its status. An implementation MAY retain the previous statement in
+its own history as well; doing so does **not** exempt it from this rule, because
+history is the implementation's to prune and the engram is not.
+
+A producer MUST NOT rewrite a `statement` in place in a way that moves its
+`content_hash`. That is precisely the operation which leaves nothing holding
+what the engram used to say.
+
+##### What each path MUST record
+
+**In place:** `engram_version` incremented (except for derived state), and a
+history event recording that the engram changed.
+
+**By supersession:** `relations.supersedes` on the new engram naming the old, the
+old engram retired rather than deleted, and — where the producer records reasons
+at all — why. A producer SHOULD write `relations.superseded_by` on the old engram
+as the reverse edge; a consumer MUST NOT rely on it being present, since it can
+only be written where the old engram is reachable (see the provenance profile
+§6.1).
+
+##### Why this is a MUST rather than a recommendation
+
+Because the alternative is unrecoverable. Every other under-specified choice in
+this document produces something a later implementation can repair — a missing
+field can be backfilled, a wrong mapping can be remapped. A statement overwritten
+in place is gone, and no amount of later specification brings it back.
+
+##### What this does not do
+
+It does not judge significance, and deliberately so. A one-character correction
+and a reversal of the claim are treated identically, because both move the hash
+and the rule has no opinion beyond that.
+
+The consequence is worth stating outright: `relations.supersedes` means *"this
+replaced that"*, not *"this contradicts that"*. A reader MUST NOT infer from a
+supersession chain that a claim changed substantively — only that the statement
+did. Where an implementation wants to distinguish the two, that is a reason
+recorded on the supersession by whoever made the change, and never something a
+consumer may compute for itself.
+
+##### Where the reference does not comply
+
+The reference's deduplication path rewrites statements in place, and it is the
+commonest way an engram changes:
+
+| Path | What it does | Reference |
+|---|---|---|
+| dedup `UPDATE` | Replaces the target's `statement` outright with the incoming one and increments `engram_version`. The previous statement is retained **only in the history log**, as `old_statement` on the `engram_updated` event — not on any engram. | `packages/core/src/learn-async.ts:235-250` |
+| dedup `MERGE` | Concatenates the incoming statement onto the target's, recording the incoming statement in the same history event. The seam is therefore computable rather than guessed, but again only from the log. | `packages/core/src/learn-async.ts:270-276` |
+
+Both change what the engram asserts, and both are exactly the case §4.7.1 makes
+a supersession. Neither writes `relations.supersedes`, so a reader who acted on
+the earlier claim has no record on the engram that it changed.
+
+The history retention above does not exempt either path, for the reason this
+section already gives: the log is the implementation's to prune and store-local,
+while the engram is neither. It does mean the earlier statement is recoverable
+today by somebody who reads the log, which is a materially better position than
+losing it — worth stating precisely, since an implementer building from this
+document would otherwise carry a wrong fact about the reference.
+
+This is the most consequential gap in the section, because deduplication is not
+an edge case — it is what happens every time a user re-states something the store
+already holds in different words. Tracked in plur-ai/plur#1041 *editing an
+engram: the spec has two mechanisms and no rule for choosing between them*.
+
 ### 4.8 Provenance — STABLE (origin/chain/license); `signature` RESERVED
 
 | Field | Type | Range / enum | Semantics |
@@ -338,6 +512,29 @@ required when `knowledge_type` is present.
 | `provenance.chain` | string[] | default `[]` | Derivation/transfer chain. |
 | `provenance.signature` | string \| null | default `null` | **RESERVED.** Detached signature over the engram. Algorithm and canonicalization are NOT specified in v1 (§7). Producers MUST write `null`; consumers MUST round-trip whatever value is present without ascribing trust to it. |
 | `provenance.license` | string | default `cc-by-sa-4.0` | License of this engram's content. |
+
+**Who is answerable, and what kind of claim it is — PROPOSED (#961, #963)**
+
+Both fields are optional. A producer that does not know a value MUST omit it
+rather than guess. A record with no agent is valid; a record with a guessed agent
+is worse than one with none.
+
+| Field | Type | Range / enum | Semantics |
+|---|---|---|---|
+| `attribution` | object | all sub-fields optional | Who is answerable for this engram. `asserted_by` (address of who or what asserted it), `runtime` (`name`, `version?` of the software that wrote it), `model` (`name`, `prompt_id?`, `prompt_version?`, `prompt_sha256?` — prompt text is never stored), `tool` (`name`, `version?`), `on_behalf_of` (the party the runtime acted for). |
+| `claim_class` | string | `observed`, `documented`, `structural`, `asserted`, `inferred`, `revised` | What kind of claim this is. Distinguishes a statement a person made from one a model inferred and one a pattern scraped — today those are stored identically. |
+
+`attribution.asserted_by` holds an address and deliberately does not fix its form.
+A local name, a Decentralized Identifier and an identifier for a running process
+are all acceptable. When no identity is configured, producers SHOULD write the
+well-known value `unidentified` rather than omitting the field: absence cannot be
+told apart from a record written before identity was captured at all, and the
+marker distinguishes the two.
+
+Producers MUST NOT derive an identity from the operating system account. That
+would write a personal name by default, without anyone choosing to share it.
+
+Full treatment in [the provenance profile](./ENGRAM-PROVENANCE-PROFILE.md).
 
 ### 4.9 Feedback & usage state
 
@@ -404,15 +601,15 @@ ignore the values.
 
 | Field | Type | Range / enum | Semantics |
 |---|---|---|---|
-| `content_hash` | string | | Hash of normalized statement, for dedup. |
-| `commitment` | string | `exploring` \| `leaning` \| `decided` \| `locked` \| `draft` | Epistemic commitment level. `draft` marks the engram as pending human approval — core stores and recalls it normally; enforcement is left to deployments with a review queue. |
+| `content_hash` | string | | SHA-256 of the normalized `statement` (§4.7.1). Used for deduplication, and as the test for whether an edit changed the claim. **Not an integrity check** — see §4.12.1. |
+| `commitment` | string | `exploring` \| `leaning` \| `decided` \| `locked` \| `draft` | Epistemic commitment level. `draft` marks the engram as pending human approval. A conforming implementation MUST NOT deliver a `draft` engram into an agent's context automatically; it MAY return one in response to an explicit retrieval, since reviewing an engram requires reading it. Feedback MUST NOT advance `draft` — relevance is not approval. |
 | `locked_at` | string | | When commitment became `locked`. |
 | `locked_reason` | string | | Why locked. |
 | `write_count` | integer | ≥0, default 1 | Same-scope re-learn count. Engram retires only at 0. Renamed from `reference_count` (#866); implementations MUST backfill on first parse. |
 | `injection_count` | integer | ≥0, default 0 | Number of times this engram was selected into a session's injection context. Distinct from `activation.frequency` (recall events). High injection_count + low positive feedback_signals is an efficacy-failure signal (#865, #866). |
 | `sources` | object[] | each: `scope` (R), `session_id?` (string\|null), `stored_at` (R, instant) | One entry per write attempt. |
 | `recurrence_count` | integer | ≥0, default 0 | Different-scope re-learn count (universality evidence). |
-| `engram_version` | integer | ≥1, default 1 | Content-evolution version. |
+| `engram_version` | integer | ≥1, default 1 | Content-evolution version. Incremented on an **in-place** edit (§4.7.1); NOT incremented by changes to derived state (`activation`, `feedback_signals`, `usage`); and never used for a change that moves `content_hash` — that is a supersession, which mints a new engram whose counter starts at 1. |
 | `previous_version_ref` | object | `{event_id, changed_at}` | Pointer to prior content version. |
 | `episode_ids` | string[] | default `[]` | Source episode IDs. |
 | `summary` | string | ≤80 chars | Injection-friendly short form. |
@@ -420,6 +617,31 @@ ignore the values.
 | `pinned_tier` | `"hard"` \| `"soft"` | default `"soft"` | Tier within the always-on budget. `"hard"`: write-rejected if adding this engram would exceed the 2,000-token hard cap — guaranteed injection. `"soft"`: priority-ordered eviction when soft budget (30% of maxTokens) is exceeded. |
 | `pinned_priority` | integer | 1–100, default 50 | Soft-tier eviction priority. Higher survives longer. Tie-break: `temporal.learned_at` ascending (FIFO). Ignored for `pinned_tier="hard"`. |
 | `measured_under` | object | `model?`, `source_type?`, `hardware?`, `dataset?`, `date?` (ISO date) | Measurement conditions for numeric/benchmark engrams — which model, environment type, hardware tier, dataset, and date the value was recorded under. Allows tension-aware retrieval to treat differently-measured values as refinements rather than contradictions (#869). |
+
+#### 4.12.1 `content_hash` detects corruption, not tampering
+
+`content_hash` is stored in the same file as the `statement` `content_hash`
+covers. Anybody able to edit the statement is able to recompute `content_hash`
+in the same write, and the recomputed value verifies.
+
+So `content_hash` answers *"has the statement changed since the hash was last
+computed"*, which detects a truncated write, a partial sync or a corrupted file.
+`content_hash` does **not** answer *"has anybody altered this engram"*, and an
+implementation MUST NOT present a `content_hash` match as evidence that an
+engram is unmodified.
+
+The distinction is easy to lose because §4.7.1 makes `content_hash` the
+authority on whether an edit changed a claim. `content_hash` is a reliable
+authority there — the producer computing `content_hash` is the party being asked
+— and unreliable as a defence against a party who does not want the change seen.
+
+Detecting tampering requires a value the editing party cannot rewrite in the
+same operation. §5.5's pack integrity value is one, because a recipient compares
+the recipient's own recomputation against a value fixed before the pack was sent.
+An external anchor is another. Neither is `content_hash`, and §7 (signing) —
+which would give an engram one — is RESERVED.
+
+---
 
 ### 4.13 Required-field summary
 
@@ -436,11 +658,18 @@ scope: project:my-app         # free-form §4.2
 All five of `id`, `statement`, `type`, `status`, `scope` are REQUIRED. Every
 other field is optional with the default given above.
 
-> **Note on `created_at`.** Some reference example documents show a top-level
-> `created_at` timestamp. It is **not** a validated field in v1 — it survives
-> only via the open-world rule (§4.1). Implementers SHOULD use `temporal.learned_at`
-> (or `sources[].stored_at`) for authoritative creation time. A future minor
-> version MAY promote a creation timestamp to a first-class field (§10.2).
+> **Note on `created_at` / `updated_at`.** Both are first-class OPTIONAL fields
+> as of 2026-09-07; see the §4.2 rows and the normative paragraph there. This
+> note previously said `created_at` was *not* a validated field and directed
+> implementers to `temporal.learned_at` instead — that text predates the change
+> and contradicted it 180 lines later in the same document.
+>
+> `temporal.learned_at` and `sources[].stored_at` remain valid and are not
+> deprecated, but neither is a substitute: on a real 5,477-engram store
+> `stored_at` was present on 2,765 records and `learned_at` on 12, so a consumer
+> relying on either sees most of the corpus as undated. Neither is defaulted,
+> and an absent `created_at` still means genuinely unknown rather than "the day
+> you loaded it".
 
 ### 4.14 Key invariants (normative)
 
@@ -468,7 +697,8 @@ an integrity file.
 <pack-name>/
 ├── SKILL.md          (REQUIRED — manifest as YAML frontmatter)
 ├── engrams.yaml      (the engrams, top-level `engrams:` sequence)
-└── INTEGRITY         (pack content hash; see §5.5)
+├── INTEGRITY         (pack content hash; see §5.5)
+└── provenance/       (OPTIONAL — PROV records; see the provenance profile §5.3)
 ```
 
 - A pack **MUST** ship a `SKILL.md`, carrying the manifest as its **YAML
@@ -483,6 +713,12 @@ an integrity file.
 - `engrams.yaml` is a §2.1 store document.
 - `INTEGRITY` is OPTIONAL on disk but RECOMMENDED for distribution; the
   authoritative integrity record at install time is the registry entry (§5.5).
+- `provenance/` is OPTIONAL. When present it holds W3C PROV records describing
+  where the pack and its engrams came from; its layout and contents are
+  specified in §5.3 of the [provenance profile](./ENGRAM-PROVENANCE-PROFILE.md).
+  These files are **not** covered by the §5.5 integrity hash, which is defined
+  over `SKILL.md` ‖ `engrams.yaml` only. A pack SHOULD declare their presence
+  via `metadata.provenance` (§5.2) so a reader need not probe for the directory.
 
 ### 5.2 Manifest fields
 
@@ -508,6 +744,7 @@ The manifest object (see `pack-manifest.schema.json`):
 | `match_terms` | string[] | default `[]` | Keywords gating `on_match`. |
 | `domain` | string | | Domain. |
 | `engram_count` | number | | Advisory count (loaders count the real file). |
+| `provenance` | boolean | default absent | The pack ships PROV records under `provenance/` (§5.1). A **declaration, not evidence**: it is written by the producer and covered by the §5.5 hash, but a reader MUST still verify the directory exists and the records parse before relying on them. Absent means "not declared", which is not the same as "none present". |
 
 `x-datacore` is the same shape **except** `injection_policy` ∈ {`on_match`,
 `on_request`} only (no `always`), `id` and `injection_policy` are required, and
@@ -544,10 +781,34 @@ When producing a pack from a live store, a producer MUST exclude:
 
 A producer SHOULD also strip store-local state that is meaningless to a
 recipient: cross-reference `relations.related`/`relations.conflicts`,
-`associations`, local `knowledge_anchors`, and SHOULD reset `activation`
-(fresh `retrieval_strength`, `frequency: 0`) and `feedback_signals` to zero so
-the recipient builds their own usage history. (This mirrors the reference
-`exportPack`.)
+**`relations.supersedes`/`relations.superseded_by`**, `associations`, local
+`knowledge_anchors`, and SHOULD reset `activation` (fresh `retrieval_strength`,
+`frequency: 0`) and `feedback_signals` to zero so the recipient builds their own
+usage history. (This mirrors the reference `exportPack`.)
+
+Supersession edges are store-local in the same way the other cross-references
+are: they name engram ids that mean nothing in the recipient's store, and a stale
+edge landing on an id collision would suppress tension detection between
+unrelated engrams.
+
+A producer MUST also neutralize fields by which a pack could override the
+recipient's own behaviour:
+
+- **`pinned` MUST be removed.** A pinned engram bypasses the relevance gate and
+  is injected unconditionally. A pack is an archive from a stranger, and letting
+  its author decide what is always in front of the recipient's model is a
+  privilege no producer may take.
+- **`commitment: locked` MUST be downgraded to `decided`,** and `locked_at` and
+  `locked_reason` removed with it. A locked engram resists dedup and correction,
+  so shipping one hands the producer a claim the recipient cannot revise.
+
+These two are stated as MUST rather than SHOULD because, unlike the strip list
+above, leaving them in place is not merely untidy — it changes whose judgement
+governs the recipient's store. A consumer MUST enforce both on import as well
+rather than trusting the producer, since a hostile pack will not comply — the
+same obligation §5.6.1 step 3 states, with the same keyword. (An earlier
+revision said SHOULD here and MUST there. A consumer following this section
+would have failed the conformance vectors while believing itself conformant.)
 
 ### 5.5 Pack integrity — STABLE
 
@@ -575,6 +836,391 @@ H = SHA256( bytes(SKILL.md)  ||  bytes(engrams.yaml) )
 > identical hash — `computePackChecksum` delegates to `computePackHash` — so they
 > cannot diverge. Hashing is over **raw file bytes**, so producers and consumers
 > MUST NOT re-serialize before hashing.
+
+#### 5.5.1 Two hashes, two questions
+
+The rule above is about the **pack integrity value**: the hash of the bytes a
+producer shipped, recorded in `INTEGRITY`, and the only value a recipient can
+compare against what they received. It answers *"did this arrive as it was sent?"*
+and it MUST be computed over the received bytes, unmodified.
+
+A consumer that alters content on import — as §5.4's MUST-neutralize rules
+require it to, and as §5.6 permits for sanitisation — then holds something that is
+no longer those bytes. The hash of *that* is a second and different value,
+answering *"has the installed copy been altered since it was installed?"*
+
+**These MUST NOT be conflated.** An implementation that stores the post-import
+hash under the name of the pack integrity value has lost the ability to answer
+the first question at all, and a recipient comparing it against the producer's
+`INTEGRITY` will see a mismatch that means nothing.
+
+An implementation that neutralizes on import therefore records both, named
+distinctly: the shipped value as received, and the installed-content value it
+computes itself. §5.1's statement that "the authoritative integrity record at
+install time is the registry entry" refers to the second — the record of what is
+installed — and does not license overwriting the first.
+
+> **Known divergence in the reference, as of this revision.** `_installPackDir`
+> re-serializes `engrams.yaml` after neutralizing `pinned` and `locked`, then
+> records the hash of the rewritten file as the registry's `integrity`. So for any
+> pack containing a pinned or locked engram, the recorded value is the
+> installed-content hash carrying the pack-integrity name, and the shipped value is
+> compared at the gate and then discarded. Tracked in plur-ai/plur#1019 *resolve the seven pack contradictions*; the fix
+> is to record both.
+
+---
+
+### 5.6 Install — SPECIFIED
+
+§5.1 to §5.5 describe a pack as an artifact. This section describes receiving
+one.
+
+A **consumer** is any implementation that takes a pack and makes its engrams
+available to a reader. The rules below are about a pack that arrived from
+somewhere else. That is the only case worth specifying, because a pack a
+consumer built itself needs no defending against.
+
+#### 5.6.1 Order of operations — MUST
+
+A consumer MUST perform these in order, and MUST NOT make any engram available
+to a reader until all of them have completed:
+
+1. **Verify integrity** (§5.5). Recompute over the received bytes and compare to
+   the shipped `INTEGRITY`. A mismatch MUST abort the install unless the
+   installer has explicitly overridden it for this pack.
+
+   A pack that ships **no** `INTEGRITY` at all is a third state, not a pass:
+   §5.1 makes the file optional on disk, so its absence is conformant, but it
+   means nothing was verified. A consumer MUST NOT report such a pack as having
+   passed an integrity check, and MUST distinguish the three outcomes wherever it
+   reports one (§5.6.5).
+2. **Refuse what §5.4 forbids a producer to ship.** A pack whose content trips
+   a secret scan MUST be refused. A pack that ships an engram declaring
+   `visibility: private` MUST be refused. §5.4 makes excluding both a producer
+   obligation; a consumer cannot assume the producer complied.
+
+   Neither refusal is overridable. There is no per-install flag, configuration
+   key or confirmation that installs such a pack, because the remedy lies with
+   the pack and not with the installer: a secret is removed by whoever holds
+   it and a private engram by whoever exported it, and an override would only
+   teach installers to look away from the finding the scan exists to make. A
+   false positive — a pack that legitimately teaches credential handling and
+   contains an example key — is resolved the same way, by the producer
+   changing the example until it no longer reads as a live credential.
+
+   Where the producer cannot be reached, the recipient MAY make that same
+   correction themselves. Doing so changes the pack's contents and therefore
+   its hash, so the corrected pack is installed by overriding **step 1**, the
+   integrity mismatch — a decision about bytes the installer changed and can
+   account for. It is not an override of this step, and a consumer MUST NOT
+   offer one: the refusal is lifted by the finding no longer being there, never
+   by a flag that installs it anyway. A consumer that offers no way at all to
+   install a locally corrected pack has made the remedy in this paragraph
+   unreachable, which is a defect in that consumer.
+
+   This standard does not define the scan; a consumer SHOULD document the scan
+   surface it applies so that a producer can predict it. (An earlier revision
+   made the secret refusal overridable. That was withdrawn: the reference has
+   never offered an override for secrets, and fail-closed is the specified
+   posture.)
+
+   An engram with **no** `visibility` field is a different case. §4.4 gives the
+   field a default of `private`, so a consumer's parser assigns that value — but
+   the assignment is the consumer's, not a declaration the producer made and
+   then shipped regardless. A consumer MUST hold such an engram as private on
+   its own side (it MUST NOT be re-exported, §5.4) and MUST report it (§5.6.5);
+   it MUST NOT refuse the pack on that ground alone.
+3. **Neutralize host-overriding fields** (§5.4): remove `pinned`, downgrade
+   `commitment: locked` to `decided`. A consumer MUST do this even though §5.4
+   also requires the producer to, and MUST report how many engrams were changed,
+   per field (§5.6.5).
+4. **Resolve scope** (§5.6.3).
+5. **Record the install** (§5.6.4).
+
+Ordering matters and is not merely tidy. It governs which verdict a consumer
+acts on first, not the order in which it reads bytes: a consumer MAY parse the
+whole pack up front to compute every verdict at once (the reference does, since
+its preview reports all of them together), but a pack that fails integrity MUST
+be refused *as tampered* and not as something a later step found, MUST NOT be
+neutralized or recorded, and MUST NOT have any engram made available. Scanning
+before neutralizing means the scan sees what was shipped rather than what was
+cleaned. Recording last means a failed install leaves no record claiming
+otherwise.
+
+A consumer MAY additionally refuse a pack on grounds this standard does not
+define — prompt-injection heuristics, size limits, an unrecognised producer. Such
+refusals are implementation policy and MUST be reported as such rather than as
+conformance failures.
+
+#### 5.6.2 Where engrams go — implementation choice, with one requirement
+
+This standard does not say where a consumer stores installed engrams. Keeping
+them in the pack directory, merging them into a primary store, or projecting them
+into a database are all conformant.
+
+**The requirement is that the consumer MUST be able to determine, for any engram
+it has made available, which pack it came from, and MUST be able to enumerate the
+engrams of an installed pack.** Membership MUST be durable — it MUST survive a
+restart and MUST NOT depend on the pack directory remaining on disk in a
+particular shape.
+
+Without that, §5.8 is not implementable: an installed pack cannot be removed if
+nothing records what it installed. The requirement is stated as a capability
+rather than a mechanism because the honest options differ by store —
+the `pack` field (§4.4), a registry keyed by engram id, or an append-only
+record naming the set are all sufficient.
+
+> **Note on `pack` (§4.4).** The field is defined as *"Owning pack name, or
+> null"*. A consumer that satisfies this section by writing it SHOULD do so.
+> A consumer that satisfies it another way MAY leave `pack` null, but MUST NOT
+> rely on the field's absence meaning an engram is not from a pack.
+
+#### 5.6.3 Scope on import — MUST NOT decide silently
+
+A pack's engrams arrive carrying the scopes its **producer** wrote. Those names
+belong to the producer's installation. `group:acme/engineering` in a received
+pack does not name the recipient's engineering group; if a group of that name
+exists locally it is a different group that happens to collide.
+
+Therefore:
+
+- A consumer **MUST NOT** place engrams from a received pack into a shared scope
+  (§4.2) on the producer's say-so alone. The installer decides.
+- A consumer **MUST NOT** place them into a scope the installer is not authorized
+  to **write** to. Placing engrams somewhere is a write, so read access is the
+  wrong ceiling: a person who can read a team's scope but not write to it must
+  not be able to put a stranger's pack into it.
+- A consumer **SHOULD** let the installer name one target scope for the pack.
+  Reporting the scope every engram landed in is required by §5.6.5; it is stated
+  there once, as a MUST, rather than restated here with a weaker keyword.
+- Where a pack declares `global` or an equivalent everyone-sees-it scope, a
+  consumer **MUST** obtain explicit consent rather than adopting it.
+
+The rule is about consent, not taxonomy. A recipient installing a pack is
+agreeing to hold its contents; they are not thereby agreeing to show them to
+their whole organisation.
+
+#### 5.6.4 The install registry — normative
+
+§5.1 and §5.5 both call the registry authoritative and neither says what it is.
+
+An **install registry** is a durable record, held by the consumer, of the packs
+it has installed. It is not part of a pack and never travels with one.
+
+A registry entry MUST carry:
+
+| Field | Semantics |
+|---|---|
+| `name` | The installed pack's manifest `name`. Unique within a registry. |
+| `version` | The manifest `version` as shipped. REQUIRED — §5.7 cannot order without it. |
+| `installed_at` | RFC 3339 instant. |
+| `integrity_shipped` | The `sha256:` value the pack shipped, verbatim, or explicitly absent if it shipped none. This is what a later re-verification compares against (§5.5.1). |
+| `source` | Where the pack came from, in a form the consumer can act on — a path, a URL, or an explicit "no longer resolvable". REQUIRED, because §5.8 makes removal reversible only if it survives. |
+
+A registry entry SHOULD carry `integrity_installed` (§5.5.1), `creator`, the
+resolved target scope (§5.6.3), and a pointer to the engram membership required
+by §5.6.2.
+
+A consumer MUST NOT treat an unreadable registry as an empty one. An empty
+registry means nothing is installed; an unreadable one means the consumer does
+not know, and proceeding as though nothing is installed silently duplicates
+every pack the user has.
+
+#### 5.6.5 What a consumer MUST report
+
+An install is a change to knowledge the reader will act on. A consumer MUST
+report, in a form the installer sees:
+
+- engrams installed
+- engrams neutralized under §5.6.1 step 3, and which field was changed — a
+  count per field, so that a pack whose only host-overriding field was a locked
+  commitment is not reported as though nothing was changed
+- engrams the consumer holds as private because the shipped record carried no
+  `visibility` (§5.6.1 step 2)
+- the integrity verdict, including "the pack shipped none" as distinct from "it
+  matched"
+- the scope every engram landed in
+- conflicts detected with content the consumer already held, where it detects any
+
+A consumer that found provenance records in the pack MUST report what it found
+— how many records were present against how many engrams the pack ships, how
+many could not be read, how many describe an engram the pack does not contain,
+and how many engrams have no record — and MUST NOT discard the `provenance/`
+directory. §5.4 *receiving a pack's provenance* of
+[the provenance profile](./ENGRAM-PROVENANCE-PROFILE.md) defines each of those
+terms and says what a consumer may do with the records; the obligation to
+report is stated here so that it binds every conformant consumer, whether or
+not it follows the profile.
+
+Silence is the failure mode this guards against. A pack that installs with no
+output is indistinguishable from one that installed nothing.
+
+---
+
+### 5.7 Update — SPECIFIED
+
+Replacing an installed pack with a later version of the same pack.
+
+#### 5.7.1 Ordering versions
+
+§5.2 validates `version` as an opaque string, which cannot be ordered. For update
+to mean anything, ordering has to exist somewhere.
+
+- A producer **SHOULD** use SemVer for `version`, and **MUST** use a scheme in
+  which later releases order after earlier ones under the comparison the producer
+  documents.
+- SemVer **build metadata MUST NOT** be the only thing distinguishing two
+  versions: SemVer ignores it for precedence, so `1.0.0+a` and `1.0.0+b` compare
+  equal and a consumer cannot tell which is later.
+- A consumer **MUST NOT** infer an ordering it cannot compute. Where two versions
+  are not comparable, it MUST treat the operation as a replacement requiring
+  explicit confirmation rather than guessing a direction.
+- **A consumer MUST assume SemVer** unless the producer says otherwise, because a
+  consumer holding two packs has no way to discover a scheme documented somewhere
+  it cannot read. A producer using anything else MUST declare it in the manifest;
+  until such a field is specified, a non-SemVer version is one a consumer cannot
+  order, and the previous rule applies.
+
+A consumer MUST distinguish three cases and MUST NOT silently perform any of
+them as though it were another: **upgrade** (candidate orders after installed),
+**reinstall** (equal), **downgrade** (orders before). A downgrade MAY be
+permitted; if it is, it MUST be explicit.
+
+#### 5.7.2 Which engrams correspond
+
+Correspondence is by engram `id`, and **judgement is by `content_hash`**. A
+consumer MUST compare the pair.
+
+§3.3.2 gives packs a dateless id form so that ids stay stable across releases.
+That makes a pack id a **name for a slot** — "the connection-pool limit" — rather
+than the identity of one particular claim. Each engram in `engrams.yaml` carries
+its own `content_hash`, so the pair is readable from the pack itself with no
+extra manifest field.
+
+For each id: present in both is a **carry-over**, new in the candidate is an
+**addition**, present only in the installed version is a **departure**. And for a
+carry-over, the hash says which kind:
+
+| Carry-over | Meaning |
+|---|---|
+| same id, same hash | the same claim, unchanged |
+| same id, **moved hash** | the same memory, **a changed claim** — the recipient should re-review it |
+
+> **Why this does not contradict §4.7.1.** In a live store, an edit that moves the
+> hash mints a new engram, because there the id *is* the identity of a claim and
+> the previous statement must survive somewhere addressable.
+>
+> A pack release is not an edit to the recipient's store. It is a new artifact, in
+> which the producer reuses a stable name for the current version of a claim.
+> Requiring a new id there would be actively worse: §5.4 strips
+> `relations.supersedes` from packs, so a renamed engram would reach the recipient
+> as an unlinked departure plus addition, and every piece of recipient state the
+> next section protects would be lost by construction — the correction arriving as
+> a stranger.
+>
+> **Identity binds to the id; judgement binds to the hash.** Both rules then say
+> the same thing in their own context: a changed claim must be visible as a
+> changed claim, and never as a silent overwrite.
+
+#### 5.7.3 Recipient-accumulated state — MUST NOT be silently discarded
+
+A recipient accumulates state against installed engrams: feedback, usage counts,
+activation, and any review or approval decisions their implementation records.
+That state is the recipient's, not the producer's, and an update MUST NOT
+silently destroy it.
+
+- For a **carry-over**, a consumer MUST preserve recipient-accumulated state,
+  including where the `content_hash` moved. The recipient's judgement attached to
+  that slot, and the id is what identifies it.
+- Where the hash moved, a consumer SHOULD additionally surface the engram for
+  re-review rather than silently carrying the old judgement onto a changed claim.
+  Preserving state and flagging it are not in tension: the state is the
+  recipient's to keep, and the change is theirs to be told about.
+- For a **departure**, a consumer MUST NOT simply drop the engram. It MUST be
+  retired under §5.8's rules, so that a reader asking about it learns it was
+  withdrawn by an update rather than finding nothing.
+- Producer-side state in the candidate — `activation`, `feedback_signals`, which
+  §5.4 has a producer reset (a SHOULD there) — MUST NOT overwrite the
+  recipient's.
+
+#### 5.7.4 What a consumer MUST report
+
+Additions, departures and carry-overs whose content changed, with counts, and the
+version transition. An update that reports only "updated" tells the reader
+nothing about what they are now relying on.
+
+---
+
+### 5.8 Uninstall — SPECIFIED
+
+Removing an installed pack.
+
+#### 5.8.1 Retire, do not erase — MUST
+
+A consumer MUST NOT make an installed pack's engrams silently disappear.
+
+Where the consumer's model has a retired or withdrawn state, engrams from an
+uninstalled pack MUST be moved into it rather than deleted, and the reason MUST
+name the pack and version. A reader who later asks about one MUST be able to
+learn that it existed and was withdrawn.
+
+**A consumer that has no such state MUST record the removal some other way** — a
+tombstone, a log entry, whatever its storage affords. The floor is that asking
+about a removed engram MUST NOT be indistinguishable from asking about one that
+never existed. Nothing here requires a particular mechanism; it requires that the
+question be answerable.
+
+The distinction matters because the alternative is indistinguishable from having
+never known. A memory system whose removals leave no trace cannot answer why it
+no longer believes something — and that question is the reason provenance exists.
+
+A consumer MAY additionally offer a permanent erase, and where it does, that MUST
+be a separate and explicit operation, never the default path of uninstall.
+
+#### 5.8.2 Reversibility — SHOULD
+
+A consumer SHOULD retain enough to reinstall: the registry entry's `source`, and
+where practical the artifact itself.
+
+A consumer MUST NOT discard the `source` before completing the removal. Removing
+the record of where a pack came from as a step of removing the pack leaves the
+operation irreversible by construction, which is a defect rather than a policy.
+
+#### 5.8.3 What survives
+
+Recipient-accumulated state MAY be discarded on uninstall, but a consumer SHOULD
+retain it against the retired engrams so a reinstall does not lose the
+recipient's judgement.
+
+Content the recipient independently learned that happens to match a pack engram
+is **not** part of the pack and MUST NOT be removed with it. Membership is what
+§5.6.2 recorded, not similarity.
+
+#### 5.8.4 What a consumer MUST report
+
+Engrams retired, whether the source was retained, and what the consumer kept.
+
+---
+
+### 5.9 Where the reference does not yet comply
+
+§5.6 to §5.8 were written from the behaviour a consumer needs, not from the
+behaviour the reference has. It has less. Listed here rather than left for an
+implementer to discover by disagreeing with us:
+
+| Rule | Reference today | Tracked |
+|---|---|---|
+| §5.6.2 (pack membership) | The registry records pack names, not engram ids, and `pack` (§4.4) is never written. There is no way to enumerate an installed pack's engrams, so §5.8 (uninstall) is not implementable. | plur-ai/plur#1025 *write `engram.pack` on import*; plur-ai/plur#1023 *project pack engrams into the primary store* |
+| §5.6.3 (scope on import) | No scope resolution on import at all. Engrams keep the producer's scopes, including `global`; the installer is warned and not asked. | plur-ai/plur#1024 *name a target scope at import* |
+| §5.6.5 (what a consumer MUST report) | Every item is reported at install except **the scope every engram landed in**, which follows from §5.6.3: there is no scope resolution to report the result of. The four provenance counts are reported (`InstallResult.provenance`, `plur packs install`, `plur_packs_install`). | plur-ai/plur#1024 *name a target scope at import* |
+| §5.6.4 (the install registry) | `integrity_shipped` is not retained — the post-neutralization hash is recorded under that name (§5.5.1, two hashes). `source` is present but removed *before* the pack directory during uninstall. | plur-ai/plur#1027 *uninstall: retire with tombstones, keep the source* |
+| §5.7 (update) | No update path exists for a user-installed pack. Versions are never compared at install, so upgrade, reinstall and downgrade are indistinguishable. | plur-ai/plur#1026 *pack update: compare versions, migrate state* |
+| §5.8.1 (retire, do not erase) | Uninstall deletes the pack directory. Nothing is retired, no reason is recorded, and no history event is written. | plur-ai/plur#1027 *uninstall: retire with tombstones, keep the source* |
+| §5.4 (`pinned` / `commitment: locked` MUST NOT ship) | `exportPack` complies. The bundled hand-authored pack `packages/mcp/packs/effective-memory` does not: it ships 12 `pinned: true` and 11 `commitment: locked` engrams. The consumer neutralizes and reports both at install (§5.6.1 step 3, §5.6.5), so a recipient's store is unaffected, but the artifact as published is not a conformant pack. | plur-ai/plur#1030 *stripping pinned silently disabled the bundled pack's purpose* |
+
+This table is a conformance statement, not an apology. A standard whose reference
+silently diverges teaches implementers the divergence; one that names its gaps
+lets them decide what to build against.
 
 ---
 
@@ -660,7 +1306,13 @@ A conformant reader MUST:
 5. Read `Flags`; reject if any RESERVED bit (`& 0xFFFC`) is set (§6.3).
 6. Read `HeaderLen`; reject if `0` or > hard limit.
 7. Read `HeaderLen` bytes of UTF-8 JSON; parse and validate against §6.4. Reject
-   on malformed JSON or schema violation.
+   on malformed JSON or schema violation. Reject also if `SIGNED` disagrees with
+   `header.signer` — set with `signer: null`, or clear with a signer present.
+   That is §6.8 step 4 read back: an envelope whose trailer nobody can interpret
+   is refused, not guessed at. (Stated in 1.7 as a clarification. §6.8 already
+   forbids a writer to emit either, so no conformant capsule is affected; the
+   reference used to fail such a capsule on a payload size mismatch and never
+   named the defect.)
 8. Determine signature length `S` = 64 if `SIGNED` set, else 0. Compute the
    payload region as `[12+HeaderLen, len-S)`. Reject on underflow.
 9. Verify `len(payload) == header.payload.size_compressed`. Reject on mismatch.
@@ -749,6 +1401,27 @@ anchor in §9).
 
 ## 9. Provenance binding (PROV-O + Swarm anchor) — PROPOSED
 
+> **Elaborated in a companion profile.**
+>
+> This section remains part of the standard. The sketch below is worked out in
+> full in [Recording where an engram came from](./ENGRAM-PROVENANCE-PROFILE.md),
+> a *profile* of this section: it specifies the mapping, every way an engram can
+> be created, the pack-level record, the licence binding, and what has to be
+> captured first.
+>
+> A profile refines; it does not replace. This section keeps its normative
+> standing, states the motivation concisely, and defines the Swarm anchor — which
+> the profile deliberately leaves out of its own scope (profile §1.2, §2.3).
+> Where the two overlap, this document governs; where the profile is more
+> specific, follow the profile. An implementer building provenance should read
+> the profile, and read this section for the anchoring layer above it.
+>
+> Two things the profile settles that this sketch left open. A record you SEND
+> must stand on its own, since the recipient has none of our files. And the four
+> provenance fields defined in §4.8, although marked stable, were written by
+> nothing at all until that work began.
+
+
 This section is a **PROPOSED profile**, non-normative for v1. It documents how an
 engram or pack binds to a W3C PROV-O provenance record and to a Swarm content
 anchor, so the design is explicit and fundable.
@@ -773,8 +1446,20 @@ Map engram/pack concepts onto [W3C PROV-O]:
 | `sources[].stored_at`, `temporal.learned_at` | `prov:generatedAtTime` |
 | `producer` (capsule) | `prov:wasAttributedTo` / `prov:wasGeneratedBy` |
 
-A pack MAY carry a sidecar `provenance.jsonld` (PROV-O in JSON-LD) inside the
-capsule payload, or reference an external PROV document by URI.
+A pack MAY carry PROV-O records in JSON-LD, or reference an external PROV
+document by URI.
+
+> **Corrected in 1.2.** This paragraph previously read *"A pack MAY carry a
+> sidecar `provenance.jsonld` (PROV-O in JSON-LD) inside the capsule payload"* —
+> a single file, because it was drafted with one engram in mind. A pack needs one
+> record per engram plus one for the pack itself, which a single file cannot hold.
+>
+> The layout is **a `provenance/` directory** containing `pack.jsonld` and one
+> `<engram-id>.jsonld` per engram, specified in §5.3.1 of
+> [the provenance profile](./ENGRAM-PROVENANCE-PROFILE.md) and reflected in §5.1
+> above. The correction is recorded here rather than made silently because §9 of
+> this document governs where it and the profile overlap, so an implementer
+> reading §9 alone was being told to build the wrong thing.
 
 ### 9.3 Swarm anchor (proposed)
 
@@ -852,6 +1537,30 @@ parseable (consumers still accept it), and providing the replacement. Removal
 happens only at a major version. The `x-datacore` manifest block (§5.2) is the
 canonical example: retained, parseable, superseded by `metadata`.
 
+### 10.5 Revision history
+
+Every revision of this document is recorded here, so a reader can tell which one
+they are holding and what changed. Version numbers follow §10.2.
+
+| Version | Date | Change class | What changed |
+|---|---|---|---|
+| 1.7 | 2026-09-08 | **Minor, but one behaviour break for consumers** | Review of plur-ai/plur#1044. **§5.6.1 step 2 is no longer overridable**: a pack that trips a secret scan, or ships an engram declaring `visibility: private`, MUST be refused with no per-install override — the 1.5 text had required an override the reference never offered, and fail-closed is the specified posture; an engram with no `visibility` at all is held as private and reported, not refused, because the default is the consumer's assignment rather than the producer's declaration. **§5.4** now says MUST where it said SHOULD for enforcing neutralization on import, matching §5.6.1 step 3 (plur-ai/plur#1092). **§5.6.5** requires the neutralization count *per field* and restates the four provenance counts in this document rather than importing them from an OPTIONAL profile. §5.6.1's ordering rationale now says what it governs — which verdict a consumer acts on, not the order it reads bytes in. §5.7.3 no longer calls §5.4's SHOULD a requirement. **§5.9** gains a row for the bundled hand-authored pack, which ships `pinned` and `locked` engrams. **§6.7 step 7** states the `SIGNED`/`header.signer` agreement a reader checks, mirroring §6.8 step 4. **Second review round.** The change class above was *Minor (additive)* and is corrected here: making the declared-private refusal unconditional refuses packs that installed before, which is a break for a consumer even though no field, constraint or default on engram *data* changed — a released consumer needs a migration note. **§5.6.3** no longer restates §5.6.5's reporting obligation with a weaker keyword; it said SHOULD where §5.6.5 says MUST, which is the same contradiction class as plur-ai/plur#1092 and left a consumer conformant by one section and not the other. **§5.6.1 step 2** now says what a recipient does when the producer cannot be reached: correcting the pack yourself moves its hash, so it installs by overriding step 1, and a consumer offering no such path has made this paragraph's remedy unreachable. **§5.9** gains the row it was missing for §5.6.5. |
+| 1.6 | 2026-08-28 | Minor (additive) | **§4.12.1 added**: `content_hash` detects corruption, not tampering. `content_hash` is stored in the same file as the statement `content_hash` covers, so anybody who edits the statement recomputes `content_hash` in the same write. The distinction was easy to lose because §4.7.1 makes `content_hash` the authority on whether an edit changed a claim — a reliable authority when the producer is the party being asked, and no defence at all against a party who does not want the change seen. §4.3's and §4.12's descriptions of `content_hash` now point at §4.12.1. Raised in the provenance-ladder design note. |
+| 1.5 | 2026-08-28 | Minor (additive) | Review corrections to 1.4, before it was ever merged. **§4.7.1 is scoped to a live store**, resolving a contradiction with §5.7: as written, a compliant producer could never emit the changed-statement carry-over that §5.7.3 was built around, and when it complied by minting a new id, §5.4 stripped the supersedes edge so the correction reached the recipient as an unlinked stranger. **§5.7.2 now keys correspondence on the `(id, content_hash)` pair** — in a pack an id is a stable *name*, so identity binds to the id and judgement binds to the hash. The rule reads "an **edit to `statement`** that moves the hash", and renormalization is explicitly not an edit: the normalizer is versioned and already on its second version, so the earlier phrasing would have turned a maintenance migration into thousands of spurious supersessions. The empty-normalization and punctuation blind spots are stated. §5.6.1 step 1 covers a **missing** `INTEGRITY` as a third outcome; step 2's secret refusal becomes **overridable**, since an unconditional refusal on a test this document does not define would permanently lock out a pack that legitimately teaches credential handling. §5.6.3 uses **write** authorization, not read — placing engrams is a write. §5.7.1 requires a consumer to assume SemVer, since it cannot discover a scheme documented where it cannot read. §5.8.1 states the floor for a consumer with no retired state. Corrected a factual error in §4.7.1's non-compliance table: the dedup paths **do** retain the previous statement, in the history log's `old_statement`. |
+| 1.4 | 2026-08-27 | Minor (additive) | **§4.7.1 added, "Changing an engram"**. The document defined two ways an engram can change — in place with `engram_version`, or by supersession with a new id — and never said which applies when, so the choice was made per code path by whoever wrote it. The test is mechanical: **a change that moves `content_hash` MUST be a supersession; anything else is in place.** A draft tested whether *the meaning* changed and was withdrawn before publication — meaning-change is a judgement, frequently subjective, and three implementations applying it independently would disagree, which defeats the purpose of specifying it. `content_hash` is already computed on every write and is invariant under capitalisation, punctuation and spacing. A producer MUST NOT rewrite a `statement` in place in a way that moves its hash, because that is the one operation leaving nothing that holds what the engram used to say. `engram_version`'s semantics expanded from six words. Nothing constrains previously-valid data; the obligation is on producers at edit time. |
+| 1.3 | 2026-08-26 | Minor (additive) | **New maturity label SPECIFIED** — normative and frozen, but not yet implemented in the reference; the vocabulary previously conflated "binding on implementers" with "implemented here" and so could not describe a rule written ahead of its own implementation. **§5.6 Install, §5.7 Update and §5.8 Uninstall added** — the standard described a pack as an artifact and said nothing about receiving one. §5.6 fixes the order of operations, requires a consumer to be able to answer which pack an engram came from, forbids adopting a producer's shared scopes without the installer's consent, and **defines the install registry** that §5.1 and §5.5 already called authoritative. §5.7 requires an orderable version and forbids silently discarding recipient-accumulated state across an update. §5.8 requires retire-rather-erase and forbids discarding a pack's source as a step of removing it. §4.4's `pack` gains a consumer-side note. §5.9 lists where the reference does not yet comply. Nothing here constrains previously-valid pack *data*; the new obligations fall on consumers, which the document did not previously address at all. |
+| 1.2 | 2026-08-26 | Minor (additive) | §5.4: the strip list gains `relations.supersedes`/`superseded_by`, and gains two MUST-neutralize rules for `pinned` and `commitment: locked` — both were performed by the reference and stated nowhere, and both change whose judgement governs the recipient's store rather than merely tidying. §5.5.1 added: the pack integrity value and the installed-content hash answer different questions and MUST NOT be conflated; the reference's current conflation is recorded as a known divergence. §9: the single `provenance.jsonld` sidecar corrected to the `provenance/` directory the profile specifies — §9 governs where the two overlap, so an implementer reading it alone was being told to build the wrong thing. No field removed, no constraint tightened on existing data, no default changed. |
+| 1.1 | 2026-08-25 | Minor (additive) | §4.8: added the OPTIONAL `attribution` and `claim_class` engram fields, marked PROPOSED. §4.12: added `injection_count` and `measured_under`; renamed `reference_count` → `write_count` (consumers MUST backfill on first parse). §3.3: canonical id form gains full ISO-8601 date separators, with the compact form retained as permanently valid legacy (§3.3.1) and the dateless pack form documented (§3.3.2). §5.1/§5.2: an OPTIONAL `provenance/` directory and a `metadata.provenance` declaration. §9: recorded that a companion profile now elaborates it. §4.12 `commitment` gains the `draft` member. No field removed, no constraint tightened, no default changed. |
+| 1.0 | 2026-06-14 | — | Initial working draft. |
+
+**Companion profiles** version independently of this document, and their version
+is stated in their own header. A profile moving to a new version does not change
+this document's version, and vice versa.
+
+| Profile | Profiles | Version |
+|---|---|---|
+| [Recording where an engram came from](./ENGRAM-PROVENANCE-PROFILE.md) | §9 | 0.9 (draft) |
+
 ---
 
 ## 11. Meta-engram extension (informative)
@@ -888,10 +1597,16 @@ normative specification of meta-engrams is deferred (a fundable remainder item).
 | §2 | Serialization | STABLE |
 | §3 | ID grammar | STABLE |
 | §4 | Engram object | STABLE (exchange block PROPOSED; provenance.signature RESERVED) |
-| §5 | Pack format & integrity | STABLE |
+| §5 | Pack format, integrity & lifecycle | STABLE for §5.1–§5.5 (`provenance/` and `metadata.provenance` OPTIONAL); **SPECIFIED** for §5.6–§5.8, with the reference's gaps listed in §5.9 |
 | §6 | `.plur` capsule | STABLE (FormatVersion 0x0001; flag bits 2–15 RESERVED) |
 | §7 | Signing (Ed25519) | RESERVED |
 | §8 | Integrity (SHA-256) | STABLE |
-| §9 | PROV-O + Swarm binding | PROPOSED |
+| §9 | PROV-O + Swarm binding | PROPOSED — the PROV-O half is elaborated in the [provenance profile](./ENGRAM-PROVENANCE-PROFILE.md) and implemented in the reference; the Swarm anchor half remains a sketch |
 | §10 | Versioning policy | STABLE |
 | §11 | Meta-engram extension | Informative |
+
+**Companion profiles**
+
+| Profile | Profiles | Maturity |
+|---|---|---|
+| [Recording where an engram came from](./ENGRAM-PROVENANCE-PROFILE.md) | §9 | PROPOSED — implemented in the reference; see its Appendix C for per-section status |

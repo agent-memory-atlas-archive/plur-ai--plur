@@ -26,12 +26,32 @@ export interface LearnContext {
   /** Current session episode ID for episodic anchoring (SP2 Idea 24). */
   session_episode_id?: string
   /**
-   * Session identifier to thread into sources[].session_id on every write
-   * (#1048). Takes priority over session_episode_id when both are provided.
-   * Never persisted beyond the source entry — it identifies the write context,
-   * not the engram's knowledge content.
+   * Who is answerable for this engram (#961). Every field optional. A caller
+   * that does not know a value omits it rather than guessing — a record with no
+   * agent is valid, a record with a guessed agent is worse than one with none.
    */
-  session_id?: string
+  attribution?: {
+    asserted_by?: string
+    runtime?: { name: string; version?: string }
+    model?: { name: string; prompt_id?: string; prompt_version?: string; prompt_sha256?: string }
+    tool?: { name: string; version?: string }
+    on_behalf_of?: string
+  }
+  /**
+   * What kind of claim this is (#963): observed, documented, structural,
+   * asserted, inferred or revised. Omitted when it cannot be determined.
+   */
+  claim_class?: 'observed' | 'documented' | 'structural' | 'asserted' | 'inferred' | 'revised'
+  /**
+   * Which licence governs reuse of this engram's content (#970).
+   *
+   * Omit it and the schema default applies. That default is not a decision
+   * anybody made, and a provenance record says so rather than presenting it
+   * beside recorded facts — so a caller who cares about reuse terms has to
+   * say which ones. Before this existed there was no way to say, which made
+   * a complete provenance record unreachable through the public API.
+   */
+  license?: string
   /** Always-load flag — bypass keyword-relevance gate during injection. */
   pinned?: boolean
   /**
@@ -123,8 +143,17 @@ export interface LearnAsyncResult {
    */
   dedup?: {
     mode: 'llm' | 'cosine' | 'hash-only'
-    /** Closest candidates and their scores — present whenever similarity ran. */
-    near_duplicates?: Array<{ id: string; score: number }>
+    /**
+     * Closest candidates and their scores — present whenever similarity ran.
+     *
+     * `statement` carries a preview of the neighbour's own text (2026-09-07).
+     * Reporting id+score alone made "read the neighbour before you write"
+     * cost an extra round-trip, so it was skipped: four near-identical
+     * engrams were written in one session, each reporting a 0.86-0.87
+     * neighbour that was never read. Cosine still never gates a write — the
+     * fix is to make the correct behaviour free, not to block the write.
+     */
+    near_duplicates?: Array<{ id: string; score: number; statement?: string }>
   }
   /**
    * Position of this result's statement in the original learnBatch input array
@@ -256,12 +285,6 @@ export interface RecallOptions {
   session?: string
 }
 
-export interface BoundedRecallResult {
-  results: Engram[]
-  truncated: boolean
-  strategy_used?: string
-}
-
 export interface InjectOptions {
   budget?: number
   scope?: string
@@ -321,6 +344,20 @@ export interface InjectionResult {
    * detected → both sides injected together). Surface, don't adjudicate.
    */
   warnings?: string[]
+  /**
+   * Pinned engrams that did NOT make this injection, with what each would have
+   * cost and which cap it lost to (#1142).
+   *
+   * `pinned: true` reads as a promise of always-load; it is really
+   * priority-subject-to-capacity. Measured on a real store, dropping the
+   * injection budget silently omitted 36 of 46 pinned engrams — safety rules
+   * among them — with nothing in the output saying so. Whether pinning should
+   * GUARANTEE inclusion is an open contract question; until it is answered, a
+   * caller must at least be able to see what it did not get.
+   *
+   * Absent when nothing was omitted.
+   */
+  omitted_pinned?: Array<{ id: string; cost: number; reason: 'pinned-sub-budget' | 'total-budget' }>
 }
 
 export interface CaptureContext {

@@ -6,12 +6,13 @@ Persistent memory for AI agents. An agent corrected on Monday remembers on Tuesd
 
 Knowledge is stored as **engrams** — small assertions that strengthen with use and decay when irrelevant, modeled on human memory (ACT-R activation). Storage is plain YAML on disk. Search is fully local: BM25 + BGE embeddings + Reciprocal Rank Fusion. Zero API calls, zero cloud.
 
-Seven packages (four npm, three Python/PyPI):
+Eight packages (five npm, three Python/PyPI):
 
 ```
 @plur-ai/core        — engram engine (learn, recall, inject, search, decay, sync)
 @plur-ai/mcp         — MCP server (Claude Code, Cursor, Windsurf)
 @plur-ai/claw        — OpenClaw ContextEngine plugin
+@plur-ai/opencode    — opencode plugin (recall + render hooks, no tool call)
 @plur-ai/cli         — CLI (plur learn / recall / inject / status)
 plur-hermes          — Hermes Agent plugin (Python, via CLI bridge)
 plur-ai              — Python SDK (LangChain, llama.cpp, scripts)
@@ -55,25 +56,22 @@ pnpm --filter @plur-ai/core build
 2. `packages/mcp/package.json`
 3. `packages/cli/package.json`
 4. `packages/migrate/package.json` — ships with the release it migrates TO
-5. `packages/mcp/src/version.ts` — `export const VERSION`
-6. `packages/mcp/src/index.ts` — `const VERSION`
-7. `packages/cli/src/index.ts` — `const VERSION`
-8. `packages/cli/src/version.ts` — `CLI_VERSION` (pins npx-fallback MCP entries, #1069; version-parity.test.ts guards the pair)
-9. `packages/mcp/test/server.test.ts` — version assertions
-10. `packages/hermes/pyproject.toml`
-11. `packages/hermes/plugin.yaml` — top-level `version:` field
-12. `packages/hermes/plur_hermes/skills/plur-memory.SKILL.md` — frontmatter `version:`
-13. `packages/hermes/plur_hermes/bridge.py` — `_NPX_CLI_VERSION`
-14. `packages/python/pyproject.toml`
-15. `packages/python/plur_ai/bridge.py` — `_NPX_CLI_VERSION`
-16. `skills/plur-memory/SKILL.md` — frontmatter `version:` (standalone skills.sh copy)
-17. `server.json` — both top-level `version` and `packages[0].version` (MCP Registry / ClawHub listing)
+5. `packages/mcp/src/version.ts` — `export const VERSION` (index.ts and server.ts import it; version-parity.test.ts guards it)
+6. `packages/cli/src/version.ts` — `CLI_VERSION` (index.ts and mcp-config.ts import it; pins npx-fallback MCP entries, #1069; version-parity.test.ts guards it)
+7. `packages/mcp/test/server.test.ts` — version assertions
+8. `packages/hermes/pyproject.toml`
+9. `packages/hermes/plugin.yaml` — top-level `version:` field
+10. `packages/hermes/plur_hermes/skills/plur-memory.SKILL.md` — frontmatter `version:`
+11. `packages/hermes/plur_hermes/bridge.py` — `_NPX_CLI_VERSION`
+12. `packages/python/pyproject.toml`
+13. `packages/python/plur_ai/bridge.py` — `_NPX_CLI_VERSION`
+14. `skills/plur-memory/SKILL.md` — frontmatter `version:` (standalone skills.sh copy)
+15. `server.json` — both top-level `version` and `packages[0].version` (MCP Registry / ClawHub listing)
 
 **Claw track** (independent — only bumped when `--claw <ver>` is passed to release.sh):
 
 - `packages/claw/package.json`
-- `packages/claw/src/index.ts` — `version:` in plugin object
-- `packages/claw/src/context-engine.ts` — `version:` in info object
+- `packages/claw/src/version.ts` — `CLAW_VERSION` (index.ts and context-engine.ts import it; version-parity.test.ts guards it)
 - `packages/claw/openclaw.plugin.json` — `version` field
 - `packages/claw/test/hello.test.ts` — version assertion
 
@@ -85,6 +83,15 @@ pnpm --filter @plur-ai/core build
 `packages/dsh/test/manifest.test.ts` asserts these two agree, so a half-done bump
 fails the suite rather than shipping. dsh is pinned to a pre-1.0 DeepSeek Harness
 dependency line (`0.1.0-rc.6`) and moves on that ecosystem's cadence, not core's.
+
+**opencode track** (independent — only bumped when `--opencode <ver>` is passed to release.sh):
+
+- `packages/opencode/package.json`
+- `packages/opencode/src/version.ts` — `OPENCODE_PLUGIN_VERSION` (index.ts imports it; version-parity.test.ts guards the pair)
+
+Currently `0.1.0`, independent of core/mcp/cli's `0.19.4` — the same reasoning
+as claw and dsh: lockstep bumps would churn its npm version for releases that
+don't touch it.
 
 **ui — no track, not published.** `packages/ui` is `private: true`. The memory
 viewer is the pages behind `plur ui` and `/plur-memory`, not a library anyone
@@ -204,7 +211,9 @@ current scores. If your PR improves any of these, mention it in the PR descripti
 | [docs/test-pyramid.md](docs/test-pyramid.md) | Test architecture — when to write unit vs integration vs smoke tests, why there are no Docker integration tests |
 | [docs/adr/README.md](docs/adr/README.md) | ADR index — architecture decisions (ADR-0001: YAML-as-truth, ADR-0002: derived-state provenance) |
 | [docs/runbooks/store-consolidation.md](docs/runbooks/store-consolidation.md) | Runbook for destructive store merges — read before touching `plur sync --consolidate` |
+| [docs/runbooks/hook-timeouts.md](docs/runbooks/hook-timeouts.md) | Why synchronous hooks are bounded, what consumes the budget, and the two timeout failures that want opposite fixes |
 | [docs/telemetry-design.md](docs/telemetry-design.md) | Opt-in telemetry design — what is collected, what is not, the no-external-calls-in-core invariant |
+| [docs/provenance.md](docs/provenance.md) | Recording where a memory came from — turning it on, where records go, what they do and do not prove |
 | [ROADMAP.md](ROADMAP.md) | Prioritized feature roadmap |
 | [RELEASING.md](RELEASING.md) | Authoritative publish procedure, manifest gate, version tracks |
 

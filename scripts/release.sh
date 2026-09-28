@@ -1,6 +1,6 @@
 #!/bin/bash
 # PLUR Release Script
-# Usage: ./scripts/release.sh <version> [--claw <claw-version>] [--dsh <dsh-version>] [--dry-run] [--skip-tweet] [--preview-tweet]
+# Usage: ./scripts/release.sh <version> [--claw <claw-version>] [--dsh <dsh-version>] [--opencode <opencode-version>] [--dry-run] [--skip-tweet] [--preview-tweet]
 #
 # Modes:
 #   default          Full release (bump, build, test, commit, tag, push,
@@ -17,6 +17,11 @@
 #                    version track: it is pinned to a pre-1.0 DeepSeek Harness
 #                    dependency line and moves on that ecosystem's cadence, not
 #                    core's. Specify explicitly when dsh should ride along.
+#   --opencode <ver> Also bump @plur-ai/opencode at <ver>. Like claw and dsh, it
+#                    has its own version track (currently 0.1.0, independent of
+#                    core/mcp/cli's 0.19.4) — bumping it in lockstep would churn
+#                    its npm version for releases that do not touch it. Specify
+#                    explicitly when opencode should ride along.
 #   --dry-run        Bump + build + test + tweet preview, then stop before commit.
 #                    Files ARE mutated (versions bumped) — revert with git.
 #   --preview-tweet  Print the tweet that would be posted for <version>, exit.
@@ -33,6 +38,11 @@
 #                    verified commit by the version bumps this script just
 #                    made — the packaged-artifact smoke test downstream is what
 #                    covers those, as it does on every release.
+#   --no-website     Skip website pre-flight (Step 3.8) and deploy (Step 8).
+#                    Normally a missing $WEBSITE_DIR is a hard abort — this flag
+#                    makes the skip explicit. Use only from worktrees or machines
+#                    where the website repo is not checked out, and complete the
+#                    deploy manually afterwards.
 #
 # Tweet validation: tweet text is generated from CHANGELOG and validated
 # (length ≤ 270) BEFORE step 4 (git). A too-long tweet would fail at the X
@@ -87,8 +97,10 @@ DRY_RUN=false
 TRUST_CI=false
 SKIP_TWEET=false
 PREVIEW_TWEET=false
+NO_WEBSITE=false
 CLAW_VERSION=""
 DSH_VERSION=""
+OPENCODE_VERSION=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -96,16 +108,38 @@ while [ $# -gt 0 ]; do
     --skip-tweet) SKIP_TWEET=true; shift ;;
     --trust-ci) TRUST_CI=true; shift ;;
     --preview-tweet) PREVIEW_TWEET=true; shift ;;
+    --no-website) NO_WEBSITE=true; shift ;;
     --claw)
       shift
       CLAW_VERSION="${1:-}"
-      [ -n "$CLAW_VERSION" ] && shift
+      # Bug class (0.20.0 audit, B1): consuming the next argv slot
+      # unconditionally means `--claw --dry-run` silently swallows --dry-run
+      # as the "version" and DRY_RUN stays false — a real release runs when
+      # the operator asked for a dry run. Reject an empty value or one that
+      # looks like another flag, at parse time, before it can propagate.
+      if [ -z "$CLAW_VERSION" ] || [[ "$CLAW_VERSION" == --* ]]; then
+        echo "FAIL: --claw requires a version argument (e.g. --claw 0.5.0), got '${CLAW_VERSION:-<nothing>}'" >&2
+        exit 1
+      fi
+      shift
       ;;
     --dsh)
       shift
       DSH_VERSION="${1:-}"
-      [ -n "$DSH_VERSION" ] && shift
-  
+      if [ -z "$DSH_VERSION" ] || [[ "$DSH_VERSION" == --* ]]; then
+        echo "FAIL: --dsh requires a version argument (e.g. --dsh 0.1.0-rc.7), got '${DSH_VERSION:-<nothing>}'" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    --opencode)
+      shift
+      OPENCODE_VERSION="${1:-}"
+      if [ -z "$OPENCODE_VERSION" ] || [[ "$OPENCODE_VERSION" == --* ]]; then
+        echo "FAIL: --opencode requires a version argument (e.g. --opencode 0.2.0), got '${OPENCODE_VERSION:-<nothing>}'" >&2
+        exit 1
+      fi
+      shift
       ;;
     --*)
       echo "Unknown flag: $1" >&2
@@ -130,10 +164,27 @@ fi
 # sed-written into version constants and interpolated into a `/bin/sh -lc`
 # config command. The parity tests check equality, not shape — a malformed
 # value would pass them and land verbatim in user configs.
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]]; then
-  echo "FAIL: '$VERSION' is not a release-shaped version (expected e.g. 0.19.1)"
-  exit 1
-fi
+#
+# Applied to VERSION and to every independent track version (--claw, --dsh,
+# --opencode) that was actually provided: the 0.20.0 audit (B1) found the
+# parse loop for those three flags would swallow a following flag (e.g.
+# `--opencode --dry-run`) as the version string. The parse-time guard above
+# now rejects an empty or flag-shaped value outright, but a value that is
+# non-empty and doesn't start with `--` (garbage like "latest" or a
+# not-quite-semver typo) would still slip through without this shape check —
+# it is what gets sed-written into version.ts/package.json and interpolated
+# downstream, same as VERSION.
+validate_version_shape() {
+  local label="$1" ver="$2"
+  if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]]; then
+    echo "FAIL: '$ver' is not a release-shaped version for $label (expected e.g. 0.19.1)"
+    exit 1
+  fi
+}
+validate_version_shape "VERSION" "$VERSION"
+[ -n "$CLAW_VERSION" ] && validate_version_shape "--claw" "$CLAW_VERSION"
+[ -n "$DSH_VERSION" ] && validate_version_shape "--dsh" "$DSH_VERSION"
+[ -n "$OPENCODE_VERSION" ] && validate_version_shape "--opencode" "$OPENCODE_VERSION"
 
 # Load env
 ENV_FILE="$HOME/Data/.datacore/env/.env"
@@ -257,7 +308,7 @@ if [ "$DRY_RUN" = false ]; then
   echo ""
 fi
 
-# --- 1. Version bump (11 locations) ---
+# --- 1. Version bump ---
 echo "--- Step 1: Version bump ---"
 
 OLD_CORE=$(node -e "console.log(require('./packages/core/package.json').version)")
@@ -278,18 +329,15 @@ for pkg in core mcp cli migrate; do
   echo "  ✓ packages/$pkg/package.json"
 done
 
-# TypeScript VERSION constants — core has no VERSION constant; mcp + cli do.
-# server.ts imports VERSION from version.ts, so version.ts is the source of truth.
+# TypeScript VERSION constants — core has no VERSION constant; mcp + cli do,
+# ONE each: mcp/src/version.ts (index.ts + server.ts import it) and
+# cli/src/version.ts (index.ts + mcp-config.ts import it). The version-parity
+# tests fail the suite if a constant and its package.json ever disagree, or if
+# an index.ts grows a second literal.
 sed -i '' "s/export const VERSION = '.*'/export const VERSION = '$VERSION'/" packages/mcp/src/version.ts
 echo "  ✓ packages/mcp/src/version.ts"
 
-sed -i '' "s/const VERSION = '.*'/const VERSION = '$VERSION'/" packages/mcp/src/index.ts
-echo "  ✓ packages/mcp/src/index.ts"
-
-sed -i '' "s/const VERSION = '.*'/const VERSION = '$VERSION'/" packages/cli/src/index.ts
-echo "  ✓ packages/cli/src/index.ts"
-# CLI_VERSION pins the npx-fallback MCP entries (#1069); version-parity.test.ts
-# fails the suite if this and package.json ever disagree.
+# CLI_VERSION also pins the npx-fallback MCP entries (#1069).
 sed -i '' "s/export const CLI_VERSION = '.*'/export const CLI_VERSION = '$VERSION'/" packages/cli/src/version.ts
 echo "  ✓ packages/cli/src/version.ts"
 
@@ -317,11 +365,10 @@ if [ -n "$CLAW_VERSION" ]; then
   "
   echo "  ✓ packages/claw/package.json"
 
-  sed -i '' "s/version: '.*'/version: '$CLAW_VERSION'/" packages/claw/src/index.ts
-  echo "  ✓ packages/claw/src/index.ts"
-
-  sed -i '' "s/version: '.*'/version: '$CLAW_VERSION'/" packages/claw/src/context-engine.ts
-  echo "  ✓ packages/claw/src/context-engine.ts"
+  # index.ts and context-engine.ts import CLAW_VERSION from here;
+  # claw/test/version-parity.test.ts guards the pair.
+  sed -i '' "s/export const CLAW_VERSION = '.*'/export const CLAW_VERSION = '$CLAW_VERSION'/" packages/claw/src/version.ts
+  echo "  ✓ packages/claw/src/version.ts"
 
   node -e "
     const fs = require('fs');
@@ -361,6 +408,29 @@ else
   echo "  (dsh stays at $CURRENT_DSH — pass --dsh <version> to bump and publish)"
 fi
 
+# opencode is on an independent version track — only bump if --opencode was
+# provided. Like dsh, bumping it in lockstep with core would churn its npm
+# version for releases that do not touch it.
+if [ -n "$OPENCODE_VERSION" ]; then
+  echo "  --- opencode bumps (independent track: $OPENCODE_VERSION) ---"
+  node -e "
+    const fs = require('fs');
+    const path = './packages/opencode/package.json';
+    const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+    pkg.version = '$OPENCODE_VERSION';
+    fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+  "
+  echo "  ✓ packages/opencode/package.json"
+
+  # index.ts imports OPENCODE_PLUGIN_VERSION from here;
+  # opencode/test/version-parity.test.ts guards the pair.
+  sed -i '' "s/export const OPENCODE_PLUGIN_VERSION = '.*'/export const OPENCODE_PLUGIN_VERSION = '$OPENCODE_VERSION'/" packages/opencode/src/version.ts
+  echo "  ✓ packages/opencode/src/version.ts"
+else
+  CURRENT_OPENCODE=$(node -e "console.log(require('./packages/opencode/package.json').version)")
+  echo "  (opencode stays at $CURRENT_OPENCODE — pass --opencode <version> to bump and publish)"
+fi
+
 # MCP Registry / ClawHub listing — both the top-level version and the package
 # version pin must track the release; without this the registry directs users
 # to install a stale version of @plur-ai/mcp.
@@ -393,6 +463,8 @@ sed -i '' "s/^version: .*/version: $VERSION/" packages/hermes/plugin.yaml
 echo "  ✓ packages/hermes/plugin.yaml"
 sed -i '' "s/^version: .*/version: $VERSION/" skills/plur-memory/SKILL.md
 echo "  ✓ skills/plur-memory/SKILL.md"
+sed -i '' "s/^version: .*/version: $VERSION/" skills/plur-create-engrams/SKILL.md
+echo "  ✓ skills/plur-create-engrams/SKILL.md"
 
 # Hermes npx-fallback CLI pin (#1) — the npx-fallback write path runs
 # @plur-ai/cli@$_NPX_CLI_VERSION; if it lags the release it runs a PRE-FIX CLI
@@ -419,7 +491,7 @@ echo ""
 
 # --- 2. Build ---
 echo "--- Step 2: Build ---"
-pnpm build 2>&1 | grep -E "success|error"
+pnpm build
 echo ""
 
 # D1-followup gate (#177): the Stage 3b v2 tracking sentinel must be present and
@@ -730,6 +802,9 @@ fi
 if [ -n "$DSH_VERSION" ]; then
   preflight_check dsh "$DSH_VERSION" || PREFLIGHT_OK=false
 fi
+if [ -n "$OPENCODE_VERSION" ]; then
+  preflight_check opencode "$OPENCODE_VERSION" || PREFLIGHT_OK=false
+fi
 if [ "$PREFLIGHT_OK" != true ]; then
   echo ""
   echo "✗ Pre-flight failed — nothing committed, tagged, or published."
@@ -743,10 +818,26 @@ echo ""
 # manual pre-step; Step 8 only DEPLOYS what's already in the repo. If the site
 # wasn't bumped to $VERSION, catch it HERE — before any irreversible publish —
 # rather than shipping a stale site and only warning post-deploy at Step 8.
-# Skipped when the website dir isn't present, same as Step 8.
+#
+# A missing $WEBSITE_DIR is a HARD ABORT, not a silent skip. The website is part
+# of every release; silently dropping Step 8 is indistinguishable from running it.
+# Use --no-website if you are deliberately releasing from a machine where the
+# website repo is not checked out and will deploy manually afterwards.
 WEBSITE_PREFLIGHT_DIR="${WEBSITE_DIR:-$REPO_ROOT/../website}"
-if [ -f "$WEBSITE_PREFLIGHT_DIR/index.html" ]; then
-  echo "--- Step 3.8: Website version pre-flight ---"
+echo "--- Step 3.8: Website version pre-flight ---"
+if [ "$NO_WEBSITE" = true ]; then
+  echo "  ⊘ Skipped (--no-website). Website deploy (Step 8) will also be skipped."
+  echo "  Remember to deploy the website manually after this release."
+  echo ""
+elif [ ! -f "$WEBSITE_PREFLIGHT_DIR/index.html" ]; then
+  echo "✗ Website dir not found at $WEBSITE_PREFLIGHT_DIR"
+  echo "  The website is part of every release — a missing dir means Step 8 would silently"
+  echo "  be skipped and the live site would serve stale content next to a tweeted release."
+  echo "  Options:"
+  echo "    1. Check out the website repo at $WEBSITE_PREFLIGHT_DIR (or set WEBSITE_DIR)"
+  echo "    2. Pass --no-website to skip explicitly and deploy manually afterwards"
+  exit 1
+else
   SITE_VERSION=$(grep -Eo '"softwareVersion":[[:space:]]*"[0-9.]+"' "$WEBSITE_PREFLIGHT_DIR/index.html" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
   if [ "$SITE_VERSION" != "$VERSION" ]; then
     echo "✗ Website not bumped: $WEBSITE_PREFLIGHT_DIR/index.html softwareVersion=${SITE_VERSION:-none}, expected $VERSION"
@@ -841,6 +932,12 @@ if [ -n "$DSH_VERSION" ]; then
   pnpm --filter "@plur-ai/dsh" publish --access public --no-git-checks --tag next 2>&1 | tail -1
 else
   echo "  @plur-ai/dsh: skipped (no --dsh flag)"
+fi
+if [ -n "$OPENCODE_VERSION" ]; then
+  echo -n "  @plur-ai/opencode@$OPENCODE_VERSION → @next..."
+  pnpm --filter "@plur-ai/opencode" publish --access public --no-git-checks --tag next 2>&1 | tail -1
+else
+  echo "  @plur-ai/opencode: skipped (no --opencode flag)"
 fi
 echo ""
 
@@ -1036,14 +1133,39 @@ if [ -n "$CLAW_VERSION" ]; then
   echo -n "  @plur-ai/claw@$CLAW_VERSION → @latest..."
   npm dist-tag add "@plur-ai/claw@$CLAW_VERSION" latest 2>&1 | tail -1
 fi
+if [ -n "$OPENCODE_VERSION" ]; then
+  echo -n "  @plur-ai/opencode@$OPENCODE_VERSION → @latest..."
+  npm dist-tag add "@plur-ai/opencode@$OPENCODE_VERSION" latest 2>&1 | tail -1
+fi
 echo ""
 
 # --- 6. Publish PyPI ---
 echo "--- Step 6: Publish PyPI ---"
 cd packages/hermes
 rm -rf dist/
-python3 -m build 2>&1 | tail -1
-TWINE_USERNAME=__token__ TWINE_PASSWORD="$PYPI_TOKEN_PLUR_HERMES" python3 -m twine upload dist/* 2>&1 | tail -1
+# Full build output: piping to tail-1 previously swallowed errors (Metadata-Version 2.5
+# incompatibility silenced the failure and `set -e` exited with no diagnostic). Emit all
+# output so any build error is immediately readable. (#947)
+python3 -m build
+# Preflight: validate dist files before upload. Catches stale twine (e.g. twine too old
+# for Metadata-Version 2.5) with a clear error rather than a silent upload failure. If
+# this fails: pip install -U twine pkginfo (#947)
+if ! python3 -m twine check dist/*; then
+  echo "✗ Step 6: twine check failed."
+  echo "  twine or pkginfo may be outdated: pip install -U twine pkginfo"
+  exit 1
+fi
+# Full output here too: `| tail -1` previously ate the twine error and `set -e` exited
+# silently, leaving the operator to notice the GH release was missing. Explicit `if !`
+# preserves exit code and prints a recovery hint. (#947)
+if ! TWINE_USERNAME=__token__ TWINE_PASSWORD="$PYPI_TOKEN_PLUR_HERMES" python3 -m twine upload dist/*; then
+  echo ""
+  echo "✗ Step 6: twine upload failed. See output above."
+  echo "  If 'not a valid metadata version': pip install -U twine pkginfo"
+  echo "  PyPI is immutable: a partial upload may have registered the filename; check"
+  echo "  https://pypi.org/project/plur-hermes/#history before retrying."
+  exit 1
+fi
 
 # Post-publish verification (#584). PyPI is IMMUTABLE — a dropped or partial
 # upload can't be overwritten, only superseded by a new version — and this step
@@ -1117,9 +1239,15 @@ DEPLOY_KEY="${DEPLOY_KEY:-$HOME/Data/.datacore/env/credentials/deploy_key}"
 DEPLOY_TARGET="${DEPLOY_TARGET:-deploy@209.38.243.88:/var/www/sites/plur.ai/}"
 
 echo "--- Step 8: Website deploy ---"
-if [ ! -d "$WEBSITE_DIR" ]; then
-  echo "  ⊘ Website dir not found at $WEBSITE_DIR — skipped"
-  echo "    Set WEBSITE_DIR env var to override"
+if [ "$NO_WEBSITE" = true ]; then
+  echo "  ⊘ Skipped (--no-website). Deploy the website manually:"
+  echo "    rsync -avz -e \"ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes\" $WEBSITE_DIR/ $DEPLOY_TARGET \\"
+  echo "      --exclude='.git' --exclude='node_modules'"
+elif [ ! -d "$WEBSITE_DIR" ]; then
+  # Step 3.8 should have aborted before we get here. If we're here it's a bug in the script.
+  echo "✗ Step 8: Website dir not found at $WEBSITE_DIR"
+  echo "  Step 3.8 should have caught this. Pass --no-website to skip, or fix WEBSITE_DIR."
+  exit 1
 elif [ ! -f "$DEPLOY_KEY" ]; then
   echo "  ⊘ Deploy key not found at $DEPLOY_KEY — skipped"
   echo "    Set DEPLOY_KEY env var to override"

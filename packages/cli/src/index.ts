@@ -1,10 +1,11 @@
 import { shouldOutputJson, outputJson, setQuiet, exit } from './output.js'
 import { parseGlobalFlags, createPlur } from './plur.js'
+import { unknownFlagMessage } from './known-flags.js'
 
 export type { GlobalFlags } from './plur.js'
 export { parseGlobalFlags, createPlur } from './plur.js'
 
-const VERSION = '0.19.4'
+import { CLI_VERSION as VERSION } from './version.js'
 
 // --- Main ---
 const argv = process.argv.slice(2)
@@ -24,7 +25,7 @@ Commands:
   recall <query>          Search engrams
   inject <task>           Get relevant engrams for a task
   list                    List all engrams
-  forget <id>             Retire an engram
+  forget <id>             Retire an engram [--scope <scope>] (target one store, #831)
   restore [--list|--yes]  Inspect or restore a daily store snapshot (#799)
   ingest <content>        Extract and save engrams from content
   import                  Import memories from another system (issue #441)
@@ -36,10 +37,13 @@ Commands:
   timeline [query]        Query episode timeline
   status                  System health check
   dashboard               Open the memory dashboard in a browser (alias: ui)
+                          [--port N] [--host <addr>] [--allow-host <name>]... [--no-open]
+  provenance <id|search>  Where a memory came from, and whether you may reuse it
+  identity [value]        Who your memories are attributed to (--clear to unset)
   receipt [--days N]      What your memory retrieved for you
   sync                    Cross-device sync
   packs list              List installed packs
-  packs install <source>  Install engram pack
+  packs install <source>  Install engram pack (--force: accept an integrity mismatch)
   packs export <name>     Export engrams as a pack
   similarity-search <q>   Search by cosine similarity with scores
   promote <id>            Promote an engram to active
@@ -48,6 +52,8 @@ Commands:
   migrate [up|down|status] Run schema migrations
   stores list             List configured stores
   stores add <path>       Add a knowledge store
+  trust [dir]             Trust a directory's .plur.yaml scope/domain (default: cwd) [--list]
+  untrust [dir]           Revoke a directory's trust grant (default: cwd)
   scopes                  List authorized-but-unregistered shared scopes (#647)
   scopes register <scope> Register one; scopes dismiss <scope>; scopes --reoffer
   outbox                  Show team-scoped writes queued for an unreachable store
@@ -57,7 +63,7 @@ Commands:
   init                    Wire PLUR into detected harnesses (Claude Code, Cursor, Codex, Antigravity)
   init-remote             Opt this project into recall from a PLUR Enterprise server
   login --status          Enterprise token validity per host (probe + expiry) (#587)
-  doctor                  Diagnose Claude Code / Claude Desktop / Cursor / Codex / Antigravity integration
+  doctor                  Diagnose Claude Code / Claude Desktop / Cursor / Codex / Antigravity / opencode integration
   rerank-eval             Per-store reranker self-eval gate (advisory, #451)
                           [--reranker <name>] [--sample N] [--seed N] [--force]
   tensions [--scan]       List or scan for engram contradictions
@@ -94,7 +100,10 @@ Global flags:
   process.exit(0)
 }
 
-const { flags, args } = parseGlobalFlags(argv)
+const { flags, args, error: flagError } = parseGlobalFlags(argv)
+// Before anything runs. A mistyped global flag must never reach a command that
+// would then act on the wrong store.
+if (flagError) exit(1, flagError)
 // Arm --quiet globally (#730) so no output site can forget it. Commands still
 // pass `flags` to outputInfo where available; this covers the ones that don't.
 // hook-* commands are unaffected: their stdout is protocol JSON written
@@ -118,6 +127,8 @@ const COMMANDS: Record<string, string> = {
   // Both names users guess land here — `dashboard` (minikube's convention,
   // and the word the release copy teaches) and `ui` (mlflow's convention).
   dashboard: './commands/ui.js',
+  provenance: './commands/provenance.js',
+  identity: './commands/identity.js',
   receipt: './commands/receipt.js',
   sync: './commands/sync.js',
   restore: './commands/restore.js',
@@ -128,6 +139,8 @@ const COMMANDS: Record<string, string> = {
   rescope: './commands/rescope.js',
   'similarity-search': './commands/similarity-search.js',
   stores: './commands/stores.js',
+  trust: './commands/trust.js',
+  untrust: './commands/untrust.js',
   scopes: './commands/scopes.js',
   outbox: './commands/outbox.js',
   'reindex-tokens': './commands/reindex-tokens.js',
@@ -193,6 +206,13 @@ if (!command || !COMMANDS[command]) {
 
 try {
   const mod = await import(COMMANDS[command])
+  // A command that declares its flags gets them checked (#986). One that does
+  // not is unchanged, so this is adopted per command rather than all at once.
+  if (Array.isArray(mod.FLAGS)) {
+    const complaint = unknownFlagMessage(
+      commandArgs, mod.FLAGS as string[], (mod.FLAGS_WITH_VALUES as string[]) ?? [])
+    if (complaint) exit(1, complaint)
+  }
   await mod.run(commandArgs, flags)
   // #1046: background index work (the PGLite initial sync when that backend
   // is opted into, and the Postgres auto-embed pass — both tracked on

@@ -85,6 +85,7 @@ const REMINDER_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 // (the original duplication was the root cause of #177 — session_start
 // ignored .plur.yaml because the reader lived in this CLI-only file).
 import { readProjectConfig, claimHookDegradationLines, type Plur } from '@plur-ai/core'
+import { resolveProjectRemote, projectRemoteRefusalNotice, type ProjectRemote } from '../lib/project-remote.js'
 
 /**
  * #776: the former `tryRemoteInject` remote-first POST /api/v1/inject path
@@ -373,7 +374,10 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   try { writeFileSync(injectLock, ''); injectLockAcquired = true } catch { /* fail-open */ }
 
   const input = readStdinSync()
-  const projectConfig = readProjectConfig()
+  // Project remote routing is resolved with the Plur instance, below — see
+  // lib/project-remote.ts. `scope`/`domain` are read here because they are
+  // local filters and need no gate.
+  let projectRemote: ProjectRemote | null = null
 
   // Get task description from hook input
   let task: string
@@ -404,6 +408,14 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // now — not later where it's only used for the label — so the injection is
   // attributed to this session on the co_injection event the receipt reads.
   const plur = createPlur(flags)
+
+  // Resolves the config path once, reads it, and gates its remote fields on
+  // directory trust (#1196). Fails closed; costs nothing when the project
+  // declares no remote settings.
+  projectRemote = resolveProjectRemote(plur)
+  const projectConfig = projectRemote.config
+  const remoteRefusedFrom = projectRemote.refusedFrom
+
   let injectSessionId: string | undefined
   try { injectSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
   // #776: the remote leg rides INSIDE injectHybrid — at most one remote call
@@ -421,17 +433,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     remote_timeout_ms: REMOTE_TIMEOUT_MS,
     ...(projectConfig.scope ? { scope: projectConfig.scope } : {}),
     ...(injectSessionId ? { session_id: injectSessionId } : {}),
-    ...(projectConfig.remote_url && projectConfig.remote_token
-      ? {
-          remote_project: {
-            url: projectConfig.remote_url,
-            token: projectConfig.remote_token,
-            ...(projectConfig.remote_scopes && projectConfig.remote_scopes.length > 0
-              ? { scopes: projectConfig.remote_scopes }
-              : {}),
-          },
-        }
-      : {}),
+    ...(projectRemote.remoteProject ? { remote_project: projectRemote.remoteProject } : {}),
   }
   let context: string | null = null
   let count = 0
@@ -485,6 +487,11 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
 
   // A4′ (#776): degradation header — one line per (host, state) change.
   for (const line of degradationLines) parts.push(line)
+
+  // #1196: say so. A remote leg that silently stops working is the regression
+  // this gate could otherwise introduce — the user must be able to tell
+  // "refused, here is the one command" from "quietly broken".
+  if (remoteRefusedFrom) parts.push(projectRemoteRefusalNotice(remoteRefusedFrom))
 
   if (context) {
     parts.push('')

@@ -1,7 +1,7 @@
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
 import { readStdinJson, cursorConversationId, markSessionStarted, writeContextRule } from '../lib/cursor-hook-io.js'
-import { readProjectConfig } from '@plur-ai/core'
+import { resolveProjectRemote, projectRemoteRefusalNotice } from '../lib/project-remote.js'
 
 /**
  * plur hook-cursor-session-start — Cursor `sessionStart` hook.
@@ -68,9 +68,22 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   let fullContext: string
   try {
     const plur = createPlur(flags)
-    const projectConfig = readProjectConfig()
+    const projectRemote = resolveProjectRemote(plur)
+    const projectConfig = projectRemote.config
     const injectOpts = { budget: 3000, ...(projectConfig.scope ? { scope: projectConfig.scope } : {}) }
 
+    // NOT hybrid, and therefore NOT remote — see the BM25-only note in this
+    // file's header (PR #502's lesson). Cursor's hook schema has no
+    // async/fire-and-forget option, this hook is bounded at 10s, and hybrid
+    // loads the BGE embedder (~20s cold on a few thousand engrams). Trying
+    // hybrid here reintroduces exactly the failure #502 fixed.
+    //
+    // The consequence, stated plainly (#1198): PLUR Enterprise team memory does
+    // NOT reach Cursor. The remote leg rides inside injectHybrid, so the only
+    // path to it today also loads the local embedder — which this hook cannot
+    // afford. Note the remote leg itself does not need the embedder at all: it
+    // sends query TEXT and the server embeds. A remote-with-BM25 mode in core
+    // would fix Cursor without touching the deadline. Tracked in #1200.
     const result = await plur.inject('general session start', injectOpts)
     const count = result.count
     const context = count > 0 ? [result.directives, result.constraints, result.consider].filter(Boolean).join('\n') : ''
@@ -78,7 +91,13 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
     const header = `[PLUR Memory — session started, ${count} engrams injected]` +
       (projectConfig.scope ? `\nProject scope: ${projectConfig.scope} — use this scope for plur_learn calls` : '')
 
-    fullContext = context ? `${header}\n\n${context}` : header
+    // A refused .plur.yaml is still worth saying: the user's scope routing is
+    // unaffected, but they should know the remote settings were not honoured —
+    // for the trust reason here, and for #1200 regardless.
+    const refusal = projectRemote.refusedFrom
+      ? `${projectRemoteRefusalNotice(projectRemote.refusedFrom)}\n\n`
+      : ''
+    fullContext = refusal + (context ? `${header}\n\n${context}` : header)
   } catch (err: unknown) {
     // Audit fix (evaluator review — user lens, iteration 4, 2026-07-09):
     // `plur_doctor` (an MCP tool, in this session's own 11-tool surface)

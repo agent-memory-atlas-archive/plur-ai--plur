@@ -1,7 +1,7 @@
 import { existsSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { Plur, extractMetaEngrams, validateMetaEngram, confidenceBand, generateProfile, getProfileForInjection, markProfileDirty, selectModelForOperation, readHistoryForEngram, getCachedUpdateCheck, minorVersionsBehind, scanForTensions, CapabilityCanary, readProjectConfig, isSharedScope, resolveRerankerName, getReranker, classifyRerankerFailure, hfCacheDirName, SUGGEST_DISPLAY_MIN_CONFIDENCE, mcpRemoteWarningLine, doctorRemoteRemediation, normalizeEndpointUrl, REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES } from '@plur-ai/core'
+import { Plur, extractMetaEngrams, validateMetaEngram, confidenceBand, generateProfile, getProfileForInjection, markProfileDirty, selectModelForOperation, readHistoryForEngram, getCachedUpdateCheck, minorVersionsBehind, scanForTensions, CapabilityCanary, readProjectConfig, isSharedScope, resolveRerankerName, getReranker, classifyRerankerFailure, hfCacheDirName, SUGGEST_DISPLAY_MIN_CONFIDENCE, mcpRemoteWarningLine, doctorRemoteRemediation, normalizeEndpointUrl, REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES, bareEngramId, summariseProvenance, renderProvenanceSummary, type LearnContext } from '@plur-ai/core'
 import type { LlmFunction, MetaField, TensionStatus, RerankerEvalResult, HistoryEvent, Receipt, RemoteStoreStatusEntry } from '@plur-ai/core'
 import { recordTelemetry } from './telemetry.js'
 import { VERSION } from './version.js'
@@ -138,7 +138,7 @@ const recallHandler: ToolDefinition['handler'] = async (args, plur) => {
               .join(', ') + ']'
           : ''
         return {
-          id: e.id,
+          id: (raw._originalId as string | undefined) ?? bareEngramId(e.id),
           statement: e.statement + annotation + measuredAnnotation,
           type: e.type,
           scope: e.scope,
@@ -215,7 +215,7 @@ const recallHandler: ToolDefinition['handler'] = async (args, plur) => {
             .join(', ') + ']'
         : ''
       const base: Record<string, unknown> = {
-        id: e.id,
+        id: (raw._originalId as string | undefined) ?? bareEngramId(e.id),
         statement: e.statement + annotation + measuredAnnotation,
         type: e.type,
         scope: e.scope,
@@ -487,7 +487,11 @@ const PLUR_GUIDE = `## PLUR Quick Start
 5. Call **plur_session_end** before the conversation ends — suggest new engrams
 
 ### Core Tools
-- **plur_learn** — record corrections, preferences, patterns (CALL THIS OFTEN)
+- **plur_learn** — one assertion per call, small enough to act on at a glance. The
+  mechanism goes in \`rationale\`, the evidence in \`source\`. Call it often, and do not
+  force one: a bad engram costs injection budget forever, a missed one costs a re-ask.
+  For anything beyond a one-line correction, use the \`plur-create-engrams\` skill —
+  it is the authoring contract, not a style preference.
 - **plur_recall** — search engrams by topic (default: hybrid BM25 + embeddings; use mode:"keyword" for BM25-only)
 - **plur_forget** — retire an outdated engram`
 
@@ -517,6 +521,48 @@ function sanitizeStatement(raw: string): string {
 }
 
 // Exported so the server dispatch loop can tick it once per tool call (#192).
+/**
+ * Composition feedback on a written engram (#1138 follow-up).
+ *
+ * Not a length warning. "Your engram is 1,454 chars" is not actionable; naming
+ * WHICH field each excess span belongs to is. Reported after the write, never
+ * blocking it — the same posture as dedup.near_duplicates.
+ *
+ * The signal that matters most is the last one: a long statement with an EMPTY
+ * rationale means the author had a mechanism to state and did not state it,
+ * which is how a 1,454-char statement carrying eleven claims gets written.
+ */
+export function composeHints(statement: string, rationale?: string, source?: string): {
+  chars: number
+  misplaced: string[]
+} | undefined {
+  const hints: string[] = []
+  const chars = statement.length
+  if (chars <= 400) return undefined
+
+  if (/\b(on|proven|observed|stated|decided|confirmed)\s+20\d\d-\d\d-\d\d/i.test(statement)) {
+    hints.push('carries a dated observation — that is a citation, move it to `source`')
+  }
+  const engRefs = statement.match(/\b(ENG|ABS|META)-[A-Za-z0-9-]+/g)
+  if (engRefs && engRefs.length >= 2) {
+    hints.push(`names ${engRefs.length} other engrams — use relations.supersedes, or cite them in \`rationale\``)
+  }
+  if (/\b(because|since|the reason is|which is why)\b/i.test(statement) && !rationale) {
+    hints.push('argues its own case inline while `rationale` is empty — move the mechanism there')
+  }
+  if (/\b(and also|additionally|separately|furthermore)\b/i.test(statement)) {
+    hints.push('contains "and also" — that is a second engram, split it')
+  }
+  if (!rationale) {
+    hints.push('`rationale` is empty on a long statement: state the mechanism that makes this true, and therefore when it stops being true')
+  }
+  if (!source) {
+    hints.push('`source` is empty: where did this come from')
+  }
+  if (!hints.length) return undefined
+  return { chars, misplaced: hints }
+}
+
 export const mcpCanary = new CapabilityCanary({ threshold: 10 })
 mcpCanary.expect({
   id: 'session_start_hook',
@@ -976,7 +1022,8 @@ function getAllToolDefinitions(): ToolDefinition[] {
       description:
         'Create an engram — record a reusable learning, preference, or correction. ' +
         'A write is never suppressed by similarity: exact content-hash duplicates NOOP, and anything merely SIMILAR ' +
-        'is written and reported back in `dedup.near_duplicates` (closest existing engrams and their cosine scores) ' +
+        'is written and reported back in `dedup.near_duplicates` (closest existing engrams, their cosine scores, and ' +
+        'a preview of each neighbour\'s own statement — read them before moving on; that is what they are for) ' +
         'so you can supersede or merge deliberately. High similarity is a reason to look, not a decision — cosine ' +
         'cannot tell a duplicate from a correction of it. ' +
         'Multi-agent note: in an orchestration that spawns subagents, have the PARENT session own plur_learn writes — ' +
@@ -986,7 +1033,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
       inputSchema: {
         type: 'object',
         properties: {
-          statement: { type: 'string', description: 'The knowledge assertion to store' },
+          statement: { type: 'string', description: 'ONE assertion, written so someone who was not there can act on it. Route the rest to the field whose job it is: the mechanism that makes it true goes in `rationale`, where it came from in `source`, when it applies in `tags`/`domain`. An "and also" means a second engram. Good: "Never name a client unless the user names them first, say the customer." Typical 100-300 chars; past ~600 you are carrying another field content. Length is a symptom, not the rule.' },
           type: {
             type: 'string',
             enum: ['behavioral', 'terminological', 'procedural', 'architectural'],
@@ -995,10 +1042,10 @@ function getAllToolDefinitions(): ToolDefinition[] {
           scope: { type: 'string', description: 'Namespace, e.g. global, project:myapp' },
           domain: { type: 'string', description: 'Domain tag, e.g. software.deployment' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Searchable keyword tags — contribute to BM25/embedding recall, so concrete keywords pay off' },
-          rationale: { type: 'string', description: 'Why this knowledge matters — also enters the search corpus, helps recall by intent not just statement' },
+          rationale: { type: 'string', description: 'The mechanism that makes the statement true, and therefore the condition under which it would STOP being true. One sentence. "Because the user said so on <date>" is a citation, not a mechanism: that belongs in `source`. This text is indexed, so a real mechanism also carries concrete nouns a future query can match. NOTE: constraints render without rationale (plur-ai/plur#1144), so a mechanism a prohibition needs the model to weigh must stay in the statement.' },
           source: { type: 'string', description: 'Origin of this knowledge (URL, conversation ref, etc.)' },
           pinned: { type: 'boolean', description: 'Always-load flag. If true, this engram bypasses the keyword-relevance gate at injection time. Use sparingly: meta-rules, safety conventions, core operating principles only.' },
-          commitment: { type: 'string', enum: ['exploring', 'leaning', 'decided', 'locked', 'draft'], description: 'How firmly the user has committed to this belief (default: leaning). `draft` marks the engram as pending human approval — core stores and recalls it normally; enforcement is left to deployments with a review queue.' },
+          commitment: { type: 'string', enum: ['exploring', 'leaning', 'decided', 'locked', 'draft'], description: 'How firmly the user has committed to this belief (default: leaning). `draft` marks the engram as pending human approval: core stores and RECALLS it normally but NEVER injects it (#1141), so an unapproved rule cannot shape agent behaviour. Retrieval stays open because reviewing something requires reading it.' },
           locked_reason: { type: 'string', description: 'Why this engram is locked (only meaningful when commitment=locked)' },
           valid_from: { type: 'string', description: 'ISO date (YYYY-MM-DD) the knowledge becomes valid — inject/recall skip the engram before this date (#347)' },
           valid_until: { type: 'string', description: 'ISO date (YYYY-MM-DD) the knowledge expires — inject/recall skip the engram after this date. Set this for any time-bound fact (offers, deadlines, temporary endpoints). When omitted, an explicit expiry phrase in the statement ("valid until 31 May 2026") is auto-parsed and echoed back (#347)' },
@@ -1006,7 +1053,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
           session_id: { type: 'string', description: 'Session this write belongs to (from plur_session_start). Resolves the session default scope (incl. mid-session plur_session_scope changes) when no explicit scope is passed. Optional when one session is open; pass it when several are (#243).' },
           measured_under: {
             type: 'object',
-            description: 'Measurement context for numeric or benchmark-derived claims (#869). Records the conditions under which the asserted value was measured — model, source_type, hardware, dataset, date. When present, differing-condition measurements are stored as refinements rather than tensions. Omit for non-numeric engrams.',
+            description: 'Measurement context for numeric or benchmark-derived claims (#869). Records the conditions under which the asserted value was measured — model, source_type, hardware, dataset, date. When present, the tension scanner does not treat two measurements from the same store taken under different configurations as a contradiction (the skipped pair is reported in the scan result). Omit for non-numeric engrams.',
             properties: {
               model: { type: 'string', description: 'Model or system variant (e.g. "claude-opus-4", "gpt-4o")' },
               source_type: { type: 'string', description: 'Source environment type (e.g. "local-git", "gitlab", "bench", "production")' },
@@ -1015,31 +1062,105 @@ function getAllToolDefinitions(): ToolDefinition[] {
               date: { type: 'string', description: 'ISO date (YYYY-MM-DD) the measurement was taken' },
             },
           },
+          attribution: {
+            type: 'object',
+            description:
+              'Who is answerable for this memory (#961). Every sub-field optional; OMIT rather than guess — a memory with no agent is honest, one with an invented agent is worse than none. Set asserted_by to "unidentified" when nobody is identified, rather than leaving it out: absence cannot be told apart from a memory written before this existed.',
+            properties: {
+              asserted_by: { type: 'string', description: 'Who or what asserted it. Any address: a local name, a Decentralized Identifier, or "unidentified".' },
+              runtime: {
+                type: 'object',
+                description: 'The software writing this. Usually known, so usually worth setting.',
+                properties: { name: { type: 'string' }, version: { type: 'string' } },
+              },
+              model: {
+                type: 'object',
+                description: 'The model behind the statement, if one was involved. Prompt TEXT is never stored, only a hash.',
+                properties: {
+                  name: { type: 'string' },
+                  prompt_id: { type: 'string' },
+                  prompt_version: { type: 'string' },
+                  prompt_sha256: { type: 'string' },
+                },
+              },
+              tool: {
+                type: 'object',
+                description: 'An extractor or importer, with its version.',
+                properties: { name: { type: 'string' }, version: { type: 'string' } },
+              },
+              on_behalf_of: { type: 'string', description: 'The party the runtime acted for.' },
+            },
+          },
+          claim_class: {
+            type: 'string',
+            enum: ['observed', 'documented', 'structural', 'asserted', 'inferred', 'revised'],
+            description:
+              'What KIND of claim this is (#963), and the most useful single field for anyone later deciding how much to trust it. Use "asserted" when a PERSON stated it outright, "inferred" when YOU worked it out, "documented" when you took it from prose someone wrote, "observed" for a record of something that happened, "structural" when read off the shape of an artifact, "revised" for a rewrite. Omit only when it genuinely cannot be determined.',
+          },
+          license: {
+            type: 'string',
+            description:
+              'Which licence governs reuse of this memory, as an SPDX-style identifier such as "cc-by-4.0" or "apache-2.0". Set it only when the user has actually said which licence applies — do NOT guess one. Left unset, a default applies that nobody chose, and a provenance record reports it as unchosen rather than presenting it as a decision.',
+          },
+          // Deliberately exposed to the LLM, reversing #139, which kept
+          // `visibility` off this schema because `public` is what gates pack
+          // export and shared git sync. Without it an agent cannot mark
+          // anything shareable, so every pack built from agent-written
+          // memories was empty (#970) — the walkthrough and the agent
+          // conversation demo both depend on it. The reason #139 was cautious
+          // still holds, and is answered elsewhere: every path `public` opens
+          // (pack export, shared sync, remote push, rescope, explicit update,
+          // outbox flush) scans the FULL engram — statement plus every other
+          // field, `attribution` and `license` included — before content
+          // leaves the machine. See `engramContentFields` in core.
+          visibility: {
+            type: 'string',
+            enum: ['private', 'public', 'template'],
+            description:
+              'Whether this memory may leave this machine. Defaults to "private", which means it is EXCLUDED from every exported pack. Set "public" only when the user has said this is shareable with others — it is their decision, not yours. Without this an agent cannot mark anything shareable at all, so every memory it writes is private forever and any pack built from them is empty.',
+          },
         },
         required: ['statement'],
       },
       handler: async (args, plur) => {
         const llm = getLlmFunction()
-        // LLM-facing context. Fields not in inputSchema (visibility,
-        // knowledge_anchors, dual_coding, abstract, derived_from, memory_class,
+        // LLM-facing context. Fields not in inputSchema (knowledge_anchors,
+        // dual_coding, abstract, derived_from, memory_class,
         // session_episode_id) stay in the engram spec and remain settable via
         // the Plur class / REST — just not asked of the LLM. Their feature
-        // paths (private/public gating, meta-engram routing, etc.) are
-        // unaffected. See plur-ai/plur#139.
+        // paths (meta-engram routing, etc.) are unaffected. See
+        // plur-ai/plur#139; `visibility` is the one exception, see the schema.
         const context = {
           type: args.type as any,
           scope: args.scope as string | undefined,
-          domain: args.domain as string | undefined,
+          // .plur.yaml `domain:` as the default (#1148). The key was parsed by
+          // project-config and consumed nowhere, so setting it was a silent
+          // no-op — the same shape as injection.pinned_ratio before #1142.
+          // Domain is not decorative: scoreEngram counts every matching
+          // hierarchy segment as a FULL term hit, double the weight of a
+          // statement word, so a missing domain forfeits the strongest
+          // retrieval signal an author has. Explicit argument always wins.
+          domain: (args.domain as string | undefined) ?? readProjectConfig().domain ?? undefined,
           source: args.source as string | undefined,
           tags: args.tags as string[] | undefined,
           rationale: args.rationale as string | undefined,
           commitment: args.commitment as any,
           locked_reason: args.locked_reason as string | undefined,
+          // Quota-gated below, before the write — `plur_pin` was the only
+          // guarded entry point, and writing a NEW pinned engram is the other
+          // normal way to create a pin (#1138 review).
           pinned: args.pinned as boolean | undefined,
           valid_from: args.valid_from as string | undefined,
           valid_until: args.valid_until as string | undefined,
           supersedes: args.supersedes as string[] | undefined,
           measured_under: args.measured_under as Record<string, string> | undefined,
+          // Who is answerable, and what kind of claim this is (#961, #963).
+          // Passed through untouched: we never invent an agent, and we never
+          // guess a claim class the caller did not state.
+          attribution: args.attribution as LearnContext['attribution'],
+          claim_class: args.claim_class as LearnContext['claim_class'],
+          license: args.license as LearnContext['license'],
+          visibility: args.visibility as LearnContext['visibility'],
           // #243: resolve which session's default scope governs this write —
           // explicit session_id first, else the lone open session. Never
           // persisted on the engram (LearnContext.session selects a scope, it
@@ -1122,11 +1243,40 @@ function getAllToolDefinitions(): ToolDefinition[] {
         }
 
         const statement = sanitizeStatement(args.statement as string)
+
+        // A NEW pinned engram is the other way to create a pin, and it was
+        // ungated: `plur_pin` refused an over-quota pin while `plur_learn
+        // { pinned: true }` walked straight past the same limit (#1138 review).
+        //
+        // Necessarily coarser than the `plur_pin` check: the engram does not
+        // exist yet, so its rendered cost is not knowable here and this cannot
+        // say "it would exceed by N". What it CAN say without guessing is that
+        // there is no room at all — which is the state the reported store was
+        // in, three times over quota. An exact pre-check would mean predicting
+        // the cost of a record that has not been built.
+        if (context.pinned === true) {
+          const q = await plur.pinnedQuota()
+          if (q.free <= 0) {
+            return {
+              success: false,
+              error: 'pinned_quota_exceeded',
+              quota: q.quota,
+              used: q.used,
+              free: q.free,
+              pinned_count: q.count,
+              note: 'The pinned set has no room left, so this engram cannot be pinned — a pin that does not fit is dropped at injection time, which is the silent failure the quota exists to prevent. Learn it unpinned (drop `pinned`), or unpin something first with plur_pin {list:true} to see the set and its costs, or raise `injection_budget` / `injection.pinned_ratio` in ~/.plur/config.yaml. The statement was NOT stored — re-send it once you have decided.',
+            }
+          }
+        }
+
         try {
           const engram = await plur.learnRouted(statement, context)
           const isOutbox = !!(engram as any).structured_data?._outbox
           const demoted = (engram as any).structured_data?._demoted as { from: string; to: string; patterns: string } | undefined
           const routed = (engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
+          // #1115: the mirror of `_routed` — a shared scope matched this write's
+          // content but was deliberately not adopted.
+          const routeRefused = (engram as any).structured_data?._routeRefused as { scope: string; confidence: number; reason: string } | undefined
           mcpCanary.signal('learn_activity')
           // Opt-in, content-free engagement counter (default-off; no statement text).
           recordTelemetry('learn')
@@ -1139,6 +1289,33 @@ function getAllToolDefinitions(): ToolDefinition[] {
           const dedup = isOutbox
             ? undefined
             : await plur.nearDuplicates(statement, context, engram.id)
+
+          // Redraft detection (2026-09-07). Superseding an engram written only
+          // minutes ago is not a correction — it is a redraft, and it leaves a
+          // chain of near-identical records behind. Cosine cannot catch this:
+          // every link in such a chain carries `supersedes`, so a similarity
+          // gate never fires, and the writes are genuinely different text.
+          // Observed: three versions of one rule inside a single session.
+          // Reported, never blocked — the write may well be right.
+          // Engram records carry no creation timestamp — only
+          // activation.last_accessed, which is a date and moves on read. The
+          // ID does carry the mint date, in either ENG-YYYY-MM-DD-NNN or
+          // ENG-YYYY-MMDD-NNN form (optionally with a store prefix), and
+          // same-day is the resolution this needs. No I/O, so it cannot fail.
+          const redraft = (() => {
+            const ids = args.supersedes as string[] | undefined
+            if (!ids?.length) return undefined
+            const today = new Date().toISOString().slice(0, 10)
+            const sameDay = ids.filter(id => {
+              const m = /(\d{4})-(\d{2})-?(\d{2})/.exec(id)
+              return m ? `${m[1]}-${m[2]}-${m[3]}` === today : false
+            })
+            if (!sameDay.length) return undefined
+            return {
+              superseded_today: sameDay,
+              note: 'You are replacing an engram minted today — that is a redraft, not a correction, and it leaves a chain of near-identical records behind. Think the assertion through once and write it once. If the earlier one was simply wrong, retire it with plur_forget instead of stacking another supersede.',
+            }
+          })()
           return {
             // #914: report the id in the form plur_recall hands back, so a
             // caller that records what it just learned and passes it to
@@ -1153,12 +1330,20 @@ function getAllToolDefinitions(): ToolDefinition[] {
             content_hash: (engram as { content_hash?: string }).content_hash,
             decision: 'ADD',
             ...(dedup?.near_duplicates?.length ? { dedup } : {}),
+            ...(redraft ? { redraft } : {}),
+            ...(() => { const c = composeHints(statement, context?.rationale, context?.source); return c ? { composition: c } : {} })(),
             ...temporalEcho(engram),
             ...scopeHint(engram.scope, !!routed),
             ...domainHint(!!routed),
             ...(isOutbox ? { outbox: true, warning: 'Remote write failed; engram queued locally for retry on next session start or plur_sync.' } : {}),
             ...(demoted ? { demoted: true, requested_scope: demoted.from, warning: `Sensitive content (${demoted.patterns}) detected — stored at "${demoted.to}"/private instead of the requested shared scope "${demoted.from}". If this is a false positive, re-scope deliberately.` } : {}),
             ...(routed ? { routed: { scope: routed.scope, confidence: routed.confidence, reason: routed.reason }, info: `No scope was provided; auto-routed to "${routed.scope}" (confidence ${routed.confidence}) because its content matched that scope's covers. Pass an explicit scope to override.` } : {}),
+            // #1115: a shared scope matched but was NOT adopted. Said plainly,
+            // as a `warning`, because the old `info` string for the opposite
+            // outcome proved easy to miss in a long session — and this one
+            // changes what the caller should do next, rather than merely
+            // reporting where the write went.
+            ...(routeRefused ? { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason }, warning: `No scope was provided. This content matched the shared scope "${routeRefused.scope}" (confidence ${routeRefused.confidence}), but unscoped writes are never auto-routed into a shared store — it was stored at "${engram.scope}" instead. If it belongs to the team, pass scope: "${routeRefused.scope}" explicitly, or move it with plur_rescope.` } : {}),
           }
         } catch (err) {
 // learnRouted now saves to outbox on remote failure, so this
@@ -1170,7 +1355,11 @@ function getAllToolDefinitions(): ToolDefinition[] {
           // Opt-in, content-free engagement counter (default-off; no statement text).
           recordTelemetry('learn')
           return {
-            id: engram.id, statement: engram.statement,
+            // Mirror the happy-path fix (#914): report the namespaced form so a
+            // caller holding this id can pass it to plur_forget / plur_feedback
+            // without hitting the collision the id form mismatch causes.
+            // Outbox engrams stay local-form (same rule as line 1149).
+            id: isOutbox ? engram.id : plur.readIdFor(engram), statement: engram.statement,
             scope: engram.scope, type: engram.type, decision: 'ADD',
             ...temporalEcho(engram),
             ...scopeHint(engram.scope, !!routedFallback),
@@ -1209,7 +1398,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
             items: {
               type: 'object',
               properties: {
-                statement: { type: 'string', description: 'The knowledge assertion to store' },
+                statement: { type: 'string', description: 'ONE assertion, written so someone who was not there can act on it. Route the rest to the field whose job it is: the mechanism that makes it true goes in `rationale`, where it came from in `source`, when it applies in `tags`/`domain`. An "and also" means a second engram. Good: "Never name a client unless the user names them first, say the customer." Typical 100-300 chars; past ~600 you are carrying another field content. Length is a symptom, not the rule.' },
                 type: { type: 'string', enum: ['behavioral', 'terminological', 'procedural', 'architectural'], description: 'Category of the engram' },
                 scope: { type: 'string', description: 'Namespace, e.g. global, project:myapp' },
                 domain: { type: 'string', description: 'Domain tag, e.g. software.deployment' },
@@ -1217,7 +1406,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
                 rationale: { type: 'string', description: 'Why this knowledge matters — also enters the search corpus' },
                 source: { type: 'string', description: 'Origin of this knowledge (URL, conversation ref, etc.)' },
                 pinned: { type: 'boolean', description: 'Always-load flag. Use sparingly: meta-rules, safety conventions, core principles.' },
-                commitment: { type: 'string', enum: ['exploring', 'leaning', 'decided', 'locked', 'draft'], description: 'How firmly the user has committed (default: leaning). `draft` marks the engram as pending human approval — core stores and recalls it normally; enforcement is left to deployments with a review queue.' },
+                commitment: { type: 'string', enum: ['exploring', 'leaning', 'decided', 'locked', 'draft'], description: 'How firmly the user has committed (default: leaning). `draft` marks the engram as pending human approval: core stores and RECALLS it normally but NEVER injects it (#1141), so an unapproved rule cannot shape agent behaviour. Retrieval stays open because reviewing something requires reading it.' },
                 valid_from: { type: 'string', description: 'ISO date (YYYY-MM-DD) the knowledge becomes valid' },
                 valid_until: { type: 'string', description: 'ISO date (YYYY-MM-DD) the knowledge expires' },
                 measured_under: {
@@ -1275,9 +1464,17 @@ function getAllToolDefinitions(): ToolDefinition[] {
         // was `results.map(r => r.engram.id)` — a COMPACTED array, so after a
         // mid-batch failure every subsequent id shifted left and mis-attributed
         // to the wrong input (#281). Build from input_index instead.
+        //
+        // #930/#914 parity: report ids in the namespaced form plur_recall returns,
+        // matching the fix applied to plur_learn in b93fa8e. An outbox engram is
+        // excluded — it sits in the LOCAL store under a local id until the retry
+        // lands, and that is what recall returns for it.
         const ids: (string | null)[] = raw.map(() => null)
         for (const r of results) {
-          if (r.input_index !== undefined) ids[r.input_index] = r.engram.id
+          if (r.input_index !== undefined) {
+            const isOutbox = !!(r.engram as any).structured_data?._outbox
+            ids[r.input_index] = isOutbox ? r.engram.id : plur.readIdFor(r.engram)
+          }
         }
         // Missing-domain nudge (#671), batch form: aggregate count instead of a
         // per-item echo. Same gate as plur_learn — only items that passed
@@ -1320,11 +1517,39 @@ function getAllToolDefinitions(): ToolDefinition[] {
             }
           } catch { /* advisory only — never fail the batch over a hint */ }
         }
+        // A per-result key is not a signal in a batch of fifty. The refusal
+        // changes what the caller should do next, so it is also summarised at
+        // the top level, where `warning` already is.
+        const refusedScopes = [...new Set(results
+          .map(r => ((r.engram as any).structured_data?._routeRefused as { scope: string } | undefined)?.scope)
+          .filter((sc): sc is string => typeof sc === 'string'))]
+        const refusedCount = results.filter(r => (r.engram as any).structured_data?._routeRefused !== undefined).length
+        const warnings: string[] = []
+        if (failures.length > 0) {
+          warnings.push(`${failures.length} of ${raw.length} engram(s) failed to persist; the rest were written.`)
+        }
+        if (refusedCount > 0) {
+          warnings.push(
+            `${refusedCount} of ${raw.length} engram(s) had no scope and matched the shared scope(s) ` +
+            `${refusedScopes.join(', ')}, which unscoped writes are never auto-routed into — they were stored ` +
+            `in a personal scope instead. Pass an explicit scope on those items if they belong to the team, ` +
+            `or move them with plur_rescope.`)
+        }
+
         return {
           ids,
-          results: results.map((r) => ({
+          results: results.map((r) => {
+            const isOutbox = !!(r.engram as any).structured_data?._outbox
+            // #1115: the batch mirror of what plur_learn already reports.
+            // `_routed` was read above to suppress a domain hint and
+            // `_routeRefused` was read nowhere, so a batch write that routed
+            // into a store the caller never named — or was declined from a
+            // shared one — reached the caller with no signal of either.
+            const routed = (r.engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
+            const routeRefused = (r.engram as any).structured_data?._routeRefused as { scope: string; confidence: number; reason: string } | undefined
+            return {
             input_index: r.input_index,
-            id: r.engram.id,
+            id: isOutbox ? r.engram.id : plur.readIdFor(r.engram),
             statement: r.engram.statement,
             scope: r.engram.scope,
             type: r.engram.type,
@@ -1334,12 +1559,14 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // reporting it exists for reached no caller — "anything below the
             // bar is still reported" was not observable anywhere.
             ...(r.dedup ? { dedup: r.dedup } : {}),
-          })),
+            ...(routed ? { routed: { scope: routed.scope, confidence: routed.confidence, reason: routed.reason } } : {}),
+            ...(routeRefused ? { route_refused: { scope: routeRefused.scope, confidence: routeRefused.confidence, reason: routeRefused.reason } } : {}),
+          }
+          }),
           stats,
           ...batchDomainHint,
-          ...(failures.length > 0
-            ? { failures, warning: `${failures.length} of ${raw.length} engram(s) failed to persist; the rest were written.` }
-            : {}),
+          ...(failures.length > 0 ? { failures } : {}),
+          ...(warnings.length > 0 ? { warning: warnings.join(' ') } : {}),
         }
       },
     },
@@ -1430,6 +1657,10 @@ function getAllToolDefinitions(): ToolDefinition[] {
           injected_ids: result.injected_ids,
           // #181: unresolved-tension warnings — flag contradicted context
           ...(result.warnings ? { warnings: result.warnings } : {}),
+          // #1142: pinned engrams that did not fit. `pinned: true` reads as a
+          // promise; it is priority-subject-to-capacity, and a caller must be
+          // able to see what it did not get.
+          ...(result.omitted_pinned?.length ? { omitted_pinned: result.omitted_pinned } : {}),
         }
       },
     },
@@ -1466,6 +1697,10 @@ function getAllToolDefinitions(): ToolDefinition[] {
           mode: 'hybrid',
           // #181: unresolved-tension warnings — flag contradicted context
           ...(result.warnings ? { warnings: result.warnings } : {}),
+          // #1142: pinned engrams that did not fit. `pinned: true` reads as a
+          // promise; it is priority-subject-to-capacity, and a caller must be
+          // able to see what it did not get.
+          ...(result.omitted_pinned?.length ? { omitted_pinned: result.omitted_pinned } : {}),
         }
         // A4′ (#776): per-host remote degradation — only when non-ok.
         attachRemoteStoreDegradation(response, plur)
@@ -1536,7 +1771,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
 
     {
       name: 'plur_pin',
-      description: 'Toggle the always-load (pinned) flag on an engram. Pinned engrams bypass the keyword-relevance gate at injection time and are eligible for loading on every session, regardless of overlap with the user task. Use sparingly — meta-rules, safety conventions, core operating principles. Pass {id, pinned:true} to pin or {id, pinned:false} to unpin. List current pinned with {list:true}.',
+      description: 'Toggle the always-load (pinned) flag on an engram. Pinned engrams bypass the keyword-relevance gate and load on every session regardless of overlap with the task. Use sparingly — meta-rules, safety conventions, core operating principles; a fact you need only sometimes should be recalled, not pinned. The pinned set has a QUOTA (injection_budget × injection.pinned_ratio): "always-load" only means anything if the set fits, so a pin that would exceed it is REFUSED with the current usage and unpin suggestions rather than silently dropping something already pinned. Resolve it by unpinning something or raising the limit — the choice is the user\'s, so surface it rather than picking one. Pass {id, pinned:true} to pin, {id, pinned:false} to unpin, {list:true} to list the set with its quota usage.',
       annotations: { title: 'Pin', destructiveHint: false, idempotentHint: true },
       inputSchema: {
         type: 'object',
@@ -1549,13 +1784,60 @@ function getAllToolDefinitions(): ToolDefinition[] {
       handler: async (args, plur) => {
         if (args.list === true) {
           const pinned = await plur.listPinned()
+          const q = await plur.pinnedQuota()
           return {
             count: pinned.length,
+            quota: { tokens: q.quota, used: q.used, free: q.free, over: q.over },
+            ...(q.over ? { warning: `Pinned engrams use ${q.used} tokens against a ${q.quota}-token quota. The overflow is dropped at injection time, so some pinned engrams are NOT being loaded. Unpin some, or raise injection_budget / injection.pinned_ratio.` } : {}),
             pinned: pinned.map(e => ({ id: e.id, statement: e.statement, scope: e.scope, domain: e.domain })),
           }
         }
         if (!args.id) throw new Error('Provide id (or list:true to list pinned)')
         const target = (args.pinned as boolean | undefined) ?? true
+
+        // Quota is enforced HERE, not at injection time (#1142). The spec calls
+        // `pinned` an always-load flag; honouring that means refusing to
+        // over-commit, because the alternative is silently dropping something
+        // the user already pinned. Pinning is a deliberate act with a human
+        // present — this is the only moment where "unpin one or raise the
+        // limit" is a question someone can actually answer.
+        if (target === true) {
+          const q = await plur.pinnedQuota(args.id as string)
+          if (q.candidate && !q.candidate.fits) {
+            const deficit = q.candidate.would_be - q.quota
+            // Take entries until the deficit is covered. This accumulated
+            // `freed` as a side effect INSIDE a `filter` predicate and then
+            // truncated to five, so whenever more than five unpins were needed
+            // the list did not cover the deficit while the note told the user
+            // to unpin one of them.
+            const covering: typeof q.entries = []
+            let freed = 0
+            for (const e of q.entries) {
+              if (freed >= deficit) break
+              covering.push(e)
+              freed += e.cost
+            }
+            const suggestions = covering
+              .slice(0, 5)
+              .map(e => ({ id: e.id, frees: e.cost, net_feedback: e.net_feedback, last_accessed: e.last_accessed, statement: e.statement.slice(0, 100) }))
+            return {
+              success: false,
+              error: 'pinned_quota_exceeded',
+              quota: q.quota,
+              used: q.used,
+              this_engram_cost: q.candidate.cost,
+              would_be: q.candidate.would_be,
+              over_by: deficit,
+              unpin_candidates: suggestions,
+              unpins_needed: covering.length,
+              note: `Pinned engrams are always-load, so the set cannot exceed its share of the injection budget — over-committing means silently dropping something already pinned. `
+                + (covering.length > suggestions.length
+                  ? `At least ${covering.length} unpins are needed to fit this one; the ${suggestions.length} largest are listed. `
+                  : `Unpin ${covering.length === 1 ? 'the suggestion' : 'the suggestions'} below to fit this one. `)
+                + 'Or raise `injection_budget` / `injection.pinned_ratio` in ~/.plur/config.yaml. Candidates are ordered by what they free, NOT by importance: feedback covers ~4% of engrams so it cannot rank them, and a ranking that looks authoritative would put a thumb on a decision only the user can make.',
+            }
+          }
+        }
         // Audit iter-1 fix (CTO): use async variant so remote pin operations
         // await the PATCH instead of returning an optimistic shell engram.
         // The sync setPinned() fire-and-forgets the remote PATCH and returns
@@ -1581,6 +1863,10 @@ function getAllToolDefinitions(): ToolDefinition[] {
         properties: {
           id: { type: 'string', description: 'Exact engram ID to retire' },
           search: { type: 'string', description: 'Search term to find engram to retire' },
+          reason: {
+            type: 'string',
+            description: 'Why this is being retired. Recorded in the history log and on the engram (#959). Say what changed, not just that something did.',
+          },
           scope: { type: 'string', description: 'Which store holds it (#831). Ids are minted per store, so one id can name several unrelated engrams. Pass "primary" to stay on disk — the local primary store and any local secondary stores, never a remote — or a remote scope (e.g. "group:plur/plur-ai/engineering") to target that server. A scope matching no configured store is rejected, not guessed at. Omit it and an id resolving in two places is refused.' },
         },
       },
@@ -1597,14 +1883,14 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // force:true — explicit user forget always fully retires, ignoring
             // reference_count. The ref-count decrement path is for internal
             // multi-agent dedup; one plur_forget call = full retirement (#766).
-            await plur.forget(args.id as string, undefined, { force: true })
+            await plur.forget(args.id as string, args.reason as string | undefined, { force: true })
             return { success: true, retired: { id: engram.id, statement: engram.statement } }
           }
           // Not in local store, or an explicit scope was given — let
           // plur.forget() resolve. It routes to remote stores (with prefix
           // stripping per #86 / PR #186), refuses an ambiguous unqualified id
           // (#831), and throws "Engram not found" if it is nowhere.
-          await plur.forget(args.id as string, undefined, { force: true, ...(scope ? { scope } : {}) })
+          await plur.forget(args.id as string, args.reason as string | undefined, { force: true, ...(scope ? { scope } : {}) })
           return { success: true, retired: { id: args.id as string, ...(scope ? { scope } : {}) } }
         }
         if (args.search) {
@@ -1613,7 +1899,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
           const matches = await plur.recall(args.search as string, { limit: 100, remote: false })
           if (matches.length === 0) return { success: false, error: `No active engrams matching "${args.search}"` }
           if (matches.length === 1) {
-            await plur.forget(matches[0].id, undefined, { force: true })
+            await plur.forget(matches[0].id, args.reason as string | undefined, { force: true })
             return { success: true, retired: { id: matches[0].id, statement: matches[0].statement } }
           }
           return {
@@ -1766,6 +2052,20 @@ function getAllToolDefinitions(): ToolDefinition[] {
           conflicts: result.conflicts,
           security: result.security,
           registry: result.registry,
+          // ENGRAM-STANDARD-v1 §5.6.5: what was neutralized, by field, and the
+          // integrity verdict with "shipped none" distinct from "matched". Both
+          // were computed and then dropped at this surface, so an agent
+          // installing a pack could not tell the user either.
+          neutralized: result.neutralized,
+          integrity_check: result.integrity_check,
+          // The four provenance counts §5.6.5 requires a consumer to report:
+          // records found against engrams shipped, how many were unreadable,
+          // how many name an engram the pack does not contain, and how many
+          // engrams have no record. Computed by the preview install already
+          // runs, and dropped at this surface until now — so an agent
+          // installing a pack could not tell the user any of it. Absent when
+          // the pack shipped no provenance directory at all.
+          provenance: result.provenance,
           success: true,
         }
       },
@@ -2178,6 +2478,8 @@ function getAllToolDefinitions(): ToolDefinition[] {
           // Core reports these; this hand-built response dropped them, so an
           // agent asking for status saw a healthy-looking `pack_count: 0`.
           ...(status.store_errors ? { store_errors: status.store_errors } : {}),
+          // Spreading-activation drop counters — absent when both are zero.
+          ...(status.spread_drops ? { spread_drops: status.spread_drops } : {}),
           // Version check (issue #151)
           ...(versionCheck?.updateAvailable && versionCheck.latest ? {
             update_available: {
@@ -2192,9 +2494,137 @@ function getAllToolDefinitions(): ToolDefinition[] {
     },
 
     {
+      name: 'plur_provenance',
+      description:
+        'Where a memory came from: who asserted it, whether a person stated it or a model worked it out, when, what it came from, and whether you may reuse it. ' +
+        'Read-only. Accepts an engram id or a search term — nobody remembers ids. ' +
+        'IMPORTANT when relaying to the user: report the `not_recorded` list as prominently as the rest. ' +
+        'A memory written before provenance was captured genuinely cannot say who asserted it, and presenting the record as complete would make it look more authoritative than it is. ' +
+        'Nothing here is guessed. Prefer relaying `summary`; ask for format "record" only when a machine-readable document is actually needed. ' +
+        'NOT plur_receipt: this describes the origin of ONE memory; plur_receipt counts how the whole store is being used.',
+      annotations: { title: 'Where a memory came from', readOnlyHint: true, idempotentHint: true },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Exact engram id, e.g. ENG-2026-08-21-086' },
+          search: { type: 'string', description: 'Find the engram by what it says, if you do not know its id' },
+          format: {
+            type: 'string',
+            enum: ['summary', 'record'],
+            description: 'summary (default) is prose a person can read. record is the JSON-LD document, for machines.',
+          },
+          // No `save` here. This tool is annotated read-only and idempotent,
+          // and a host may run it without asking on that basis; a flag that
+          // writes files would make the annotation a lie. Writing a record is
+          // `plur provenance --write` on the command line, or
+          // `plur.writeProvenance()`.
+        },
+      },
+      handler: async (args, plur) => {
+        let id = args.id as string | undefined
+        let matchedStatement: string | undefined
+        let matchCount = 0
+        // Truncating without a marker turns a clipped sentence into what reads
+        // like a complete, different one.
+        // Count CHARACTERS, not code units. Slicing by code unit splits an
+        // emoji in half and prints a replacement character in its place.
+        const ellipsise = (t: string, n: number) => {
+          const chars = Array.from(t)
+          return chars.length > n ? `${chars.slice(0, n).join('')}…` : t
+        }
+        let alternatives: Array<{ id: string; statement: string }> = []
+
+        if (!id && typeof args.search === 'string' && args.search.length) {
+          // Ask for more than we list, so the count is honest. Listing three of
+          // six and saying nothing about the other three lets an agent answer
+          // confidently about a memory nobody asked about — the exact failure
+          // this tool exists to prevent.
+          const LIST = 3
+          // remote:false (#776): this is a lookup in OUR store for an engram
+          // whose provenance WE hold. Dialling every configured host with the
+          // phrase leaks the query, and a remote top hit would then fail
+          // `provenanceFor`, which reads the local store.
+          const matches = await plur.recall(args.search, { limit: 25, remote: false })
+          if (!matches.length) {
+            return {
+              found: false,
+              message: `Nothing matched "${args.search}". Try different words, or pass an exact id.`,
+            }
+          }
+          id = matches[0].id
+          // What the CHOSEN engram says. Without this the rejected candidates
+          // were quoted and the selected one was not, so an agent could get a
+          // confident answer about a memory it never meant to ask about.
+          matchedStatement = matches[0].statement
+          matchCount = matches.length
+          // Say what else matched, so a wrong pick is visible rather than silent.
+          alternatives = matches.slice(1, LIST).map((m: { id: string; statement: string }) =>
+            ({ id: m.id, statement: ellipsise(m.statement, 80) }))
+        }
+
+        if (!id) {
+          return { found: false, message: 'Pass either an engram id or a search term.' }
+        }
+
+        const record = await plur.provenanceFor(id, { mode: 'portable' })
+        if (!record) {
+          return { found: false, message: `No engram with id ${id}.` }
+        }
+
+        // An unrecognised format used to fall through to the summary, so a
+        // caller asking for "jsonld" got prose and had no way to tell. Say no.
+        if (args.format !== undefined && args.format !== 'summary' && args.format !== 'record') {
+          return {
+            found: false,
+            message: `Unknown format "${String(args.format)}". Use "summary" for prose or "record" for the JSON-LD document.`,
+          }
+        }
+
+        const summary = summariseProvenance(record as any)
+
+        if (args.format === 'record') {
+          return {
+            found: true,
+            engram_id: id,
+            record,
+            // The same answers the summary gives. Asking for the document used
+            // to mean losing every reuse verdict, so the same question got an
+            // answer through one surface and silence through the other.
+            ...summary.fields,
+            not_recorded: summary.missing,
+            complete: summary.complete,
+          }
+        }
+
+        return {
+          found: true,
+          engram_id: id,
+          ...(matchedStatement ? { matched: matchedStatement.slice(0, 200) } : {}),
+          summary: renderProvenanceSummary(summary),
+          // Structured values, NOT a line-split of the prose above. `facts`
+          // used to be exactly that: the same text a second time, which an
+          // agent pays for twice and cannot parse either copy of.
+          ...summary.fields,
+          not_recorded: summary.missing,
+          complete: summary.complete,
+          ...(matchCount > 1
+            ? {
+                note: `${matchCount} engrams matched "${String(args.search)}"; this is the closest.`
+                  + (matchCount - 1 > alternatives.length
+                    ? ` Showing ${alternatives.length} of the other ${matchCount - 1}.`
+                    : ''),
+                match_count: matchCount,
+                other_matches: alternatives,
+              }
+            : {}),
+        }
+      },
+    },
+
+    {
       name: 'plur_receipt',
       description:
-        'Counted report of what your memory retrieved for you: engrams stored, how many were retrieved and how often, which are most relied on, and how much of the store is dormant. Local and read-only; every figure is directly counted, never estimated. IMPORTANT when relaying to the user: `activation_rate` is COVERAGE over the logging window (≈ how much of the store was surfaced), NOT a quality or effectiveness score — it is naturally low and FALLS as more engrams are added, so never present it as "memory is N% effective". A `summary` line is included; prefer relaying that.',
+        'Counted report of what your memory retrieved for you: engrams stored, how many were retrieved and how often, which are most relied on, and how much of the store is dormant. Local and read-only; every figure is directly counted, never estimated. IMPORTANT when relaying to the user: `activation_rate` is COVERAGE over the logging window (≈ how much of the store was surfaced), NOT a quality or effectiveness score — it is naturally low and FALLS as more engrams are added, so never present it as "memory is N% effective". A `summary` line is included; prefer relaying that. NOT plur_provenance: this counts usage across the whole store; plur_provenance says where a single memory came from.',
       annotations: { title: 'Memory receipt', readOnlyHint: true, idempotentHint: true },
       inputSchema: {
         type: 'object',
@@ -2613,6 +3043,14 @@ function getAllToolDefinitions(): ToolDefinition[] {
             ? 'project-config'
             : 'none'
 
+        // Surface the project domain the same way (#1147). `scope` and `domain`
+        // sit adjacent in .plur.yaml and in `plur init`'s own usage line, so a
+        // user reasonably reads them as a pair. Until now `scope` was
+        // load-bearing and `domain` produced one sentence of injected text —
+        // an asymmetry nothing signalled. plur_learn now defaults from it; this
+        // makes the default visible at session start rather than implicit.
+        const default_domain = projectConfig.domain ?? null
+
         // Always reset _sessionScope BEFORE possibly setting it. The MCP server
         // is one long-lived process serving many sequential session_start calls;
         // without this reset, a default_scope set in session A leaks into every
@@ -2668,10 +3106,30 @@ function getAllToolDefinitions(): ToolDefinition[] {
           })
           _recordInjectionTelemetry(session_id, result.injected_packs)
           if (result.count > 0) {
+            // CONSTRAINTS FIRST — deliberate, do not "restore" the old order.
+            // A session_start payload can exceed the host's tool-result limit and
+            // be spilled to a file, leaving the agent a pointer it may only read
+            // the head of. Whatever is emitted first is what actually gets read.
+            // 2026-09-07: DIRECTIVES ran 35,260 chars, pushing CONSTRAINTS past
+            // char 35k; an agent read the first 3,000 and disclosed a customer
+            // name on a live demo. Every rule it broke was in CONSTRAINTS.
+            // Prohibitions outrank process hygiene at every budget.
             const lines: string[] = []
-            if (result.directives) lines.push('## DIRECTIVES\n', result.directives)
-            if (result.constraints) lines.push('\n## CONSTRAINTS\n', result.constraints)
+            if (result.constraints) lines.push('## CONSTRAINTS\n', result.constraints)
+            if (result.directives) lines.push('\n## DIRECTIVES\n', result.directives)
             if (result.consider) lines.push('\n## ALSO CONSIDER\n', result.consider)
+            // #1142: name the pinned rules that did NOT fit, in the payload the
+            // agent reads. An engram the user pinned and the budget dropped is
+            // exactly the case where silence is worst — the user believes a
+            // standing rule is loaded and it is not.
+            if (result.omitted_pinned?.length) {
+              lines.push(
+                '\n## PINNED, NOT LOADED\n',
+                `${result.omitted_pinned.length} pinned engram(s) did not fit this injection: `
+                + `${result.omitted_pinned.map(o => o.id).join(', ')}. `
+                + 'Treat them as unread, not as absent — recall one explicitly if the task touches it.',
+              )
+            }
             engrams = { text: lines.join('\n'), count: result.count, injected_ids: result.injected_ids }
           }
         } catch {
@@ -2683,10 +3141,30 @@ function getAllToolDefinitions(): ToolDefinition[] {
           })
           _recordInjectionTelemetry(session_id, result.injected_packs)
           if (result.count > 0) {
+            // CONSTRAINTS FIRST — deliberate, do not "restore" the old order.
+            // A session_start payload can exceed the host's tool-result limit and
+            // be spilled to a file, leaving the agent a pointer it may only read
+            // the head of. Whatever is emitted first is what actually gets read.
+            // 2026-09-07: DIRECTIVES ran 35,260 chars, pushing CONSTRAINTS past
+            // char 35k; an agent read the first 3,000 and disclosed a customer
+            // name on a live demo. Every rule it broke was in CONSTRAINTS.
+            // Prohibitions outrank process hygiene at every budget.
             const lines: string[] = []
-            if (result.directives) lines.push('## DIRECTIVES\n', result.directives)
-            if (result.constraints) lines.push('\n## CONSTRAINTS\n', result.constraints)
+            if (result.constraints) lines.push('## CONSTRAINTS\n', result.constraints)
+            if (result.directives) lines.push('\n## DIRECTIVES\n', result.directives)
             if (result.consider) lines.push('\n## ALSO CONSIDER\n', result.consider)
+            // #1142: name the pinned rules that did NOT fit, in the payload the
+            // agent reads. An engram the user pinned and the budget dropped is
+            // exactly the case where silence is worst — the user believes a
+            // standing rule is loaded and it is not.
+            if (result.omitted_pinned?.length) {
+              lines.push(
+                '\n## PINNED, NOT LOADED\n',
+                `${result.omitted_pinned.length} pinned engram(s) did not fit this injection: `
+                + `${result.omitted_pinned.map(o => o.id).join(', ')}. `
+                + 'Treat them as unread, not as absent — recall one explicitly if the task touches it.',
+              )
+            }
             engrams = { text: lines.join('\n'), count: result.count, injected_ids: result.injected_ids }
           }
         }
@@ -2852,6 +3330,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
           // Remote scope routing info (#229)
           ...(remote_scopes.length > 0 ? { remote_scopes } : {}),
           ...(default_scope ? { default_scope, scope_source } : {}),
+          ...(default_domain ? { default_domain, domain_source: 'project-config' as const } : {}),
           // Ask LLM to check back — MCP can't push, but we can request a follow-up
           follow_up: store_stats.engram_count === 0
             ? 'This is a fresh store with 0 engrams. After your first exchange with the user, review what you learned and call plur_learn for any corrections, preferences, or patterns. Build the memory from this session.'
@@ -3059,9 +3538,12 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
         const session_id = args.session_id as string | undefined
         const suggestions = args.engram_suggestions as unknown[] | undefined
 
-        // Create engrams from suggestions. Tolerate bare strings (a common
-        // LLM mistake — see issue #231) by coercing them into {statement} objects.
-        let engrams_created = 0
+        // Validate every suggestion BEFORE anything is written. Tolerate bare
+        // strings (a common LLM mistake — see issue #231) by coercing them into
+        // {statement} objects. The episode is captured below and the learns
+        // point at it, so a malformed item found halfway through would leave an
+        // episode and some engrams behind with the call reported as failed.
+        const items: Array<{ statement: string; type?: string }> = []
         if (Array.isArray(suggestions) && suggestions.length) {
           for (let i = 0; i < suggestions.length; i++) {
             const s = suggestions[i]
@@ -3078,16 +3560,49 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
                 `engram_suggestions[${i}] must be a string or {statement: string, type?: string}, got ${typeof s}`,
               )
             }
-            await plur.learn(statement, { type: type as any })
-            engrams_created++
+            items.push({ statement, type })
           }
         }
 
-        // Capture episode
+        // Capture the episode FIRST (#960).
+        //
+        // Engrams created at session end are derived from this session, and
+        // `sources[].session_id` is filled from `session_episode_id`. Capturing
+        // the episode after the learns left every one of them with no session to
+        // point at — and this path writes a large share of all engrams.
         const episode = plur.capture(summary, {
           session_id,
           channel: 'mcp',
         })
+
+        // One suggestion that cannot be learned — a credential in it, say —
+        // must not abort the rest and leave the call half done. Each write is
+        // complete on its own; the ones that failed are named in the result,
+        // the way learnBatch reports its failures.
+        let engrams_created = 0
+        const engrams_failed: Array<{ index: number; statement: string; error: string }> = []
+        for (let i = 0; i < items.length; i++) {
+          const { statement, type } = items[i]
+          try {
+            // Sanitise here too (#940). core's learn() collapses line
+            // terminators, so this is not the only thing standing between a
+            // forged boundary and the corpus — but sanitizeStatement ALSO cuts
+            // at the tool-call markers (`</statement>`, `<parameter name=`),
+            // and session_end is the write path where an agent transcribing its
+            // own session is most likely to carry them in.
+            await plur.learn(sanitizeStatement(statement), {
+              type: type as any,
+              // Link the engram back to the session that produced it (#960).
+              session_episode_id: episode.id,
+              // An end-of-session summary is the model's reading of what
+              // happened, not something the user stated outright (#963).
+              claim_class: 'inferred',
+            })
+            engrams_created++
+          } catch (err) {
+            engrams_failed.push({ index: i, statement: statement.slice(0, 80), error: (err as Error).message })
+          }
+        }
 
         // Collect injection telemetry before cleanup
         const telemetry = session_id ? _sessionTelemetry.get(session_id) : undefined
@@ -3126,10 +3641,13 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
 
         return {
           engrams_created,
+          ...(engrams_failed.length ? { engrams_failed } : {}),
           episode_id: episode.id,
           total_engrams: status.engram_count,
           ...(injection_summary ? { injection_summary } : {}),
-          hint: engrams_created === 0
+          hint: engrams_failed.length
+            ? `${engrams_failed.length} suggestion(s) could not be stored — see engrams_failed. The rest were.`
+            : engrams_created === 0
             ? 'No engrams captured this session. If any corrections, preferences, or patterns came up, consider calling plur_learn before ending.'
             : undefined,
         }
@@ -3245,12 +3763,30 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
         const minConfidence = explicit
           ?? plur.getScopeRoutingConfig().min_confidence
           ?? SUGGEST_DISPLAY_MIN_CONFIDENCE
-        const candidates = await plur.suggestScope({
+        const signals = {
           statement: args.statement as string,
           domain: args.domain as string | undefined,
           tags: args.tags as string[] | undefined,
-        }, { minConfidence })
-        return { candidates, count: candidates.length, min_confidence: minConfidence }
+        }
+        const candidates = await plur.suggestScope(signals, { minConfidence })
+        // #1115: report what an unscoped write would ACTUALLY do, from the same
+        // decision function the write path uses. Ranking and routing used to be
+        // separate answers — the ranker weighs domain, tags and keywords, while
+        // the write path routed a forward domain-prefix match deterministically
+        // and ignored the rest — so an agent could read this list, write without
+        // a scope, and land somewhere the list did not say.
+        const decision = plur.previewAutoRoute(signals)
+        const would_route =
+          decision.action === 'route' && decision.scope
+            ? { scope: decision.scope, note: 'An unscoped write of these signals would be auto-routed here.' }
+            : decision.action === 'refuse-shared' && decision.refusedShared
+              ? {
+                  scope: null,
+                  refused_shared: decision.refusedShared.scope,
+                  note: `"${decision.refusedShared.scope}" is the best match but is a SHARED scope, and unscoped writes are never auto-routed into one. An unscoped write would land at the local default instead. Pass that scope explicitly if the engram belongs to the team.`,
+                }
+              : { scope: null, note: 'An unscoped write of these signals would land at the local default — nothing matched confidently enough to route.' }
+        return { candidates, count: candidates.length, min_confidence: minConfidence, would_route }
       },
     },
 
@@ -3452,6 +3988,7 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
             batch_size: args.batch_size as number | undefined,
             temporal_domains: tensionsConfig.temporal_domains,
             snapshot_pairs: tensionsConfig.snapshot_pairs,
+            measured_under_pairs: tensionsConfig.measured_under_pairs,
             temporal_discount: (args.temporal_discount as boolean | undefined) ?? tensionsConfig.temporal_discount,
             ...(persist ? { exclude_pairs: new Set(plur.suppressedTensionPairKeys()) } : {}),
           })
@@ -3461,6 +3998,8 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
 
           return {
             pairs_checked: result.pairs_checked,
+            // #869 review: policy skips are reported, never silent.
+            skipped: result.skipped,
             count: result.new_tensions,
             ...(persisted ? { persisted_new: persisted.new_count } : {}),
             tensions: result.tensions.map((t, i) => ({
@@ -3669,6 +4208,15 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
           filter_type: { type: 'string', enum: ['behavioral', 'procedural', 'architectural', 'terminological'], description: 'Filter by engram type' },
           output_dir: { type: 'string', description: 'Output directory (default: ~/plur-packs/<name>)' },
           creator: { type: 'string', description: 'Creator name' },
+          license: {
+            type: 'string',
+            description:
+              'Licence for the pack as a collection, e.g. "cc-by-4.0", "apache-2.0", "cc0-1.0", or '
+              + '"unlicensed" to grant nothing. REQUIRED unless the user has set '
+              + 'provenance.default_license in their config — export fails without one. Ask the user '
+              + 'which licence applies; do NOT guess. A pack goes to strangers, and leaving this blank '
+              + 'does not leave it blank: a share-alike default fills in that nobody agreed to.',
+          },
         },
         required: ['name'],
       },
@@ -3694,12 +4242,32 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
         const { homedir } = await import('os')
         const { join } = await import('path')
         const outputDir = (args.output_dir as string) || join(homedir(), 'plur-packs', name)
-        const result = plur.exportPack(engrams, outputDir, {
-          name,
-          version: '1.0.0',
-          description: args.description as string | undefined,
-          creator: (args.creator as string) || undefined,
-        })
+        let result: ReturnType<typeof plur.exportPack>
+        try {
+          result = plur.exportPack(engrams, outputDir, {
+            name,
+            version: '1.0.0',
+            description: args.description as string | undefined,
+            creator: (args.creator as string) || undefined,
+            license: (args.license as string) || undefined,
+          })
+        } catch (err) {
+          // Export refuses to run without a licence (breaking since #970).
+          // For an agent that refusal has to say what to DO, not only why —
+          // and what to do is ask the user, never pick one.
+          const message = (err as Error).message
+          if (/needs a licence/.test(message)) {
+            return {
+              exported: false,
+              error: 'This pack has no licence, and export will not choose one.',
+              next_step: 'Ask the user which licence applies to this pack (for example cc-by-4.0, apache-2.0, cc0-1.0, '
+                + 'or "unlicensed" to grant nothing) and call plur_packs_export again with `license` set. '
+                + 'The user can also set provenance.default_license in their config to answer once.',
+              name,
+            }
+          }
+          throw err
+        }
         return {
           path: result.path,
           engram_count: result.engram_count,

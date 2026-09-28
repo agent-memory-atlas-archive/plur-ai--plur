@@ -1,10 +1,10 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, cpSync, readdirSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { homedir, platform } from 'os'
 import { createInterface } from 'readline'
-import { type GlobalFlags } from '../plur.js'
+import { createPlur, type GlobalFlags } from '../plur.js'
 import { outputInfo } from '../output.js'
 import { CLI_VERSION } from '../version.js'
 import {
@@ -47,6 +47,10 @@ import {
   hasPlurAgyHooks,
   AGY_HOOK_SET_NAME,
 } from '../antigravity-hooks.js'
+import {
+  writeOpencodeConfig,
+  opencodeConfigPath,
+} from '../opencode-config.js'
 
 /**
  * plur init — install Claude Code hooks AND register the plur MCP server.
@@ -71,6 +75,11 @@ import {
  *   plur init --codex / --no-codex            # force / skip Codex (auto: ~/.codex exists)
  *   plur init --antigravity | --agy / --no-antigravity
  *                             # force / skip Antigravity (auto: ~/.gemini/antigravity-cli exists)
+ *   plur init --opencode / --no-opencode      # enable / skip opencode — OPT-IN ONLY, no
+ *                             # auto-detection like the legs above: @plur-ai/opencode is not
+ *                             # yet on npm, and opencode resolves a bare plugin name from the
+ *                             # registry silently on a miss, so auto-enabling would write a
+ *                             # dead plugin entry into every opencode user's config
  *   plur init --no-prompt     # never ask interactive questions (telemetry opt-in)
  *   plur init --domain X      # set default domain for this project (.plur.yaml)
  *   plur init --scope Y       # set default scope for this project (.plur.yaml)
@@ -550,6 +559,72 @@ function installClaudeMd(): string {
 
   writeFileSync(claudeMdPath, `# CLAUDE.md\n\n${CLAUDE_MD_SECTION}`)
   return `created ${claudeMdPath}`
+}
+
+/**
+ * Ship the bundled skills to the harness that reads them (#1190).
+ *
+ * `skills/` lives at the REPO root, and `files[]` in package.json is
+ * package-relative, so no manifest entry can reach it — the build copies the
+ * tree into `dist/skills/`, which `files: ["dist"]` already covers, and this
+ * leg installs it. Before both halves existed, the skills were version-stamped
+ * by release.sh on every release and delivered to nobody: `npm i -g
+ * @plur-ai/cli` carried no engram-authoring guidance at all, and `plur init`
+ * had no skill leg (its one `Skill` reference is a PreToolUse matcher that
+ * fires WHEN a skill runs — a different thing).
+ *
+ * Target is `<dir of settings.json>/skills/`, so this follows init's existing
+ * scope decision: --global lands in ~/.claude/skills, project mode in
+ * ./.claude/skills. No new flag, and one place decides scope.
+ */
+function bundledSkillsDir(): string | null {
+  // import.meta.url -> .../dist/commands/init.js, so skills are ../skills.
+  const fromDist = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills')
+  if (existsSync(fromDist)) return fromDist
+  // Running from source (tsx): fall back to the repo-root tree the build copies.
+  const fromRepo = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', 'skills')
+  return existsSync(fromRepo) ? fromRepo : null
+}
+
+function installSkills(settingsPath: string): string {
+  const src = bundledSkillsDir()
+  if (!src) return 'Skills: skipped (no bundled skills found in this install)'
+
+  const names = readdirSync(src).filter(n => existsSync(join(src, n, 'SKILL.md')))
+  if (names.length === 0) return 'Skills: skipped (bundle contains no */SKILL.md)'
+
+  const destRoot = join(dirname(settingsPath), 'skills')
+  mkdirSync(destRoot, { recursive: true })
+
+  const added: string[] = []
+  const replaced: string[] = []
+  for (const name of names) {
+    const from = join(src, name)
+    const to = join(destRoot, name)
+    const marker = join(to, 'SKILL.md')
+    if (!existsSync(marker)) {
+      added.push(name)
+    } else {
+      // Byte comparison only. Do NOT use mtime to guess whether the difference
+      // is a local edit or a newer shipped version: npm normalises every mtime
+      // in a published tarball to 1985-10-26, so the bundled copy is ALWAYS
+      // older than anything on disk and every ordinary upgrade would be
+      // reported as clobbering a local edit. A local edit and an older shipped
+      // version are indistinguishable from what we have, so the message says
+      // what happened — replaced — and does not claim which it was.
+      if (readFileSync(marker, 'utf8') === readFileSync(join(from, 'SKILL.md'), 'utf8')) continue
+      replaced.push(name)
+    }
+    cpSync(from, to, { recursive: true, dereference: true })
+  }
+
+  if (added.length === 0 && replaced.length === 0) {
+    return `Skills: already current in ${destRoot} (${names.length})`
+  }
+  const parts: string[] = []
+  if (added.length) parts.push(`added ${added.join(', ')}`)
+  if (replaced.length) parts.push(`replaced ${replaced.join(', ')} (any local edits overwritten)`)
+  return `Skills: ${parts.join('; ')} in ${destRoot}`
 }
 
 function findSettingsPath(_flags: GlobalFlags, args: string[]): string {
@@ -1033,6 +1108,66 @@ function installAntigravity(cmd: string): string {
   ].join('\n')
 }
 
+// ── opencode ─────────────────────────────────────────────────────────────
+
+function shouldSetupOpencode(args: string[]): boolean {
+  // Opt-in ONLY — unlike --cursor/--codex/--antigravity, this leg never
+  // auto-detects from existsSync(opencodeConfigDir()). @plur-ai/opencode is
+  // not yet published to npm (see scripts/release.sh --opencode); opencode
+  // resolves a bare plugin name from the registry with no error on a miss,
+  // so auto-enabling here would silently write a dead `plugin` entry into
+  // every opencode user's config the day this CLI ships, before the package
+  // exists to resolve. `--no-opencode` still works as an explicit no-op.
+  if (args.includes('--no-opencode')) return false
+  return args.includes('--opencode')
+}
+
+/**
+ * Wire PLUR into opencode by writing BOTH layers into its config file
+ * (`writeOpencodeConfig` — see packages/cli/src/opencode-config.ts):
+ *
+ *   - `plugin: ["@plur-ai/opencode"]` — the automatic layer (recall injected
+ *     each turn, learning harvested after it), which needs no tool calls.
+ *   - `mcp.plur` — the explicit `plur_*` tool surface from `@plur-ai/mcp`,
+ *     for when the user wants to query or teach memory directly.
+ *
+ * Same three-layer strategy PLUR already commits to everywhere else
+ * (context files + hooks/plugins + MCP tools), pinned to CLI_VERSION for the
+ * same reason every other npx-fallback MCP entry is pinned (#1069): an
+ * unpinned spec re-resolves on every publish and races the npx cache
+ * rewrite.
+ */
+function installOpencode(cliVersion: string): string {
+  const configPath = opencodeConfigPath()
+  const result = writeOpencodeConfig(configPath, cliVersion)
+
+  if (!result.ok) {
+    // Same refusal shape as every other host leg (#1059 class): a config
+    // PLUR cannot safely merge into — either it doesn't parse (most likely
+    // an opencode.jsonc file using comments), its top level parses but isn't
+    // a plain object (e.g. a top-level array — valid JSON, wrong shape), or
+    // an existing `plugin`/`mcp` field is already the wrong shape to extend
+    // — must never be coerced to {}/[] and written back over.
+    return `Opencode: skipped — ${configPath} exists but PLUR could not safely write into it ` +
+      '(either invalid JSON — JSONC comments/trailing commas are not supported here — or a ' +
+      'valid JSON document whose top level, or existing `plugin`/`mcp` field, is not the ' +
+      `expected shape); add the entries by hand, then re-run \`plur init --opencode\`:\n` +
+      `    "plugin": ["@plur-ai/opencode"]\n` +
+      `    "mcp": { "plur": { "type": "local", "command": ["npx", "-y", "@plur-ai/mcp@${cliVersion}"], "enabled": true } }`
+  }
+
+  const status = result.created ? 'created' : result.changed ? 'updated' : 'already up to date'
+  const mcpNote = result.mcpPlurPreserved
+    // B2 (0.20.0 audit): an existing mcp.plur (possibly a non-default
+    // PLUR_PATH, or an enterprise remote store with bearer headers) is left
+    // completely untouched rather than overwritten with PLUR's own local
+    // entry. Say so explicitly — the user should know this from the init
+    // output, not discover it later from where their memory writes landed.
+    ? '\n  mcp.plur: left as-is (an entry already existed — not overwritten)'
+    : ''
+  return `Opencode: config ${status} (${configPath})${mcpNote}`
+}
+
 function writeSettings(path: string, settings: Settings): void {
   mkdirSync(join(path, '..'), { recursive: true })
   writeFileSync(path, JSON.stringify(settings, null, 2) + '\n')
@@ -1116,6 +1251,78 @@ export async function promptTelemetryOptIn(opts: {
     )
     // Handle non-TTY / closed stdin gracefully — no answer given, so default off.
     rl.on('close', () => settle('non-interactive', false))
+  })
+}
+
+// ── Identity prompt ─────────────────────────────────────────────────────────
+// Asks once during `plur init` who memories should be attributed to (#961).
+//
+// Same resolution rules as the telemetry prompt above, and for the same reason:
+// ask an interactive user once, never nag a returning one, and never block a
+// script. The difference is what happens when nobody answers — telemetry
+// defaults to off, and this defaults to the `unidentified` marker, which is a
+// recorded fact rather than a silence.
+//
+// It must never fall back to the operating system account. That is the obvious
+// value and the wrong one: it would put a real name into shared records because
+// somebody installed software, not because they chose to be named.
+
+/**
+ * Prompt for an identity during `plur init`.
+ *
+ * Returns what happened, so `init` can print a matching line. Exported for
+ * testing with injected streams.
+ */
+export async function promptIdentity(opts: {
+  current?: { identity: string; stated: boolean }
+  setIdentity?: (value: string) => void
+  noPrompt?: boolean
+  env?: NodeJS.ProcessEnv
+  input?: NodeJS.ReadableStream & { isTTY?: boolean }
+  output?: NodeJS.WritableStream & { isTTY?: boolean }
+} = {}): Promise<'set' | 'skipped' | 'already-set' | 'non-interactive'> {
+  const env = opts.env ?? process.env
+  const input = opts.input ?? process.stdin
+  const output = opts.output ?? process.stdout
+
+  // Never nag somebody who has already decided.
+  if (opts.current?.stated) return 'already-set'
+
+  const isInteractive = Boolean(input.isTTY && output.isTTY)
+  if (!isInteractive || opts.noPrompt || env.CI) return 'non-interactive'
+
+  return new Promise((resolve) => {
+    const rl = createInterface({ input, output })
+    let settled = false
+    const settle = (result: 'set' | 'skipped' | 'non-interactive') => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+
+    rl.question(
+      '\nWho should your memories be attributed to?'
+      + '\n  Any address: a name like local:alex, an email, or a Decentralized Identifier.'
+      + '\n  Leave blank to stay unidentified — you can set it later with `plur identity`.'
+      + '\n> ',
+      (answer) => {
+        const value = answer.trim()
+        if (value) {
+          try {
+            opts.setIdentity?.(value)
+            settle('set')
+          } catch {
+            // A failed write must not fail `init`. The user can retry with
+            // `plur identity`, and staying unidentified is a working state.
+            settle('skipped')
+          }
+        } else {
+          settle('skipped')
+        }
+        rl.close()
+      },
+    )
+    rl.on('close', () => settle('non-interactive'))
   })
 }
 
@@ -1253,6 +1460,14 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     ? containLeg('Cursor', () => installCursor(cmd))
     : 'skipped (no .cursor/ dir found — pass --cursor to force, --no-cursor to silence this)'
 
+  const opencodeStatus = shouldSetupOpencode(args)
+    ? containLeg('Opencode', () => installOpencode(CLI_VERSION))
+    : 'skipped (opt-in only — pass --opencode to enable once @plur-ai/opencode is installed/published)'
+
+  // Contained like the harness legs: an unwritable skills dir must not abort
+  // the hooks and MCP registration that are the point of `plur init`.
+  const skillsStatus = containLeg('Skills', () => installSkills(injectionPath))
+
   // Write project config if --domain or --scope provided
   const projectConfigPath = installProjectConfig(args)
 
@@ -1265,6 +1480,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo('', flags)
   outputInfo('Architecture: One global engram store (~/.plur/), enforcement hooks global, injection hooks project-scoped.', flags)
   outputInfo('Multi-project scoping via domain/scope fields on engrams, not separate installs.', flags)
+  outputInfo('', flags)
+  outputInfo(skillsStatus, flags)
   outputInfo('', flags)
   outputInfo(`MCP server (plur): ${mcpStatus}`, flags)
   outputInfo(`  command: ${entry.command} ${entry.args.join(' ')}`, flags)
@@ -1290,6 +1507,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo(codexStatus, flags)
   outputInfo(agyStatus, flags)
   outputInfo(cursorStatus, flags)
+  outputInfo(opencodeStatus, flags)
   if (shouldSetupCursor(args)) {
     // Audit fix (user evaluator): the 11-tools-instead-of-39 tradeoff and
     // plur_admin indirection were previously only discoverable by reading
@@ -1350,4 +1568,27 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     outputInfo('           See docs/telemetry-design.md for what is collected.', flags)
   }
   // 'already-configured' → silent, user already made a choice
+
+  // Who memories are attributed to (#961). Asked after telemetry so the two
+  // questions do not compete, and skipped entirely for a returning user.
+  try {
+    const plur = createPlur(flags)
+    const identityResult = await promptIdentity({
+      noPrompt,
+      current: plur.identity(),
+      setIdentity: (value: string) => { plur.setIdentity(value) },
+    })
+    if (identityResult === 'set') {
+      outputInfo('', flags)
+      outputInfo(`Identity:  ${plur.identity().identity} — memories you write will say so.`, flags)
+      outputInfo('           Change it: plur identity <value>. Override once: plur learn --asserted-by <who>.', flags)
+    } else if (identityResult === 'skipped' || identityResult === 'non-interactive') {
+      outputInfo('', flags)
+      outputInfo('Identity:  not set — memories are recorded as "unidentified".', flags)
+      outputInfo('           That is fine until a memory leaves this machine. Set one: plur identity <value>', flags)
+    }
+    // 'already-set' → silent, nothing to tell them
+  } catch {
+    // Never fail `init` over this. Staying unidentified is a working state.
+  }
 }

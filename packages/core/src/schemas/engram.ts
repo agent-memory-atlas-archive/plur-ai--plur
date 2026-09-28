@@ -58,6 +58,66 @@ export const ProvenanceSchema = z.object({
   license: z.string().default('cc-by-sa-4.0'),
 }).describe('Origin and signing chain. STABLE for origin/chain/license; signature is RESERVED (see ENGRAM-STANDARD-v1.md §7).')
 
+/**
+ * Who is answerable for an engram (#961).
+ *
+ * Every field is optional and every field is omitted rather than guessed. A
+ * record with no agent is valid PROV; a record with a guessed agent is worse
+ * than one with none.
+ *
+ * `asserted_by` holds an address, and deliberately does not say which kind.
+ * The provenance standard treats an agent identifier as an ordinary address,
+ * so a local name, a Decentralized Identifier and a process identifier are all
+ * acceptable. When no identity is configured, the writer supplies the
+ * well-known `UNIDENTIFIED` value rather than leaving the field out: absence is
+ * ambiguous between "nobody was identified" and "this predates identity
+ * capture", and the marker distinguishes them.
+ *
+ * The identity is NEVER taken from the operating system account. That would
+ * write a personal name by default without anyone choosing to share it.
+ */
+export const ATTRIBUTION_UNIDENTIFIED = 'unidentified'
+
+export const AttributionSchema = z.object({
+  asserted_by: z.string().optional()
+    .describe('Address of who or what asserted this. Any form. Use ATTRIBUTION_UNIDENTIFIED when nobody was identified.'),
+  runtime: z.object({
+    name: z.string(),
+    version: z.string().optional(),
+  }).optional().describe('The software that wrote this engram. Always knowable, so usually present.'),
+  model: z.object({
+    name: z.string(),
+    prompt_id: z.string().optional(),
+    prompt_version: z.string().optional(),
+    prompt_sha256: z.string().optional(),
+  }).optional().describe('The model behind a decision, and which prompt it ran. Prompt TEXT is never stored, only a hash (#962).'),
+  tool: z.object({
+    name: z.string(),
+    version: z.string().optional(),
+  }).optional().describe('An extractor or importer, with its version.'),
+  on_behalf_of: z.string().optional()
+    .describe('The party the runtime acted for. Becomes prov:actedOnBehalfOf.'),
+}).describe('Who is answerable for this engram (#961). All fields optional; omit rather than guess.')
+
+/**
+ * What kind of claim an engram is (#963).
+ *
+ * A statement a person typed, a line a pattern scraped and a conclusion a model
+ * inferred are all stored identically today. This is the single most useful
+ * field for a reader deciding how much weight to give a memory.
+ *
+ * The vocabulary is reused from the repository extraction tool rather than
+ * invented, so the two agree.
+ */
+export const ClaimClassSchema = z.enum([
+  'observed',    // a plain record of something that happened
+  'documented',  // taken from prose a human wrote
+  'structural',  // read off the shape of an artifact
+  'asserted',    // stated outright by a person or agent
+  'inferred',    // worked out by a model from other engrams
+  'revised',     // a rewrite of an earlier version
+]).describe('What kind of claim this is (#963). Omitted when it genuinely cannot be determined.')
+
 export const FeedbackSignalsSchema = z.object({
   positive: z.number().int().default(0),
   negative: z.number().int().default(0),
@@ -304,6 +364,23 @@ export const EngramSchema = z.object({
   visibility: z.enum(['private', 'public', 'template']).default('private')
     .describe("Sharing posture. 'private' engrams MUST NOT be exported in packs."),
 
+  // Provenance timestamps (added 2026-09-07).
+  //
+  // Before this the object carried no canonical creation time. `sources[]`
+  // records a `stored_at` per write, but only 2,765 of 5,477 engrams in a real
+  // store had one; `temporal.learned_at` had 12. So for half the corpus there
+  // was no answer to "when was this learned", and callers fell back to parsing
+  // the date out of the ID — which is date-only, absent on non-canonical ids,
+  // and silently wrong for a store-namespaced or migrated engram.
+  //
+  // Both OPTIONAL rather than defaulted: a default would stamp today's date
+  // onto every legacy engram at load time and destroy the very provenance this
+  // adds. Absent means genuinely unknown; the backfill sets what can be known.
+  created_at: z.string().optional()
+    .describe('ISO 8601 timestamp of first mint. Immutable — never rewritten by an update. Absent on engrams written before this field existed and not recoverable from any other record.'),
+  updated_at: z.string().optional()
+    .describe('ISO 8601 timestamp of the last mutation to this record (statement, scope, commitment, relations). Not touched by reads, decay, injection or feedback — those move activation/usage, not the content.'),
+
   // Content
   statement: z.string().min(1).describe('The assertion itself — the load-bearing content of the engram.'),
   rationale: z.string().optional().describe('Why this is true / why it matters.'),
@@ -338,6 +415,12 @@ export const EngramSchema = z.object({
 
   // Provenance
   provenance: ProvenanceSchema.optional(),
+
+  /** Who is answerable for this engram (#961). Optional; omitted rather than guessed. */
+  attribution: AttributionSchema.optional(),
+
+  /** What kind of claim this is (#963). Optional; omitted when undeterminable. */
+  claim_class: ClaimClassSchema.optional(),
 
   // Feedback
   feedback_signals: FeedbackSignalsSchema.default({ positive: 0, negative: 0, neutral: 0 }),
@@ -376,7 +459,7 @@ export const EngramSchema = z.object({
   // === SP1: Memory Intelligence fields ===
   content_hash: z.string().optional().describe('Hash of normalized statement content, used for dedup.'),
   commitment: z.enum(['exploring', 'leaning', 'decided', 'locked', 'draft']).optional()
-    .describe("Commitment level of the asserted knowledge. `draft` marks an engram as pending human approval; core stores and recalls it like any other value — enforcement is left to deployments that implement a review queue. A positive feedback signal does not advance it (see feedback.ts:nextCommitment)."),
+    .describe("Commitment level of the asserted knowledge. `draft` marks an engram as pending human approval: core stores and RECALLS it like any other value but NEVER injects it (#1141), so an unapproved rule cannot shape an agent's behaviour before someone has agreed to it. Retrieval stays open because reviewing something requires reading it. A positive feedback signal does not advance it (see feedback.ts:nextCommitment) — relevance is not approval."),
   locked_at: z.string().optional().describe("Timestamp when commitment reached 'locked'."),
   locked_reason: z.string().optional().describe('Why this engram was locked.'),
 
@@ -465,9 +548,11 @@ export const EngramSchema = z.object({
 
   /** Measurement context for numeric or benchmark-derived claims (#869).
    *  Records model, source_type, hardware, dataset, and/or date under which the
-   *  asserted value was measured, so differing-condition measurements can be
-   *  stored as refinements rather than tensions (#203). Absent for non-numeric
-   *  engrams; all sub-fields are optional even when the object is present. */
+   *  asserted value was measured. The tension scanner does not judge two
+   *  same-origin measurements taken under different configurations as a
+   *  contradiction (it counts the skipped pair instead, or caps the verdict in
+   *  'floor' mode). Absent for non-numeric engrams; all sub-fields are optional
+   *  even when the object is present. */
   measured_under: MeasuredUnderSchema.optional(),
 })
 

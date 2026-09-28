@@ -15,10 +15,24 @@ producer/consumer in any language without reading the TypeScript.
 
 | File | What it is |
 |---|---|
-| `ENGRAM-STANDARD-v1.md` | The **normative spec** — prose, byte layouts, grammars, invariants, maturity labels. |
+| `ENGRAM-STANDARD-v1.md` | The **normative spec** — prose, byte layouts, grammars, invariants, maturity labels. Revision history is §10.5. |
+| `ENGRAM-PROVENANCE-PROFILE.md` | A **companion profile** of §9 — how to record where an engram came from, as W3C PROV in JSON-LD, at engram and at pack level. Optional to follow; binding on anyone who does. |
 | `engram.schema.json` | Canonical **JSON Schema (Draft 2020-12)** for the engram object. |
 | `pack-manifest.schema.json` | Canonical **JSON Schema (Draft 2020-12)** for the pack manifest. |
+| `scope-metadata.schema.json` | Canonical **JSON Schema (Draft 2020-12)** for scope metadata. |
+| `examples/` | Worked provenance records built from a real store, plus the scripts that check them against outside implementations (`rdflib`, `prov`). |
+| `vectors/` | **Conformance vectors** — golden packs and `.plur` capsules with known expected outcomes. Authored in Python, verified in TypeScript, so neither implementation grades its own work. See `vectors/README.md`. |
 | `README.md` | This file. |
+
+### Profiles
+
+A **profile** refines one section of the standard and says exactly how that part
+should work. It never replaces the section it profiles, and the standard governs
+wherever the two overlap. Profiles version independently of the standard.
+
+| Profile | Profiles | Version | Status |
+|---|---|---|---|
+| `ENGRAM-PROVENANCE-PROFILE.md` | §9 (the PROV-O half) | 0.9 (draft) | Proposed; implemented in the reference |
 
 ## What is normative vs proposed
 
@@ -26,9 +40,14 @@ Every section of the spec carries a maturity label. In short:
 
 - **STABLE** — implemented in the reference, frozen for v1, MUST be followed to
   conform. Covers: the engram object (§4), the ID grammar (§3), serialization
-  (§2), the pack format and SHA-256 pack integrity (§5), the `.plur` capsule
-  byte layout / format version `0x0001` / flag bits 0–1 / read+write algorithms
-  / SHA-256 payload integrity (§6, §8), and the versioning policy (§10).
+  (§2), the pack format and SHA-256 pack integrity (§5.1–§5.5), the `.plur`
+  capsule byte layout / format version `0x0001` / flag bits 0–1 / read+write
+  algorithms / SHA-256 payload integrity (§6, §8), and the versioning policy
+  (§10).
+- **SPECIFIED** — normative and frozen, binding on an implementer, but not yet
+  fully implemented in the reference; §5.9 lists where the reference falls
+  short, with a tracking issue per row. Covers: the pack lifecycle — install,
+  update and uninstall (§5.6–§5.8).
 - **RESERVED** — wire space is allocated and MUST be preserved, but behavior is
   not yet specified. Covers: the **Ed25519 signing model** (§7) — the `SIGNED`
   flag, the 64-byte signature trailer, `header.signer`, and
@@ -36,7 +55,9 @@ Every section of the spec carries a maturity label. In short:
   derive trust from them. Capsule flag bits 2–15 are also RESERVED.
 - **PROPOSED** — planned profiles, non-normative for v1, documented so the design
   space (and the fundable remainder) is explicit. Covers: the engram `exchange`
-  metadata block (§4.11) and the **PROV-O + Swarm provenance binding** (§9).
+  metadata block (§4.11) and the **PROV-O + Swarm provenance binding** (§9). The
+  PROV-O half of §9 is now worked out in `ENGRAM-PROVENANCE-PROFILE.md` and
+  implemented; the Swarm anchor half remains a sketch.
 - **Informative** — the meta-engram (`META-`) extension (§11).
 
 The maturity index is Appendix B of the spec.
@@ -95,12 +116,15 @@ standard is the NGI/NLnet-fundable scope:
    `pnpm --filter @plur-ai/core gen:schemas`; CI gates the build on equality
    (`git diff --exit-code spec/`). The divergence risk is eliminated.
 
-2. **Conformance test vectors.** A language-neutral corpus of canonical inputs +
-   expected outcomes: valid/invalid engrams (one per invariant in §4.14), golden
-   packs with known `INTEGRITY` hashes, and **golden `.plur` capsules** (hex
-   fixtures) covering magic/version/flags/header/payload/sha-256 — including
-   negative cases (bad magic, reserved-flag-set, size-mismatch, sha-mismatch,
-   truncated). This is what lets an independent implementation prove conformance.
+2. ~~**Conformance test vectors.**~~ **Partly done (#1022).** `spec/vectors/`
+   now holds 13 golden packs with known `INTEGRITY` values and declared
+   install outcomes (load, refuse, report, neutralize — with every count a
+   consumer must report), and 13 `.plur` capsules covering magic, version,
+   flags, header, payload, SHA-256 and the `SIGNED`/`signer` agreement,
+   including every §6.7 negative with the reason each MUST be refused for.
+   They are authored in Python and verified in TypeScript, and CI runs both
+   sides plus the drift gates. **Still missing:** per-invariant engram vectors
+   (one per §4.14 invariant), and `content_hash` vectors for §4.7.1 (#1091).
 
 3. **Ed25519 signing — finalize and implement (§7 → STABLE).** Decide and fix:
    (a) the exact capsule signed message (candidate: `preamble || header ||
@@ -108,10 +132,16 @@ standard is the NGI/NLnet-fundable scope:
    RFC 8785 JCS over a defined, state-excluding field subset), (c) key
    distribution / `key_id` resolution / revocation. Ship a verifying reader.
 
-4. **PROV-O + Swarm provenance binding (§9 → STABLE).** Fix the `anchor` field
-   shape, the PROV-O/JSON-LD sidecar, the canonical bytes the Swarm reference
-   commits to, and a verifier that resolves anchor → bytes → §8 hash → recorded
-   integrity. Delivers tamper-evident, producer-independent provenance.
+4. **PROV-O + Swarm provenance binding (§9 → STABLE).** The **PROV-O half is
+   done**: `ENGRAM-PROVENANCE-PROFILE.md` specifies the mapping, the pack-level
+   record and the ODRL licence binding, the reference implements it, and
+   `spec/examples/` holds worked records checked against two outside
+   implementations (plur-ai/plur#958). What remains is the **anchoring half** —
+   fix the `anchor` field shape, the canonical bytes the Swarm reference commits
+   to, and a verifier that resolves anchor → bytes → §8 hash → recorded
+   integrity. That is what turns a description into tamper-evident,
+   producer-independent provenance, and profile §10.6 explains why it, rather
+   than local hash chaining, is the thing worth funding.
 
 5. **Interop SDK + second implementation.** A reference reader/writer in at least
    one non-TypeScript language (e.g. Python or Rust) that passes the conformance

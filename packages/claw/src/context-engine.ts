@@ -1,4 +1,5 @@
-import { Plur } from '@plur-ai/core'
+import { Plur, recordEvent, flushIfNeeded, extractSelfReportedLearnings } from '@plur-ai/core'
+import { CLAW_VERSION } from './version.js'
 import type { LearnContext } from '@plur-ai/core'
 import type {
   ContextEngine, ContextEngineInfo, AssembleResult, IngestResult,
@@ -7,18 +8,24 @@ import type {
 } from './types.js'
 import { extractLearnings, isCorrection } from './learner.js'
 import { assembleContext } from './assembler.js'
-import { recordEvent } from './telemetry-counters.js'
-import { flushIfNeeded } from './telemetry-flush.js'
 
 // #128: if recordEvent rolled the day, ship yesterday's pending snapshot now
 // (rather than waiting for process exit — long-lived plugin sessions might
 // span multiple days otherwise). Fire-and-forget; flushIfNeeded swallows.
+// Telemetry is core's module; `packageVersion` keeps the heartbeat reporting
+// the claw version.
 function maybeFlushAfter(rolledOver: boolean): void {
-  if (rolledOver) void flushIfNeeded({}).catch(() => {})
+  if (rolledOver) void flushIfNeeded({ packageVersion: CLAW_VERSION }).catch(() => {})
 }
 
 /**
  * Extract text from message content — handles string and array-of-blocks formats.
+ *
+ * Kept local (not moved to core): `assemble()` and the episodic-capture branch
+ * of `afterTurn()` below still call this directly on their own messages. Core
+ * also has its own private copy behind `extractSelfReportedLearnings`
+ * (2026-09, opencode plugin task 6b) — see that function's docstring for why
+ * it isn't shared.
  */
 function extractMessageText(message: AgentMessage): string {
   const content = message.content
@@ -32,21 +39,9 @@ function extractMessageText(message: AgentMessage): string {
   return ''
 }
 
-/**
- * Extract self-reported learnings from assistant message.
- * Looks for the 🧠 I learned: section and parses bullet points.
- */
-function extractSelfReportedLearnings(message: AgentMessage): string[] {
-  const content = extractMessageText(message)
-  // Match the learning section: ---\n🧠 I learned:\n- item\n- item
-  const match = content.match(/---\s*\n🧠 I learned:\s*\n([\s\S]*?)(?:\n---|\n\n[^-]|$)/)
-  if (!match) return []
-
-  return match[1]
-    .split('\n')
-    .map(line => line.replace(/^[-•*]\s*/, '').trim())
-    .filter(line => line.length >= 10) // skip empty or trivial lines
-}
+// `extractSelfReportedLearnings` moved to `@plur-ai/core` (2026-09, opencode
+// plugin task 6b) so `@plur-ai/opencode` can harvest the same 🧠 I learned:
+// self-report block instead of vendoring a second copy. Imported above.
 
 export interface PlurContextEngineOptions {
   path?: string
@@ -59,7 +54,7 @@ export class PlurContextEngine implements ContextEngine {
   readonly info: ContextEngineInfo = {
     id: 'plur-claw',
     name: 'PLUR Memory Engine',
-    version: '0.17.1',
+    version: CLAW_VERSION,
     ownsCompaction: false,
   }
 

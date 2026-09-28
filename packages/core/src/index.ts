@@ -2,25 +2,26 @@ import * as fs from 'fs'
 import { tmpdir } from 'os'
 import { join, dirname, basename } from 'path'
 import yaml from 'js-yaml'
+import { collapseLineTerminators } from './sanitize.js'
 import { detectPlurStorage, type PlurPaths } from './storage.js'
 import { IndexedStorage } from './storage-indexed.js'
 import { PGLiteAdapter } from './storage-pglite.js'
 import { loadConfig } from './config.js'
-import { generateEngramId, engramIdDatePrefix, loadAllPacks, storePrefix, namespaceEngramId, initFilesystemStore } from './engrams.js'
+import { generateEngramId, engramIdDatePrefix, loadAllPacks, storePrefix, namespaceEngramId, bareEngramId, initFilesystemStore } from './engrams.js'
 import { maybeDailyBackup } from './backup.js'
 import { logger } from './logger.js'
 import { searchEngrams, ftsTokenize, extendCorpusStats, searchTextFrom } from './fts.js'
-import { selectAndSpread, scoreEngramsPublic, formatWithLayer, assignLayer, PINNED_HARD_TOKEN_CAP, estimateEngramTokens } from './inject.js'
+import { selectAndSpread, scoreEngramsPublic, formatWithLayer, assignLayer, estimateTokens } from './inject.js'
 import { reactivate } from './decay.js'
 import { captureEpisode, queryTimeline } from './episodes.js'
 import { agenticSearch } from './agentic-search.js'
 import { embeddingSearch, embeddingSearchWithScores, type SimilarityResult } from './embeddings.js'
 import { applyFeedbackSignal } from './feedback.js'
 import { hybridSearch, hybridSearchWithMeta, applyReranker, rrfMergeEngrams as pgliteRrfMerge, type HybridSearchResult, type RerankOptions } from './hybrid-search.js'
-import { getReranker, resolveRerankerName, isRerankerOff, rerankerStatus, resetRerankerStatus, _resetRerankerCache, checkRerankerFit, type RerankerAdapter, type RerankerRuntimeStatus, type RerankerName, type FitCheckResult } from './rerankers/index.js'
+import { getReranker, resolveRerankerName, isRerankerOff, rerankerStatus, resetRerankerStatus, _resetRerankerCache, type RerankerAdapter, type RerankerRuntimeStatus, type RerankerName } from './rerankers/index.js'
+import { checkRerankerFit, type FitCheckResult } from './rerankers/fit-check.js'
 import { runRerankerSelfEval, loadRerankerEvalCache, saveRerankerEvalResult, isRerankerEvalStale, logRerankerEvalAdvisory, type RerankerEvalResult } from './reranker-eval.js'
-import { _resetBgeRerankerCache } from './rerankers/bge-reranker-v2-m3.js'
-import { _resetMsMarcoMiniLmCache } from './rerankers/ms-marco-minilm-l6.js'
+import { _resetCrossEncoderCaches } from './rerankers/transformers-cross-encoder.js'
 import { classifyQuery, routeForIntent, applyIntentRouting, isIntentRoutingDisabled, isEntityDomain, rewriteLexicalQuery, isQueryRewriteDisabled, type QueryIntent, type IntentRoutingProfile } from './intent/index.js'
 import { getEmbedder, resolveEmbedderName } from './embedders/index.js'
 import { emitMissSignal } from './telemetry-miss-signal.js'
@@ -28,16 +29,19 @@ import { embedderStatus, resetEmbedder, setEmbeddingsEnabled, type EmbedderStatu
 import { expandedSearch } from './query-expansion.js'
 import { recallAuto, type AutoSearchResult } from './search-orchestrator.js'
 import { autoSummary } from './summary.js'
-import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack } from './packs.js'
+import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack, containsEmail } from './packs.js'
+import type { ExportOptions } from './packs.js'
+import { learnContextContent, engramContentFields } from './content-fields.js'
+export { LEARN_CONTEXT_FIELD_ROLES, LEARN_CONTENT_FIELDS, learnContextContent, engramContentFields } from './content-fields.js'
 // SP5 imports (deferred — vault-export, registry not yet merged)
 // import { exportVault, type VaultExportOptions, type VaultExportResult } from './vault-export.js'
 // import { fetchRegistry, discoverPacks, verifyPackIntegrity, DEFAULT_REGISTRY_URL, type PackRegistry, type RegistryPack } from './registry.js'
 import { atomicWrite, CONFIG_FILE_MODE, sync as gitSync, getSyncStatus, withLock, type SyncResult, type SyncStatus, type SyncRemoteType } from './sync.js'
-import { detectSecrets, detectSensitive, sensitivityCategory, SCAN_TRUNCATED } from './secrets.js'
+import { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory, SCAN_TRUNCATED } from './secrets.js'
 import type { SecretMatch } from './secrets.js'
 import { SENSITIVITY_CATEGORIES, type ScopeMetadata, type SensitivityCategory } from './schemas/scope-metadata.js'
-import { rankScopes, SCOPE_MATCH_THRESHOLD, type ScopeSignals, type ScopeCandidate } from './scope-routing.js'
-import { mintedIdsWithPrefix, appendHistory, readHistoryForEngram, generateEventId, generateInjectionId, computeQueryHash, findLatestInjectionFor, countInjectionEvents, type InjectionEventCounts } from './history.js'
+import { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, type ScopeSignals, type ScopeCandidate, type AutoRouteDecision, type ScopeSource } from './scope-routing.js'
+import { mintedIdsWithPrefix, appendHistory, readHistoryForEngram, type HistoryEvent as HistoryEventType, generateEventId, generateInjectionId, computeQueryHash, findLatestInjectionFor, countInjectionEvents, isRecentDuplicateInjection, type InjectionEventCounts } from './history.js'
 import { computeContentHash, isHashable } from './content-hash.js'
 import { isLocalOnlyScope, assertScopeNamesATarget } from './scope-target.js'
 import { orderBySupersedes } from './outbox-order.js'
@@ -45,7 +49,8 @@ import { loadTensions, loadTensionsWithQuarantine, saveTensions, generateTension
 import type { TensionRecord, TensionStatus } from './schemas/tension.js'
 import type { TensionPair } from './tensions.js'
 import { engramDate } from './tensions.js'
-import { resolveValidity, buildTemporal, normalizeIsoDate } from './expiry.js'
+import { resolveValidity, buildTemporal, normalizeIsoDate, type ResolvedValidity } from './expiry.js'
+import { isCurrentlyValid } from './validity.js'
 import { decodeJwtExpiry, decodeJwtPayload } from './jwt.js'
 import { RemoteStore, normalizeEndpointUrl } from './store/remote-store.js'
 import {
@@ -61,7 +66,15 @@ import { requiresIndexSync, asDerivedIndex } from './storage-adapter.js'
 import type { StorageAdapter } from './storage-adapter.js'
 import { resolveBackendTier, type BackendSelection } from './backend-selection.js'
 import { isSharedScope, isScopeWithin, scopeAllowFilter, makeVisibilityPredicate } from './scope-util.js'
+import {
+  isDirectoryTrusted as _isDirectoryTrusted,
+  trustDirectory as _trustDirectory,
+  untrustDirectory as _untrustDirectory,
+  listTrustedDirectories as _listTrustedDirectories,
+  coveringTrustedAncestor as _coveringTrustedAncestor,
+} from './trust.js'
 import type { Engram } from './schemas/engram.js'
+import { ATTRIBUTION_UNIDENTIFIED, MeasuredUnderSchema, type MeasuredUnder } from './schemas/engram.js'
 import type { Episode } from './schemas/episode.js'
 import type { PackManifest } from './schemas/pack.js'
 import type { PlurConfig, StoreEntry, ScopeRoutingConfig } from './schemas/config.js'
@@ -87,8 +100,33 @@ export { computeConfidence, computeMetaConfidence, confidenceBand } from './conf
 export { SessionBreadcrumbs } from './session-state.js'
 export { SessionScopeRegistry } from './session-scopes.js'
 export { AsyncMutex, KeyedAsyncMutex } from './async-mutex.js'
-export { findProjectConfigPath, readProjectConfig, type ProjectConfig } from './project-config.js'
+export { findProjectConfigPath, readProjectConfig, readProjectConfigFromPath, canonicalize, type ProjectConfig } from './project-config.js'
+// The trust gate a project's REMOTE settings must pass before an adapter may
+// route prompt text to the host they name (#1196/#1198). Lives here, not in
+// the CLI, so out-of-package adapters (@plur-ai/opencode) can take the
+// capability and the gate together rather than copying one without the other
+// (#1207). See project-remote.ts.
+export {
+  resolveProjectRemote,
+  resolveProjectRemoteFromConfig,
+  projectRemoteRefusalNotice,
+  type ProjectRemote,
+  type TrustChecker,
+} from './project-remote.js'
+// Directory trust (2026-09 audit, D2) — a one-time per-directory grant
+// (`plur trust`) an adapter should require before adopting behaviour-changing
+// configuration it finds on disk (a `.plur.yaml` scope, say) from a directory
+// the user opened but never explicitly vetted. See trust.ts for the model.
+export { isDirectoryTrusted, trustDirectory, untrustDirectory, listTrustedDirectories, coveringTrustedAncestor } from './trust.js'
 export { generateGuardrails } from './guardrails.js'
+// Shared memory system-prompt renderer (opencode plugin's task 1): one
+// implementation so @plur-ai/claw and @plur-ai/opencode render the PLUR
+// memory block byte-identically instead of each vendoring a copy.
+export { renderMemoryBlock, PLUR_MEMORY_INSTRUCTIONS } from './memory-block.js'
+// Shared learning-extraction heuristics (opencode plugin's task 6a): one
+// implementation so @plur-ai/claw and @plur-ai/opencode derive learning
+// candidates identically instead of each vendoring a copy.
+export { extractLearnings, extractSelfReportedLearnings, isCorrection, type LearnCandidate, type LearnableMessage } from './learner.js'
 export type { MetaField, StructuralTemplate, EvidenceEntry, MetaConfidence, DomainCoverage, HierarchyPosition, Falsification } from './schemas/meta-engram.js'
 export { MetaFieldSchema, StructuralTemplateSchema, EvidenceEntrySchema, MetaConfidenceSchema, DomainCoverageSchema, HierarchyPositionSchema, FalsificationSchema } from './schemas/meta-engram.js'
 export { engramSearchText, termMatches, computeIdf, type CorpusStats } from './fts.js'
@@ -103,7 +141,7 @@ export { loadEngrams, saveEngrams } from './engrams.js'
 // The id-namespacing pair (#914). `readIdFor` is the API a surface should use;
 // these are exported so a caller (and the tests) can reason about the shape
 // without re-deriving the prefix rule a fourth time.
-export { storePrefix, namespaceEngramId } from './engrams.js'
+export { storePrefix, namespaceEngramId, bareEngramId } from './engrams.js'
 export {
   maybeDailyBackup,
   listBackups,
@@ -129,9 +167,10 @@ export { isLocalOnlyScope, assertScopeNamesATarget } from './scope-target.js'
 export { orderBySupersedes } from './outbox-order.js'
 export { parseDedupResponse, buildDedupPrompt, buildBatchDedupPrompt } from './dedup.js'
 export { runMigrations, rollbackMigrations, getSchemaVersion, setSchemaVersion, ALL_MIGRATIONS, CURRENT_SCHEMA_VERSION, type Migration, type MigrationResult } from './migrations/index.js'
-export { detectSecrets, detectSensitive, sensitivityCategory } from './secrets.js'
+export { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory } from './secrets.js'
+export { scanForInversions, type InversionSuspect } from './inversion-scan.js'
 export { ScopeMetadataSchema, ScopeSensitivitySchema, SENSITIVITY_CATEGORIES, type ScopeMetadata, type ScopeSensitivity, type SensitivityCategory } from './schemas/scope-metadata.js'
-export { rankScopes, SCOPE_MATCH_THRESHOLD, WEIGHT_TAG, SUGGEST_DISPLAY_MIN_CONFIDENCE, type ScopeSignals, type ScopeCandidate, type RankScopesOptions } from './scope-routing.js'
+export { rankScopes, decideAutoRoute, SCOPE_MATCH_THRESHOLD, WEIGHT_TAG, SUGGEST_DISPLAY_MIN_CONFIDENCE, type ScopeSignals, type ScopeCandidate, type RankScopesOptions, type AutoRouteDecision, type DecideAutoRouteOptions, type ScopeSource } from './scope-routing.js'
 
 // Scope-family predicates live in the leaf module `scope-util.ts` to break a
 // module cycle: `inject.ts` (imported by index.ts) needs `isPersonalScope`, and
@@ -188,7 +227,6 @@ export {
   type BackendSelectionInput,
   type BackendSelectionReason,
 } from './backend-selection.js'
-export { YamlStore, SqliteStore, createStore, migrateStore, type EngramStore, type StorageBackend, type StorageConfig } from './store/index.js'
 export { exportPgliteEmbeddingsToCache, type PgliteEmbeddingsExportReport } from './pglite-embeddings-export.js'
 export { YamlPrimaryStore, MemoryPrimaryStore, ReadonlyStoreGuard, ReadonlyStoreError, type PrimaryStore, type AsyncPrimaryStore, type PrimaryStoreKind } from './store/index.js'
 export { withAsyncLock, asyncAtomicWrite } from './store/index.js'
@@ -206,9 +244,9 @@ export {
   getReranker, isRerankerOff, resolveRerankerName, RERANKER_NAMES, DEFAULT_RERANKER,
   rerankerStatus, resetRerankerStatus, classifyRerankerFailure, hfCacheDirName,
   _resetRerankerCache, _setCachedReranker,
-  checkRerankerFit,
-  type RerankerName, type RerankerRuntimeStatus, type RerankerFailureKind, type FitCheckResult, type FitCheckEngram,
+  type RerankerName, type RerankerRuntimeStatus, type RerankerFailureKind,
 } from './rerankers/index.js'
+export { checkRerankerFit, type FitCheckResult, type FitCheckEngram } from './rerankers/fit-check.js'
 export type { RerankerAdapter } from './rerankers/types.js'
 // Per-store reranker eval gate (#451) — the self-check that must pass before
 // anyone flips reranking on by default for a store. Advisory only.
@@ -231,7 +269,7 @@ export type { SyncResult, SyncStatus, SyncRemoteType } from './sync.js'
 export { atomicWrite, withLock } from './sync.js'
 export { markRemoteHostDown, remoteHostDownRemainingMs, clearRemoteHostDown, _resetRemoteHostBreaker, salvageRemoteRow } from './store/remote-store.js'
 export { checkForUpdate, settleVersionChecks, getCachedUpdateCheck, clearVersionCache, minorVersionsBehind, VERSION_CHECK_SUCCESS_TTL_MS, VERSION_CHECK_FAILURE_TTL_MS, type VersionCheckResult } from './version-check.js'
-export { scanForTensions, getCandidatePairs, scopesOverlap, domainSegmentsOverlap, subjectsOverlap, statementOverlap, buildContradictionPrompt, parseContradictionResponse, buildBatchContradictionPrompt, parseBatchContradictionResponse, engramDate, daysApart, inTemporalDomain, temporalDiscountFactor, SNAPSHOT_CONFIDENCE_CAP, type ContradictionVerdict, type TensionPair, type TensionScanResult, type TensionScanOptions, type TemporalGateOptions, type CandidatePairOptions, type JudgeStatement } from './tensions.js'
+export { scanForTensions, getCandidatePairs, getCandidatePairsDetailed, measuredUnderDiffers, measuredUnderGateApplies, engramOrigin, MEASURED_UNDER_DIMENSIONS, MEASURED_UNDER_CONFIDENCE_CAP, type CandidatePairs, scopesOverlap, domainSegmentsOverlap, subjectsOverlap, statementOverlap, buildContradictionPrompt, parseContradictionResponse, buildBatchContradictionPrompt, parseBatchContradictionResponse, engramDate, daysApart, inTemporalDomain, temporalDiscountFactor, SNAPSHOT_CONFIDENCE_CAP, type ContradictionVerdict, type TensionPair, type TensionScanResult, type TensionScanOptions, type TemporalGateOptions, type CandidatePairOptions, type JudgeStatement } from './tensions.js'
 // Tension lifecycle persistence (#181)
 export { loadTensions, saveTensions, generateTensionId, tensionPairKey, categorizeTension } from './tension-store.js'
 export { TensionRecordSchema, TensionStatusSchema, TensionCategorySchema, type TensionRecord, type TensionStatus, type TensionCategory } from './schemas/tension.js'
@@ -249,7 +287,7 @@ export type { Engram, PreviousVersionRef } from './schemas/engram.js'
 export { ExtractionProvenanceSchema, getExtractionProvenance, type ExtractionProvenance } from './schemas/engram.js'
 export type { Episode } from './schemas/episode.js'
 export type { PackManifest } from './schemas/pack.js'
-export type { PreviewResult, RegistryEntry, PrivacyScanResult, PrivacyIssue } from './packs.js'
+export type { PreviewResult, RegistryEntry, PrivacyScanResult, PrivacyIssue, PackProvenanceView, InstallResult, NeutralizedCounts } from './packs.js'
 export type { PlurConfig, StoreEntry, ScopeRoutingConfig } from './schemas/config.js'
 export type { ManifestSummary, PayloadDescriptor, Producer, Signer, CapsuleHeader, CapsulePreamble } from './schemas/capsule.js'
 export {
@@ -395,6 +433,14 @@ export interface StatusResult {
   store_errors?: Record<string, string>
   /** @deprecated Use `store_errors.packs`. Kept so existing readers still work. */
   pack_registry_error?: string
+  /**
+   * Spreading-activation association edges dropped since process start, by reason.
+   * Accumulates across all `inject()` calls in this process — resets on restart.
+   * `dropped_unresolvable`: target id absent from local engramMap (remote-only or
+   * deleted engram). `dropped_retired`: target found but not active. Absent when
+   * both counts are zero.
+   */
+  spread_drops?: { dropped_unresolvable: number; dropped_retired: number }
 }
 
 /**
@@ -579,14 +625,6 @@ function stableJson(v: unknown): string {
       : val)
 }
 
-/** Commitment level scoring multipliers for injection priority (Idea 6). */
-export const COMMITMENT_MULTIPLIER: Record<string, number> = {
-  locked: 1.0,
-  decided: 0.9,
-  leaning: 0.7,
-  exploring: 0.5,
-}
-
 /**
  * LLM dedup circuit breaker (convergence Phase 2).
  *
@@ -636,6 +674,14 @@ const TYPE_TO_COGNITIVE: Record<string, string> = {
   terminological: 'remember',
   procedural: 'apply',
   architectural: 'evaluate',
+}
+
+/** Default memory_class per engram type when the caller sets none (SP2 Idea 3). */
+const TYPE_TO_MEMORY_CLASS: Record<string, 'semantic' | 'episodic' | 'procedural' | 'metacognitive'> = {
+  behavioral: 'semantic',
+  terminological: 'semantic',
+  procedural: 'procedural',
+  architectural: 'semantic',
 }
 
 const VALID_ENGRAM_TYPES = new Set<string>(['behavioral', 'terminological', 'procedural', 'architectural'])
@@ -716,6 +762,157 @@ function isStoreTeardownError(err: unknown): boolean {
   return msg.includes('adapter is closed') || msg.includes('after calling end')
 }
 
+/**
+ * The origin block, written only when the caller chose a licence (#970).
+ *
+ * The block is left off otherwise. A default licence written into every engram
+ * would be indistinguishable from one somebody picked, and the whole point of
+ * marking defaults is that the difference is visible.
+ */
+/** How far back a derivation chain is followed before it is truncated. */
+const MAX_CHAIN_DEPTH = 32
+
+/**
+ * The ancestors of a new engram, nearest first (#958, spec §4.1).
+ *
+ * `chain` was the last of the four origin fields that nothing ever wrote — not
+ * read anywhere, not written anywhere, for the whole life of the schema.
+ *
+ * It is a SHORTCUT, not the truth. Section 2.1 of the profile is explicit that
+ * where the shortcut and the history log disagree, the log wins. It exists so a
+ * reader can see the lineage without walking a log they may not have — which is
+ * exactly the case for a portable record.
+ *
+ * `supersedes` comes before `derived_from` because a replacement is the nearer
+ * relationship: engram C that replaces B, which was derived from A, has B as its
+ * immediate ancestor.
+ *
+ * The walk is bounded and cycle-guarded. Neither should happen — supersession is
+ * acyclic by construction — but a chain built from store data that a user can
+ * edit by hand has no business hanging on a loop somebody typed.
+ */
+function buildChain(
+  context: LearnContext | undefined,
+  ancestorsOf: (id: string) => string[],
+): string[] {
+  const immediate = [...(context?.supersedes ?? []), ...(context?.derived_from ? [context.derived_from] : [])]
+  const chain: string[] = []
+  const seen = new Set<string>()
+  const queue = [...immediate]
+  while (queue.length && chain.length < MAX_CHAIN_DEPTH) {
+    const id = queue.shift() as string
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    chain.push(id)
+    for (const parent of ancestorsOf(id)) {
+      if (!seen.has(parent)) queue.push(parent)
+    }
+  }
+  return chain
+}
+
+/**
+ * The origin block, written when there is something to record in it.
+ *
+ * Was gated on a licence alone, which meant the other three fields could only
+ * be written by somebody who happened to be licensing their memory — so `chain`
+ * stayed empty even where the lineage was known. It is now written whenever any
+ * of origin, chain or licence has content.
+ *
+ * A licence is still only recorded when somebody chose one. A default written
+ * here would be indistinguishable from a decision, which is the whole point of
+ * marking defaults.
+ */
+function buildProvenanceBlock(
+  context: LearnContext | undefined,
+  ancestorsOf: (id: string) => string[] = () => [],
+): NonNullable<Engram['provenance']> | undefined {
+  const chain = buildChain(context, ancestorsOf)
+  const origin = context?.source
+    ?? (context?.session_episode_id ? `session:${context.session_episode_id}` : undefined)
+  if (!context?.license && !origin && chain.length === 0) return undefined
+  return {
+    // `direct` only when there is other content worth a block. As the sole
+    // occupant it said nothing at all.
+    origin: origin ?? 'direct',
+    chain,
+    signature: null,
+    ...(context?.license ? { license: context.license } : {}),
+  } as NonNullable<Engram['provenance']>
+}
+
+/**
+ * Assemble the attribution block for a new engram (#961).
+ *
+ * Returns undefined when the caller supplied nothing, so the field is absent
+ * rather than present-and-empty. We never invent a runtime, and we never read
+ * the operating system account for an identity.
+ */
+function buildAttribution(
+  context?: LearnContext,
+  /** `provenance.identity` from config, when the user has set one. */
+  configuredIdentity?: string,
+): NonNullable<Engram['attribution']> | undefined {
+  const a = context?.attribution
+  const out: NonNullable<Engram['attribution']> = {}
+
+  // WHO. Three states, and the third is the point.
+  //
+  //   the caller said so         -> use it (a per-engram override)
+  //   the user configured one    -> use that
+  //   neither                    -> the `unidentified` marker, written OUT
+  //
+  // Writing the marker rather than omitting the field is what makes the record
+  // honest. An absent field cannot be told apart from a record written before
+  // identity was captured at all; the marker says we looked and found nobody.
+  //
+  // Never the operating system account. That writes a real person's name into
+  // shared records because they installed software, not because they chose to
+  // be named.
+  out.asserted_by = a?.asserted_by ?? configuredIdentity ?? ATTRIBUTION_UNIDENTIFIED
+
+  // WHAT WROTE IT. Always recorded, because it is the one fact we always have:
+  // software knows its own name.
+  //
+  // No version here, deliberately. Core has no version constant, and adding one
+  // would create a seventeenth place `release.sh` has to bump — a standing cost
+  // for a value that is almost never the one a reader wants. Every real write
+  // arrives through a wrapper that DOES track its version (plur-mcp, plur-cli),
+  // and those pass name and version both; this is the honest floor beneath them.
+  out.runtime = a?.runtime ?? { name: 'plur-core' }
+
+  if (a?.model) out.model = a.model
+  if (a?.tool) out.tool = a.tool
+  if (a?.on_behalf_of) out.on_behalf_of = a.on_behalf_of
+  return out
+}
+
+import { buildProvenanceRecord, type ProvenanceOptions } from './provenance.js'
+import { FileProvenanceStore, provenanceMode, type ProvenanceStore } from './provenance-store.js'
+
+export {
+  FileProvenanceStore,
+  MemoryProvenanceStore,
+  provenanceMode,
+  type ProvenanceStore,
+  type ProvenanceMode,
+} from './provenance-store.js'
+
+export {
+  buildProvenanceRecord,
+  buildPackProvenanceRecord,
+  serializeProvenanceRecord,
+  summariseProvenance,
+  renderProvenanceSummary,
+  assertDomainFields,
+  LICENSE_SOURCES,
+  type LicenseSource,
+  type ProvenanceOptions,
+  type DomainExtension,
+  type PackProvenanceInput,
+  type ProvenanceSummary,
+} from './provenance.js'
+
 export class Plur {
   private paths: PlurPaths
   private config: PlurConfig
@@ -779,6 +976,8 @@ export class Plur {
    * event; findLatestInjectionFor covers the cross-process case.
    */
   private _lastInjectionByEngram: Map<string, string> = new Map()
+  /** Spreading-activation drop counters — accumulated in-memory, reset on process restart. */
+  private _spreadDrops = { dropped_unresolvable: 0, dropped_retired: 0 }
   /**
    * Timestamps (ms) of recent LLM failures, newest last (convergence Phase 2).
    *
@@ -1198,6 +1397,22 @@ export class Plur {
         if (e.status !== 'active') continue
         const cloned = { ...e } as any
         cloned._pack = pack.manifest.name
+        // Sanitise HERE, at the point pack content enters the injection corpus
+        // (#940, #952). Pack install does not call learn() or learnRouted() —
+        // it copies the pack's file into the packs directory and this loop
+        // feeds those rows straight into the corpus — so a pack statement with
+        // a forged boundary would mint a fabricated entry with neither write
+        // path in front of it. Pack content is the explicit threat model in the
+        // splitter's own docstring: it is the one corpus whose author is by
+        // definition someone else.
+        //
+        // Load time rather than install time, deliberately. Install time would
+        // leave every already-installed pack, and any pack placed in the
+        // directory by hand or by a sync, unsanitised. This is the last gate
+        // before injection, so it is the one that has to hold.
+        for (const f of ['statement', 'rationale', 'source', 'summary', 'domain'] as const) {
+          if (typeof cloned[f] === 'string') cloned[f] = collapseLineTerminators(cloned[f])
+        }
         all.push(cloned)
       }
     }
@@ -1657,25 +1872,194 @@ export class Plur {
 
   /** Build the {scope, session_id, stored_at} source entry that gets appended
    * to an engram's sources[] on every write (initial or duplicate). */
+  /**
+   * Build a provenance record for an engram (#964), without storing it.
+   *
+   * Defaults to a portable record: one that stands on its own, names no other
+   * engram, and can be handed to someone who has none of our files.
+   */
+  async provenanceFor(engramId: string, options: ProvenanceOptions = {}): Promise<unknown | undefined> {
+    const engram = await this.getById(engramId)
+    if (!engram) return undefined
+    const cfg = (this.config as any)?.provenance
+    return buildProvenanceRecord(engram, this.getEngramHistory(engramId), {
+      includeStatement: cfg?.include_statement ?? false,
+      ...options,
+    })
+  }
+
+  /**
+   * Build a provenance record and store it (#964, #965).
+   *
+   * Returns the reference the store gave back, or undefined when the engram is
+   * unknown. Storage is pluggable: pass a store, or let it default to files
+   * under the PLUR home directory.
+   */
+  async writeProvenance(
+    engramId: string,
+    options: ProvenanceOptions & { store?: ProvenanceStore } = {},
+  ): Promise<string | undefined> {
+    const record = await this.provenanceFor(engramId, options)
+    if (!record) return undefined
+    const store = options.store ?? this._provenanceStore()
+    return store.put(engramId, record)
+  }
+
+  /**
+   * Append a history event, stamped with who caused it (#959).
+   *
+   * Every event site in this class goes through here rather than calling
+   * `appendHistory` directly, for the same reason `buildAttribution` exists:
+   * there are 28 of them, and a policy applied at 28 call sites is a policy
+   * that will be missed at the 29th. Stamping centrally also means a new event
+   * type gets an actor without its author having to know that it should.
+   *
+   * A caller that knows better — a dedup pass acting on behalf of somebody
+   * else, say — passes its own `actor` and this leaves it alone.
+   *
+   * The actor answers a DIFFERENT question from the engram's `attribution`.
+   * Attribution says who asserted the statement; this says who caused this
+   * event. An engram asserted by one person and retired by another has two
+   * answers, and collapsing them loses both — which is precisely what a reader
+   * auditing a correction needs to know.
+   */
+  /**
+   * @returns whether the event was written — propagated from `appendHistory`,
+   *   which reports rather than throws (#1017). `inject()` gates
+   *   `injection_count` on this, so swallowing it here would put the counter
+   *   back out of step with the log it is supposed to be explained by.
+   */
+  private _appendHistory(event: HistoryEventType): boolean {
+    if (!event.actor) {
+      event.actor = {
+        asserted_by: this._configuredIdentity() ?? ATTRIBUTION_UNIDENTIFIED,
+        runtime: { name: 'plur-core' },
+      }
+    }
+    return appendHistory(this.paths.root, event)
+  }
+
+  /**
+   * The recorded ancestors of one engram, for extending a derivation chain.
+   *
+   * Reads the chain the ancestor already carries rather than walking the graph
+   * again — each engram's chain was resolved when it was written, so this is
+   * one lookup deep instead of a traversal per write.
+   *
+   * Takes the already-loaded engram list rather than reading the store: both
+   * call sites have it in hand, and a store read inside the write path would
+   * add latency to every learn for a field that is a convenience. An ancestor
+   * that is not in the list contributes nothing, which shortens the chain and
+   * never fails the write.
+   */
+  private _ancestorsOf(loaded: Engram[], id: string): string[] {
+    const engram = loaded.find(e => e.id === id)
+    const chain = (engram as { provenance?: { chain?: string[] } } | undefined)?.provenance?.chain
+    return Array.isArray(chain) ? chain : []
+  }
+
+  /**
+   * The identity this user configured, if any (`provenance.identity`).
+   *
+   * Returns undefined when unset, and `buildAttribution` then writes the
+   * `unidentified` marker. Never falls back to the operating system account.
+   */
+  private _configuredIdentity(): string | undefined {
+    const id = (this.config as any)?.provenance?.identity
+    return typeof id === 'string' && id.trim() ? id.trim() : undefined
+  }
+
+  /**
+   * Who new memories will be attributed to, and whether anybody chose that.
+   *
+   * Exposed so a surface can ask before writing — the CLI prompts on `init`,
+   * and `plur identity` reports it. `stated: false` means every engram written
+   * from here is recorded as `unidentified`, which is honest but answers
+   * nobody's question about who is responsible.
+   */
+  identity(): { identity: string; stated: boolean } {
+    const configured = this._configuredIdentity()
+    return { identity: configured ?? ATTRIBUTION_UNIDENTIFIED, stated: Boolean(configured) }
+  }
+
+  /**
+   * Set, change, or clear who memories are attributed to.
+   *
+   * Applies to memories written from now on. Existing engrams keep whatever was
+   * recorded at the time, which is the point of recording it — rewriting them
+   * would be editing history to match a later decision.
+   */
+  setIdentity(identity: string | null): { identity: string; stated: boolean; warning?: string } {
+    const value = typeof identity === 'string' ? identity.trim() : ''
+    // An email address is the most natural identity to type and the one that
+    // silently breaks sharing: the export privacy scan flags email addresses,
+    // so every memory attributed this way is dropped from every pack (#999).
+    // Accept it — it is the user's decision — but say so at the moment they
+    // choose it rather than at the first empty export.
+    const warning = value && containsEmail(value)
+      ? `"${value}" is an email address. The pack export privacy scan flags email addresses, so memories `
+        + 'attributed to it are held back from every pack until #999 lands. Prefer a local name '
+        + '(local:yourname) or a DID if you intend to share.'
+      : undefined
+    if (warning) logger.warning(`[plur:identity] ${warning}`)
+    // Same read-modify-write discipline as every other config mutation here:
+    // under the config lock, and written atomically. A plain write truncates in
+    // place, and a parse failure makes loadConfig fall back to DEFAULT config —
+    // so a crash mid-write would silently erase store registrations too.
+    withLock(this.paths.config, () => {
+      let configData: Record<string, unknown> = {}
+      try {
+        const raw = fs.readFileSync(this.paths.config, 'utf8')
+        if (raw) configData = (yaml.load(raw) as Record<string, unknown>) ?? {}
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err
+      }
+      const provenance = (configData.provenance as Record<string, unknown> | undefined) ?? {}
+      if (value) provenance.identity = value
+      else delete provenance.identity
+      configData.provenance = provenance
+      atomicWrite(this.paths.config, yaml.dump(configData, { lineWidth: 120, noRefs: true }), { mode: CONFIG_FILE_MODE })
+    })
+    this.config = loadConfig(this.paths.config)
+    this.configMtimeMs = this.statConfigMtime()
+    return { ...this.identity(), ...(warning ? { warning } : {}) }
+  }
+
+  private _provenanceStoreInstance?: ProvenanceStore
+
+  private _provenanceStore(): ProvenanceStore {
+    if (!this._provenanceStoreInstance) {
+      this._provenanceStoreInstance = new FileProvenanceStore(
+        this.paths.root,
+        this.config.provenance?.path,
+      )
+    }
+    return this._provenanceStoreInstance
+  }
+
+  /**
+   * Write a record at creation time, when the setting asks for it (#966).
+   *
+   * Default is `never`: a record per engram duplicates the history log, and the
+   * trust boundary is the moment an engram leaves, not the moment it is written.
+   * Never throws — provenance is a description, and failing to write one must
+   * not fail the learn that prompted it.
+   */
+  private _maybeWriteProvenance(engramId: string): void {
+    if (provenanceMode(this.config) !== 'always') return
+    void this.writeProvenance(engramId).catch(err => {
+      logger.warning(`[plur:provenance] could not write a record for ${engramId}: ${(err as Error).message}`)
+    })
+  }
+
   private _buildSourceEntry(scope: string, context?: LearnContext): {
     scope: string; session_id: string | null; stored_at: string
   } {
     return {
       scope,
-      // session_id takes priority over session_episode_id (#1048)
-      session_id: context?.session_id ?? context?.session_episode_id ?? null,
+      session_id: context?.session_episode_id ?? null,
       stored_at: new Date().toISOString(),
     }
-  }
-
-  /** Build the provenance object to stamp on every new engram (#1048/#1049).
-   * Returns undefined when mode='never'; otherwise stamps origin from config
-   * identity or falls back to 'agent:unidentified'. */
-  private _buildProvenanceField(): { origin: string; chain: string[]; signature: null; license: string } | undefined {
-    const cfg = (this.config as any).provenance ?? { mode: 'always' }
-    if (cfg.mode === 'never') return undefined
-    const origin: string = cfg.identity ?? 'agent:unidentified'
-    return { origin, chain: [], signature: null, license: 'cc-by-sa-4.0' }
   }
 
   /** Apply a duplicate-write to an existing engram: increment write_count,
@@ -1716,7 +2100,7 @@ export class Plur {
     // difference between "a duplicate was counted" and "my memory vanished".
     // The caller is handed an engram it did not write; the log should say so.
     try {
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: 'engram_duplicate_absorbed',
         engram_id: target.id,
         timestamp: new Date().toISOString(),
@@ -1955,7 +2339,7 @@ export class Plur {
     const scopeChanged = hit.scope !== previousScope
     const commitmentChanged = hit.commitment !== previousCommitment
     if (scopeChanged || commitmentChanged || persistedTo === 'in-memory') {
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: 'recurrence_detected',
         engram_id: hit.id,
         timestamp: lockTimestamp,
@@ -2079,6 +2463,46 @@ export class Plur {
   // actually breaking, and leaving it async would have been a breaking
   // signature change that bought nothing. Shrinking the migration surface is
   // worth more than uniformity.
+  /**
+   * Registered scopes eligible as an AUTO-ROUTE target: those declaring
+   * metadata, minus readonly stores (MED-12). Shared by the write path and
+   * {@link previewAutoRoute} so the two cannot rank different candidate sets —
+   * the same drift #1115 is about, one level up from the decision itself.
+   */
+  private _writableScopeMetadata(): ScopeMetadata[] {
+    return this.listScopeMetadata().filter(md => {
+      const entry = (this.config.stores ?? []).find(s => s.scope === md.scope)
+      return entry?.readonly !== true
+    })
+  }
+
+  /**
+   * What a genuinely-unscoped write of these signals WOULD do (#1115).
+   *
+   * `suggestScope` ranks; this decides. They answered differently before: the
+   * ranker weighs domain, tags and statement keywords, while the write path
+   * routed a forward domain-prefix match deterministically and ignored the rest.
+   * A user could consult the suggestion tool and then write without a scope and
+   * land somewhere else. Both now go through `decideAutoRoute`, so a suggestion
+   * surface can report the real outcome instead of an approximation of it.
+   */
+  previewAutoRoute(input: ScopeSignals): AutoRouteDecision {
+    this.reloadConfigIfChanged()
+    if (this.config.auto_route_scope === false) {
+      return { action: 'no-match', scope: null, candidate: null, refusedShared: null }
+    }
+    const cfg = this.config.scope_routing ?? {}
+    const candidates = rankScopes(
+      input,
+      this._writableScopeMetadata(),
+      cfg.weight_tag !== undefined ? { weightTag: cfg.weight_tag } : undefined,
+    )
+    return decideAutoRoute(candidates, {
+      matchThreshold: cfg.match_threshold ?? SCOPE_MATCH_THRESHOLD,
+      allowSharedScope: cfg.allow_shared_auto_route === true,
+    })
+  }
+
   suggestScope(input: ScopeSignals, options?: { minConfidence?: number }): ScopeCandidate[] {
     this.reloadConfigIfChanged()  // pick up out-of-process config edits (#307)
     const minConfidence =
@@ -2181,44 +2605,19 @@ export class Plur {
   }
 
   /**
-   * Collect the context-ish fields of an engram (rationale, source, snippet,
-   * dual_coding, domain, tags, knowledge_anchors, structured_data) into a plain
-   * object for the explicit-update / meta / outbox-reguard leak scan (LOW-2, #353).
-   * Must mirror the field set a LearnContext carries into `_guardSensitiveScope` —
-   * which scans `JSON.stringify(context)`. LearnContext carries `domain`, `tags`,
-   * and `knowledge_anchors`, so all three must be reconstructed here too, or the
-   * reconstruct-from-engram guards (update / meta / outbox-reguard) scan a strictly
-   * SMALLER surface than learn-time and than the learnAsync demote (which scans
-   * tags, #409) — letting a host:port / basic-auth value placed in a `tag` (or an
-   * anchor snippet/path, or `domain`) ride to a git-synced shared scope unguarded
-   * (pre-Crt audit, #405/#409 parity). Classification domains and ordinary tags
-   * produce no detector hits, so scanning them adds no false-positive demotions.
-   * Returns undefined when none are present so the scan text stays statement-only.
+   * Everything on an engram, apart from its statement, for the explicit-update /
+   * meta / outbox-reguard / rescope leak scan (LOW-2, #353).
    *
-   * PLUR-internal bookkeeping keys in `structured_data` (underscore-prefixed:
-   * `_outbox`, `_routed`, `_demoted`, …) are STRIPPED before scanning — they are
-   * system-generated, never user content, and legitimately carry the very host
-   * topology the infra detector flags (e.g. `_outbox.target_url` =
-   * `http://127.0.0.1:<port>`). Scanning them would falsely demote every
-   * remote-origin or auto-routed engram on update.
+   * This used to be a hand-kept list of context-ish fields that had to mirror
+   * `LearnContext`, and it drifted three times (#381, #405, and the #1002
+   * review: `attribution`, `claim_class` and `provenance.license` were added to
+   * the write path and not here, so a credential in `attribution.asserted_by`
+   * rescoped from local into a shared scope unscanned). It now serialises the
+   * whole engram — see `engramContentFields` for the one deliberate exclusion —
+   * so a field that reaches the engram by any route is scanned by construction.
    */
   private _engramContextFields(engram: Engram): Record<string, unknown> | undefined {
-    const e = engram as Record<string, unknown>
-    const fields: Record<string, unknown> = {}
-    for (const k of ['rationale', 'source', 'snippet', 'dual_coding', 'domain', 'tags', 'knowledge_anchors'] as const) {
-      if (e[k] != null) fields[k] = e[k]
-    }
-    const sd = e.structured_data
-    if (sd != null && typeof sd === 'object' && !Array.isArray(sd)) {
-      const userSd: Record<string, unknown> = {}
-      for (const [k, v] of Object.entries(sd as Record<string, unknown>)) {
-        if (!k.startsWith('_')) userSd[k] = v
-      }
-      if (Object.keys(userSd).length > 0) fields.structured_data = userSd
-    } else if (sd != null) {
-      fields.structured_data = sd
-    }
-    return Object.keys(fields).length > 0 ? fields : undefined
+    return engramContentFields(engram)
   }
 
   /**
@@ -2305,7 +2704,7 @@ export class Plur {
   private async _resolveUnscopedScope(
     statement: string,
     context?: LearnContext,
-  ): Promise<{ scope: string; routed: { scope: string; confidence: number; reason: string } | null }> {
+  ): Promise<{ scope: string; routed: { scope: string; confidence: number; reason: string } | null; refusedShared: { scope: string; confidence: number; reason: string } | null }> {
     // Pick up out-of-process config edits (#307) — mirrors suggestScope. Without
     // this the WRITE path routed against a stale stores/covers snapshot: a scope
     // registered (or covers synced) by another process after startup was
@@ -2316,7 +2715,7 @@ export class Plur {
     // so the two cannot drift; reverted local→global in 0.10.0 (#353).
     const fallback = this.config.unscoped_default ?? 'global'
     if (this.config.auto_route_scope === false) {
-      return { scope: fallback, routed: null }
+      return { scope: fallback, routed: null, refusedShared: null }
     }
     // MED-12 (#353, COSMETIC/REPORTING per D3): exclude readonly / non-writable
     // scopes from the AUTO-ROUTE candidate set so a clean unscoped write is never
@@ -2328,10 +2727,7 @@ export class Plur {
     // path- and url-based stores, so this view covers both. `listScopeMetadata()`
     // and `suggestScope()` are left UNCHANGED — advisory discovery still surfaces
     // readonly scopes.
-    const writableScopeMetadata = (await this.listScopeMetadata()).filter(md => {
-      const entry = (this.config.stores ?? []).find(s => s.scope === md.scope)
-      return entry?.readonly !== true
-    })
+    const writableScopeMetadata = this._writableScopeMetadata()
     // Scope-routing tuning (#362): enterprise installs with many narrow,
     // covers-rich scopes can raise `match_threshold` to cut false-positive
     // routing, or adjust `weight_tag` to re-weight tag-only signals. Both default
@@ -2346,46 +2742,47 @@ export class Plur {
       writableScopeMetadata,
       weightTagOverride !== undefined ? { weightTag: weightTagOverride } : undefined,
     )
-    const top = candidates[0]
-    // PR-6 (#353) + reaudit finding 4: a FORWARD domain-prefix match — the scope's
-    // declared coverage CONTAINS the engram's topic (`cover ⊃ domain` or equal) —
-    // is the strongest, most deliberate routing signal. Route to it
-    // DETERMINISTICALLY — bypass the squash/threshold gate entirely — so a clean
-    // domain match routes with headroom instead of landing at exactly
-    // SCOPE_MATCH_THRESHOLD (0.5) and clearing only via the edge-of-threshold `>=`.
+    // #1115: ONE decision function, shared with `previewAutoRoute` (and through
+    // it the `plur_suggest_scope` surface), so the write path and the suggestion
+    // tool can no longer disagree about where an unscoped write lands.
     //
-    // Key the bypass on `coverContainsDomain`, NOT `domainMatch`: `domainMatch` is
-    // also true for the REVERSE direction (engram domain BROADER than the cover,
-    // `domain ⊃ cover`), and bypassing on that would over-route a broad/generic
-    // engram (domain `plur`) into a NARROW shared scope (cover `plur.core`) it
-    // doesn't belong in. The reverse match adds only the down-weighted
-    // WEIGHT_DOMAIN_REVERSE (0.5 raw, NOT the full WEIGHT_DOMAIN of 1.5), so a lone
-    // reverse hit squashes to 0.25 — BELOW SCOPE_MATCH_THRESHOLD (0.5) — and so
-    // does NOT route via the `>=` threshold path either (and never gets the
-    // deterministic bypass). rankScopes prefers a domain-match candidate at the top
-    // on equal confidence, so `top` is the right scope to route to. Weights/
-    // threshold/squash UNCHANGED.
-    if (top && top.coverContainsDomain) {
-      return { scope: top.scope, routed: { scope: top.scope, confidence: top.confidence, reason: top.reason } }
+    // Eligibility is unchanged — a FORWARD domain match routes deterministically,
+    // everything weaker stays gated by `matchThreshold`. What changed is that a
+    // SHARED candidate is refused unless this install opted in: an unscoped write
+    // whose domain prefix happened to match a team scope's covers used to land in
+    // that team store and be pushed to its remote, where local cleanup could not
+    // undo it. A refused shared candidate does not end the search — the next
+    // eligible PERSONAL candidate still wins, so personal-scope routing is intact.
+    const decision = decideAutoRoute(candidates, {
+      matchThreshold,
+      allowSharedScope: scopeRoutingCfg.allow_shared_auto_route === true,
+    })
+    const marker = (c: ScopeCandidate) => ({ scope: c.scope, confidence: c.confidence, reason: c.reason })
+    const refusedShared = decision.refusedShared ? marker(decision.refusedShared) : null
+    if (decision.action === 'route' && decision.scope && decision.candidate) {
+      return { scope: decision.scope, routed: marker(decision.candidate), refusedShared }
     }
-    // No forward domain match: a reverse domain hit, tag-only, or keyword-only
-    // candidate stays gated by the threshold. A LONE reverse-direction match
-    // squashes to 0.25 (WEIGHT_DOMAIN_REVERSE = 0.5 raw) and so does NOT clear the
-    // `>=` gate at the default threshold (0.5); it falls to the unscoped default
-    // unless additional tag/keyword evidence lifts the squashed score to
-    // >= the threshold. The threshold is configurable (#362): a higher
-    // `match_threshold` makes routing more conservative, a lower one more
-    // permissive. The deterministic forward-domain bypass above is unaffected.
-    if (top && top.confidence >= matchThreshold) {
-      return { scope: top.scope, routed: { scope: top.scope, confidence: top.confidence, reason: top.reason } }
-    }
-    return { scope: fallback, routed: null }
+    // Both 'refuse-shared' and 'no-match' fall to the unscoped default. The
+    // refusal travels separately so the caller can say what it declined to do,
+    // rather than reporting a plain unrouted write.
+    return { scope: fallback, routed: null, refusedShared }
+  }
+
+  /**
+   * The text the write-time HARD secret scan reads: the statement plus every
+   * caller-supplied content field, as listed by `LEARN_CONTEXT_FIELD_ROLES`.
+   * Statement-only when the context carries no content field, so a plain
+   * write scans exactly what it always did.
+   */
+  private _hardScanText(statement: string, context: LearnContext | undefined): string {
+    const content = learnContextContent(context)
+    return content ? `${statement}\n${JSON.stringify(content)}` : statement
   }
 
   private async _guardSensitiveScope(
     statement: string,
     context?: LearnContext,
-  ): Promise<{ scope: string; context: LearnContext | undefined; demotion: { from: string; to: string; patterns: string } | null; routed: { scope: string; confidence: number; reason: string } | null }> {
+  ): Promise<{ scope: string; context: LearnContext | undefined; demotion: { from: string; to: string; patterns: string } | null; routed: { scope: string; confidence: number; reason: string } | null; refusedShared: { scope: string; confidence: number; reason: string } | null; scopeSource: ScopeSource }> {
     // "Truly unscoped" = caller passed no scope AND no session/`.plur.yaml`
     // default is in effect (both land in the session scope registry). Only this
     // path auto-routes / applies unscoped_default; everything else is honored
@@ -2397,16 +2794,28 @@ export class Plur {
     // `session-scopes.ts`.
     const sessionScope = this._sessionScopes.get(context?.session)
     let routed: { scope: string; confidence: number; reason: string } | null = null
+    let refusedShared: { scope: string; confidence: number; reason: string } | null = null
     let scope: string
+    // #1221: WHO chose this scope. The decision is made here and nowhere else,
+    // so it is recorded here rather than inferred later from the absence of a
+    // `_routed` marker — "the caller named it" and "nothing named it and the
+    // default applied" are different facts and both are absent-marker cases.
+    let scopeSource: ScopeSource
     if (context?.scope == null && sessionScope == null) {
       const resolved = await this._resolveUnscopedScope(statement, context)
       scope = resolved.scope
       routed = resolved.routed
+      refusedShared = resolved.refusedShared
+      scopeSource = resolved.routed ? 'routed' : 'default'
     } else {
       // Terminal fallback respects unscoped_default so a `unscoped_default:'local'`
       // user with no session scope and no context scope is not silently forced
       // to global (#353). No behavior change for the default-global user.
       scope = context?.scope ?? sessionScope ?? (this.config.unscoped_default ?? 'global')
+      // A session / `.plur.yaml` scope is a human's standing choice, not a
+      // guess — deliberate, but not stated on this call, which is a distinction
+      // a server reviewing writes may reasonably care about.
+      scopeSource = context?.scope != null ? 'explicit' : 'session'
     }
     // Guard fires when the write can leave the machine: shared scope (others can
     // read it) OR remote-backed scope (routes to a remote store, e.g. a personal
@@ -2414,7 +2823,7 @@ export class Plur {
     // local-file stores) stay on this machine and are exempt — same gate as
     // _offendingHitsForScope, kept in sync because this short-circuits before it.
     if (!isSharedScope(scope) && !this._isRemoteBackedScope(scope)) {
-      return { scope, context, demotion: null, routed }
+      return { scope, context, demotion: null, routed, refusedShared, scopeSource }
     }
     // Scan the FULL content the engram will carry — the statement AND the
     // context fields (rationale, key_files, source, …), not just the statement.
@@ -2422,7 +2831,7 @@ export class Plur {
     const scanText = `${statement}\n${JSON.stringify(context ?? {})}`
     // Single source of truth for the offending-hit policy (#353).
     const offending = this._offendingHitsForScope(scanText, scope)
-    if (offending.length === 0) return { scope, context, demotion: null, routed }
+    if (offending.length === 0) return { scope, context, demotion: null, routed, refusedShared, scopeSource }
 
     const patterns = [...new Set(offending.map(h => h.pattern))].join(', ')
     logger.warning(
@@ -2437,32 +2846,114 @@ export class Plur {
       context: { ...context, scope: 'local', visibility: 'private' },
       demotion: { from: scope, to: 'local', patterns },
       routed,
+      refusedShared,
+      // The demotion overrode the destination; it did not change who picked it.
+      scopeSource,
     }
+  }
+
+/**
+   * `measured_under` as it may be persisted (#869 review): validated against
+   * MeasuredUnderSchema, or absent. The MCP tool passes the LLM's object
+   * through as a bare cast, and a non-string dimension written to disk makes
+   * the loader quarantine the WHOLE engram on the next read — the field that
+   * was meant to add context would silently remove the memory. Refusing at
+   * write time keeps the store loadable; the caller gets a TypeError naming
+   * the field instead of a warning in a log they may never see.
+   */
+  private _validatedMeasuredUnder(context: LearnContext | undefined): MeasuredUnder | undefined {
+    const raw = context?.measured_under
+    if (raw === undefined || raw === null) return undefined
+    const parsed = MeasuredUnderSchema.safeParse(raw)
+    if (!parsed.success) {
+      const issues = parsed.error.issues.map(i => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ')
+      throw new TypeError(`plur.learn: invalid measured_under — ${issues}. Every dimension must be a string.`)
+    }
+    return parsed.data
+  }
+
+  /**
+   * The input gate every learn path runs before touching a store.
+   *
+   * The statement must be a non-empty string; line terminators are collapsed
+   * so a crafted boundary cannot be promoted to system-prompt authority by the
+   * renderer's splitter (#952, #940); the type must be a known engram type —
+   * checked BEFORE the secret scan (#729) so a bad type fails loudly even when
+   * the statement would also trip the detector; and, unless
+   * `config.allow_secrets`, the statement plus every caller-supplied content
+   * field — as listed by `LEARN_CONTEXT_FIELD_ROLES`, which the compiler
+   * checks against `LearnContext` (#381, #389, #1002 review) — must carry no
+   * secret. Shared/remote writes are additionally policy-scanned by
+   * `_guardSensitiveScope`.
+   *
+   * `learn()` and `learnRouted()` both call it on entry. learnRouted must,
+   * because on its remote route it never enters learn(): it posts the shape it
+   * builds and the outbox fallback writes that same shape locally — a gate
+   * living only in learn() would miss the CLI and the Python SDK, and the
+   * highest-impact variant (a forged entry on a SHARED store reaching other
+   * people's system prompts). Idempotent, so the local route gating twice is
+   * harmless. Returns the sanitised statement, which every downstream gate
+   * and the content hash must see. One function (2026-09 audit): it used to
+   * be two inline copies that had already diverged on the empty-statement
+   * check.
+   */
+  private _validateLearnInput(fn: 'learn' | 'learnRouted', statement: string, context?: LearnContext): string {
+    if (typeof statement !== 'string' || statement.length === 0) {
+      throw new TypeError(`plur.${fn}: statement must be a non-empty string, got ${typeof statement}`)
+    }
+    statement = collapseLineTerminators(statement)
+    if (context?.type !== undefined && !VALID_ENGRAM_TYPES.has(context.type)) {
+      throw new TypeError(
+        `plur.${fn}: invalid type '${context.type}'. Must be one of: behavioral, terminological, procedural, architectural`
+      )
+    }
+    if (!this.config.allow_secrets) {
+      // Scan the statement AND every caller-supplied content field (#381,
+      // #389, #1002 review). The field set comes from ONE table,
+      // `LEARN_CONTEXT_FIELD_ROLES`, checked against `LearnContext` by the
+      // compiler — a hand-picked subset here is how `attribution` and
+      // `license` went unscanned. Shared/remote writes are additionally
+      // policy-scanned by _guardSensitiveScope below.
+      const secrets = detectSecrets(this._hardScanText(statement, context))
+      if (secrets.length > 0) {
+        throw new Error(`Secret detected in statement or context: ${secrets[0].pattern}. Use config.allow_secrets to override.`)
+      }
+    }
+    // D4 (2026-09 audit): `detectPromptInjection` (secrets.ts) was wired only
+    // to pack installs, on the premise "a third-party pack is untrusted, my
+    // own conversation is trusted." An adapter that auto-harvests engrams
+    // from text an agent merely READ (a webpage it summarized, a file it was
+    // asked to quote, tool output) breaks that premise: the "conversation"
+    // can itself carry attacker-authored content the agent never asserted on
+    // its own account.
+    //
+    // The signal that distinguishes the two is `claim_class: 'inferred'`
+    // (#963) — "I worked this out", set by every automatic harvester
+    // (opencode's self-report/user-text paths; `@plur-ai/mcp`'s
+    // `plur_session_end` engram_suggestions) and never set by a human calling
+    // `plur_learn` directly. Gating on it rather than on `source` (free text,
+    // one string per adapter, easy to add a new harvester without updating an
+    // allowlist) means a human-invoked write is untouched by construction —
+    // nobody types `claim_class: 'inferred'` to describe their own assertion.
+    // Refuses (does not quarantine) on a hit, mirroring the secret check just
+    // above: there is no queued-for-review path for engram writes yet, and a
+    // caller can still write the statement as `asserted`/omitted if it
+    // genuinely came from the user.
+    if (context?.claim_class === 'inferred') {
+      const injections = detectPromptInjection(this._hardScanText(statement, context))
+      if (injections.length > 0) {
+        throw new Error(
+          `Prompt injection pattern detected in an auto-harvested (claim_class: 'inferred') statement or context: `
+          + `${injections[0].pattern}. Refusing the write.`,
+        )
+      }
+    }
+    return statement
   }
 
   async learn(statement: string, context?: LearnContext): Promise<Engram> {
     this._assertWritable()
-    if (typeof statement !== 'string' || statement.length === 0) {
-      throw new TypeError(`plur.learn: statement must be a non-empty string, got ${typeof statement}`)
-    }
-    if (context?.type !== undefined && !VALID_ENGRAM_TYPES.has(context.type)) {
-      throw new TypeError(
-        `plur.learn: invalid type '${context.type}'. Must be one of: behavioral, terminological, procedural, architectural`
-      )
-    }
-    if (!this.config.allow_secrets) {
-      // Scan statement AND the caller-supplied fields that are exported verbatim /
-      // rendered into agent context — `domain`, `tags`, `abstract` (#381, #389).
-      // A secret in any of them would otherwise reach a shared pack/store. Other
-      // context fields are covered by _guardSensitiveScope on shared/remote writes.
-      const secretText = [statement, context?.domain, context?.abstract, ...(context?.tags ?? [])]
-        .filter(Boolean)
-        .join(' ')
-      const secrets = detectSecrets(secretText)
-      if (secrets.length > 0) {
-        throw new Error(`Secret detected in statement/domain/tags: ${secrets[0].pattern}. Use config.allow_secrets to override.`)
-      }
-    }
+    statement = this._validateLearnInput('learn', statement, context)
     const guarded = await this._guardSensitiveScope(statement, context)
     context = guarded.context
     // #347: resolve the validity window up-front (pure) so malformed
@@ -2471,35 +2962,6 @@ export class Plur {
     const validity = resolveValidity(statement, context)
 
     return await this._withStoreLock(this.paths.engrams, async () => {
-      // Hard-tier cap enforcement, INSIDE the lock.
-      //
-      // It used to run before acquiring it, on the reasoning that listPinned is
-      // only a read and the lock is not reentrant. But a cap is a
-      // read-modify-write on a shared total: N concurrent hard-tier writes each
-      // read the same current total, each conclude they fit, and all commit —
-      // and the resulting overrun is not cosmetic, because hard-tier engrams are
-      // guaranteed injection AND bypass the per-pack and per-domain fairness
-      // caps, so exceeding the budget crowds contextual recall out of the
-      // prompt. The check has to observe the same state the write commits into.
-      //
-      // Reentrancy is not a problem here: listPinned takes no lock of its own,
-      // it only reads through _loadAllEngrams.
-      if (context?.pinned === true && (context?.pin_tier ?? 'soft') === 'hard') {
-        const hardPinned = (await this.listPinned()).filter(e => ((e as any).pinned_tier ?? 'soft') === 'hard')
-        const currentHardTokens = hardPinned.reduce((sum, e) => sum + estimateEngramTokens(e), 0)
-        const estimatedNewCost = Math.ceil((statement.length + (context?.rationale?.length ?? 0)) / 4) + 80
-        if (currentHardTokens + estimatedNewCost > PINNED_HARD_TOKEN_CAP) {
-          const engramList = hardPinned.map(e => `${e.id} (${estimateEngramTokens(e)} tokens)`).join(', ')
-          throw new Error(
-            `Hard-tier pinned cap exceeded: current hard-tier total is ${currentHardTokens} tokens, ` +
-            `estimated cost of new engram is ${estimatedNewCost} tokens, ` +
-            `cap is ${PINNED_HARD_TOKEN_CAP} tokens. ` +
-            `Existing hard-tier engrams: [${engramList}]. ` +
-            `Demote an existing engram to soft tier (pinned_tier="soft") or unpin it before adding a new hard-tier engram.`
-          )
-        }
-      }
-
       const scope = guarded.scope
       const ps = this._primaryStore
       // Can the store answer BOTH derived facts `learn()` needs — "is this
@@ -2585,93 +3047,11 @@ export class Plur {
       // one whose history append fails — could both take the same suffix.
       this._rememberMintedId(id)
       const now = new Date().toISOString()
-      const type = context?.type ?? 'behavioral'
-      const cogLevel = TYPE_TO_COGNITIVE[type] ?? 'remember'
-      const commitment = context?.commitment ?? 'leaning'
-
-      const conflictIds: string[] = []
-
-      // Auto-set memory_class based on type if not explicitly provided (SP2 Idea 3)
-      const TYPE_TO_MEMORY_CLASS: Record<string, 'semantic' | 'episodic' | 'procedural' | 'metacognitive'> = {
-        behavioral: 'semantic',
-        terminological: 'semantic',
-        procedural: 'procedural',
-        architectural: 'semantic',
-      }
-      const engramType = context?.type ?? 'behavioral'
-      const memoryClass = context?.memory_class ?? TYPE_TO_MEMORY_CLASS[engramType] ?? 'semantic'
-
-      // Auto-link to session episode if provided (SP2 Idea 24)
-      const episodeIds: string[] = []
-      if (context?.session_episode_id) {
-        episodeIds.push(context.session_episode_id)
-      }
-
+      // One constructor for every write path: `_buildEngramShape` is what the
+      // remote route posts, so a field added there is a field added here.
       const engram: Engram = {
+        ...this._buildEngramShape(statement, scope, context, now, validity, id => this._ancestorsOf(engrams, id), guarded.scopeSource),
         id,
-        version: 2,
-        status: 'active',
-        consolidated: false,
-        type,
-        scope,
-        // #401: visibility defaults to 'private'. Having a `domain` (a topic
-        // classification most engrams carry) must NOT auto-publish an engram —
-        // public is opt-in, set it deliberately.
-        visibility: context?.visibility ?? 'private',
-        statement,
-        rationale: context?.rationale,
-        source: context?.source,
-        domain: context?.domain,
-        // #347: validity window — explicit valid_from/valid_until params, or
-        // an explicit expiry phrase lifted from the statement. Unset for
-        // ordinary engrams.
-        temporal: buildTemporal(validity, now),
-        activation: {
-          retrieval_strength: 0.7,
-          storage_strength: 1.0,
-          frequency: 0,
-          last_accessed: now.slice(0, 10),
-        },
-        feedback_signals: { positive: 0, negative: 0, neutral: 0 },
-        knowledge_type: { memory_class: memoryClass, cognitive_level: cogLevel as any },
-        knowledge_anchors: (context?.knowledge_anchors ?? []).map(a => ({
-          path: a.path,
-          relevance: (a.relevance as 'primary' | 'supporting' | 'example') ?? 'supporting',
-          snippet: a.snippet,
-        })),
-        associations: [],
-        derivation_count: 1,
-        tags: context?.tags ?? [],
-        pack: null,
-        abstract: context?.abstract ?? null,
-        derived_from: context?.derived_from ?? null,
-        dual_coding: context?.dual_coding,
-        polarity: null,
-        content_hash: computeContentHash(statement),
-        commitment,
-        locked_at: commitment === 'locked' ? now : undefined,
-        locked_reason: commitment === 'locked' ? context?.locked_reason : undefined,
-        write_count: 1,
-        injection_count: 0,
-        sources: [this._buildSourceEntry(scope, context)],
-        provenance: this._buildProvenanceField(),
-        recurrence_count: 0,
-        summary: autoSummary(statement, undefined),
-        engram_version: 1,
-        episode_ids: episodeIds ?? [],
-        relations: (conflictIds.length > 0 || (context?.supersedes?.length ?? 0) > 0) ? {
-          broader: [],
-          narrower: [],
-          related: [],
-          conflicts: conflictIds,
-          supersedes: context?.supersedes ?? [],
-          superseded_by: [],
-        } : undefined,
-        pinned: context?.pinned === true ? true : undefined,
-        pinned_tier: context?.pin_tier,
-        pinned_priority: context?.pinned_priority,
-        // #869: measurement context — present only when the caller supplies it.
-        measured_under: context?.measured_under,
       }
 
       // #240: supersedes is a graph edge, not a temporality enum — write the
@@ -2696,16 +3076,6 @@ export class Plur {
           )
         : []
 
-      // Stamp the extraction marker (#347) so the plur_learn MCP response can
-      // echo the parsed expiry date back for confirmation — extraction must
-      // never silently guess.
-      if (validity.extracted) {
-        ;(engram as any).structured_data = {
-          ...((engram as any).structured_data ?? {}),
-          _expiry_extracted: { valid_until: validity.extracted.valid_until, phrase: validity.extracted.phrase },
-        }
-      }
-
       // Stamp the demotion marker (#326 review, finding 2) so the plur_learn MCP
       // response can tell the agent its engram was held back from the shared scope
       // it asked for. Set only on a direct learn() whose own guard demoted.
@@ -2725,6 +3095,14 @@ export class Plur {
         ;(engram as any).structured_data = {
           ...((engram as any).structured_data ?? {}),
           _routed: guarded.routed,
+        }
+      }
+      // #1115 mirror: a shared scope matched and was refused. Stamped the same
+      // way and only when present, so a caller can report what did NOT happen.
+      if (guarded.refusedShared) {
+        ;(engram as any).structured_data = {
+          ...((engram as any).structured_data ?? {}),
+          _routeRefused: guarded.refusedShared,
         }
       }
 
@@ -2838,12 +3216,13 @@ export class Plur {
           logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
         })
 
-        appendHistory(this.paths.root, {
+        this._appendHistory({
           event: 'engram_created',
           engram_id: engram.id,
           timestamp: now,
           data: { type: engram.type, scope: engram.scope, source: engram.source, routed_to: 'remote', outbox: true },
         })
+        this._maybeWriteProvenance(engram.id)
         return engram
       }
 
@@ -2855,12 +3234,13 @@ export class Plur {
         await this._updateEngrams(engrams, supersededTargets)
       }
       await this._syncIndex()
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: 'engram_created',
         engram_id: engram.id,
         timestamp: now,
         data: { type: engram.type, scope: engram.scope, source: engram.source },
       })
+      this._maybeWriteProvenance(engram.id)
       return engram
     })
   }
@@ -2940,13 +3320,23 @@ export class Plur {
       const scored = await embeddingSearchWithScores(candidates, query, candidates.length, this.paths.root)
       if (scored.length === 0) return { mode: 'hash-only' }
 
+      // Carry the neighbour's own text, not just its id. Reporting id+score
+      // alone makes "read the neighbour first" an extra tool call, and that
+      // call does not get made (2026-09-07: four near-identical engrams in one
+      // session, every one reporting an unread 0.86-0.87 neighbour).
       const ranked = scored
-        .map(s => ({ id: s.engram.id, score: s.score }))
+        .map(s => ({
+          id: s.engram.id,
+          score: s.score,
+          statement: s.engram.statement.length > 240
+            ? `${s.engram.statement.slice(0, 240)}…`
+            : s.engram.statement,
+        }))
         .sort((a, b) => b.score - a.score)
       const top = ranked[0]
       if (top.score >= NEAR_DUPLICATE_OBSERVATION_FLOOR) {
         try {
-          appendHistory(this.paths.root, {
+          this._appendHistory({
             event: 'dedup_near_duplicate',
             engram_id: top.id,
             timestamp: new Date().toISOString(),
@@ -2970,26 +3360,7 @@ export class Plur {
 
   async learnRouted(statement: string, context?: LearnContext): Promise<Engram> {
     this._assertWritable()
-    // #729: validate type BEFORE the secrets scan — a bad type must fail
-    // loudly even when the statement would also trip the secret detector.
-    if (context?.type !== undefined && !VALID_ENGRAM_TYPES.has(context.type)) {
-      throw new TypeError(
-        `plur.learnRouted: invalid type '${context.type}'. Must be one of: behavioral, terminological, procedural, architectural`
-      )
-    }
-    if (!this.config.allow_secrets) {
-      // Scan statement AND the caller-supplied fields that are exported verbatim /
-      // rendered into agent context — `domain`, `tags`, `abstract` (#381, #389).
-      // A secret in any of them would otherwise reach a shared pack/store. Other
-      // context fields are covered by _guardSensitiveScope on shared/remote writes.
-      const secretText = [statement, context?.domain, context?.abstract, ...(context?.tags ?? [])]
-        .filter(Boolean)
-        .join(' ')
-      const secrets = detectSecrets(secretText)
-      if (secrets.length > 0) {
-        throw new Error(`Secret detected in statement/domain/tags: ${secrets[0].pattern}. Use config.allow_secrets to override.`)
-      }
-    }
+    statement = this._validateLearnInput('learnRouted', statement, context)
     const guarded = await this._guardSensitiveScope(statement, context)
     const scope = guarded.scope
     context = guarded.context
@@ -3017,6 +3388,14 @@ export class Plur {
           _routed: guarded.routed,
         }
       }
+      // #1115 mirror: a shared scope matched and was refused. Stamped the same
+      // way and only when present, so a caller can report what did NOT happen.
+      if (guarded.refusedShared) {
+        ;(engram as any).structured_data = {
+          ...((engram as any).structured_data ?? {}),
+          _routeRefused: guarded.refusedShared,
+        }
+      }
       return engram
     }
     // Remote route — dedup against the merged local+cached-remote view,
@@ -3041,13 +3420,19 @@ export class Plur {
       })
     }
     const now = new Date().toISOString()
-    const localPlaceholder = this._buildEngramShape(statement, scope, context, now)
+    const localPlaceholder = this._buildEngramShape(statement, scope, context, now, undefined, undefined, guarded.scopeSource)
     // Stamp the auto-route marker on the remote-routed shape (Stage 3b, #351) so
     // the decision survives onto the server engram and into the MCP response.
     if (guarded.routed) {
       ;(localPlaceholder as any).structured_data = {
         ...((localPlaceholder as any).structured_data ?? {}),
         _routed: guarded.routed,
+      }
+    }
+    if (guarded.refusedShared) {
+      ;(localPlaceholder as any).structured_data = {
+        ...((localPlaceholder as any).structured_data ?? {}),
+        _routeRefused: guarded.refusedShared,
       }
     }
     let serverEngram: Engram
@@ -3089,12 +3474,13 @@ export class Plur {
         // (its id was just minted above).
         await this._appendEngram(engrams, localPlaceholder)
         await this._syncIndex()
-        appendHistory(this.paths.root, {
+        this._appendHistory({
           event: 'engram_created',
           engram_id: localPlaceholder.id,
           timestamp: now,
           data: { type: localPlaceholder.type, scope, source: localPlaceholder.source, routed_to: 'outbox', error: (err as Error).message },
         })
+        this._maybeWriteProvenance(localPlaceholder.id)
         logger.warning(`[plur:outbox] remote write failed for ${localPlaceholder.id}, queued for retry: ${(err as Error).message}`)
         return localPlaceholder
       })
@@ -3108,12 +3494,13 @@ export class Plur {
     // A bookkeeping write must never be able to undo, or appear to undo, a
     // commit that succeeded.
     try {
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: 'engram_created',
         engram_id: serverEngram.id,
         timestamp: now,
         data: { type: serverEngram.type, scope: serverEngram.scope, source: serverEngram.source, routed_to: 'remote' },
       })
+      this._maybeWriteProvenance(serverEngram.id)
     } catch (err) {
       logger.warning(
         `[plur] engram ${serverEngram.id} was stored remotely but its history record could not be ` +
@@ -3146,28 +3533,48 @@ export class Plur {
   }
 
   /**
-   * Build an Engram object without persisting it. Used by learnRouted to
-   * give callers a fully-shaped Engram with the server's ID after the
-   * remote POST completes. Mirrors the construction in learn() but
-   * doesn't acquire the lock or touch disk.
+   * THE engram constructor — the one place the shape of a new engram is
+   * written down (2026-09 audit; it used to be duplicated inline in `learn()`,
+   * so every new field had to be added twice).
+   *
+   * Builds without persisting: `learn()` spreads the result and sets the id it
+   * minted; `learnRouted()` posts it to the remote, which assigns the id, and
+   * on failure mints a local id for the outbox copy. Neither acquires the
+   * lock nor touches disk here. `validity` (#347) is taken from callers that
+   * already resolved it — learn() fails fast on a malformed window before
+   * taking the lock — and derived otherwise.
    */
-  private _buildEngramShape(statement: string, scope: string, context: LearnContext | undefined, now: string): Engram {
+  private _buildEngramShape(
+    statement: string,
+    scope: string,
+    context: LearnContext | undefined,
+    now: string,
+    validity: ResolvedValidity = resolveValidity(statement, context),
+    /**
+     * Recorded ancestors of an engram, for the derivation chain (#958).
+     * learn() passes a lookup over the corpus it already holds; the remote
+     * route passes nothing — it holds no engram list, and reading the store
+     * would put disk I/O in the middle of a remote write — so its chain
+     * carries the immediate ancestors only. Section 2.1 of the profile makes
+     * the history log authoritative over the chain precisely so a shortcut
+     * may be incomplete.
+     */
+    ancestorsOf: (id: string) => string[] = () => [],
+    /**
+     * Who chose `scope` (#1221). Defaulted from the context so a direct call
+     * to this constructor produces the same shape the write paths do — they
+     * pass the guard's answer, which also knows about session scopes and the
+     * router, neither of which is visible from here.
+     */
+    scopeSource: ScopeSource = context?.scope != null ? 'explicit' : 'default',
+  ): Engram {
     const type = context?.type ?? 'behavioral'
     const cogLevel = TYPE_TO_COGNITIVE[type] ?? 'remember'
-    const TYPE_TO_MEMORY_CLASS: Record<string, 'semantic' | 'episodic' | 'procedural' | 'metacognitive'> = {
-      behavioral: 'semantic',
-      terminological: 'semantic',
-      procedural: 'procedural',
-      architectural: 'semantic',
-    }
     const memoryClass = context?.memory_class ?? TYPE_TO_MEMORY_CLASS[type] ?? 'semantic'
     const commitment = context?.commitment ?? 'leaning'
-    // #347: validity window — same resolution as the sync learn() constructor.
-    const validity = resolveValidity(statement, context)
     const shape: Engram = {
-      // Placeholder id — overwritten by the server's assigned id before return.
-      // Any consumer that observes this id directly (rather than via learnRouted's
-      // return value) is doing it wrong — log says so.
+      // Placeholder id — learn() overwrites it with the id it minted and
+      // learnRouted with the server's assigned id before anything observes it.
       id: '__pending__',
       version: 2,
       status: 'active',
@@ -3204,16 +3611,23 @@ export class Plur {
       pack: null,
       abstract: context?.abstract ?? null,
       derived_from: context?.derived_from ?? null,
+      // Who is answerable (#961) and what kind of claim this is (#963).
+      // Both absent when the caller supplied nothing: a missing agent is
+      // honest, a guessed one is not.
+      attribution: buildAttribution(context, this._configuredIdentity()),
+      claim_class: context?.claim_class,
+      provenance: buildProvenanceBlock(context, ancestorsOf),
       dual_coding: context?.dual_coding,
       polarity: null,
       content_hash: computeContentHash(statement),
       commitment,
       locked_at: commitment === 'locked' ? now : undefined,
       locked_reason: commitment === 'locked' ? context?.locked_reason : undefined,
+      created_at: now,
+      updated_at: now,
       write_count: 1,
       injection_count: 0,
       sources: [this._buildSourceEntry(scope, context)],
-      provenance: this._buildProvenanceField(),
       recurrence_count: 0,
       summary: autoSummary(statement, undefined),
       engram_version: 1,
@@ -3229,14 +3643,25 @@ export class Plur {
       pinned_tier: context?.pin_tier,
       pinned_priority: context?.pinned_priority,
       // #869: measurement context — present only when the caller supplies it.
-      measured_under: context?.measured_under,
+      measured_under: this._validatedMeasuredUnder(context),
     }
     // Echo marker for extracted expiry (#347) — mirrors the learn() stamping
     // so the remote-routed MCP response can confirm the parse too.
-    if (validity.extracted) {
-      ;(shape as any).structured_data = {
-        _expiry_extracted: { valid_until: validity.extracted.valid_until, phrase: validity.extracted.phrase },
-      }
+    //
+    // #1221 joins it here rather than being stamped by each caller afterwards.
+    // Both write paths run through this constructor, so putting it here is what
+    // makes them agree by construction instead of by two parallel stamps that
+    // can drift — the property test/write-path-consolidation.test.ts and
+    // test/leak-surface.test.ts both exist to hold.
+    //
+    // Unlike every other marker it is unconditional: "the caller named it" is
+    // as much an answer as "the router guessed it", and a field present on only
+    // some writes cannot be read as an answer on the rest.
+    ;(shape as any).structured_data = {
+      ...(validity.extracted
+        ? { _expiry_extracted: { valid_until: validity.extracted.valid_until, phrase: validity.extracted.phrase } }
+        : {}),
+      _scopeSource: scopeSource,
     }
     return shape
   }
@@ -3252,6 +3677,9 @@ export class Plur {
       recallHybrid: (query: string, options?: { limit?: number }) => this.recallHybrid(query, { ...options, remote: false }),
       recall: (query: string, options?: { limit?: number }) => this.recall(query, { ...options, remote: false }),
       learn: (statement: string, context?: LearnContext) => this.learn(statement, context),
+      // #930: learnBatch uses this instead of `learn` so remote-scope writes
+      // await the server push and return the server-assigned id. See LearnAsyncDeps.learnRouted.
+      learnRouted: (statement: string, context?: LearnContext) => this.learnRouted(statement, context),
       getById: (id: string) => this.getById(id),
       store: this._primaryStore,
       engramsPath: this.paths.engrams,
@@ -3949,8 +4377,7 @@ export class Plur {
    */
   resetReranker(): void {
     _resetRerankerCache()
-    _resetBgeRerankerCache()
-    _resetMsMarcoMiniLmCache()
+    _resetCrossEncoderCaches()
     resetRerankerStatus()
     this._reranker = null
   }
@@ -4024,12 +4451,11 @@ export class Plur {
   private _applyResidualFilters(engrams: Engram[], options?: RecallOptions & { include_expired?: boolean }): Engram[] {
     let out = engrams
     if (!options?.include_expired) {
-      const today = new Date().toISOString().slice(0, 10)
-      out = out.filter(e => {
-        if (e.temporal?.valid_until && e.temporal.valid_until < today) return false
-        if (e.temporal?.valid_from && e.temporal.valid_from > today) return false
-        return true
-      })
+      // #1150: instants compared as instants. The lexical form this replaces
+      // read `valid_until: 2026-09-07T01:00:00Z` as still valid at noon that
+      // day, and a `valid_from` of the same shape as not yet reached.
+      const nowMs = Date.now()
+      out = out.filter(e => isCurrentlyValid(e.temporal, nowMs))
     }
     if (options?.min_strength !== undefined) {
       out = out.filter(e => e.activation.retrieval_strength >= options.min_strength!)
@@ -4588,12 +5014,9 @@ export class Plur {
     // with learn()'s content-hash gate (which ignores temporal validity,
     // e.g. the migration import engine, #441) must see the full active set.
     if (!options?.include_expired) {
-      const today = new Date().toISOString().slice(0, 10)
-      engrams = engrams.filter(e => {
-        if (e.temporal?.valid_until && e.temporal.valid_until < today) return false
-        if (e.temporal?.valid_from && e.temporal.valid_from > today) return false
-        return true
-      })
+      // #1150: one evaluator, shared with _applyResidualFilters and injection.
+      const nowMs = Date.now()
+      engrams = engrams.filter(e => isCurrentlyValid(e.temporal, nowMs))
     }
     if (options?.min_strength !== undefined) {
       engrams = engrams.filter(e => e.activation.retrieval_strength >= options.min_strength!)
@@ -4958,6 +5381,11 @@ export class Plur {
       embeddingBoosts,
     )
 
+    if (result.spread_drops) {
+      this._spreadDrops.dropped_unresolvable += result.spread_drops.dropped_unresolvable
+      this._spreadDrops.dropped_retired += result.spread_drops.dropped_retired
+    }
+
     const directivesStr = formatWithLayer(result.directives, assignLayer('directives'))
     const constraintsStr = formatWithLayer(result.constraints, assignLayer('constraints'))
     const considerStr = formatWithLayer(result.consider, assignLayer('consider'))
@@ -5012,31 +5440,152 @@ export class Plur {
     // edges (#200/#201) and temporal-replay self-labeling (#202). Compact by
     // design (IDs + query hash, never statements); best-effort — a history
     // write failure must never break injection.
+    //
+    // #975: cross-process dedup. Hooks spawn fresh processes (empty address
+    // space each time), so an in-memory map cannot see the other process's
+    // injection. The check reads the HISTORY FILE — durable, shared across
+    // processes. Keyed on query_hash + sorted engram IDs (not hash alone)
+    // because the same query can legitimately select different engrams after
+    // a write.
     if (injected_ids.length > 0) {
-      const injection_id = generateInjectionId()
+      // #975: cross-process dedup for the co_injection HISTORY EVENT only.
+      // The injection_count increment (#866) is NOT gated — the engram was
+      // genuinely injected into context even if the history event is a
+      // duplicate. Only the provenance log is deduped.
+      const queryHash = computeQueryHash(task)
+
+      // The check and the append are ONE critical section, or this does not
+      // dedup anything.
+      //
+      // The duplicates being suppressed come from hook processes that spawn
+      // "within milliseconds" of each other — which is precisely the window in
+      // which both read the tail before either has appended to it. Read, decide,
+      // then append is a read-modify-write across processes, and O_APPEND makes
+      // the WRITE atomic without making the SEQUENCE atomic. Both would see no
+      // duplicate and both would write one, so the fix would help only when the
+      // processes happen to be staggered by more than a read plus an append —
+      // the case that was never the problem.
+      //
+      // Its OWN lock file, deliberately not the one #1051 uses for chain
+      // stamping. #1051 moves that lock INSIDE appendHistory; taking the same
+      // file here would mean this frame holds it while appendHistory tries to
+      // take it again, and withLock is file-based and not reentrant — so once
+      // both changes are on main every co_injection would fail to acquire,
+      // fall through to the unlocked path, and the dedup would be silently
+      // inert again. Two locks, two concerns: this one serialises the
+      // dedup DECISION, #1051's serialises the chain STAMP. They nest in one
+      // direction only (this one outside), and never contend for the same file.
+      //
+      // Tuned like #1051's: the section is a tail read and an append, so the
+      // stock 100 ms first backoff has waiters sleeping orders of magnitude
+      // longer than the holder needs.
+      const historyDir = join(this.paths.root, 'history')
+      // Whether THIS call is the one that recorded the injection. Decided inside
+      // the lock, read afterwards by the injection_count block so both counters
+      // follow the same verdict.
+      let recordedInjection = false
+      // Dedup applies to HOOK-sourced injections only.
+      //
+      // The key is content-based — query hash, engram set, source, session — so
+      // it cannot tell "the hook fired twice for one event" from "the caller
+      // injected the same thing three times". #975's duplicates come from
+      // hook processes: a fresh process per event, racing a sibling
+      // milliseconds away. Every other source ('inject', 'session_start')
+      // originates in a single long-lived MCP process making deliberate calls,
+      // and three deliberate calls are three injections, not one duplicated.
+      //
+      // Applied to all sources, the filter swallowed those: it turned three
+      // explicit `inject()` calls into one recorded injection, which
+      // inject-counter-and-flush-merge.test.ts has asserted against since
+      // #900. That test predates this dedup and is right — the counter is
+      // supposed to accumulate.
+      //
+      // Narrowing here is what lets BOTH counters follow one reading without
+      // redefining what an injection is for every other caller.
+      const dedupApplies = options?.source === 'hook'
+      const writeCoInjection = (): void => {
+        if (dedupApplies
+          && isRecentDuplicateInjection(this.paths.root, queryHash, injected_ids, 5_000, options?.source, options?.session_id)) return
+        const injection_id = generateInjectionId()
+        try {
+          // ASK whether the write landed; do not infer it from the absence of a
+          // throw (review of #1017). `recordedInjection = true` used to sit
+          // above this block, so a failed history write still counted the
+          // injection — injection_count incremented with no co_injection event
+          // to explain it, which is the store-disagrees-with-its-own-history
+          // state this change set out to eliminate, relocated to the error
+          // path.
+          //
+          // Moving the assignment below `appendHistory` — the obvious fix, and
+          // the one the review suggested — does NOT close it: appendHistory
+          // deliberately swallows its own failure and returns normally, so an
+          // unwritable history directory cannot fail the learn that called it.
+          // Nothing is ever thrown, so the try/catch never fires and the
+          // assignment runs either way. Verified: the regression test still
+          // read injection_count: 1 with the assignment moved.
+          //
+          // So it reports instead.
+          // `this._appendHistory`, not the bare `appendHistory` (#963). The
+          // wrapper stamps `event.actor` with the configured identity, and
+          // taking main's dedup block wholesale would have dropped that from
+          // co_injection events alone — the one history event with no actor.
+          const wrote = this._appendHistory({
+            event: 'co_injection',
+            engram_id: injection_id,
+            timestamp: new Date().toISOString(),
+            data: {
+              ids: injected_ids,
+              query_hash: queryHash,
+              // Event provenance for offline token-economics analysis of real
+              // sessions (the plur-bench #42 measurement). Deliberately NOT read
+              // by the receipt, which shows no token/cost figure by design.
+              tokens_used: tokensUsed,
+              source: options?.source ?? 'inject',
+              ...(options?.scope ? { scope: options.scope } : {}),
+              ...(options?.session_id ? { session_id: options.session_id } : {}),
+            },
+          })
+          // In-memory provenance is set regardless: the engrams WERE injected,
+          // whatever the log managed to record.
+          for (const id of injected_ids) this._lastInjectionByEngram.set(id, injection_id)
+          recordedInjection = wrote
+        } catch { /* best-effort */ }
+      }
+
       try {
-        appendHistory(this.paths.root, {
-          event: 'co_injection',
-          engram_id: injection_id,
-          timestamp: new Date().toISOString(),
-          data: {
-            ids: injected_ids,
-            query_hash: computeQueryHash(task),
-            // Event provenance for offline token-economics analysis of real
-            // sessions (the plur-bench #42 measurement). Deliberately NOT read
-            // by the receipt, which shows no token/cost figure by design.
-            tokens_used: tokensUsed,
-            source: options?.source ?? 'inject',
-            ...(options?.scope ? { scope: options.scope } : {}),
-            ...(options?.session_id ? { session_id: options.session_id } : {}),
-          },
-        })
-        for (const id of injected_ids) this._lastInjectionByEngram.set(id, injection_id)
-      } catch { /* best-effort */ }
+        // The lock file lives beside the month files, so the directory has to
+        // exist before we can take it. appendHistory creates it too, but that
+        // is inside the section we are trying to guard.
+        if (!fs.existsSync(historyDir)) fs.mkdirSync(historyDir, { recursive: true })
+        withLock(join(historyDir, 'co-injection-dedup'), writeCoInjection, { maxRetries: 12, baseDelay: 2 })
+      } catch {
+        // Could not take the lock. Write UNDEDUPED rather than dropping the
+        // event: a duplicate provenance record is noise, a missing one is a
+        // hole in the log `plur restore` reads to NAME what it cannot recover.
+        // Losing a record to avoid a duplicate is the wrong way round.
+        writeCoInjection()
+      }
 
       // #866: increment injection_count on primary-store engrams selected for context.
       // Distinct from activation.frequency (recall events) — this tracks actual
       // injection into the model's context window. Best-effort: never breaks injection.
+      //
+      // GATED on the same verdict as the history event. It used to be exempt, on
+      // the reasoning that the engram was genuinely injected even when the log
+      // entry is a duplicate — but that contradicts the premise the dedup rests
+      // on. Either the two events describe ONE injection, in which case counting
+      // it twice is the inflation #975 opens with ("usage data is inflated, and
+      // not by a constant factor"), or they describe two, in which case the
+      // history event should not have been suppressed either. It cannot be one
+      // reading for the log and the other for the counter: that left
+      // engrams.yaml showing injection_count: 2 against a single co_injection
+      // event, which is a store that disagrees with its own history.
+      //
+      // One reading, taken: they are one injection. Both counters follow.
+      if (!recordedInjection) {
+        // A duplicate. The engram's count was already incremented by the call
+        // that recorded the event, microseconds ago and in another process.
+      } else {
       //
       // TARGETED, via the `_loadTargeted`/`_updateEngrams` pair (2026-08-13
       // panel). This first loaded the whole corpus and wrote the whole corpus
@@ -5081,14 +5630,12 @@ export class Plur {
           )
         }
       }
+      }
     }
 
     // #181: surface persisted tensions touching this injection — flag,
     // don't adjudicate (audit #213 item 4).
-    const tensionWarnings = this._tensionWarningsFor(injected_ids)
-    // Surface soft-tier eviction warnings alongside tension warnings.
-    const evictionWarnings = result.eviction_warnings ?? []
-    const warnings = [...evictionWarnings, ...tensionWarnings]
+    const warnings = this._tensionWarningsFor(injected_ids)
 
     return {
       directives: directivesStr,
@@ -5098,6 +5645,11 @@ export class Plur {
       tokens_used: tokensUsed,
       injected_ids,
       ...(injected_packs ? { injected_packs } : {}),
+      // Pinned engrams that did not make it (#1142). Surfaced here because the
+      // internal result carried it and the public shape dropped it, so the
+      // reporting existed and never reached a caller — the same silent-omission
+      // shape the field was added to close.
+      ...(result.omitted_pinned?.length ? { omitted_pinned: result.omitted_pinned } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
     }
   }
@@ -5134,7 +5686,7 @@ export class Plur {
         if (!remoteEngram) throw new Error(`Engram "${id}" not found in store "${scope}"`)
         await driver.feedback(serverId, signal)
         try {
-          appendHistory(this.paths.root, {
+          this._appendHistory({
             event: 'feedback_received',
             engram_id: id,
             timestamp: new Date().toISOString(),
@@ -5235,7 +5787,7 @@ export class Plur {
       // reject the call, and a retry then applied the signal a SECOND time
       // (#813, audit finding 13). Log and continue: the mutation committed.
       try {
-        appendHistory(this.paths.root, {
+        this._appendHistory({
           event: 'feedback_received',
           engram_id: id,
           timestamp: new Date().toISOString(),
@@ -5349,7 +5901,7 @@ export class Plur {
         await driver.feedback(serverId, signal)
         // Same reasoning as the local path: the remote already counted it.
         try {
-          appendHistory(this.paths.root, {
+          this._appendHistory({
             event: 'feedback_received',
             engram_id: id,
             timestamp: new Date().toISOString(),
@@ -5385,7 +5937,7 @@ export class Plur {
       const injectionId = this._lastInjectionByEngram.get(engramId)
         ?? findLatestInjectionFor(this.paths.root, engramId)?.injection_id
       if (!injectionId) return
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: 'injection_outcome',
         engram_id: engramId,
         timestamp: new Date().toISOString(),
@@ -5478,28 +6030,50 @@ export class Plur {
    * false if no local or writable remote store holds it.
    *
    * Since 0.16 a remote-routed update is awaited and its outcome reported, so a
-   * `true` means the write happened. {@link updateEngramAsync} is now
-   * equivalent and kept only for source compatibility.
+   * `true` means the write happened. {@link updateEngramAsync} is the same
+   * operation returning the written engram.
    */
   async updateEngram(updated: Engram): Promise<boolean> {
+    return (await this._updateEngramReturning(updated)) !== null
+  }
+
+  /**
+   * @deprecated Equivalent to {@link updateEngram} since 0.16 — that method now
+   * awaits the remote PATCH too — differing only in returning the written
+   * engram (the server-authoritative view for a remote hit) instead of a
+   * boolean. Kept so existing callers keep compiling. One implementation
+   * (2026-09 audit): the two bodies had drifted on how a refusing remote is
+   * handled; both now try the next writable store rather than throwing.
+   */
+  async updateEngramAsync(updated: Engram): Promise<Engram | null> {
+    return await this._updateEngramReturning(updated)
+  }
+
+  private async _updateEngramReturning(updated: Engram): Promise<Engram | null> {
     this._assertWritable()
     // Local primary first.
     const localResult = await this._withStoreLock(this.paths.engrams, async () => {
       // Targeted read (#827): resolving one engram by id.
       const engrams = await this._loadTargeted([updated.id])
       const idx = engrams.findIndex(e => e.id === updated.id)
-      if (idx === -1) return false
+      if (idx === -1) return null
       // Leak guard (#353): local-resident → demote a sensitive update in place.
       // LOW-2: scan context fields too, not just the statement.
       const demote = this._guardExplicitUpdate(updated.statement, updated.scope, false, this._engramContextFields(updated))
-      const toWrite = demote ? { ...updated, ...demote } : updated
+      // #1138 review: stamp `updated_at` on the mutation path, not only on
+      // creation and retirement. Without this it equalled `created_at` for
+      // every engram that had ever been edited — worse than an absent field,
+      // because it reads as authoritative. The spec added alongside it names
+      // statement, scope, commitment, relations and retirement as the tracked
+      // mutations, and this is where four of the five actually happen.
+      const toWrite = { ...(demote ? { ...updated, ...demote } : updated), updated_at: new Date().toISOString() }
       engrams[idx] = toWrite
       // Incremental write (#740): only the updated engram row changed.
       await this._updateEngrams(engrams, [toWrite])
       await this._syncIndex()
-      return true
+      return toWrite
     })
-    if (localResult) return true
+    if (localResult) return localResult
 
     // Remote routing. Awaited, and the outcome reported.
     //
@@ -5514,6 +6088,15 @@ export class Plur {
     // Verified against a stub remote returning 401: the old code logged
     // `updateEngram RETURNED: true` alongside
     // `UNHANDLED REJECTIONS: [Error: Remote patch failed: 401 token expired]`.
+    // Refusal rule (2026-09 audit), the same one `forget()` uses since #1109:
+    // when the id is NAMESPACED to this store (`_stripRemotePrefix` stripped
+    // its prefix), the target is unambiguous, so a refusal (auth, validation,
+    // transport) is thrown as-is — reporting it as "not found" would claim
+    // an absence that was never verified, which is how the MCP plur_pin tool
+    // came to turn a 401 into "Engram not found". A BARE id is ambiguous
+    // across stores, so there the walk keeps the graceful contract pinned by
+    // `set-pinned-remote.test.ts`: try the next store, and report null/false
+    // rather than a success that did not happen.
     for (const entry of (this.config.stores ?? [])) {
       if (!entry.url || entry.readonly === true) continue
       // Leak guard (#353): remote-resident, explicit update → THROW on a
@@ -5533,58 +6116,11 @@ export class Plur {
           statement: updated.statement,
         })
         // `null` is a 404 — this remote does not hold it, so keep looking.
-        if (patched) return true
-      } catch {
-        // This remote refused it (auth, validation, transport). Try the next
-        // writable store rather than reporting a success that did not happen.
+        if (patched) return patched
+      } catch (err) {
+        if (serverId !== updated.id) throw err
         continue
       }
-    }
-    return false
-  }
-
-  /**
-   * @deprecated Equivalent to {@link updateEngram} since 0.16 — that method now
-   * awaits the remote PATCH too. Kept so existing callers keep compiling.
-   *
-   * Async variant of updateEngram that awaits remote PATCH for ordering
-   * guarantees. Returns the patched engram (server-authoritative view)
-   * on remote success, null if not found locally or remotely.
-   */
-  async updateEngramAsync(updated: Engram): Promise<Engram | null> {
-    this._assertWritable()
-    // Local primary first.
-    const localResult = await this._withStoreLock(this.paths.engrams, async () => {
-      // Targeted read (#827): resolving one engram by id.
-      const engrams = await this._loadTargeted([updated.id])
-      const idx = engrams.findIndex(e => e.id === updated.id)
-      if (idx === -1) return null
-      // Leak guard (#353): local-resident → demote a sensitive update in place.
-      // LOW-2: scan context fields too, not just the statement.
-      const demote = this._guardExplicitUpdate(updated.statement, updated.scope, false, this._engramContextFields(updated))
-      const toWrite = demote ? { ...updated, ...demote } : updated
-      engrams[idx] = toWrite
-      // Incremental write (#740): only the updated engram row changed.
-      await this._updateEngrams(engrams, [toWrite])
-      await this._syncIndex()
-      return toWrite
-    })
-    if (localResult) return localResult
-
-    for (const entry of (this.config.stores ?? [])) {
-      if (!entry.url || entry.readonly === true) continue
-      // Leak guard (#353): remote-resident, explicit update → THROW on a
-      // forbidden hit (no coherent demotion for a remote engram).
-      // LOW-2: scan context fields too, not just the statement.
-      this._guardExplicitUpdate(updated.statement, entry.scope, true, this._engramContextFields(updated))
-      const serverId = this._stripRemotePrefix(updated.id, entry.scope)
-      const driver = this._getRemoteDriver({ url: entry.url, token: entry.token, scope: entry.scope })
-      const patched = await driver.patch(serverId, {
-        pinned: updated.pinned,
-        status: updated.status,
-        statement: updated.statement,
-      })
-      if (patched) return patched
     }
     return null
   }
@@ -5595,8 +6131,7 @@ export class Plur {
    * Returns the updated engram on success, `null` if it is not found in the
    * local primary store or in any writable remote. Since 0.16 the remote PATCH
    * is awaited and its result returned, so the value is the real engram rather
-   * than a placeholder — {@link setPinnedAsync} is now equivalent and kept only
-   * for source compatibility.
+   * than a placeholder — {@link setPinnedAsync} is the same call.
    */
   async setPinned(id: string, pinned: boolean): Promise<Engram | null> {
     this._assertWritable()
@@ -5607,7 +6142,12 @@ export class Plur {
       const idx = engrams.findIndex(e => e.id === id)
       if (idx === -1) return null
       const e = engrams[idx]
-      const updated: Engram = { ...e, pinned: pinned === true ? true : undefined }
+      // #1138 review: pinning is a mutation, so it moves `updated_at`.
+      const updated: Engram = {
+        ...e,
+        pinned: pinned === true ? true : undefined,
+        updated_at: new Date().toISOString(),
+      }
       engrams[idx] = updated
       // Incremental write (#740): only the (un)pinned engram row changed.
       await this._updateEngrams(engrams, [updated])
@@ -5617,7 +6157,10 @@ export class Plur {
     if (localResult) return localResult
 
     // Remote routing (closes #86 pin remainder). Strip the namespace prefix
-    // before sending the server the unprefixed ID it knows about.
+    // before sending the server the unprefixed ID it knows about. Same
+    // refusal rule as `_updateEngramReturning`: a namespaced id names ONE
+    // store, so its refusal is thrown; a bare id keeps walking and reports
+    // null rather than a success that did not happen.
     for (const entry of (this.config.stores ?? [])) {
       if (!entry.url || entry.readonly === true) continue
       const serverId = this._stripRemotePrefix(id, entry.scope)
@@ -5635,9 +6178,26 @@ export class Plur {
         // The justification was that `setPinned` had to keep a synchronous
         // signature. It is `async` since the 0.16 flip, so that reason is gone
         // and the honest version costs nothing.
-        const patched = await driver.patch(serverId, { pinned: pinned === true ? true : undefined })
+        // Send the BOOLEAN, including an explicit `false` (#1149).
+        //
+        // This read `pinned === true ? true : undefined`, mirroring the local
+        // branch above — but the two representations exist for opposite
+        // reasons. Locally the engram is rewritten WHOLE, so `undefined`
+        // drops the key and keeps unpinned rows out of the YAML. Here the
+        // object is a PARTIAL update, and `JSON.stringify` omits `undefined`,
+        // so the unpin left as `{}` — a server applying ordinary PATCH
+        // semantics changed nothing and returned the still-pinned row, which
+        // this method then reported as success.
+        //
+        // Measured on a loopback server against the real serializer: PATCH
+        // body `{}`, engram still pinned afterwards, no error raised. An
+        // unpin the user was told had worked had not happened on any other
+        // machine — and with the pinned set now quota-enforced at pin time,
+        // it also held budget nobody could reclaim.
+        const patched = await driver.patch(serverId, { pinned })
         if (patched) return patched
-      } catch {
+      } catch (err) {
+        if (serverId !== id) throw err
         continue
       }
     }
@@ -5646,41 +6206,96 @@ export class Plur {
 
   /**
    * @deprecated Equivalent to {@link setPinned} since 0.16 — that method now
-   * awaits the remote PATCH too. Kept so existing callers keep compiling.
+   * awaits the remote PATCH too. Kept so existing callers keep compiling; it
+   * IS setPinned (2026-09 audit), so the two cannot drift apart.
    */
   async setPinnedAsync(id: string, pinned: boolean): Promise<Engram | null> {
-    this._assertWritable()
-    // Local primary first.
-    const localResult = await this._withStoreLock(this.paths.engrams, async () => {
-      // Targeted read (#827): resolving one engram by id.
-      const engrams = await this._loadTargeted([id])
-      const idx = engrams.findIndex(e => e.id === id)
-      if (idx === -1) return null
-      const e = engrams[idx]
-      const updated: Engram = { ...e, pinned: pinned === true ? true : undefined }
-      engrams[idx] = updated
-      // Incremental write (#740): only the (un)pinned engram row changed.
-      await this._updateEngrams(engrams, [updated])
-      await this._syncIndex()
-      return updated
-    })
-    if (localResult) return localResult
-
-    // Remote routing
-    for (const entry of (this.config.stores ?? [])) {
-      if (!entry.url || entry.readonly === true) continue
-      const serverId = this._stripRemotePrefix(id, entry.scope)
-      const driver = this._getRemoteDriver({ url: entry.url, token: entry.token, scope: entry.scope })
-      const patched = await driver.patch(serverId, { pinned: pinned === true ? true : undefined })
-      if (patched) return patched
-    }
-    return null
+    return await this.setPinned(id, pinned)
   }
 
   /** List engrams that have pinned: true. */
   async listPinned(): Promise<Engram[]> {
     const all = await this._loadAllEngrams()
     return all.filter(e => (e as any).pinned === true && e.status === 'active')
+  }
+
+  /**
+   * Pinned-budget accounting (#1142).
+   *
+   * The spec says `pinned` is an "always-load flag". The selector did not
+   * honour that: it capped pinned at a share of the injection budget and
+   * silently skipped the overflow, so pinning something could quietly evict
+   * something else the user had also pinned. Measured on a real store,
+   * lowering `injection_budget` from 56,000 to 12,000 dropped 36 of 46 pinned
+   * engrams with nothing in the output saying so.
+   *
+   * The fix is not a better eviction rule — it is to stop over-committing.
+   * Pinning is a deliberate act with a human present, so the quota is checked
+   * THERE, where someone can decide, instead of at injection time where nobody
+   * can. Over quota, the user unpins something or raises the limit.
+   */
+  async pinnedQuota(candidateId?: string): Promise<{
+    quota: number
+    used: number
+    free: number
+    count: number
+    over: boolean
+    /** Pinned engrams, most-expendable first — the unpin suggestion order. */
+    entries: Array<{ id: string; statement: string; cost: number; net_feedback: number; last_accessed: string | null }>
+    /** Set when `candidateId` names a not-yet-pinned engram: what pinning it would cost. */
+    candidate?: { id: string; cost: number; would_be: number; fits: boolean }
+  }> {
+    const budget = this.config.injection_budget ?? 2000
+    const ratio = this.config.injection?.pinned_ratio ?? 0.5
+    const quota = Math.floor(budget * ratio)
+    const pinned = await this.listPinned()
+
+    const entries = pinned.map(e => {
+      const fb = e.feedback_signals
+      return {
+        id: e.id,
+        statement: e.statement,
+        cost: estimateTokens(e as never),
+        net_feedback: (fb?.positive ?? 0) - (fb?.negative ?? 0),
+        last_accessed: e.activation?.last_accessed ?? null,
+      }
+    })
+
+    // Ordered by COST, largest first — "what frees the most budget", which is
+    // arithmetic. Deliberately NOT an expendability ranking.
+    //
+    // The first version sorted by net feedback ascending, on the theory that
+    // an unendorsed engram is a safe cut. Run against a real store it proposed
+    // unpinning the demo-redaction rule, "never name enterprise customers",
+    // and "customer-named work runs in a dedicated session" — the three rules
+    // whose absence had caused a live disclosure that same day. The reason is
+    // structural: only 275 of 7,920 injections were ever rated, so ~96% of
+    // engrams sit at net_feedback 0 and the sort collapses into noise.
+    //
+    // `net_feedback` and `last_accessed` are still reported per entry, because
+    // they are real signals a human can weigh. They are just not a ranking,
+    // and presenting them as one puts the system's thumb on a decision it has
+    // no basis for.
+    entries.sort((a, b) => b.cost - a.cost)
+
+    const used = entries.reduce((n, e) => n + e.cost, 0)
+
+    let candidate: { id: string; cost: number; would_be: number; fits: boolean } | undefined
+    if (candidateId) {
+      const e = await this.getById(candidateId)
+      // Already-pinned is a no-op re-pin, not a new commitment — it must not
+      // be charged twice or it would refuse itself.
+      if (e && (e as { pinned?: boolean }).pinned !== true) {
+        const cost = estimateTokens(e as never)
+        candidate = { id: e.id, cost, would_be: used + cost, fits: used + cost <= quota }
+      }
+    }
+
+    return {
+      quota, used, free: Math.max(0, quota - used),
+      count: entries.length, over: used > quota, entries,
+      ...(candidate ? { candidate } : {}),
+    }
   }
 
   /**
@@ -5816,7 +6431,7 @@ export class Plur {
             + `Check that the token has delete rights for that scope.`,
           )
         }
-        appendHistory(this.paths.root, {
+        this._appendHistory({
           event: 'engram_retired',
           engram_id: id,
           timestamp: new Date().toISOString(),
@@ -5958,6 +6573,7 @@ export class Plur {
 
       if (newCount === 0) {
         engram.status = 'retired'
+        engram.updated_at = new Date().toISOString()
         if (reason && !engram.rationale) {
           engram.rationale = `Retired: ${reason}`
         }
@@ -5976,7 +6592,7 @@ export class Plur {
       // update, not a removal.
       await this._updateEngrams(engrams, [engram])
       await this._syncIndex()
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: newCount === 0 ? 'engram_retired' : 'engram_decremented',
         engram_id: id,
         timestamp: new Date().toISOString(),
@@ -6030,6 +6646,7 @@ export class Plur {
 
         if (newCount === 0) {
           engram.status = 'retired'
+          engram.updated_at = new Date().toISOString()
           if (reason && !engram.rationale) {
             engram.rationale = `Retired: ${reason}`
           }
@@ -6037,7 +6654,7 @@ export class Plur {
 
         await this._writeEngrams(storeInfo.path, storeEngrams)
         await this._syncIndex()
-        appendHistory(this.paths.root, {
+        this._appendHistory({
           event: newCount === 0 ? 'engram_retired' : 'engram_decremented',
           engram_id: id,
           timestamp: new Date().toISOString(),
@@ -6084,6 +6701,13 @@ export class Plur {
      *  contract (`forget handles remote server error gracefully`, #84) is that
      *  a degraded fleet must not stop a retire, and that is worth keeping. */
     const unreachedStores: string[] = []
+    // Deferred throw for unreachable stores whose prefix matched the id (#1126).
+    // storePrefix() is a lossy 3-char derivation — two distinct scopes can produce
+    // the same prefix, so a prefix match does not prove this store is the unique
+    // owner. Throwing immediately aborts the walk and prevents a later reachable
+    // store (same prefix, actual owner) from retiring the engram. Record and defer:
+    // fire only after the walk completes without a retirement.
+    let pendingUnreachableError: string | null = null
     for (const entry of (this.config.stores ?? [])) {
       if (!entry.url) continue
       const serverId = this._stripRemotePrefix(id, entry.scope)
@@ -6101,12 +6725,19 @@ export class Plur {
       // remote was walked past and the engram reported as simply not found —
       // absence the walk never verified, which is #831's harm by another route.
       //
-      // The walk CONTINUES on `unknown` rather than refusing: `forget handles
-      // remote server error gracefully` (#84) asserts a degraded fleet does
-      // not stop a retire, and that availability is worth keeping. What
-      // changes is only that the store is recorded, so the terminal message
-      // below stops claiming knowledge it does not have. Same resolution
-      // `feedback` already uses.
+      // For bare IDs the walk CONTINUES on `unknown`: `forget handles remote
+      // server error gracefully` (#84) asserts a degraded fleet does not stop
+      // a retire — availability is worth keeping for the ambiguous case. What
+      // changes is only that the store is recorded so the terminal message
+      // stops claiming knowledge it does not have. Same resolution `feedback`
+      // already uses.
+      //
+      // For namespaced IDs (ENG-GPL-...) the prefix was stripped above, so this
+      // store likely is the intended target — but storePrefix() is lossy, so
+      // two scopes can share a prefix (#1126). Throwing immediately here aborts
+      // the walk before a later reachable store (same prefix, actual owner) gets
+      // a chance to retire the engram. Defer instead: record the error and
+      // continue; fire it only once the walk completes without a retirement.
       // Optional capability: a driver without `probeById` (an injected stub, a
       // third-party implementation) keeps the previous two-state behaviour
       // rather than crashing. Absence of the capability is not a reason to
@@ -6115,6 +6746,17 @@ export class Plur {
         ? await driver.probeById(serverId)
         : ((await driver.getById(serverId)) ? 'owned' : 'absent')
       if (ownership === 'unknown') {
+        const isNamespaced = id !== serverId
+        if (isNamespaced) {
+          // Record and continue — do not throw yet (#1126). If a subsequent
+          // store retires the engram, this error is silently discarded.
+          pendingUnreachableError = (
+            `Cannot reach "${entry.scope ?? entry.url}" to retire "${id}" — `
+            + `the token may be expired or the server unavailable. `
+            + `Retry once access is restored, or pass scope: "${entry.scope ?? entry.url}" to target this store directly.`
+          )
+          continue
+        }
         unreachedStores.push(entry.scope ?? entry.url!)
         logger.warning(
           `[plur] could not reach "${entry.scope ?? entry.url}" while looking for ${id} — `
@@ -6127,7 +6769,7 @@ export class Plur {
       if (found) {
         const removed = await driver.remove(serverId)
         if (removed) {
-          appendHistory(this.paths.root, {
+          this._appendHistory({
             event: 'engram_retired',
             engram_id: id,
             timestamp: new Date().toISOString(),
@@ -6140,6 +6782,12 @@ export class Plur {
         refusedBy = entry.scope ?? 'a remote store'
       }
     }
+
+    // Namespaced-id unreachable: fire now that the walk is complete and nothing
+    // was retired (#1126). Sits above "Engram not found" because "cannot reach"
+    // is actionable — the engram may exist — while "not found" falsely claims
+    // absence. Sits below `refusedBy` because a refused DELETE proves presence.
+    if (pendingUnreachableError) throw new Error(pendingUnreachableError)
 
     // A refused DELETE is not a missing engram and must not be reported as one.
     // Both used to fall through to "Engram not found", so a user whose token
@@ -6386,7 +7034,7 @@ export class Plur {
       if (!opts.keepLocal) {
         await this._retireRescopedSource(id, target, serverId)
       }
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: 'engram_rescoped',
         engram_id: id,
         timestamp: now,
@@ -6446,7 +7094,7 @@ export class Plur {
         error: `Engram ${id} changed underneath the rescope (retired or removed concurrently) — nothing written`,
       }
     }
-    appendHistory(this.paths.root, {
+    this._appendHistory({
       event: 'engram_rescoped',
       engram_id: id,
       timestamp: now,
@@ -6486,6 +7134,7 @@ export class Plur {
       const t = fresh.find(e => e.id === id)
       if (!t) return
       t.status = 'retired'
+      t.updated_at = new Date().toISOString()
       if (!t.rationale) t.rationale = `Retired: rescoped to ${toScope} as ${newId}`
       const rel = t.relations ?? { broader: [], narrower: [], related: [], conflicts: [], supersedes: [], superseded_by: [] }
       rel.superseded_by = rel.superseded_by ?? []
@@ -6500,7 +7149,7 @@ export class Plur {
       await this._updateEngrams(fresh, [t])
       await this._syncIndex()
     })
-    appendHistory(this.paths.root, {
+    this._appendHistory({
       event: 'engram_retired',
       engram_id: id,
       timestamp: now,
@@ -6937,7 +7586,11 @@ export class Plur {
    * and on prompt-injection text unless opts.allowInjection), clamps host-
    * overriding fields (pinned / locked), detects conflicts, records in registry.
    */
-  async installPack(source: string, opts?: { allowInjection?: boolean }): Promise<ReturnType<typeof installPack>> {
+  // `allowModified` was declared on `InstallOptions` and then narrowed away
+  // here, so no caller outside this module could ever pass it. That made the
+  // standard's own remedy for a false-positive scan — correct the pack and
+  // install it — unreachable, since correcting a pack moves the hash it shipped.
+  async installPack(source: string, opts?: { allowInjection?: boolean; allowModified?: boolean }): Promise<ReturnType<typeof installPack>> {
     const existing = await this._loadAllEngrams()
     return installPack(this.paths.packs, source, existing, opts)
   }
@@ -6947,13 +7600,19 @@ export class Plur {
     return uninstallPack(this.paths.packs, name)
   }
 
-  /** Export engrams as a shareable pack with privacy scanning and integrity hash. */
+  /**
+   * Export engrams as a shareable pack with privacy scanning and integrity hash.
+   *
+   * Throws when no licence has been chosen — by the caller here, or once in
+   * `provenance.default_license`. That is deliberate: see `exportPack`.
+   */
   exportPack(
     engrams: Engram[],
     outputDir: string,
-    manifest: { name: string; version: string; description?: string; creator?: string },
+    manifest: ExportOptions,
   ): ReturnType<typeof exportPack> {
-    return exportPack(engrams, outputDir, manifest)
+    const configured = (this.config as any)?.provenance?.default_license as string | undefined
+    return exportPack(engrams, outputDir, manifest, configured)
   }
 
   /** List all installed packs (with integrity hashes). */
@@ -7344,12 +8003,13 @@ export class Plur {
         const idx = engrams.findIndex(e => e.id === engram.id)
         if (idx !== -1) engrams.splice(idx, 1)
         flushed++
-        appendHistory(this.paths.root, {
+        this._appendHistory({
           event: 'engram_created',
           engram_id: engram.id,
           timestamp: now.toISOString(),
           data: { routed_to: 'remote', outbox_flush: true, scope: engram.scope },
         })
+        this._maybeWriteProvenance(engram.id)
       } catch (err) {
         outbox.last_attempt = now.toISOString()
         outbox.attempt_count += 1
@@ -7447,7 +8107,7 @@ export class Plur {
       session_episode_id: episodeId,
     })
 
-    appendHistory(this.paths.root, {
+    this._appendHistory({
       event: 'engram_promoted',
       engram_id: engram.id,
       timestamp: new Date().toISOString(),
@@ -7503,7 +8163,7 @@ export class Plur {
 
     // Log the failure event
     const failureEventId = generateEventId()
-    appendHistory(this.paths.root, {
+    this._appendHistory({
       event: 'failure_reported',
       engram_id: engramId,
       timestamp: new Date().toISOString(),
@@ -7573,7 +8233,7 @@ Generate an improved version of the procedure that prevents this failure. Return
             await this._writeEngrams(this.paths.engrams, engrams)
             await this._syncIndex()
 
-            appendHistory(this.paths.root, {
+            this._appendHistory({
               event: 'procedure_evolved',
               engram_id: engramId,
               timestamp: now,
@@ -7617,7 +8277,7 @@ Generate an improved version of the procedure that prevents this failure. Return
             const driver = this._getRemoteDriver({ url: entry.url, token: entry.token, scope: entry.scope })
             const patched = await driver.patch(serverId, { statement: improved.trim() })
             if (patched) {
-              appendHistory(this.paths.root, {
+              this._appendHistory({
                 event: 'procedure_evolved',
                 engram_id: engramId,
                 timestamp: now,
@@ -7777,6 +8437,9 @@ Generate an improved version of the procedure that prevents this failure. Return
       ...(Object.keys(storeErrors).length > 0 ? { store_errors: storeErrors } : {}),
       // Back-compat alias for the field this replaced.
       ...(storeErrors.packs ? { pack_registry_error: storeErrors.packs } : {}),
+      ...(this._spreadDrops.dropped_unresolvable > 0 || this._spreadDrops.dropped_retired > 0
+        ? { spread_drops: { ...this._spreadDrops } }
+        : {}),
     }
   }
 
@@ -7903,7 +8566,7 @@ Generate an improved version of the procedure that prevents this failure. Return
         out.push(record)
         newCount++
         try {
-          appendHistory(this.paths.root, {
+          this._appendHistory({
             event: 'contradiction_detected',
             engram_id: pair.id_a,
             timestamp: nowIso,
@@ -8034,6 +8697,7 @@ Generate an improved version of the procedure that prevents this failure. Return
   private async _retireEngramForResolution(id: string, reason: string): Promise<boolean> {
     const stamp = (engram: Engram): void => {
       engram.status = 'retired'
+      engram.updated_at = new Date().toISOString()
       if (!engram.rationale) engram.rationale = `Retired: ${reason}`
     }
     const foundInPrimary = await this._withStoreLock(this.paths.engrams, async () => {
@@ -8043,7 +8707,7 @@ Generate an improved version of the procedure that prevents this failure. Return
       stamp(engram)
       await this._writeEngrams(this.paths.engrams, engrams)
       await this._syncIndex()
-      appendHistory(this.paths.root, {
+      this._appendHistory({
         event: 'engram_retired',
         engram_id: id,
         timestamp: new Date().toISOString(),
@@ -8069,7 +8733,7 @@ Generate an improved version of the procedure that prevents this failure. Return
         stamp(engram)
         await this._writeEngrams(storeInfo.path, storeEngrams)
         await this._syncIndex()
-        appendHistory(this.paths.root, {
+        this._appendHistory({
           event: 'engram_retired',
           engram_id: id,
           timestamp: new Date().toISOString(),
@@ -8132,11 +8796,12 @@ Generate an improved version of the procedure that prevents this failure. Return
    * Resolved tension-scan defaults from config (#240). Consumers (MCP
    * plur_tensions, CLI) merge explicit args over these.
    */
-  getTensionsConfig(): { temporal_domains: string[]; snapshot_pairs: 'skip' | 'floor'; temporal_discount: boolean } {
+  getTensionsConfig(): { temporal_domains: string[]; snapshot_pairs: 'skip' | 'floor'; measured_under_pairs: 'skip' | 'floor'; temporal_discount: boolean } {
     const t = this.config.tensions ?? {}
     return {
       temporal_domains: t.temporal_domains ?? [],
       snapshot_pairs: t.snapshot_pairs ?? 'skip',
+      measured_under_pairs: t.measured_under_pairs ?? 'skip',
       temporal_discount: t.temporal_discount ?? false,
     }
   }
@@ -8594,6 +9259,50 @@ Generate an improved version of the procedure that prevents this failure. Return
   /** Whether this instance ran (and would re-run) cwd store discovery. */
   autoDiscoveryEnabled(): boolean {
     return this._autoDiscover
+  }
+
+  /**
+   * True when `dir` (or an ancestor of it) has been explicitly trusted via
+   * `trustDirectory` / `plur trust` (D2, 2026-09 audit).
+   *
+   * This is the gate an ADAPTER (opencode, claw, ...) should check before
+   * adopting behaviour-changing configuration it finds on disk — a
+   * `.plur.yaml` `scope`/`domain`, for instance — from a directory it did not
+   * create and the user may not have vetted. It is deliberately NOT about
+   * whether the scope is local or remote: a remote/team store is the
+   * legitimate reason a project declares a scope at all, so the gate is on
+   * the DIRECTORY, the same way `direnv allow` / `git config safe.directory`
+   * / VS Code workspace trust gate on the directory rather than on what the
+   * config inside it says.
+   */
+  isDirectoryTrusted(dir: string): boolean {
+    return _isDirectoryTrusted(dir, this.paths.root)
+  }
+
+  /** Grant trust to `dir` (`plur trust`). Returns the canonicalized path recorded. */
+  trustDirectory(dir: string): string {
+    return _trustDirectory(dir, this.paths.root)
+  }
+
+  /** Revoke trust from `dir` (`plur untrust`). Returns whether an entry was removed. */
+  untrustDirectory(dir: string): boolean {
+    return _untrustDirectory(dir, this.paths.root)
+  }
+
+  /** List every directory this user has explicitly trusted. */
+  listTrustedDirectories(): string[] {
+    return _listTrustedDirectories(this.paths.root)
+  }
+
+  /**
+   * Find the trusted entry — `dir` itself or a covering ancestor — that
+   * makes `isDirectoryTrusted(dir)` true. `null` when nothing covers it.
+   * See trust.ts's `coveringTrustedAncestor` (E3, 2026-09 audit): this is
+   * what `plur untrust` uses to avoid claiming a directory is untrusted
+   * when an ancestor's grant still covers it.
+   */
+  coveringTrustedAncestor(dir: string): string | null {
+    return _coveringTrustedAncestor(dir, this.paths.root)
   }
 
   autoDiscoverStores(cwd?: string): Array<{ path: string; scope: string }> {
@@ -9355,7 +10064,7 @@ Generate an improved version of the procedure that prevents this failure. Return
   ): { previous: string | null; next: string | null } {
     const previous = this._sessionScopes.get(opts?.session)
     this._sessionScopes.set(scope, opts?.session)
-    appendHistory(this.paths.root, {
+    this._appendHistory({
       event: 'session_scope_changed',
       engram_id: '', // session-level event — no engram (see HistoryEvent doc)
       timestamp: new Date().toISOString(),

@@ -1,7 +1,7 @@
 {
   "name": "@plur-ai/mcp",
   "mcpName": "io.github.plur-ai/plur",
-  "version": "0.19.4",
+  "version": "0.20.1",
   "type": "module",
   "bin": {
     "plur-mcp": "dist/index.js"
@@ -13,7 +13,8 @@
   ],
   "scripts": {
     "build": "tsup",
-    "test": "vitest run"
+    "test": "vitest run",
+    "pretest": "npm run build"
   },
   "dependencies": {
     "@plur-ai/core": "workspace:*",
