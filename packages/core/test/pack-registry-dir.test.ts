@@ -321,3 +321,32 @@ describe('case-insensitive filesystems: the row follows the directory (finding 2
   })
 })
 
+describe('normalization-insensitive filesystems: the row follows the directory (#1246)', () => {
+  const nfd = 'cafe\u0301' // "café", decomposed
+  const nfc = 'caf\u00e9'  // "café", composed
+  const normalizationInsensitive = (() => {
+    const d = mkdtempSync(join(tmpdir(), 'plur-nfd-probe-'))
+    try {
+      writeFileSync(join(d, nfd), '')
+      return existsSync(join(d, nfc))
+    } finally {
+      rmSync(d, { recursive: true, force: true })
+    }
+  })()
+
+  it.skipIf(!normalizationInsensitive)('uninstall spelled in another normalization removes the directory AND its row', async () => {
+    await installPack(packs, source(nfd, 'n1'))
+    await installPack(packs, source('other', 'n2'))
+    expect(rows().map(r => r.dir).sort()).toEqual([nfd, 'other'].sort())
+    uninstallPack(packs, nfc)
+    expect(readdirSync(packs).some(e => e.normalize('NFC') === nfc)).toBe(false)
+    expect(rows().map(r => r.dir)).toEqual(['other'])
+  })
+
+  it.skipIf(!normalizationInsensitive)('install from a normalization-variant source over an existing pack replaces its row', async () => {
+    await installPack(packs, source(nfd, 'n1'))
+    await installPack(packs, source(nfc, 'n1'))
+    expect(rows().map(r => r.dir)).toEqual([nfd])
+    expect(status()).toEqual({ [nfd]: 'ok' })
+  })
+})

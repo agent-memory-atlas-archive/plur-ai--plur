@@ -348,7 +348,8 @@ function ownedRegistryRowIndex(packsDir: string, entries: RegistryEntry[], dir: 
 
 /**
  * The name `name` has in the packs directory's own listing. On a
- * case-insensitive filesystem `PACK-ONE` opens `pack-one`, but a row keyed by
+ * case-insensitive filesystem `PACK-ONE` opens `pack-one` (and on APFS a
+ * composed `café` opens a decomposed one, #1246), but a row keyed by
  * `dir` must carry the name the directory actually has, or the row and the
  * directory part ways: uninstall removed the directory and kept its row, and a
  * reinstall from a case-variant source added a second row (audit of #1230,
@@ -360,8 +361,12 @@ function onDiskEntryName(packsDir: string, name: string): string {
   if (listing.includes(name)) return name
   let target: fs.Stats
   try { target = fs.statSync(path.join(packsDir, name)) } catch { return name }
+  // Case and Unicode normalization: APFS ignores both, so `café` spelled
+  // composed (NFC) opens the directory listed decomposed (NFD) (#1246). The
+  // inode comparison below is what decides; this only narrows the candidates.
+  const fold = (s: string) => s.normalize('NFC').toLowerCase()
   for (const e of listing) {
-    if (e.toLowerCase() !== name.toLowerCase()) continue
+    if (fold(e) !== fold(name)) continue
     try {
       const st = fs.statSync(path.join(packsDir, e))
       if (st.ino === target.ino && st.dev === target.dev) return e
