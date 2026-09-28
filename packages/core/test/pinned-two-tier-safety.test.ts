@@ -108,7 +108,7 @@ describe('the hard-tier cap', () => {
     const big = 'q'.repeat(5000)
     const e = {
       id: 'ENG-2026-09-28-001', statement: big, rationale: big, domain: big,
-      contraindications: [big, big], commitment: 'decided',
+      contraindications: [big, big], commitment: 'decided', claim_class: big,
       activation: { last_accessed: '2026-09-28' }, confidence_score: 0.5,
     }
     expect(formatLayer3(e as never).length).toBeLessThanOrEqual(estimateTokens(e as never) * 4)

@@ -312,6 +312,7 @@ export function estimateTokens(engram: ScoredEngram): number {
     contraindications?: string[]
     rationale?: string
     commitment?: string
+    claim_class?: unknown
   }
   let chars = e.id.length + 4 + (e.statement?.length ?? 0)          // "[ID] statement"
   const contra = e.contraindications
@@ -321,6 +322,11 @@ export function estimateTokens(engram: ScoredEngram): number {
   const meta =
     (e.domain ? e.domain.length + 10 : 0) +
     (e.commitment ? e.commitment.length + 14 : 0) +
+    // "Kind: <claim_class>" (#963). Rendered by formatLayer3 and, until the
+    // pinned two-tier work, not counted — a rendered field the estimate does
+    // not read is a way to put unbudgeted text into the prompt, and nothing
+    // validates `claim_class` against its enum before it is stored.
+    (typeof e.claim_class === 'string' ? e.claim_class.length + 9 : 0) +
     20 +                                                             // "Confidence: 0.00"
     (e.activation?.last_accessed ? e.activation.last_accessed.length + 15 : 0)
   if (meta > 20) chars += meta + 3
