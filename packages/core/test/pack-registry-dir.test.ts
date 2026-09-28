@@ -41,7 +41,7 @@ function source(dir: string, manifestName: string, prose = 'Prose.'): string {
   return d
 }
 
-type Row = { name: string; dir?: string; integrity: string }
+type Row = { name: string; dir?: string; integrity: string; ambiguous?: true }
 const rows = (): Row[] => (yaml.load(readFileSync(join(packs, 'registry.yaml'), 'utf8')) as { packs: Row[] }).packs
 const status = () => Object.fromEntries(listPacks(packs).map(p => [p.path.split('/').pop(), p.integrity_status]))
 
@@ -135,7 +135,9 @@ describe('legacy rows without `dir` still resolve by name', () => {
     writeFileSync(regPath, yaml.dump(reg))
     uninstallPack(packs, 'pack-one')
     expect(rows()).toHaveLength(1)
-    expect(status()).toEqual({ 'pack-two': 'ok' })
+    // The row is kept for pack-two to reclaim by reinstalling, but it may be
+    // pack-one's baseline, so pack-two is not verified against it (#1245).
+    expect(status()).toEqual({ 'pack-two': 'unverified' })
   })
 })
 
@@ -243,6 +245,44 @@ describe('a legacy row shared by two directories (findings 3 and 4)', () => {
     expect(readFileSync(join(packs, 'registry.yaml')).equals(before)).toBe(true)
   })
 
+  // #1245: uninstall correctly leaves the row, since it cannot tell whose it
+  // is. The survivor then used to be the only candidate, was verified against
+  // the row — here pack-two's hash — and reported a false `modified`.
+  it('uninstalling one leaves the survivor unverified, not modified (#1245)', () => {
+    uninstallPack(packs, 'pack-two')
+    expect(rows()).toEqual([expect.objectContaining({ name: 'shared-name', ambiguous: true })])
+    expect(rows()[0].dir).toBeUndefined()
+    expect(status()).toEqual({ 'pack-one': 'unverified' })
+    expect(listPacks(packs)[0].registry_ambiguous).toBe(true)
+  })
+
+  it('after that uninstall, migrate still skips the survivor as ambiguous (#1245)', async () => {
+    const { computePackHash, migratePackIntegrity } = await import('../src/packs.js')
+    // Give the row a v1 value that pack-two had: a migration against it would
+    // otherwise report the untouched survivor as skipped-modified.
+    const regPath = join(packs, 'registry.yaml')
+    const reg = yaml.load(readFileSync(regPath, 'utf8')) as { packs: Row[] }
+    reg.packs[0].integrity = `sha256:${computePackHash(join(packs, 'pack-two'))}`
+    writeFileSync(regPath, yaml.dump(reg))
+    uninstallPack(packs, 'pack-two')
+    const by = Object.fromEntries(migratePackIntegrity(packs).packs.map(p => [p.dir, p.action]))
+    expect(by).toEqual({ 'pack-one': 'skipped-ambiguous-legacy-row' })
+  })
+
+  it('after that uninstall, reinstalling the survivor replaces the marked row (#1245)', async () => {
+    uninstallPack(packs, 'pack-two')
+    await installPack(packs, join(tmp, 'src', 'pack-one'))
+    expect(rows()).toEqual([expect.objectContaining({ dir: 'pack-one' })])
+    expect(rows()[0]).not.toHaveProperty('ambiguous')
+    expect(status()).toEqual({ 'pack-one': 'ok' })
+  })
+
+  it('after that uninstall, uninstalling the survivor removes the marked row (#1245)', () => {
+    uninstallPack(packs, 'pack-two')
+    uninstallPack(packs, 'pack-one')
+    expect(rows()).toEqual([])
+  })
+
   it('reinstalling each pack resolves it: both get their own rows', async () => {
     await installPack(packs, join(tmp, 'src', 'pack-one'))
     await installPack(packs, join(tmp, 'src', 'pack-two'))
@@ -280,3 +320,4 @@ describe('case-insensitive filesystems: the row follows the directory (finding 2
     expect(status()).toEqual({ 'pack-one': 'ok' })
   })
 })
+

@@ -143,6 +143,17 @@ export interface RegistryEntry {
    * changes made before it. A reinstall writes a fresh row without it.
    */
   integrity_carried_from?: 'v1'
+  /**
+   * Set on a legacy row (no `dir`) when a pack that could have owned it was
+   * uninstalled while another installed directory with the same manifest name
+   * could also own it. The row stays, because nothing records whose baseline it
+   * is, but the remaining directory is no longer the only candidate in any
+   * meaningful sense: verifying it against the row would compare it with what
+   * may be the uninstalled pack's hash and report a false `modified` (#1245).
+   * A row carrying it is reported as ambiguous. A reinstall writes a fresh row
+   * without it.
+   */
+  ambiguous?: true
 }
 
 // `isTransientPackDir` lives in engrams.ts so `loadAllPacks` can use it
@@ -314,6 +325,19 @@ function otherDirsNamed(packsDir: string, dir: string, name: string, entries: Re
   })
 }
 
+/**
+ * Is `row`, found for the pack at `dir`, a legacy row that cannot be told to be
+ * that pack's baseline? Either another installed directory could equally own
+ * it, or it was marked `ambiguous` when such a directory was uninstalled
+ * (#1245). Used where a row is VERIFIED against; claiming or removing a row
+ * goes by `ownedRegistryRowIndex`, which ignores the mark, so the last
+ * candidate can still reinstall over the row or remove it.
+ */
+function isAmbiguousLegacyRow(packsDir: string, dir: string, name: string, row: RegistryEntry | undefined, entries: RegistryEntry[]): boolean {
+  if (row === undefined || row.dir !== undefined) return false
+  return row.ambiguous === true || otherDirsNamed(packsDir, dir, name, entries).length > 0
+}
+
 /** Index of the row `dir` may claim or remove: its own, or a legacy row only it can own. */
 function ownedRegistryRowIndex(packsDir: string, entries: RegistryEntry[], dir: string, name: string | undefined): number {
   const idx = findRegistryRowIndex(entries, dir, name)
@@ -365,9 +389,21 @@ function removeFromRegistry(packsDir: string, dir: string, name: string | undefi
   withRegistryLock(packsDir, () => {
     const entries = loadRegistry(packsDir)
     const idx = ownedRegistryRowIndex(packsDir, entries, dir, name)
-    if (idx < 0) return
-    entries.splice(idx, 1)
-    saveRegistry(packsDir, entries)
+    if (idx >= 0) {
+      entries.splice(idx, 1)
+      saveRegistry(packsDir, entries)
+      return
+    }
+    // A legacy row this pack might own but cannot claim, because another
+    // installed directory could too. It stays, but once this pack is gone the
+    // other directory would look like its only owner and be verified against
+    // what may be this pack's hash (#1245). Mark it so it keeps being reported
+    // as ambiguous.
+    const legacy = findRegistryRowIndex(entries, dir, name)
+    if (legacy >= 0 && entries[legacy].dir === undefined && entries[legacy].ambiguous !== true) {
+      entries[legacy].ambiguous = true
+      saveRegistry(packsDir, entries)
+    }
   })
 }
 
@@ -1739,7 +1775,7 @@ export function listPacks(packsDir: string): PackInfo[] {
   // called the same row ambiguous (audit of #1230, finding 3). Report it as
   // unanswerable, the same verdict migration reaches.
   const ambiguous = (dir: string, name: string, reg: RegistryEntry | undefined): boolean =>
-    reg !== undefined && reg.dir === undefined && otherDirsNamed(packsDir, dir, name, registry).length > 0
+    isAmbiguousLegacyRow(packsDir, dir, name, reg, registry)
 
   const result: PackInfo[] = []
   for (const entry of fs.readdirSync(packsDir)) {
@@ -2593,7 +2629,7 @@ export type PackIntegrityMigrationAction =
   | 'skipped-modified'
   /** No registry row for this pack. No baseline is invented. */
   | 'skipped-no-entry'
-  /** A legacy row (no `dir`) that another installed directory's manifest also names: it could be either pack's baseline, so it is left alone. */
+  /** A legacy row (no `dir`) that another installed directory's manifest also names, or one marked `ambiguous` when such a pack was uninstalled (#1245): it could be either pack's baseline, so it is left alone. */
   | 'skipped-ambiguous-legacy-row'
   /** The pack's manifest could not be read, so it cannot be matched to a row. */
   | 'skipped-unreadable'
@@ -2707,7 +2743,7 @@ export function migratePackIntegrity(
     // either pack's baseline: leave it alone rather than guess.
     const idx = findRegistryRowIndex(entries, dir, name)
     const row = idx >= 0 ? entries[idx] : undefined
-    if (row && row.dir === undefined && otherDirsNamed(packsDir, dir, name, entries).length > 0) {
+    if (isAmbiguousLegacyRow(packsDir, dir, name, row, entries)) {
       report.packs.push({ dir, name, action: 'skipped-ambiguous-legacy-row' })
       continue
     }

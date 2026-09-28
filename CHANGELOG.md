@@ -89,8 +89,10 @@ manifest name — your registry may hold one row that both packs could own.
 Nothing records which pack it belongs to, so `plur packs list` now reports both
 as `UNVERIFIED` (it used to report one of them as `modified` when it was not),
 `plur packs migrate-integrity` skips both as `skipped-ambiguous-legacy-row`, and
-uninstalling one never removes the row. **Reinstall each affected pack from a
-trusted source**; each then gets its own row.
+uninstalling one never removes the row. The pack left behind after such an
+uninstall stays `UNVERIFIED`: the row is marked `ambiguous: true`, so it is not
+checked against a value that may be the removed pack's. **Reinstall each
+affected pack from a trusted source**; each then gets its own row.
 
 **Do not share a packs directory between this version and an older one.** An
 older PLUR matches rows by manifest name only: installing there replaces a
