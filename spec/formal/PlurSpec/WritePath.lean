@@ -417,7 +417,7 @@ Code (`outbox-lease.ts`, `_flushOutboxClaimed`, learn()'s remote branch):
 - `respond p ok` — the remote answers. Accepted: one delivery, and p now owes
   the hand-off. Failed: p holds its lease again, to retry or release.
 - `merge p` — the merge-back, under the store lock: the accepted row is handed
-  off and p's own lease dropped (`dropOwnLease`). A step of its own since the
+  off and p's own lease dropped (`dropLease`). A step of its own since the
   audit of #1231 (finding 2): the merge-back waits for the store lock after the
   POST, once per batch, and before that audit the model made the two one atomic
   `finish`, which the code never was.
@@ -442,7 +442,23 @@ timed out on the store lock, after the remote accepted and before its
 merge-back re-delivers once the lease expires: the documented at-least-once
 edge the single-process path always had. Retire DELETEs (`_retireRemote`) use
 the same lease and selection, so `delivered` stands for either network effect.
-Assumption: one clock (skew within the margin, see `outbox-lease.ts`). -/
+Assumption: one clock (skew within the margin, see `outbox-lease.ts`).
+
+What `P` stands for (review of #1231, 2026-09-28): `P` ranges over PUSHES, one
+lease each, not over `Plur` instances. One instance can run two pushes of the
+same row one after the other (`learn()`'s immediate push, then a flush's
+retry), and the code tells their leases apart by a per-lease `nonce`:
+`dropLease` removes a lease only when holder, nonce and expiry all match the
+lease that push wrote. That is `dropOwn` below with `p` a push. Matching by
+holder id alone, as the code did before that review, is `dropOwn` with `p` an
+instance, and it let a failed push release the lease of a later push by the
+same instance, so another process delivered the row twice. In the code,
+`leaseFree` still treats the instance's own lease as free. Two pushes by one
+instance are kept apart by the in-process claim (`_outboxInFlight`), which a
+push now holds from writing its lease until it has released it. Together, the
+claim and the per-lease release give the per-push `leaseFree` this model
+checks. The model text changed with that review, and no definition or proof
+did; `lake build` was not re-run for the change. -/
 
 inductive Phase where
   | idle
@@ -491,7 +507,7 @@ def leaseFree (c : LCfg) (l : Option (P × Nat)) (p : P) (now : Nat) : Bool :=
     | none => true
     | some (q, e) => decide (q = p) || decide (e ≤ now) || decide (now + c.T + c.M < e)
 
-/-- `dropOwnLease`: only the holder's own lease is released. -/
+/-- `dropLease`: only the push's own lease is released (`p` is a push — see §1c). -/
 def dropOwn (l : Option (P × Nat)) (p : P) : Option (P × Nat) :=
   match l with
   | some (q, e) => if q = p then none else some (q, e)

@@ -64,6 +64,16 @@ export const OUTBOX_MERGE_WRITE_MS = 30_000
 export const OUTBOX_LEASE_MARGIN_MS =
   LOAD_FETCH_TIMEOUT_MS + DEFAULT_ACQUIRE_TIMEOUT + OUTBOX_MERGE_WRITE_MS + OUTBOX_LEASE_SKEW_MS
 
+// The margin must leave part of the lease to push in. Were it to reach the TTL
+// (DEFAULT_ACQUIRE_TIMEOUT raised to ~8.5 min or more), `canStartPush` would
+// never hold and no flush would push again — fail loudly at load instead.
+export function assertLeaseMarginFits(marginMs: number, ttlMs: number): void {
+  if (!(marginMs < ttlMs)) {
+    throw new Error(`outbox lease margin (${marginMs} ms) must be shorter than its TTL (${ttlMs} ms)`)
+  }
+}
+assertLeaseMarginFits(OUTBOX_LEASE_MARGIN_MS, OUTBOX_LEASE_TTL_MS)
+
 /** The bookkeeping key the lease is stored under, in `structured_data`. */
 export const OUTBOX_LEASE_KEY = '_outboxLease'
 
@@ -72,6 +82,13 @@ export interface OutboxLease {
   holder: string
   /** ISO timestamp. */
   expires_at: string
+  /**
+   * Opaque, unique per lease written. One instance can hold leases for two
+   * pushes (learn()'s immediate push, then a flush's retry), so the holder id
+   * alone cannot say WHICH lease a release is for — see `dropLease`. Absent on
+   * a lease written by a client that predates it.
+   */
+  nonce?: string
 }
 
 /** A fresh holder id for one `Plur` instance. */
@@ -80,7 +97,7 @@ export function newLeaseHolder(): string {
 }
 
 export function makeLease(holder: string, nowMs: number, ttlMs: number = OUTBOX_LEASE_TTL_MS): OutboxLease {
-  return { holder, expires_at: new Date(nowMs + ttlMs).toISOString() }
+  return { holder, expires_at: new Date(nowMs + ttlMs).toISOString(), nonce: randomUUID() }
 }
 
 /** The lease on a row's `structured_data`, or undefined when absent or malformed (= unleased). */
@@ -88,9 +105,9 @@ export function readLease(sd: unknown): OutboxLease | undefined {
   if (!sd || typeof sd !== 'object') return undefined
   const l = (sd as Record<string, unknown>)[OUTBOX_LEASE_KEY]
   if (!l || typeof l !== 'object') return undefined
-  const { holder, expires_at } = l as Record<string, unknown>
+  const { holder, expires_at, nonce } = l as Record<string, unknown>
   if (typeof holder !== 'string' || typeof expires_at !== 'string') return undefined
-  return { holder, expires_at }
+  return { holder, expires_at, ...(typeof nonce === 'string' ? { nonce } : {}) }
 }
 
 /**
@@ -115,9 +132,19 @@ export function canStartPush(leaseUntilMs: number, nowMs: number): boolean {
   return nowMs + OUTBOX_LEASE_MARGIN_MS <= leaseUntilMs
 }
 
-/** Drop `holder`'s lease from a `structured_data` copy. Returns whether it was there. Mutates `sd`. */
-export function dropOwnLease(sd: Record<string, unknown>, holder: string): boolean {
-  if (readLease(sd)?.holder !== holder) return false
+/**
+ * Drop exactly `lease` — the one this push wrote — from a `structured_data`
+ * copy. Returns whether it was there. Mutates `sd`.
+ *
+ * Release is per lease, not per holder (review of #1231). A release matched by
+ * holder id alone let a failed learn() push delete the lease a flush in the
+ * same instance had just written for its own POST; the row then sat unleased
+ * while that POST was on the wire, and another process delivered it again.
+ */
+export function dropLease(sd: Record<string, unknown>, lease: OutboxLease): boolean {
+  const onRow = readLease(sd)
+  if (!onRow || onRow.holder !== lease.holder || onRow.nonce !== lease.nonce
+    || onRow.expires_at !== lease.expires_at) return false
   delete sd[OUTBOX_LEASE_KEY]
   return true
 }

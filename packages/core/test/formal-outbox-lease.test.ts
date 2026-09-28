@@ -25,7 +25,7 @@ import { StubServer } from './helpers/stub-server.js'
 import { withAsyncLock, DEFAULT_ACQUIRE_TIMEOUT } from '../src/store/async-lock.js'
 import { recordWriteOutcome } from '../src/remote-recall.js'
 import {
-  leaseFree, canStartPush, dropOwnLease, newLeaseHolder, OUTBOX_LEASE_TTL_MS, OUTBOX_LEASE_MARGIN_MS,
+  leaseFree, canStartPush, dropLease, makeLease, newLeaseHolder, assertLeaseMarginFits, OUTBOX_LEASE_TTL_MS, OUTBOX_LEASE_MARGIN_MS,
 } from '../src/outbox-lease.js'
 
 const TOKEN = 'lease-token'
@@ -363,6 +363,108 @@ describe('outbox lease — two processes flushing one store', () => {
     expect(r.flushed).toBe(1)
   })
 
+  // ---- Review of #1231 (2026-09-28) ------------------------------------------
+
+  it("a failed learn() push does not release the lease a flush in the same instance just took", async () => {
+    // A's learn() push fails; before its bookkeeping write, a flush in A takes
+    // the store lock. Releasing by holder id (and the in-flight claim before
+    // that write) let the flush re-lease and POST the row, and then the failed
+    // push's bookkeeping removed the flush's lease: B saw the row unleased
+    // while A's POST was on the wire and delivered it a second time.
+    const a = new Plur({ path: dir })
+    const b = new Plur({ path: dir })
+    let failFirst!: () => void
+    const firstGate = new Promise<void>(r => { failFirst = r })
+    let releaseSecond!: () => void
+    const secondGate = new Promise<void>(r => { releaseSecond = r })
+    let arrivals = 0
+    server.appendHook = async (n: number) => {
+      arrivals = n
+      if (n === 1) { await firstGate; server.appendErrorResponse = { status: 503, body: 'down' }; return }
+      server.appendErrorResponse = null
+      if (n === 2) await secondGate
+    }
+    try {
+      const e = await a.learn('a team fact whose first push fails', { scope: SCOPE, type: 'behavioral' })
+      await waitFor(() => arrivals === 1, "learn()'s POST to be on the wire")
+      // The flush queues on the store lock AHEAD of the failed push's bookkeeping.
+      const lock = await holdStoreLock()
+      const flushingA = a.flushOutbox()
+      await new Promise(r => setTimeout(r, 30))
+      failFirst()
+      await new Promise(r => setTimeout(r, 100)) // the failure reaches learn(), which waits for the lock
+      await lock.release()
+      await waitFor(() => rowOf(e.id)?.structured_data?._outbox?.attempt_count === 1, "the failed push's bookkeeping")
+      const flushingB = b.flushOutbox()
+      await new Promise(r => setTimeout(r, 50))
+      releaseSecond()
+      await flushingB
+      await flushingA
+      const accepted = (server as any).engrams as Map<string, { data: { statement?: string } }>
+      const copies = [...accepted.values()].filter(x => x.data.statement === 'a team fact whose first push fails')
+      expect(copies.length, 'the remote accepted the same engram twice').toBe(1)
+      expect(rowOf(e.id), 'the delivered row is handed off').toBeUndefined()
+    } finally { failFirst(); releaseSecond() }
+  })
+
+  it('a flush whose lease runs short mid-batch does not start the remaining pushes', async () => {
+    const a = new Plur({ path: dir })
+    const e1 = await queued(a, 'the first team fact of a batch that outlives its lease')
+    const e2 = await queued(a, 'the second team fact of a batch that outlives its lease')
+    const clock = shiftClock()
+    try {
+      // The first push takes so long that less than the margin is left after it.
+      server.appendHook = async (n: number) => { if (n === 1) clock.add(OUTBOX_LEASE_TTL_MS - OUTBOX_LEASE_MARGIN_MS + 1_000) }
+      const r = await a.flushOutbox()
+      expect(r.flushed).toBe(1)
+      expect(server.appendCalls, 'a push started with less than the margin left on its lease').toBe(1)
+      expect(r.expired_warnings.some(w => w.includes('ran short'))).toBe(true)
+      const left = [rowOf(e1.id), rowOf(e2.id)].filter(Boolean)
+      expect(left).toHaveLength(1)
+      expect(left[0].structured_data._outbox, 'the row not attempted stays queued').toBeTruthy()
+      expect(left[0].structured_data._outboxLease, 'its lease is released for the next flush').toBeUndefined()
+    } finally { clock.restore() }
+  })
+
+  it('a flush whose lease runs short mid-batch does not start the remaining retirements', async () => {
+    const a = new Plur({ path: dir })
+    const ids: string[] = []
+    for (const [i, stmt] of ['the first forgotten team fact', 'the second forgotten team fact'].entries()) {
+      const e = await queued(a, stmt)
+      editRow(e.id, row => {
+        row.status = 'retired'
+        delete row.structured_data._outbox
+        row.structured_data._retireRemote = {
+          target_url: url, target_scope: SCOPE, server_id: `ENG-SRV-90${i}`,
+          queued_at: new Date().toISOString(), last_attempt: '', attempt_count: 0, last_error: '',
+        }
+      })
+      ids.push(e.id)
+    }
+    const clock = shiftClock()
+    const orig = (a as any)._getRemoteDriver.bind(a)
+    let deletes = 0
+    ;(a as any)._getRemoteDriver = (...args: any[]) => {
+      const d = orig(...args)
+      const remove = d.removeIdempotent.bind(d)
+      d.removeIdempotent = async (id: string) => {
+        const out = await remove(id)
+        if (++deletes === 1) clock.add(OUTBOX_LEASE_TTL_MS - OUTBOX_LEASE_MARGIN_MS + 1_000)
+        return out
+      }
+      return d
+    }
+    try {
+      const r = await a.flushOutbox()
+      expect(server.deleteCalls, 'a retirement started with less than the margin left on its lease').toBe(1)
+      expect(r.flushed).toBe(1)
+      expect(r.expired_warnings.some(w => w.includes('ran short'))).toBe(true)
+      const still = ids.map(rowOf).filter(row => row?.structured_data?._retireRemote)
+      expect(still, 'the retirement not attempted stays queued').toHaveLength(1)
+      expect(still[0].structured_data._outboxLease).toBeUndefined()
+    } finally { clock.restore() }
+  })
+
   it("listOutbox reports leased_until for a row being pushed now, this instance's own push included", async () => {
     const a = new Plur({ path: dir })
     const e = await queued(a, 'a team fact listed while its push is on the wire')
@@ -409,12 +511,26 @@ describe('outbox-lease helpers', () => {
     expect(canStartPush(until, until - OUTBOX_LEASE_MARGIN_MS + 1)).toBe(false)
   })
 
-  it('only the holder releases its lease; holder ids are unique per instance', () => {
-    const a = { ...sd('a', 1000) } as Record<string, unknown>
-    expect(dropOwnLease(a, 'b')).toBe(false)
-    expect(a._outboxLease).toBeDefined()
-    expect(dropOwnLease(a, 'a')).toBe(true)
-    expect(a._outboxLease).toBeUndefined()
+  it('a release drops only the exact lease it wrote, not another lease of the same holder', () => {
+    const holder = newLeaseHolder()
+    const mine = makeLease(holder, now)
+    const later = makeLease(holder, now) // a second push by the same instance
+    expect(later.nonce).not.toBe(mine.nonce)
+    const row = { _outboxLease: { ...later } } as Record<string, unknown>
+    expect(dropLease(row, mine), 'released another push of the same holder').toBe(false)
+    expect(row._outboxLease).toEqual(later)
+    expect(dropLease(row, makeLease('someone-else', now))).toBe(false)
+    expect(dropLease(row, later)).toBe(true)
+    expect(row._outboxLease).toBeUndefined()
+    // A lease from a client that predates the nonce is never released by one that has it.
+    const old = { _outboxLease: { holder, expires_at: mine.expires_at } } as Record<string, unknown>
+    expect(dropLease(old, mine)).toBe(false)
     expect(newLeaseHolder()).not.toBe(newLeaseHolder())
+  })
+
+  it('the margin must be shorter than the TTL, or no push could ever start', () => {
+    expect(() => assertLeaseMarginFits(OUTBOX_LEASE_MARGIN_MS, OUTBOX_LEASE_TTL_MS)).not.toThrow()
+    expect(() => assertLeaseMarginFits(OUTBOX_LEASE_TTL_MS, OUTBOX_LEASE_TTL_MS)).toThrow(/shorter than its TTL/)
+    expect(() => assertLeaseMarginFits(OUTBOX_LEASE_TTL_MS + 1, OUTBOX_LEASE_TTL_MS)).toThrow()
   })
 })

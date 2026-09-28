@@ -26,6 +26,15 @@ queued row's host in cooldown, or no store configured) leases nothing and
 leaves the store file untouched, as before the lease; and a flush that fails
 part-way releases the leases it took instead of holding them for ten minutes.
 
+Each lease also carries a `nonce`, and a push releases only the exact lease it
+wrote. Before, release matched the holder id, so when `learn()`'s immediate
+push failed it could remove the lease that a flush in the same process had just
+taken for its own retry. Another process then saw the row unleased and
+delivered it a second time. `learn()` now also keeps its in-process claim on
+the row until it has recorded the failure. A lease without a `nonce`, written
+by a client that predates the field, still blocks other processes until it
+expires.
+
 ### PGLite recall reports its fusion score
 
 With `PLUR_BACKEND=pglite`, hybrid recall returned no top score, and the opt-in

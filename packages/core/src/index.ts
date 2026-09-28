@@ -32,7 +32,7 @@ import { autoSummary } from './summary.js'
 import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack, containsEmail } from './packs.js'
 import type { ExportOptions } from './packs.js'
 import { learnContextContent, engramContentFields } from './content-fields.js'
-import { newLeaseHolder, makeLease, leaseFree, readLease, canStartPush, dropOwnLease, OUTBOX_LEASE_KEY, OUTBOX_LEASE_TTL_MS } from './outbox-lease.js'
+import { newLeaseHolder, makeLease, leaseFree, readLease, canStartPush, dropLease, OUTBOX_LEASE_KEY, OUTBOX_LEASE_TTL_MS, type OutboxLease } from './outbox-lease.js'
 
 /** One flush's on-disk leases (decision D2), shared with `flushOutbox()` so a throw can release them. */
 interface OutboxFlushLeases {
@@ -42,6 +42,8 @@ interface OutboxFlushLeases {
   settled: Set<string>
   /** The merge-back ran (it releases every lease itself), or nothing was leased. */
   mergedBack: boolean
+  /** The lease this flush wrote on every row it leased; released exactly (`dropLease`). */
+  lease?: OutboxLease
 }
 export { LEARN_CONTEXT_FIELD_ROLES, LEARN_CONTENT_FIELDS, learnContextContent, engramContentFields } from './content-fields.js'
 // SP5 imports (deferred — vault-export, registry not yet merged)
@@ -3557,6 +3559,8 @@ export class Plur {
         // scope), but we still guard for null because config drift between
         // resolver-time and outbox-time is possible if config is reloaded.
         const storeEntry = (this.config.stores ?? []).find(s => s.url && s.scope === scope && !s.readonly)
+        // Decision D2: the lease this push writes, and later releases exactly.
+        const pushLease = makeLease(this._outboxLeaseHolder, Date.now())
         if (!storeEntry) {
           // Resolver gave us a driver (probably readonly), but we can't queue
           // an outbox entry without a writable target. Skip outbox; the
@@ -3575,7 +3579,7 @@ export class Plur {
             },
             // Decision D2: the push below starts at once, so the row is born
             // leased — a flush in another process never sees it unleased.
-            [OUTBOX_LEASE_KEY]: makeLease(this._outboxLeaseHolder, Date.now()),
+            [OUTBOX_LEASE_KEY]: pushLease,
           }
         }
         // Incremental write (#740): append the new engram; on a store without
@@ -3612,20 +3616,22 @@ export class Plur {
             ;({ id: serverId } = await remoteDriver.appendAndGetServerId(engram))
             pushed = true
           } catch (err) {
-            // The POST did not land, so nothing is on the wire any more: a
-            // flush may take the row now. Release the claim before the
-            // bookkeeping write below (which only touches a row that still
-            // carries `_outbox`), not after it.
-            this._outboxInFlight.delete(engram.id)
+            // The POST did not land. The in-flight claim is still held, and is
+            // released only by the `finally` below, AFTER this bookkeeping
+            // write (review of #1231): released before it, a flush in this
+            // instance could take the row in the gap and put its own POST on
+            // the wire, and the write below then removed the flush's lease —
+            // so another process delivered the row a second time.
             // Already saved locally with outbox metadata — will be retried.
             logger.warning(`[plur:outbox] immediate push failed for ${engram.id}, queued for retry: ${(err as Error).message}`)
             await this._withStoreLock(this.paths.engrams, async () => {
               // Targeted read (#827): only this engram's outbox bookkeeping.
               const fresh = await this._loadTargeted([engram.id])
               const target = fresh.find(e => e.id === engram.id) as any
-              // Decision D2: release this push's lease with the outcome.
+              // Decision D2: release this push's lease with the outcome — this
+              // push's lease exactly, never another push's by the same holder.
               const leaseDropped = !!target?.structured_data
-                && dropOwnLease(target.structured_data, this._outboxLeaseHolder)
+                && dropLease(target.structured_data, pushLease)
               if (target?.structured_data?._outbox) {
                 target.structured_data._outbox.last_error = (err as Error).message
                 target.structured_data._outbox.attempt_count = 1
@@ -3672,7 +3678,7 @@ export class Plur {
                   : false
                 // Decision D2: the push is over — release its lease.
                 const sdKept = (fresh[idx] as any).structured_data as Record<string, unknown> | undefined
-                const leaseDropped = !!sdKept && dropOwnLease(sdKept, this._outboxLeaseHolder)
+                const leaseDropped = !!sdKept && dropLease(sdKept, pushLease)
                 if (queuedRetire || leaseDropped) await this._updateEngrams(fresh, [fresh[idx]])
                 logger.warning(
                   `[plur:outbox] ${engram.id} reached the remote${serverId ? ` as ${serverId}` : ''} after its delivery `
@@ -8511,15 +8517,15 @@ export class Plur {
       // keeps another process from delivering it a second time until the TTL
       // runs out, which is the at-least-once edge the lease documents.
       if (!leases.mergedBack && leases.leased.size > 0) {
-        await this._releaseOutboxLeases([...leases.leased].filter(id => !leases.settled.has(id)))
+        await this._releaseOutboxLeases([...leases.leased].filter(id => !leases.settled.has(id)), leases.lease)
       }
       for (const id of claimed) this._outboxInFlight.delete(id)
     }
   }
 
-  /** Drop this instance's outbox lease from `ids`, under the store lock. Best effort: never throws. */
-  private async _releaseOutboxLeases(ids: string[]): Promise<void> {
-    if (ids.length === 0) return
+  /** Drop exactly `lease` from `ids`, under the store lock. Best effort: never throws. */
+  private async _releaseOutboxLeases(ids: string[], lease: OutboxLease | undefined): Promise<void> {
+    if (ids.length === 0 || !lease) return
     try {
       await this._withStoreLock(this.paths.engrams, async () => {
         const fresh = await this._primaryStore.load()
@@ -8529,7 +8535,7 @@ export class Plur {
           const sd = (e as any).structured_data as Record<string, unknown> | undefined
           if (!want.has(e.id) || !sd) continue
           const next = { ...sd }
-          if (!dropOwnLease(next, this._outboxLeaseHolder)) continue
+          if (!dropLease(next, lease)) continue
           ;(e as any).structured_data = Object.keys(next).length > 0 ? next : undefined
           changed.push(e)
         }
@@ -8766,8 +8772,10 @@ export class Plur {
       for (const e of retiring) { this._outboxInFlight.add(e.id); claimed.add(e.id) }
       const leased = [...new Map([...pending, ...retiring].map(e => [e.id, e] as const)).values()]
       if (leased.length === 0) return
+      const lease = makeLease(holder, leaseTakenAt)
+      leases.lease = lease
       for (const e of leased) {
-        ;(e as any).structured_data = { ...(e as any).structured_data, [OUTBOX_LEASE_KEY]: makeLease(holder, leaseTakenAt) }
+        ;(e as any).structured_data = { ...(e as any).structured_data, [OUTBOX_LEASE_KEY]: lease }
         leases.leased.add(e.id)
       }
       // Incremental write (#740): only the lease changed on these rows.
@@ -9164,7 +9172,7 @@ export class Plur {
           .map(e => {
             if (!leasedIds.has(e.id)) return e
             const fSd = { ...((e as any).structured_data as Record<string, unknown> | undefined ?? {}) }
-            if (!dropOwnLease(fSd, holder)) return e
+            if (!leases.lease || !dropLease(fSd, leases.lease)) return e
             return { ...e, structured_data: Object.keys(fSd).length > 0 ? fSd : undefined } as Engram
           })
         // The dropped engrams are the ones the remote accepted — a deliberate
