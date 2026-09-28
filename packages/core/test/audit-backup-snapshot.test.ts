@@ -109,3 +109,10 @@ it('replaces an unverifiable same-day snapshot with a fresh verified one, keepin
   expect(aside).toHaveLength(1)
   expect(fs.readFileSync(join(root, 'backups', aside[0]), 'utf8')).toBe('damaged\n')
 })
+
+it.skipIf(process.platform === 'win32')('keeps the pre-restore copy as private as the store', () => {
+  fs.writeFileSync(store, content(1)); maybeDailyBackup(root, store)
+  fs.writeFileSync(store, content(2)); fs.chmodSync(store, 0o600)
+  const restored = restoreBackup(root, store)
+  expect(fs.statSync(restored.supersededPath).mode & 0o777).toBe(0o600)
+})

@@ -120,3 +120,46 @@ describe('migration configuration fails closed', () => {
     expect(getSchemaVersion(config)).toBe(0)
   })
 })
+
+describe('round-2 review: configuration shapes, file modes and actionable refusals', () => {
+  it.each(['', '# comment only\n', '---\n'])('treats an empty or comment-only config as an empty mapping: %j', source => {
+    fs.writeFileSync(config, source)
+    expect(getSchemaVersion(config)).toBe(0)
+    setSchemaVersion(config, 1)
+    expect(getSchemaVersion(config)).toBe(1)
+  })
+
+  it.each(['42\n', '- a\n- b\n'])('still refuses a scalar or list config: %j', source => {
+    fs.writeFileSync(config, source)
+    expect(() => getSchemaVersion(config)).toThrow(/mapping/)
+    expect(() => setSchemaVersion(config, 1)).toThrow()
+    expect(fs.readFileSync(config, 'utf8')).toBe(source)
+  })
+
+  it('says a store from a newer PLUR needs an upgrade', () => {
+    fs.writeFileSync(config, `schema_version: ${ALL_MIGRATIONS.length + 1}\n`)
+    expect(() => getSchemaVersion(config)).toThrow(/newer PLUR.*Upgrade PLUR/s)
+  })
+
+  it.skipIf(process.platform === 'win32')('keeps the version backup as private as the corpus', () => {
+    saveEngrams(store, [row(1)])
+    fs.chmodSync(store, 0o600)
+    setSchemaVersion(config, 0)
+    runMigrations(store, config)
+    expect(fs.statSync(`${store}.bak.0`).mode & 0o777).toBe(0o600)
+  })
+
+  it('names the journal and how to reconcile when an interrupted migration cannot complete', () => {
+    saveEngrams(store, [row(1)])
+    setSchemaVersion(config, 0)
+    fault.path = config
+    expect(() => runMigrations(store, config)).toThrow('injected commit interruption')
+    fault.path = ''
+    saveEngrams(store, [row(1), row(2)])
+    let message = ''
+    try { runMigrations(store, config) } catch (error) { message = String(error) }
+    expect(message).toContain(`${store}.migration.json`)
+    expect(message).toMatch(/schema_version: \d+/)
+    expect(message).toMatch(/delete the journal/)
+  })
+})

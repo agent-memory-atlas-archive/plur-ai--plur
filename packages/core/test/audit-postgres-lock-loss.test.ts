@@ -131,4 +131,54 @@ describe.skipIf(!url)('Postgres ownership and transaction interruption', () => {
       await new Promise<void>(r => server.close(() => r()))
     }
   }, 30000)
+
+  it('drops post-commit work registered after the protected function failed', async () => {
+    const { a } = pair(); await a.save([row(1)])
+    let count = 0
+    let resume!: () => void, registered!: Promise<void>
+    const held = new Promise<void>(r => { resume = r })
+    await expect(a.withExclusiveAccess(async () => {
+      await a.append(row(2))
+      // Detached: registers from inside the session, but only after the
+      // operation has thrown and rolled back.
+      registered = held.then(() => a.afterCommit(() => { count++ }))
+      throw new Error('injected failure')
+    })).rejects.toThrow('injected failure')
+    resume(); await registered
+    await new Promise(r => setTimeout(r, 50))
+    expect(count).toBe(0)
+    expect((await a.load()).map(e => e.id)).toEqual(['ENG-AUDIT-1'])
+  }, 30000)
+
+  it('still runs post-commit work registered after a confirmed commit', async () => {
+    const { a } = pair()
+    let count = 0
+    let resume!: () => void, registered!: Promise<void>
+    const held = new Promise<void>(r => { resume = r })
+    await a.withExclusiveAccess(async () => {
+      await a.append(row(1))
+      registered = held.then(() => a.afterCommit(() => { count++ }))
+    })
+    resume(); await registered
+    expect(count).toBe(1)
+  }, 30000)
+
+  it('writes a learn\'s provenance record only after the commit, outside the write session', async () => {
+    const { a } = pair()
+    const path = mkdtempSync(join(tmpdir(), 'plur-pg-provenance-')); roots.push(path)
+    writeFileSync(join(path, 'config.yaml'), 'provenance:\n  generate: always\n', 'utf8')
+    const plur = new Plur({ path, store: a, autoDiscover: false })
+    let calls = 0
+    let insideSession: boolean | undefined
+    const original = plur.writeProvenance.bind(plur)
+    ;(plur as any).writeProvenance = (...args: Parameters<typeof plur.writeProvenance>) => {
+      calls++
+      insideSession = (a as any).exclusiveSession.getStore() !== undefined
+      return original(...args)
+    }
+    await plur.learn('Provenance is written after the transaction commits', { scope: 'global' })
+    await new Promise(r => setTimeout(r, 100))
+    expect(calls).toBe(1)
+    expect(insideSession).toBe(false)
+  }, 30000)
 })

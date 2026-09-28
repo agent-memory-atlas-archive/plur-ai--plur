@@ -357,7 +357,11 @@ export function maybeDailyBackup(root: string, storePath: string, now = new Date
   }
 }
 
-/** Atomic, private, durable publication, including directory metadata. */
+/**
+ * Atomic, durable publication: temp file, fsync, rename, directory fsync.
+ * Not a permission change: a new snapshot gets the process default mode
+ * (0644 under umask 022), exactly as the previous open-write-fsync did.
+ */
 function writeFileDurable(dest: string, bytes: Buffer): void {
   atomicWrite(dest, bytes)
 }
@@ -605,7 +609,9 @@ export function restoreBackup(
       }
     }
     if (fs.existsSync(storePath)) {
-      atomicWrite(superseded, fs.readFileSync(storePath))
+      // Same mode as the store it copies (copyFileSync did this before): it
+      // holds the whole corpus, including scope:local engrams.
+      atomicWrite(superseded, fs.readFileSync(storePath), { mode: fs.statSync(storePath).mode & 0o777 })
     }
     // tmp + fsync + rename, rather than truncating the live file in place.
     atomicWrite(storePath, snapshot.bytes)

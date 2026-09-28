@@ -280,7 +280,7 @@ export class PostgresAdapter implements StorageAdapter, AsyncPrimaryStore {
   private readonly efSearch: number
   private readonly maxConnections: number
 
-  private readonly exclusiveSession = new AsyncLocalStorage<{ client: any; active: boolean; failure?: Error; afterCommit: Array<() => void> }>()
+  private readonly exclusiveSession = new AsyncLocalStorage<{ client: any; active: boolean; committed: boolean; failure?: Error; afterCommit: Array<() => void> }>()
   private pool: any = null
   /**
    * In-flight (or completed) pool construction. Memoized so concurrent first
@@ -1061,8 +1061,12 @@ export class PostgresAdapter implements StorageAdapter, AsyncPrimaryStore {
    * ownership context. Rolled-back operations never launch these callbacks. */
   afterCommit(callback: () => void): void {
     const session = this.exclusiveSession.getStore()
-    if (session?.active) session.afterCommit.push(callback)
-    else this.exclusiveSession.exit(callback)
+    if (!session || session.committed) { this.exclusiveSession.exit(callback); return }
+    if (session.active) { session.afterCommit.push(callback); return }
+    // Registered after the protected function ended but before a COMMIT was
+    // confirmed — after a throw, or while COMMIT is in flight. The outcome is
+    // rollback or unknown, so work that assumes the write landed must not run.
+    logger.warning('[postgres] dropped post-commit work registered after the transaction stopped accepting it')
   }
 
   async withExclusiveAccess<T>(fn: () => Promise<T>): Promise<T> {
@@ -1077,7 +1081,7 @@ export class PostgresAdapter implements StorageAdapter, AsyncPrimaryStore {
     // and transaction die together; no stale writer can switch connections.
     const pool = await this.getLockPool()
     const client = await this.acquire(pool)
-    const session: { client: any; active: boolean; failure?: Error; afterCommit: Array<() => void> } = { client, active: true, afterCommit: [] }
+    const session: { client: any; active: boolean; committed: boolean; failure?: Error; afterCommit: Array<() => void> } = { client, active: true, committed: false, afterCommit: [] }
     let discard: Error | undefined
     const onError = (error: Error) => { session.failure = error; discard = error }
     client.on('error', onError)
@@ -1090,6 +1094,7 @@ export class PostgresAdapter implements StorageAdapter, AsyncPrimaryStore {
       session.active = false
       const committed = await client.query('COMMIT')
       if (committed.command !== 'COMMIT') throw new Error('[postgres] transaction was aborted; protected writes were rolled back')
+      session.committed = true
       for (const callback of session.afterCommit) {
         const report = (error: unknown) => logger.warning(`[postgres] post-commit background work failed: ${String(error)}`)
         try { Promise.resolve(this.exclusiveSession.exit(callback)).catch(report) } catch (error) { report(error) }

@@ -36,16 +36,25 @@ export function getSchemaVersion(configPath: string): number {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0
     throw new Error('Cannot read or parse migration configuration')
   }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+  // An empty or comment-only file loads as null/undefined: that is an empty
+  // mapping, as loadConfig treats it. A scalar or a list is not.
+  const config: unknown = raw ?? {}
+  if (typeof config !== 'object' || config === null || Array.isArray(config)) {
     throw new Error('Cannot read migration schema version: config must be a mapping')
   }
-  const version = Object.hasOwn(raw, 'schema_version') ? (raw as Record<string, unknown>).schema_version : 0
+  const version = Object.hasOwn(config, 'schema_version') ? (config as Record<string, unknown>).schema_version : 0
   assertVersion(version)
   return version
 }
 
 function assertVersion(version: unknown): asserts version is number {
-  if (typeof version !== 'number' || !Number.isInteger(version) || version < 0 || version > CURRENT_SCHEMA_VERSION) {
+  if (typeof version === 'number' && Number.isInteger(version) && version > CURRENT_SCHEMA_VERSION) {
+    throw new Error(
+      `Schema version ${version} was written by a newer PLUR than this one, which supports up to ${CURRENT_SCHEMA_VERSION}. `
+      + 'Upgrade PLUR before migrating or rolling back this store.',
+    )
+  }
+  if (typeof version !== 'number' || !Number.isInteger(version) || version < 0) {
     throw new Error(`Invalid schema version: expected a non-negative integer from 0 to ${CURRENT_SCHEMA_VERSION}`)
   }
 }
@@ -73,8 +82,8 @@ export function setSchemaVersion(configPath: string, version: number): void {
     let configData: Record<string, unknown> = {}
     try {
       const raw = fs.readFileSync(configPath, 'utf8')
-      const parsed: unknown = yaml.load(raw)
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Migration config must be a mapping')
+      const parsed: unknown = yaml.load(raw) ?? {}
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('Migration config must be a mapping')
       configData = parsed as Record<string, unknown>
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw new Error('Cannot read or parse migration configuration')
@@ -98,7 +107,8 @@ function createBackup(engramsPath: string, version: number): string | null {
   // rollback target was gone. An existing backup is by definition from an
   // earlier, better state; keep it.
   if (fs.existsSync(backupPath)) return backupPath
-  atomicWrite(backupPath, fs.readFileSync(engramsPath))
+  // Same mode as the corpus (copyFileSync kept it): a backup is the corpus.
+  atomicWrite(backupPath, fs.readFileSync(engramsPath), { mode: fs.statSync(engramsPath).mode & 0o777 })
   return backupPath
 }
 
@@ -126,7 +136,14 @@ function recoverMigration(engramsPath: string, configPath: string): void {
   assertVersion(journal.version)
   const current = corpusHash(engramsPath)
   if (current === journal.after) setSchemaVersion(configPath, journal.version)
-  else if (current !== journal.before) throw new Error('Interrupted migration followed by other writes; preserve the corpus and reconcile the migration journal manually')
+  else if (current !== journal.before) {
+    throw new Error(
+      `An interrupted migration to schema version ${journal.version} was followed by other writes, so it cannot be completed automatically. `
+      + `The corpus has been left as it is. To reconcile: check whether ${engramsPath} is already in the version ${journal.version} shape. `
+      + `If it is, set schema_version: ${journal.version} in ${configPath}; if it is not, leave schema_version as it is. `
+      + `Then delete the journal ${journalPath} and run the migration again.`,
+    )
+  }
   fs.unlinkSync(journalPath)
   fsyncDir(join(engramsPath, '..'))
 }
@@ -138,7 +155,7 @@ function commitMigration(engramsPath: string, configPath: string, engrams: Retur
   let bytes: Buffer
   try {
     if (fs.existsSync(engramsPath)) {
-      atomicWrite(staged, fs.readFileSync(engramsPath))
+      atomicWrite(staged, fs.readFileSync(engramsPath), { mode: fs.statSync(engramsPath).mode & 0o777 })
       loadEngrams(staged) // retain quarantined rows through the serializer
     }
     saveEngrams(staged, engrams, { allowShrink: true })
