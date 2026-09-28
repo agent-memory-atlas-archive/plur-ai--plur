@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Queued team writes now leave the laptop when a session ends
+
+**An enterprise deployment reported engrams that stayed on laptops** (#1269).
+A team-scoped write that cannot reach its store is queued locally (the
+outbox), and was retried only by the MCP tools `plur_session_start`,
+`plur_sync` and `plur_outbox`, or by `plur outbox --flush`. No editor hook
+retried it, and `plur sync` did not either — although `plur outbox` told you
+it did.
+
+**Session-end and stop hooks now flush the outbox**: Claude Code
+`SessionEnd`, Codex `SessionEnd`, and Cursor `stop`. Each flush has a budget
+that fits inside its hook's timeout (2.5s, 1.2s, 1.2s), and with nothing
+queued it is skipped after a single file read; Cursor's `stop`, which fires
+on every turn, retries at most once every five minutes. When the budget runs out the
+in-flight push is cut and the rest stays queued, unchanged; a failing remote
+leaves entries queued with the failure recorded, as before. The hook itself
+never fails over it. `PLUR_HOOK_OUTBOX_FLUSH=0` turns it off and
+`PLUR_HOOK_OUTBOX_FLUSH_MS` changes the budget.
+
+**`plur sync` now flushes too**, and reports what happened: `outbox` in
+`--json` output (`flushed`, `pending`, `warnings`), and a line for writes that
+are still queued.
+
+`flushOutbox()` takes an optional `{ timeoutMs }` and returns a new `deferred`
+count — entries it did not get to. A cut is not counted as an attempt or as a
+failure against the host.
+
 ### An unscoped write can no longer land in a team store
 
 **If you wrote an engram without a scope, it could be auto-routed into a shared
