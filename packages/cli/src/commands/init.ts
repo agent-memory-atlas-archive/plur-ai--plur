@@ -7,6 +7,7 @@ import { createInterface } from 'readline'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { outputInfo } from '../output.js'
 import { CLI_VERSION } from '../version.js'
+import { hookCommandPrefix, isPlurHookCommand } from '../lib/hook-command.js'
 import {
   buildMcpServerEntry,
   claudeDesktopConfigPath,
@@ -689,9 +690,8 @@ function settingsRefusal(path: string): string {
 }
 
 function isPlurHook(entry: HookEntry): boolean {
-  return (entry.hooks ?? []).some((h) =>
-    h.command.includes('@plur-ai/cli') || h.command.includes('.plur/bin/plur-hook'),
-  )
+  // Both slash styles, quoted or not (#1267) — see isPlurHookCommand.
+  return (entry.hooks ?? []).some((h) => isPlurHookCommand(h.command ?? ''))
 }
 
 function hasPlurHooks(settings: Settings): boolean {
@@ -1339,7 +1339,12 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Fallback PINNED, never floating (#1069 class, data-loss audit finding 7):
   // an unpinned spec re-resolves on every publish and races the npx cache
   // rewrite that SIGKILLs whatever pages in a native binary mid-rewrite.
-  const cmd = shim.shimPath || `npx -y @plur-ai/cli@${CLI_VERSION}` // fallback if shim failed
+  // The shim path is quoted on Windows (and wherever it contains a space):
+  // harnesses run hook commands through a shell, and an unquoted
+  // `C:\Users\Test User\...` splits at the space (#1267).
+  const cmd = shim.shimPath
+    ? hookCommandPrefix(shim.shimPath)
+    : `npx -y @plur-ai/cli@${CLI_VERSION}` // fallback if shim failed
 
   // Install local MCP shim — same fix pattern for MCP server launch (#234)
   const mcpShim = installMcpBinary()

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### `plur init` works on Windows, including home directories with a space
+
+**An enterprise deployment reported editors on Windows not set up, or set up
+twice** (#1267). Three separate faults:
+
+- **Hook commands were the bare shim path.** Harnesses run hooks through a
+  shell, so `C:\Users\Test User\.plur\bin\plur-hook.cmd hook-inject` split at
+  the space and every hook failed. The shim path is now quoted on Windows, and
+  on any platform where it contains whitespace. A macOS/Linux path without a
+  space is written byte-for-byte as before (pinned by a snapshot test).
+- **Re-running init did not recognise its own hooks.** The matcher looked for
+  `.plur/bin/plur-hook` with forward slashes only, so every re-run on Windows
+  appended another hook set. It now normalises slashes, quotes and case. Re-run
+  `plur init` once: it removes the duplicated, unquoted hooks older versions
+  wrote and leaves exactly one set per event. Your own hooks are untouched.
+- **The MCP entry launched a `.cmd`.** Current Node refuses to spawn a `.cmd`
+  directly (`spawn EINVAL`). On Windows the entry is now
+  `{ command: <node.exe>, args: [<@plur-ai/mcp js entry>] }`, for Claude Code,
+  Claude Desktop, Cursor, Codex and Antigravity alike. When the js entry cannot
+  be resolved (a CLI-only install), the pinned `cmd.exe /c npx` form remains
+  the fallback. Re-running init heals an existing `plur-mcp.cmd` entry that init
+  wrote; a hand-written entry is never changed.
+
 ### An unscoped write can no longer land in a team store
 
 **If you wrote an engram without a scope, it could be auto-routed into a shared

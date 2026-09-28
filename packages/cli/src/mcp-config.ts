@@ -53,6 +53,22 @@ export function findMcpShim(): string | null {
 }
 
 /**
+ * The @plur-ai/mcp js entry `plur init` resolved when it installed the MCP
+ * shim, read from `~/.plur/bin/plur-mcp.meta.json`. Null when the metadata is
+ * missing or unreadable, or the file it names no longer exists (the package
+ * was moved or uninstalled since).
+ */
+export function findMcpJsEntry(): string | null {
+  try {
+    const meta = JSON.parse(readFileSync(join(homedir(), '.plur', 'bin', 'plur-mcp.meta.json'), 'utf8')) as { entrypoint?: unknown }
+    if (typeof meta.entrypoint === 'string' && meta.entrypoint.length > 0 && existsSync(meta.entrypoint)) {
+      return meta.entrypoint
+    }
+  } catch { /* no metadata — caller falls back */ }
+  return null
+}
+
+/**
  * Build the MCP server entry to register for the `plur` server.
  *
  * Preferred: local shim at ~/.plur/bin/plur-mcp installed by `plur init`.
@@ -63,12 +79,30 @@ export function findMcpShim(): string | null {
  * without the user's shell PATH, which would cause `npx` to fail with
  * "command not found". On Windows, uses `cmd.exe /c npx ...` which
  * inherits the system PATH.
+ *
+ * Windows (#1267): `{ command: <node.exe>, args: [<@plur-ai/mcp js entry>] }`
+ * whenever the entry is resolvable, never the `.cmd` shim; the npx form
+ * above is the documented fallback when it is not.
  */
 export function buildMcpServerEntry(opts?: { env?: Record<string, string> }): McpServerEntry {
-  // Prefer the local shim if `plur init` has installed it.
-  const shim = findMcpShim()
-  if (shim) {
-    return { command: shim, args: [], ...(opts?.env ? { env: opts.env } : {}) }
+  if (platform() === 'win32') {
+    // Windows never gets the `.cmd` shim as a command (#1267): current Node
+    // refuses to spawn a `.cmd` directly (`spawn EINVAL`, the
+    // CVE-2024-27980 hardening), and MCP clients spawn without a shell. The
+    // shim's own resolution — node binary plus @plur-ai/mcp's js entry,
+    // recorded by `plur init` in plur-mcp.meta.json — is launched directly
+    // instead. When that entry cannot be resolved, the pinned
+    // `cmd.exe /c npx` fallback below applies (cmd.exe is a real executable).
+    const entrypoint = findMcpJsEntry()
+    if (entrypoint) {
+      return { command: process.execPath, args: [entrypoint], ...(opts?.env ? { env: opts.env } : {}) }
+    }
+  } else {
+    // Prefer the local shim if `plur init` has installed it.
+    const shim = findMcpShim()
+    if (shim) {
+      return { command: shim, args: [], ...(opts?.env ? { env: opts.env } : {}) }
+    }
   }
   // npx fallback pins THIS CLI's version, never @latest (#1069 root cause).
   // An @latest entry makes npx re-resolve on every publish and REWRITE the
@@ -375,9 +409,11 @@ export function upgradePlurMcpEntry(config: Record<string, unknown>, opts?: { en
   const servers = (config.mcpServers ?? {}) as Record<string, McpServerEntry | undefined>
   const existing = servers.plur
   if (!existing) return false
-  if (!isRaceyPlurNpxEntry(existing)) return false
+  if (!isRaceyPlurNpxEntry(existing) && !isOwnWin32CmdShimEntry(existing)) return false
   const effectiveOpts = opts ?? (existing.env ? { env: existing.env } : undefined)
   const recommended = buildMcpServerEntry(effectiveOpts)
+  if (recommended.command === existing.command &&
+      JSON.stringify(recommended.args) === JSON.stringify(existing.args ?? [])) return false
   // Field-level MERGE, not object replacement (0.19.1 data-loss audit,
   // finding 2): a user entry can carry keys we never modeled — type, cwd,
   // timeout, disabled, envFile — and `servers.plur = recommended` silently
@@ -390,6 +426,19 @@ export function upgradePlurMcpEntry(config: Record<string, unknown>, opts?: { en
   }
   config.mcpServers = servers as Record<string, unknown>
   return true
+}
+
+/**
+ * Is this the Windows `.cmd` MCP shim entry an older `plur init` wrote
+ * (`~/.plur/bin/plur-mcp.cmd`, no args)? Current Node cannot spawn it
+ * (`spawn EINVAL`), so re-running init heals it to the node.exe form (#1267).
+ * Matches only our own shim path, in either slash style; any other command is
+ * the user's and is never touched.
+ */
+function isOwnWin32CmdShimEntry(entry: McpServerEntry): boolean {
+  if (platform() !== 'win32') return false
+  const cmd = (entry.command ?? '').replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
+  return cmd.endsWith('/.plur/bin/plur-mcp.cmd') && (entry.args ?? []).length === 0
 }
 
 /**
