@@ -407,6 +407,37 @@ describe('outbox lease — two processes flushing one store', () => {
     } finally { failFirst(); releaseSecond() }
   })
 
+  it("learn() keeps its in-flight claim until the failed push is recorded: a flush in the same instance does not POST the row", async () => {
+    // The ordering the WritePath §1c text relies on: the claim is released only
+    // AFTER the failure bookkeeping write. A flush in the same instance queued
+    // on the store lock ahead of that write must find the row still claimed.
+    const a = new Plur({ path: dir })
+    let failFirst!: () => void
+    const firstGate = new Promise<void>(r => { failFirst = r })
+    let arrivals = 0
+    server.appendHook = async (n: number) => {
+      arrivals = n
+      if (n === 1) { await firstGate; server.appendErrorResponse = { status: 503, body: 'down' }; return }
+      server.appendErrorResponse = null
+    }
+    try {
+      const e = await a.learn('a team fact whose failed push is still being recorded', { scope: SCOPE, type: 'behavioral' })
+      await waitFor(() => arrivals === 1, "learn()'s POST to be on the wire")
+      const lock = await holdStoreLock()
+      const flushing = a.flushOutbox() // queued on the lock ahead of the failure bookkeeping
+      await new Promise(r => setTimeout(r, 30))
+      failFirst()
+      await new Promise(r => setTimeout(r, 100)) // the failure reaches learn(), which waits for the lock
+      await lock.release()
+      const r = await flushing
+      expect(r.flushed, 'the flush took a row whose failed push was not yet recorded').toBe(0)
+      expect(server.appendCalls, 'the flush POSTed the row before the failure bookkeeping landed').toBe(1)
+      await waitFor(() => rowOf(e.id)?.structured_data?._outbox?.attempt_count === 1, "the failed push's bookkeeping")
+      expect(server.appendCalls).toBe(1)
+      expect(rowOf(e.id)?.structured_data?._outboxLease, 'the failed push released its lease').toBeUndefined()
+    } finally { failFirst() }
+  })
+
   it('a flush whose lease runs short mid-batch does not start the remaining pushes', async () => {
     const a = new Plur({ path: dir })
     const e1 = await queued(a, 'the first team fact of a batch that outlives its lease')
