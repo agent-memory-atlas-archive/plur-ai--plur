@@ -25,7 +25,7 @@ const ids = (file: string): string[] =>
 
 // Many real git invocations per case; generous timeout for a loaded machine.
 describe('formal-persistence: sync pulls while scope:local engrams exist', { timeout: 120_000 }, () => {
-  isolateGitConfig()
+  isolateGitConfig({ defaultBranch: 'main' }) // the fixture names `main`
   let base: string, bare: string, A: string, B: string
 
   beforeEach(() => {
