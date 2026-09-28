@@ -360,6 +360,43 @@ describe('supersedes chain — a replaced engram is not injected as current', ()
     expect(ids).toContain('ENG-2026-0102-003')
   })
 
+  it('a draft or expired replacement inside an injectable pack does not suppress the engram it supersedes', () => {
+    // The pack loop has its own deliverability gate; the personal-loop tests
+    // above do not reach it.
+    for (const replacement of [
+      make({ ...tip(), commitment: 'draft' }),
+      make({ ...tip(), temporal: { learned_at: '2026-01-01', valid_until: '2026-01-31' } }),
+    ]) {
+      const result = selectAndSpread(
+        { prompt: 'how do I deploy the website', maxTokens: 5000 },
+        [older()], [packOf('always', [replacement])],
+      )
+      const ids = allIds(result)
+      expect(ids).toContain('ENG-2026-0102-001')
+      expect(ids).not.toContain('ENG-2026-0102-002')
+    }
+  })
+
+  it('members of a supersede cycle inside a pack are still injected', () => {
+    const a = make({
+      id: 'ENG-2026-0102-001',
+      statement: 'deploy the website with npm run deploy',
+      relations: rel(['ENG-2026-0102-002'], ['ENG-2026-0102-002']),
+    })
+    const b = make({
+      id: 'ENG-2026-0102-002',
+      statement: 'deploy the website with the deploy.sh script',
+      relations: rel(['ENG-2026-0102-001'], ['ENG-2026-0102-001']),
+    })
+    const result = selectAndSpread(
+      { prompt: 'how do I deploy the website', maxTokens: 5000 },
+      [], [packOf('always', [a, b])],
+    )
+    const ids = allIds(result)
+    expect(ids).toContain('ENG-2026-0102-001')
+    expect(ids).toContain('ENG-2026-0102-002')
+  })
+
   it('a historical prompt still reaches the superseded engram', () => {
     const result = selectAndSpread(
       { prompt: 'how did we previously deploy the website', maxTokens: 5000 },

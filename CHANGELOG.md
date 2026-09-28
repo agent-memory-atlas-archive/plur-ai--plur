@@ -15,7 +15,9 @@ replacement could not be injected here — retired, only in a remote store, a
 draft awaiting approval, expired, or in an `on_request` pack — the old one is
 kept, re-ranked as before, rather than lost. Engrams that supersede themselves
 or each other in a loop are also kept at the old re-rank instead of all
-disappearing. Recall is unchanged (#997 keeps that question open).
+disappearing. Only the engram's direct replacement counts: on a chain
+A → B → C where B cannot be injected but C can, A is kept at the old re-rank
+beside C. Recall is unchanged (#997 keeps that question open).
 
 **Another project's engrams no longer reach a scoped session.** The prompt
 hook reads the directory's `.plur.yaml` scope and passes it on, and the

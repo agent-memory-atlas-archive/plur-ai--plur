@@ -371,6 +371,10 @@ function isSupersededEngram(engram: ScoredEngram): boolean {
  * whose own superseded_by chain leads back to this engram (A → B → A), would
  * otherwise make every member of the loop disappear; each member keeps the
  * ×0.3 re-rank instead, as before #1232.
+ *
+ * Only DIRECT superseded_by edges count. On a chain A → B → C where B is not
+ * deliverable and C is, A is not suppressed: it keeps the ×0.3 re-rank and is
+ * injected beside C, as before #1232.
  */
 function isReplacedByDeliverable(
   engram: Engram,
