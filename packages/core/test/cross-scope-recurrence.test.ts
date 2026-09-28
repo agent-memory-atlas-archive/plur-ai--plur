@@ -269,7 +269,8 @@ describe('cross-scope recurrence (#176)', () => {
       expect((eng as any).write_count).toBe(1)
 
       // Cross-scope relearn → write_count=2, same engram returned
-      const relearned = await plur.learn('comms rule', { scope: 'group:team/comms' })
+      // Personal→personal (a shared write would not be absorbed, #1268).
+      const relearned = await plur.learn('comms rule', { scope: 'local' })
       expect(relearned.id).toBe(eng.id)  // cross-scope recurrence matched, same ID
       expect((relearned as any).write_count).toBe(2)
 
@@ -303,8 +304,10 @@ describe('cross-scope recurrence (#176)', () => {
       const first = await plur.learn('personal rule', { scope: 'local' })
       expect(first.scope).toBe('local')
 
-      await plur.learn('personal rule', { scope: 'project:a' })  // 1st cross-scope, recurrence=1
-      const third = await plur.learn('personal rule', { scope: 'project:b' })  // 2nd cross-scope
+      // Personal scopes only: since #1268 a shared write (project:*) is never
+      // absorbed into a personal engram, so it would not recur onto this one.
+      await plur.learn('personal rule', { scope: 'user:a' })  // 1st cross-scope, recurrence=1
+      const third = await plur.learn('personal rule', { scope: 'agent:b' })  // 2nd cross-scope
 
       // recurrence_count increments as normal
       expect(third.recurrence_count).toBe(2)

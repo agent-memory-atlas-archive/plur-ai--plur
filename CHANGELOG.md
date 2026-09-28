@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### A team save is no longer swallowed by a personal note with the same text (#1268)
+
+**A shared-scope write whose text matched a personal engram was never
+written.** Cross-scope recurrence (#176) matched any active engram with the same
+content hash in a different scope, and on a match it updates that engram
+*instead* of writing a new one. So a `group:` or `project:` learn identical to
+something in `global`, `local`, `user:` or `agent:` bumped the personal note's
+recurrence count and nothing reached the team scope. Found while triaging an
+enterprise deployment's report of team saves that never reached the team store.
+
+A shared-scope write now only recurs onto a shared engram — or onto one the
+ladder itself graduated to `global` from a shared origin, so the #176 escalation
+keeps working. It otherwise becomes its own engram in the scope you named.
+Shared↔shared recurrence, personal→personal recurrence, and a personal write
+recurring onto a shared engram behave as before.
+
 ### An unscoped write can no longer land in a team store
 
 **If you wrote an engram without a scope, it could be auto-routed into a shared

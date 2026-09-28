@@ -2142,10 +2142,29 @@ export class Plur {
     // commitment. A false positive here is louder than a missed one.
     if (!isHashable(statement)) return null
     const hash = computeContentHash(statement)
+    // #1268: a shared-scope write is never absorbed into a personal engram.
+    // The recurrence path returns the hit INSTEAD of writing, so a team save
+    // whose text matched a personal note used to update the note and never
+    // reach the team scope. Only shared hits count for a shared write;
+    // shared↔shared and personal→(any) recurrence are unchanged.
+    //
+    // "Shared" includes an engram this ladder itself graduated: on the 2nd
+    // cross-scope hit a shared engram is broadened to 'global' (see
+    // `_recordCrossScopeRecurrence`), and later shared hits must keep landing
+    // on it or the ladder would restart with a duplicate at every new scope.
+    // It is recognisable by its ORIGIN — `sources[0]` is the scope it was first
+    // written at, and only a shared origin is ever broadened (#362 ceiling).
+    const sharedWrite = isSharedScope(currentScope)
+    const sharedOrGraduated = (e: Engram): boolean => {
+      if (isSharedScope(e.scope)) return true
+      const origin = (e as any).sources?.[0]?.scope
+      return e.scope === 'global' && typeof origin === 'string' && isSharedScope(origin)
+    }
     for (const e of engrams) {
       if (e.status === 'active'
           && (e as any).content_hash === hash
-          && e.scope !== currentScope) {
+          && e.scope !== currentScope
+          && (!sharedWrite || sharedOrGraduated(e))) {
         return e
       }
     }
