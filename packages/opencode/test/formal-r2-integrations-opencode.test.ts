@@ -42,7 +42,7 @@ describe('render path: at most one injection per request', () => {
     const pushed = out.parts.filter((p: any) => p.synthetic && String(p.text).includes(BLOCK_TEXT))
     expect(pushed).toHaveLength(1)
     const sys = await transform(hooks, 's1')      // transform fires again in this turn
-    expect(sys.system.filter(s => s.includes(BLOCK_TEXT))).toHaveLength(0)
+    expect(sys.system.filter((s: string) => s.includes(BLOCK_TEXT))).toHaveLength(0)
   })
 
   it('good case: the next turn renders through system.transform again', async () => {
@@ -55,7 +55,7 @@ describe('render path: at most one injection per request', () => {
     const out3 = await chat(hooks, 's1', 'm3')
     expect(out3.parts.some((p: any) => p.synthetic)).toBe(false)
     const sys = await transform(hooks, 's1')
-    expect(sys.system.filter(s => s.includes(BLOCK_TEXT))).toHaveLength(1)
+    expect(sys.system.filter((s: string) => s.includes(BLOCK_TEXT))).toHaveLength(1)
   })
 })
 

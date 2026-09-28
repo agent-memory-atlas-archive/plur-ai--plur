@@ -59,7 +59,9 @@ function gatedRemote() {
     if (mode === 'gate') {
       await new Promise<void>(r => waiters.push(r))
       // Switching to 'fail' before release() fails the gated POST itself.
-      if (mode === 'fail') throw new Error('fetch failed')
+      // `mode` is reassigned by setMode() while this POST is parked, so the
+      // widening cast only undoes TypeScript's narrowing from the check above.
+      if ((mode as 'ok' | 'fail' | 'gate') === 'fail') throw new Error('fetch failed')
     }
     return { ok: true, status: 201, json: async () => ({ id: `SRV-${++n}` }), text: async () => '' } as unknown as Response
   })
