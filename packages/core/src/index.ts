@@ -2045,10 +2045,25 @@ export class Plur {
    * Never throws — provenance is a description, and failing to write one must
    * not fail the learn that prompted it.
    */
+  /**
+   * Run fire-and-forget work only once the store has committed (#1178, F16).
+   *
+   * A transactional store runs a protected write inside one connection and one
+   * ownership context. Background work started inside that context would
+   * inherit it, then fail once the transaction ends, or run against state that
+   * a later rollback discards. Stores without transactions run it immediately.
+   */
+  private _afterStoreCommit(callback: () => void): void {
+    if (this._primaryStore.afterCommit) this._primaryStore.afterCommit(callback)
+    else callback()
+  }
+
   private _maybeWriteProvenance(engramId: string): void {
     if (provenanceMode(this.config) !== 'always') return
-    void this.writeProvenance(engramId).catch(err => {
-      logger.warning(`[plur:provenance] could not write a record for ${engramId}: ${(err as Error).message}`)
+    this._afterStoreCommit(() => {
+      void this.writeProvenance(engramId).catch(err => {
+        logger.warning(`[plur:provenance] could not write a record for ${engramId}: ${(err as Error).message}`)
+      })
     })
   }
 
@@ -3163,56 +3178,61 @@ export class Plur {
         // with nothing attached — an unhandled rejection, which terminates the
         // process on modern Node. A background task must not be able to take
         // the host down.
-        void (async () => {
-          let pushed = false
-          try {
-            await remoteDriver.append(engram)
-            pushed = true
-          } catch (err) {
-            // Already saved locally with outbox metadata — will be retried.
-            logger.warning(`[plur:outbox] immediate push failed for ${engram.id}, queued for retry: ${(err as Error).message}`)
-            await this._withStoreLock(this.paths.engrams, async () => {
-              // Targeted read (#827): only this engram's outbox bookkeeping.
-              const fresh = await this._loadTargeted([engram.id])
-              const target = fresh.find(e => e.id === engram.id) as any
-              if (target?.structured_data?._outbox) {
-                target.structured_data._outbox.last_error = (err as Error).message
-                target.structured_data._outbox.attempt_count = 1
-                // Incremental write (#740): only the outbox bookkeeping changed.
-                await this._updateEngrams(fresh, [target as Engram])
-              }
-            })
-            return
-          }
+        // Started only once the local write has committed (#1178, F16). A
+        // transactional primary store would otherwise hand this task the
+        // write's own connection, which is gone by the time it runs.
+        this._afterStoreCommit(() => {
+          void (async () => {
+            let pushed = false
+            try {
+              await remoteDriver.append(engram)
+              pushed = true
+            } catch (err) {
+              // Already saved locally with outbox metadata — will be retried.
+              logger.warning(`[plur:outbox] immediate push failed for ${engram.id}, queued for retry: ${(err as Error).message}`)
+              await this._withStoreLock(this.paths.engrams, async () => {
+                // Targeted read (#827): only this engram's outbox bookkeeping.
+                const fresh = await this._loadTargeted([engram.id])
+                const target = fresh.find(e => e.id === engram.id) as any
+                if (target?.structured_data?._outbox) {
+                  target.structured_data._outbox.last_error = (err as Error).message
+                  target.structured_data._outbox.attempt_count = 1
+                  // Incremental write (#740): only the outbox bookkeeping changed.
+                  await this._updateEngrams(fresh, [target as Engram])
+                }
+              })
+              return
+            }
 
-          if (!pushed) return
-          // Remote has it. Remove the local copy — and if this fails, say so
-          // rather than re-queueing something already accepted.
-          try {
-            await this._withStoreLock(this.paths.engrams, async () => {
-              // NOT `_loadTargeted` (#827): this REMOVES a row, and the only
-              // removal primitive `PrimaryStore` has is a whole-corpus save of
-              // the array without it. A one-row targeted read here would be a
-              // full replace by an empty array — the corpus, deleted. It stays
-              // a full load until there is a `remove`/`deleteMany` seam.
-              const fresh = await this._primaryStore.load()
-              const idx = fresh.findIndex(e => e.id === engram.id)
-              if (idx !== -1) {
-                fresh.splice(idx, 1)
-                // Deliberate removal: the remote accepted this engram, so the
-                // local copy is redundant by design (audit #794 shrink guard).
-                await this._writeEngrams(this.paths.engrams, fresh, { allowShrink: true })
-                await this._syncIndex()
-              }
-            })
-          } catch (err) {
-            logger.warning(
-              `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
-              + `${(err as Error).message}. It will be retried, which may create a duplicate on the remote.`,
-            )
-          }
-        })().catch(err => {
-          logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
+            if (!pushed) return
+            // Remote has it. Remove the local copy — and if this fails, say so
+            // rather than re-queueing something already accepted.
+            try {
+              await this._withStoreLock(this.paths.engrams, async () => {
+                // NOT `_loadTargeted` (#827): this REMOVES a row, and the only
+                // removal primitive `PrimaryStore` has is a whole-corpus save of
+                // the array without it. A one-row targeted read here would be a
+                // full replace by an empty array — the corpus, deleted. It stays
+                // a full load until there is a `remove`/`deleteMany` seam.
+                const fresh = await this._primaryStore.load()
+                const idx = fresh.findIndex(e => e.id === engram.id)
+                if (idx !== -1) {
+                  fresh.splice(idx, 1)
+                  // Deliberate removal: the remote accepted this engram, so the
+                  // local copy is redundant by design (audit #794 shrink guard).
+                  await this._writeEngrams(this.paths.engrams, fresh, { allowShrink: true })
+                  await this._syncIndex()
+                }
+              })
+            } catch (err) {
+              logger.warning(
+                `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
+                + `${(err as Error).message}. It will be retried, which may create a duplicate on the remote.`,
+              )
+            }
+          })().catch(err => {
+            logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
+          })
         })
 
         this._appendHistory({
@@ -4319,7 +4339,7 @@ export class Plur {
       if (typeof adapter.listEngramsMissingEmbeddings === 'function') {
         const gap = await adapter.listEngramsMissingEmbeddings(1)
         if (gap.length > 0) {
-          this._kickPrimaryAutoEmbed(adapter)
+          this._afterStoreCommit(() => this._kickPrimaryAutoEmbed(adapter))
           return fallback()
         }
       }
@@ -7452,7 +7472,7 @@ export class Plur {
     const primary = this._primaryQueryAdapter()
     if (primary && typeof primary.listEngramsMissingEmbeddings === 'function') {
       this._lastIndexError = null // new pass — stale failures cleared on success
-      this._kickPrimaryAutoEmbed(primary)
+      this._afterStoreCommit(() => this._kickPrimaryAutoEmbed(primary))
       return
     }
     if (this.indexedStorage) {

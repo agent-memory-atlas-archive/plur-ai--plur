@@ -87,6 +87,10 @@ export interface SaveOptions {
  * that satisfies neither is outside what the engine can defend.
  */
 export interface PrimaryStore {
+  /** Queue background work until the current transaction commits. Stores
+   * without transactions may omit this capability. */
+  afterCommit?(callback: () => void): void
+
   /** Backing medium — for diagnostics and `status()` reporting. */
   readonly kind: PrimaryStoreKind
 

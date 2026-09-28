@@ -915,7 +915,7 @@ let tmpCounter = 0
  * already been renamed away. Unique names make concurrent writers independent;
  * the last rename wins cleanly instead of publishing a half-written blend.
  */
-export function atomicWrite(filePath: string, content: string, opts: AtomicWriteOptions = {}): void {
+export function atomicWrite(filePath: string, content: string | Buffer, opts: AtomicWriteOptions = {}): void {
   const durable = opts.durable !== false
   const dir = dirname(filePath)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
