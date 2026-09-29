@@ -7,7 +7,14 @@ import { createInterface } from 'readline'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { outputInfo } from '../output.js'
 import { CLI_VERSION } from '../version.js'
-import { hookCommandPrefix, isPlurHookCommand } from '../lib/hook-command.js'
+import {
+  hookCommandPrefix,
+  isPlurHookSpec,
+  claudeHookSpec,
+  windowsHookCommand,
+  resolveShortPath,
+  type StringHookHost,
+} from '../lib/hook-command.js'
 import {
   buildMcpServerEntry,
   claudeDesktopConfigPath,
@@ -104,10 +111,19 @@ interface HookEntry {
   hooks: Array<{
     type: string
     command: string
+    /** Exec form (decision H3, Windows): argv spawned with no shell. */
+    args?: string[]
     timeout?: number
     async?: boolean
   }>
 }
+
+/**
+ * Builds the launch part of one Claude Code hook: `{ command }` (a shell
+ * string, darwin/linux) or `{ command, args }` (exec form, Windows).
+ * See `claudeHookSpec`.
+ */
+type HookLaunch = (sub: string, ...extra: string[]) => { command: string; args?: string[] }
 
 // ── Hook shim installation ──────────────────────────────────────────────────
 // Instead of using `npx @plur-ai/cli hook-*` (slow, races on version bumps),
@@ -257,12 +273,12 @@ function installMcpBinary(): { shimPath: string; status: string } {
 // Installed into global ~/.claude/settings.json unconditionally (issue #95) so
 // they fire from any subdirectory project. Each hook silent-passes when
 // isPlurConfigured() is false, so projects without plur are unaffected.
-function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
+function buildEnforcementHooks(mk: HookLaunch): Record<string, HookEntry[]> {
   return {
     SessionStart: [
       {
         hooks: [
-          { type: 'command', command: `${cmd} hook-session-remind`, timeout: 3 },
+          { type: 'command', ...mk('hook-session-remind'), timeout: 3 },
         ],
       },
     ],
@@ -273,7 +289,7 @@ function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
     SessionEnd: [
       {
         hooks: [
-          { type: 'command', command: `${cmd} hook-session-end`, timeout: 5 },
+          { type: 'command', ...mk('hook-session-end'), timeout: 5 },
         ],
       },
     ],
@@ -284,7 +300,7 @@ function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
       {
         matcher: '*',
         hooks: [
-          { type: 'command', command: `${cmd} hook-session-guard`, timeout: 3 },
+          { type: 'command', ...mk('hook-session-guard'), timeout: 3 },
         ],
       },
     ],
@@ -294,7 +310,7 @@ function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
       {
         matcher: 'mcp__plur__plur_session_start',
         hooks: [
-          { type: 'command', command: `${cmd} hook-session-mark`, timeout: 3 },
+          { type: 'command', ...mk('hook-session-mark'), timeout: 3 },
         ],
       },
     ],
@@ -304,7 +320,7 @@ function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
 // Injection hooks pull relevant engrams into the conversation context. Installed
 // at the path chosen by --global/--project (default project) because per-project
 // domain/scope tuning may matter for what gets injected.
-function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
+function buildInjectionHooks(mk: HookLaunch): Record<string, HookEntry[]> {
   return {
     // First message: inject engrams based on the prompt.
     // Subsequent messages: periodic reminder to call plur_learn (~1ms skip).
@@ -319,7 +335,7 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
     UserPromptSubmit: [
       {
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject`, timeout: 90, async: true },
+          { type: 'command', ...mk('hook-inject'), timeout: 90, async: true },
         ],
       },
     ],
@@ -329,7 +345,7 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
       {
         matcher: 'auto|manual',
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject --rehydrate`, timeout: 90, async: true },
+          { type: 'command', ...mk('hook-inject', '--rehydrate'), timeout: 90, async: true },
         ],
       },
     ],
@@ -339,28 +355,28 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
       {
         matcher: 'EnterPlanMode',
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject --event plan_mode`, timeout: 10 },
+          { type: 'command', ...mk('hook-inject', '--event', 'plan_mode'), timeout: 10 },
         ],
       },
       // Domain-specific engrams when a skill is invoked
       {
         matcher: 'Skill',
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject --event skill`, timeout: 10 },
+          { type: 'command', ...mk('hook-inject', '--event', 'skill'), timeout: 10 },
         ],
       },
       // Agent-scoped engrams when spawning an agent
       {
         matcher: 'Agent',
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject --event agent`, timeout: 10 },
+          { type: 'command', ...mk('hook-inject', '--event', 'agent'), timeout: 10 },
         ],
       },
       // Observation capture — log tool calls for offline pattern extraction
       {
         matcher: 'Bash|Edit|Write|Agent',
         hooks: [
-          { type: 'command', command: `${cmd} hook-observe`, timeout: 3 },
+          { type: 'command', ...mk('hook-observe'), timeout: 3 },
         ],
       },
     ],
@@ -369,7 +385,7 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
       {
         matcher: 'Bash|Edit|Write|Agent',
         hooks: [
-          { type: 'command', command: `${cmd} hook-observe --post`, timeout: 3 },
+          { type: 'command', ...mk('hook-observe', '--post'), timeout: 3 },
         ],
       },
     ],
@@ -379,7 +395,7 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
       {
         matcher: '.*',
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject --event subagent`, timeout: 10 },
+          { type: 'command', ...mk('hook-inject', '--event', 'subagent'), timeout: 10 },
         ],
       },
     ],
@@ -390,7 +406,7 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
       {
         matcher: '*',
         hooks: [
-          { type: 'command', command: `${cmd} hook-learn-check`, timeout: 2 },
+          { type: 'command', ...mk('hook-learn-check'), timeout: 2 },
         ],
       },
     ],
@@ -691,8 +707,9 @@ function settingsRefusal(path: string): string {
 }
 
 function isPlurHook(entry: HookEntry): boolean {
-  // The shim or npx fallback plus a known subcommand (#1267) — see isPlurHookCommand.
-  return (entry.hooks ?? []).some((h) => isPlurHookCommand(h.command ?? ''))
+  // PLUR's launcher (shim, npx fallback, or the Windows exec form) plus any
+  // hook-* (decisions H2, H3) — see isPlurHookSpec.
+  return (entry.hooks ?? []).some(isPlurHookSpec)
 }
 
 function hasPlurHooks(settings: Settings): boolean {
@@ -715,7 +732,7 @@ function stripPlurHooks(settings: Settings): Settings {
     const kept: HookEntry[] = []
     for (const e of entries) {
       if (!isPlurHook(e)) { kept.push(e); continue }
-      const own = e.hooks.filter((h) => !isPlurHookCommand(h.command ?? ''))
+      const own = e.hooks.filter((h) => !isPlurHookSpec(h))
       if (own.length > 0) kept.push({ ...e, hooks: own })
     }
     if (kept.length > 0) {
@@ -1357,18 +1374,35 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Fallback PINNED, never floating (#1069 class, data-loss audit finding 7):
   // an unpinned spec re-resolves on every publish and races the npx cache
   // rewrite that SIGKILLs whatever pages in a native binary mid-rewrite.
-  // The shim path is quoted on Windows (and wherever it contains a space):
-  // harnesses run hook commands through a shell, and an unquoted
-  // `C:\Users\Test User\...` splits at the space (#1267).
-  const cmd = shim.shimPath
-    ? hookCommandPrefix(shim.shimPath)
-    : `npx -y @plur-ai/cli@${CLI_VERSION}` // fallback if shim failed
+  // darwin/linux: the shim path, quoted only if it contains whitespace —
+  // byte-identical to earlier versions otherwise.
+  const npxCmd = `npx -y @plur-ai/cli@${CLI_VERSION}` // fallback if shim failed
+  const cmd = shim.shimPath ? hookCommandPrefix(shim.shimPath) : npxCmd
+  const win32 = platform() === 'win32'
+
+  // Decision H3: on Windows no hook relies on shell quoting. Claude Code gets
+  // the exec form (node + CLI js entry + subcommand, no shell); Codex, Cursor
+  // and Antigravity get one unquoted forward-slash string (8.3 short path
+  // when the path has whitespace; a reported per-editor fallback otherwise).
+  const hookLaunch: HookLaunch = (sub, ...extra) => claudeHookSpec({
+    plat: platform(),
+    shellCmd: cmd,
+    node: process.execPath,
+    cliEntry: shim.shimPath ? resolveCliEntrypoint() : null,
+  }, sub, ...extra)
+  let shortPathMemo: string | null | undefined
+  const shortPath = (p: string): string | null => {
+    if (shortPathMemo === undefined) shortPathMemo = resolveShortPath(p)
+    return shortPathMemo
+  }
+  const stringHookCmd = (host: StringHookHost): string =>
+    win32 && shim.shimPath ? windowsHookCommand(shim.shimPath, host, shortPath).command : cmd
 
   // Install local MCP shim — same fix pattern for MCP server launch (#234)
   const mcpShim = installMcpBinary()
 
-  const PLUR_HOOKS_ENFORCEMENT = buildEnforcementHooks(cmd)
-  const PLUR_HOOKS_INJECTION = buildInjectionHooks(cmd)
+  const PLUR_HOOKS_ENFORCEMENT = buildEnforcementHooks(hookLaunch)
+  const PLUR_HOOKS_INJECTION = buildInjectionHooks(hookLaunch)
 
   const injectionPath = findSettingsPath(flags, args)
   const enforcementPath = join(homedir(), '.claude', 'settings.json')
@@ -1472,15 +1506,15 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   }
 
   const agyStatus = shouldSetupAntigravity(args)
-    ? containLeg('Antigravity', () => installAntigravity(cmd))
+    ? containLeg('Antigravity', () => installAntigravity(stringHookCmd('agy')))
     : 'skipped (no ~/.gemini/antigravity-cli found — pass --antigravity to force, --no-antigravity to silence this)'
 
   const codexStatus = shouldSetupCodex(args)
-    ? containLeg('Codex', () => installCodex(cmd))
+    ? containLeg('Codex', () => installCodex(stringHookCmd('codex')))
     : 'skipped (no ~/.codex found — pass --codex to force, --no-codex to silence this)'
 
   const cursorStatus = shouldSetupCursor(args)
-    ? containLeg('Cursor', () => installCursor(cmd))
+    ? containLeg('Cursor', () => installCursor(stringHookCmd('cursor')))
     : 'skipped (no .cursor/ dir found — pass --cursor to force, --no-cursor to silence this)'
 
   const opencodeStatus = shouldSetupOpencode(args)
@@ -1557,11 +1591,13 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     // that only clones the repo, that path won't exist and PLUR silently
     // won't start there. `plur doctor` now catches this after the fact
     // (cursorWired checks the command exists); this warns before it bites.
-    // The shim path may be quoted (#1267); test the path itself.
-    const bareCmd = cmd.replace(/"/g, '')
-    if (bareCmd.startsWith('/') || /^[A-Za-z]:\\/.test(bareCmd)) {
+    // The path may be quoted, forward-slashed or behind PowerShell's `& `
+    // (#1267, decision H3); test the path itself.
+    const cursorCmd = stringHookCmd('cursor')
+    const bareCmd = cursorCmd.replace(/^&\s+/, '').replace(/"/g, '')
+    if (bareCmd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(bareCmd)) {
       outputInfo('  Committing .cursor/mcp.json / .cursor/hooks.json? Their command is this machine\'s local', flags)
-      outputInfo(`  path (${cmd}) — it won't exist on a teammate's machine or a fresh Background Agent VM.`, flags)
+      outputInfo(`  path (${cursorCmd}) — it won't exist on a teammate's machine or a fresh Background Agent VM.`, flags)
       outputInfo('  Run `plur init --cursor` there too (it pins the right version — avoid @latest, #1069).', flags)
     }
   }

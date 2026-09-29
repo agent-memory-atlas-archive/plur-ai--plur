@@ -41,21 +41,41 @@ skips it.
 **An enterprise deployment reported editors on Windows not set up, or set up
 twice** (#1267). Three separate faults:
 
-- **Hook commands were the bare shim path.** Harnesses run hooks through a
+- **Hook commands were the bare shim path.** Editors run hooks through a
   shell, so `C:\Users\Test User\.plur\bin\plur-hook.cmd hook-inject` split at
-  the space and every hook failed. The shim path is now quoted on Windows, and
-  on any platform where it contains whitespace. A macOS/Linux path without a
-  space is written byte-for-byte as before (pinned by a snapshot test).
+  the space and every hook failed. Quoting the path does not fix it: the
+  editors use different shells (Git Bash or PowerShell for Claude Code,
+  PowerShell for Codex and reportedly Cursor, `cmd /C` with escaped quotes
+  for Antigravity), and a quoted path is an expression in PowerShell and a
+  wrong name in Antigravity. So on Windows no hook relies on shell quoting:
+  - **Claude Code** hooks use the documented exec form — `command` + `args`,
+    spawned with no shell (https://code.claude.com/docs/en/hooks): node plus
+    the CLI's js entry plus the subcommand.
+  - **Codex, Cursor and Antigravity** hooks are one unquoted string with
+    forward slashes. When the path contains a space, init uses its Windows
+    8.3 short name (`C:/Users/TESTUS~1/...`). If the volume has no short
+    names, Codex and Cursor get PowerShell's `& "<path>"` and Antigravity the
+    plain path, and `plur doctor` names each affected editor
+    (`windowsHookFallback`), because those hooks may not run.
+  - A Windows CI job (`Windows init hooks`) runs `plur init` into a home with
+    a space and executes every generated hook through `bash -c`,
+    `pwsh -NoProfile -Command` and `cmd /C`, checking each one reached the CLI.
+
+  macOS/Linux output is unchanged: the path is quoted only when it contains
+  whitespace, and a path without one is written byte-for-byte as before
+  (pinned by a snapshot test).
 - **Re-running init did not recognise its own hooks.** The matcher looked for
   `.plur/bin/plur-hook` with forward slashes only, so every re-run on Windows
   appended another hook set. It now normalises slashes, quotes and case, and
-  claims a hook only when it runs PLUR's shim (or the `npx @plur-ai/cli`
-  fallback) with one of the subcommands init writes. Re-run `plur init` once:
-  it removes the duplicated, unquoted hooks older versions wrote and leaves
-  exactly one set per event. Your own hooks are untouched, including one that
-  shares an entry with a PLUR hook.
-  `plur doctor` uses the same matcher, so it no longer reports Windows hooks
-  as missing.
+  claims a hook when PLUR's own launcher — the shim, the `npx @plur-ai/cli`
+  fallback, or the Claude Code exec form — runs any `hook-*` subcommand. There
+  is no subcommand list to keep up to date, so a new hook never duplicates on
+  re-init. Re-run `plur init` once: it removes the duplicated, unquoted hooks
+  older versions wrote and leaves exactly one set per event. Your own hooks are
+  untouched, including one named `hook-*` that another program runs and one
+  that shares an entry with a PLUR hook. `plur doctor`, the Cursor and Codex
+  legs and `plur-mcp init` use the same matcher (`plur-mcp init` no longer adds
+  a second set next to the shim hooks `plur init` wrote).
 - **The MCP entry launched a `.cmd`.** Current Node refuses to spawn a `.cmd`
   directly (`spawn EINVAL`). On Windows the entry is now
   `{ command: <node.exe>, args: [<@plur-ai/mcp js entry>] }`, for Claude Code,

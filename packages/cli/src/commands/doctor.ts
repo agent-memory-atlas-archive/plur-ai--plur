@@ -17,7 +17,7 @@ import {
   readConfig,
 } from '../mcp-config.js'
 import { hasPlurCursorHooks, readCursorHooksConfig } from '../cursor-hooks.js'
-import { isPlurHookCommand } from '../lib/hook-command.js'
+import { isPlurHookCommand, isPlurHookSpec } from '../lib/hook-command.js'
 import { hasPlurCodexHooks, readCodexHooksConfig } from '../codex-hooks.js'
 import { hasPlurAgyHooks, readAgyHooksConfig } from '../antigravity-hooks.js'
 import { codexHome, missingNodeEntryPaths, readCodexPlurMcpEntry, isOwnWin32CmdShimEntry } from '../mcp-config.js'
@@ -126,6 +126,14 @@ interface DoctorReport {
    */
   codexCmdShimMcp: boolean
   /**
+   * Windows only (decision H3): the editors whose PLUR hook path still
+   * contains whitespace because no 8.3 short path was available — `plur
+   * init` wrote PowerShell's `& "<path>"` (Codex, Cursor) or the plain path
+   * (Antigravity, where no quoted form runs). Those hooks may not run.
+   * Empty elsewhere and when every hook path is a single unquoted word.
+   */
+  windowsHookFallback: string[]
+  /**
    * Antigravity CLI (agy). Same machine-level detection rationale as Codex —
    * reported as its own line, deliberately NOT folded into `overall`. Unlike
    * Codex there is no trust caveat: agy runs configured hooks immediately.
@@ -225,16 +233,58 @@ interface OpencodeReport {
 }
 
 function hasAnyPlurHook(config: Record<string, unknown>): boolean {
-  const hooks = (config.hooks ?? {}) as Record<string, Array<{ hooks?: Array<{ command?: string }> }>>
+  const hooks = (config.hooks ?? {}) as Record<string, Array<{ hooks?: Array<{ command?: string; args?: unknown }> }>>
   for (const entries of Object.values(hooks)) {
     for (const entry of entries) {
       for (const h of entry.hooks ?? []) {
-        // The same two-part matcher init uses: binary plus known subcommand (#1267).
-        if (h.command && isPlurHookCommand(h.command)) return true
+        // The same matcher init uses: PLUR's launcher (shim, npx, or the
+        // Windows exec form) plus any hook-* (decisions H2, H3).
+        if (isPlurHookSpec(h)) return true
       }
     }
   }
   return false
+}
+
+/** Every string under a `command` key, anywhere in a parsed hooks file. */
+function collectHookCommands(value: unknown, out: string[] = []): string[] {
+  if (Array.isArray(value)) for (const v of value) collectHookCommands(v, out)
+  else if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === 'command' && typeof v === 'string') out.push(v)
+      else collectHookCommands(v, out)
+    }
+  }
+  return out
+}
+
+/**
+ * The string-hook editors (Cursor, Codex, Antigravity) whose PLUR hook
+ * launcher path still contains whitespace — the fallback `plur init` writes
+ * on Windows when no 8.3 short path exists (decision H3). Such a hook relies
+ * on PowerShell's `& "<path>"` (Codex, Cursor) or cannot run at all
+ * (Antigravity, whose `cmd /C` escapes quotes).
+ */
+function windowsHookFallbackEditors(configs: ConfigFileReport[]): string[] {
+  const editors: Array<[string, string]> = [
+    ['Cursor', 'Cursor (.cursor/hooks.json)'],
+    ['Codex', 'Codex (~/.codex/hooks.json)'],
+    ['Antigravity', 'Antigravity (~/.gemini/config/hooks.json)'],
+  ]
+  const out: string[] = []
+  for (const [name, label] of editors) {
+    const c = configs.find((x) => x.label === label)
+    if (!c?.exists) continue
+    let parsed: unknown
+    try { parsed = JSON.parse(readFileSync(c.path, 'utf8')) } catch { continue }
+    const fallback = collectHookCommands(parsed).some((cmd) => {
+      if (!isPlurHookCommand(cmd)) return false
+      const launcher = cmd.slice(0, cmd.search(/\shook-[a-z0-9]/i)).replace(/^&\s+/, '').replace(/"/g, '')
+      return /\s/.test(launcher)
+    })
+    if (fallback) out.push(name)
+  }
+  return out
 }
 
 function hasStaleNpxHooks(config: Record<string, unknown>): boolean {
@@ -957,6 +1007,11 @@ function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<Doctor
     codexTomlReport?.exists && codexTomlReport.hasPlurMcp && !codexCmdShimMcp,
   )
 
+  // Decision H3: on Windows a string-editor hook must be a single unquoted
+  // path. When init had to fall back (the path has whitespace and no 8.3
+  // short name exists), name the editor: its hooks may not run.
+  const windowsHookFallback = platform() === 'win32' ? windowsHookFallbackEditors(configs) : []
+
   // Antigravity health, from agy's OWN two files only.
   const agyDetected = existsSync(join(homedir(), '.gemini', 'antigravity-cli'))
   const agyHooksReport = configs.find((c) => c.label === 'Antigravity (~/.gemini/config/hooks.json)')
@@ -1047,7 +1102,7 @@ function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<Doctor
     return {
       configs, hooksInstalled, mcpRegistered, datacoreCollision, staleNpxHooks, staleNpxMcp, brokenNodeMcp,
       hookShim, mcpShim, handshake, cursorHandshake, embedder,
-      cursorProjectDetected, cursorWired, codexDetected, codexWired, codexCmdShimMcp, agyDetected, agyWired,
+      cursorProjectDetected, cursorWired, codexDetected, codexWired, codexCmdShimMcp, windowsHookFallback, agyDetected, agyWired,
       pgliteGemmaReembedNeeded, staleContentHashes, pgliteOrphan, opencode, overall,
     }
   })
@@ -1199,6 +1254,16 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
     outputText(`✓ MCP shim:  ${report.mcpShim.shimPath}`)
   } else {
     outputText(`✗ MCP shim:  ${report.mcpShim.error}`)
+  }
+
+  for (const editor of report.windowsHookFallback ?? []) {
+    outputText('')
+    outputText(`✗ ${editor} hooks: the PLUR hook path contains a space and no 8.3 short name is available,`)
+    outputText(editor === 'Antigravity'
+      ? '   and Antigravity runs hooks through cmd /C, where no quoted path works — its hooks will not run.'
+      : '   so init wrote PowerShell\'s `& "<path>"` form, which runs only if the editor uses PowerShell.')
+    outputText('   Fix: enable 8.3 names on the volume (`fsutil 8dot3name set`), or install to a path without spaces,')
+    outputText('   then re-run `plur init`.')
   }
 
   for (const b of report.brokenNodeMcp) {

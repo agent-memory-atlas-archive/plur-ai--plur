@@ -23,14 +23,18 @@ import { builtCliPath } from './helpers/built-cli.js'
 const CLI = builtCliPath(join(__dirname, '..'))
 const WIN32_PRELOAD = pathToFileURL(join(__dirname, 'helpers', 'win32-platform.mjs')).href
 
-interface HookSpec { command: string; timeout?: number; async?: boolean }
+interface HookSpec { command: string; args?: string[]; timeout?: number; async?: boolean }
 interface Settings {
   hooks?: Record<string, Array<{ matcher?: string; hooks: HookSpec[] }>>
   mcpServers?: Record<string, { command: string; args: string[] }>
 }
 
 function allCommands(settings: Settings): string[] {
-  return Object.values(settings.hooks ?? {}).flatMap((entries) => entries.flatMap((e) => e.hooks.map((h) => h.command)))
+  return Object.values(settings.hooks ?? {}).flatMap((entries) => entries.flatMap((e) => e.hooks.map((h) => [h.command, ...(h.args ?? [])].join(' '))))
+}
+
+function allSpecs(settings: Settings): HookSpec[] {
+  return Object.values(settings.hooks ?? {}).flatMap((entries) => entries.flatMap((e) => e.hooks))
 }
 
 describe('plur init on win32 with a home dir containing a space (#1267)', { timeout: 60000 }, () => {
@@ -54,21 +58,29 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
   const settingsPath = () => join(home, '.claude', 'settings.json')
   const readSettings = (): Settings => JSON.parse(readFileSync(settingsPath(), 'utf-8'))
 
-  it('quotes every hook command around the shim path', () => {
+  // Decision H3: Claude Code hooks use the documented exec form on Windows
+  // (https://code.claude.com/docs/en/hooks) — no shell, so no quoting.
+  it('writes every Claude Code hook in exec form: node + the CLI js entry + hook-*', () => {
     runInit()
-    const shim = join(home, '.plur', 'bin', 'plur-hook.cmd')
-    const commands = allCommands(readSettings())
-    expect(commands.length).toBeGreaterThan(5)
-    for (const c of commands) expect(c.startsWith(`"${shim}" hook-`)).toBe(true)
+    const specs = allSpecs(readSettings())
+    expect(specs.length).toBeGreaterThan(5)
+    for (const h of specs) {
+      expect(h.command).toBe(process.execPath)
+      expect(h.args?.[0]).toMatch(/[\\/]cli[\\/]dist[\\/]index\.js$/)
+      expect(h.args?.[1]).toMatch(/^hook-/)
+    }
   })
 
-  it('quotes Cursor hook commands too', () => {
+  // Decision H3: string editors get the unquoted short path. This host has no
+  // cmd.exe to ask for one, so Cursor (a PowerShell editor) gets the
+  // `& "<path>"` fallback, and doctor reports it (below).
+  it('Cursor on a spaced home without short names: the & "<path>" fallback', () => {
     runInit(['--cursor'])
-    const shim = join(home, '.plur', 'bin', 'plur-hook.cmd')
+    const shim = join(home, '.plur', 'bin', 'plur-hook.cmd').replace(/\\/g, '/')
     const cursor = JSON.parse(readFileSync(join(home, '.cursor', 'hooks.json'), 'utf-8'))
     const commands = Object.values(cursor.hooks as Record<string, HookSpec[]>).flat().map((h) => h.command)
     expect(commands.length).toBe(4)
-    for (const c of commands) expect(c.startsWith(`"${shim}" hook-cursor-`)).toBe(true)
+    for (const c of commands) expect(c.startsWith(`& "${shim}" hook-cursor-`)).toBe(true)
   })
 
   it('two init runs leave exactly one PLUR hook set per event', () => {
@@ -103,7 +115,7 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     const settings = readSettings()
     const commands = allCommands(settings)
     expect(commands.some((c) => c.includes('C:\\Users'))).toBe(false)
-    expect(settings.hooks?.UserPromptSubmit?.filter((e) => e.hooks[0].command.includes('hook-inject'))).toHaveLength(1)
+    expect(settings.hooks?.UserPromptSubmit?.filter((e) => e.hooks[0].args?.[1] === 'hook-inject')).toHaveLength(1)
     expect(settings.hooks?.SessionStart).toHaveLength(1)
     expect(settings.hooks?.Stop).toHaveLength(1)
     // The user's own hook survives.
@@ -138,8 +150,7 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     // Legacy PLUR hooks are gone: no unquoted shim, no npx form.
     expect(commands).not.toContain(legacy)
     expect(commands.some((c) => c.includes('npx @plur-ai/cli'))).toBe(false)
-    const shim = join(home, '.plur', 'bin', 'plur-hook.cmd')
-    expect(commands.filter((c) => c === `"${shim}" hook-inject`)).toHaveLength(1)
+    expect(allSpecs(settings).filter((h) => h.args?.length === 2 && h.args[1] === 'hook-inject')).toHaveLength(1)
   })
 
   it('heals a node-form MCP entry whose node.exe and js entry no longer exist', () => {
@@ -185,12 +196,16 @@ describe('plur doctor sees Windows hooks (#1267)', { timeout: 60000 }, () => {
   afterEach(() => { rmSync(home, { recursive: true, force: true }) })
 
   it.each([
-    ['unquoted backslash (older init)', 'C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd hook-inject'],
-    ['quoted backslash (this init)', '"C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd" hook-inject'],
-  ])('reports hooksInstalled for a %s hook', (_label, command) => {
+    ['unquoted backslash (older init)', { command: 'C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd hook-inject' }],
+    ['quoted backslash (#1267 first round)', { command: '"C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd" hook-inject' }],
+    ['exec form (decision H3)', {
+      command: 'C:\\Program Files\\nodejs\\node.exe',
+      args: ['C:\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js', 'hook-inject'],
+    }],
+  ])('reports hooksInstalled for a %s hook', (_label, spec) => {
     mkdirSync(join(home, '.claude'), { recursive: true })
     writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
-      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command }] }] },
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', ...spec }] }] },
     }, null, 2))
     let stdout: string
     try {

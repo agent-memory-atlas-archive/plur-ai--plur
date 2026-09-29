@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url'
 import { homedir, platform } from 'os'
 
 import { VERSION } from './version.js'
+import { isPlurHookCommand } from './hook-command.js'
 
 const HELP = `plur-mcp v${VERSION} — persistent memory for AI agents
 
@@ -287,7 +288,10 @@ function installHooks(): string {
   for (const entries of Object.values(hooks)) {
     for (const entry of (entries as HookEntry[])) {
       for (const h of entry.hooks ?? []) {
-        if (h.command.includes('@plur-ai/cli')) {
+        // The same matcher `plur init` uses (decision H2): the shim or npx
+        // launcher followed by any hook-*. The old `@plur-ai/cli` substring
+        // missed the shim-form hooks `plur init` writes and added a second set.
+        if (typeof h.command === 'string' && isPlurHookCommand(h.command)) {
           return `already installed in ${settingsPath}`
         }
       }
