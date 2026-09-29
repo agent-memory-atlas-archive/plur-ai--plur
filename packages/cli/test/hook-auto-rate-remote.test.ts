@@ -16,10 +16,9 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { spawn, spawnSync } from 'child_process'
-import yaml from 'js-yaml'
 import { StubServer } from '../../core/test/helpers/stub-server.js'
 import { RemoteStore } from '../../core/src/store/remote-store.js'
-import { namespaceEngramId } from '../../core/src/engrams.js'
+import { namespaceEngramId, loadEngrams } from '../../core/src/engrams.js'
 import { builtCliPath } from './helpers/built-cli.js'
 import { trustDirectory } from '@plur-ai/core'
 
@@ -55,7 +54,8 @@ describe('hook-auto-rate × remote store (#1318 review)', { timeout: 120_000 }, 
     mkdirSync(join(root, '.plur'), { recursive: true })
     writeFileSync(join(project, '.plur.yaml'), '# test project\n')
     writeFileSync(join(root, '.plur', 'engrams.yaml'), 'engrams: []\n')
-    writeFileSync(join(root, '.plur', 'config.yaml'), yaml.dump({
+    // JSON is valid YAML, so config.yaml needs no YAML serializer here.
+    writeFileSync(join(root, '.plur', 'config.yaml'), JSON.stringify({
       embeddings: { enabled: false },
       stores: [{ url: baseUrl, token: TOKEN, scope: SCOPE, readonly: false }],
       index: false,
@@ -145,8 +145,8 @@ describe('hook-auto-rate × remote store (#1318 review)', { timeout: 120_000 }, 
     server.feedbackDelayMs = 6_000 // the remote rating is slow
     const learn = spawnSync(process.execPath, [CLI, 'learn', LOCAL_STATEMENT, '--scope', 'global'], { env, cwd: project, encoding: 'utf8' })
     expect(learn.status, learn.stderr).toBe(0)
-    const localId = (yaml.load(readFileSync(join(root, '.plur', 'engrams.yaml'), 'utf8')) as any).engrams
-      .find((e: any) => e.statement === LOCAL_STATEMENT).id
+    const localId = loadEngrams(join(root, '.plur', 'engrams.yaml'))
+      .find(e => e.statement === LOCAL_STATEMENT)!.id
     injected('r-3', [localId, remoteId])
     const reply = `Done. ${LOCAL_STATEMENT}. Also: ${REMOTE_STATEMENT}.`
     const payload = { hook_event_name: 'Stop', session_id: 'r-3', cwd: project, last_assistant_message: reply }
@@ -157,8 +157,7 @@ describe('hook-auto-rate × remote store (#1318 review)', { timeout: 120_000 }, 
     expect(hook.ms).toBeLessThan(6_000)
     await idle()
     expect(server.feedbackBodies).toEqual([{ signal: 'positive', source: 'auto' }])
-    const localAfter = () => (yaml.load(readFileSync(join(root, '.plur', 'engrams.yaml'), 'utf8')) as any).engrams
-      .find((e: any) => e.id === localId)
+    const localAfter = () => loadEngrams(join(root, '.plur', 'engrams.yaml')).find(e => e.id === localId) as any
     expect(localAfter().feedback_signals.positive).toBe(1)
     // The same reply again: nothing is applied twice.
     server.feedbackDelayMs = 0
@@ -196,7 +195,7 @@ describe('hook-auto-rate × remote store (#1318 review)', { timeout: 120_000 }, 
       await stop('cap-1', CAPTURE_REPLY, { PLUR_AUTO_CAPTURE: '1' })
       expect(server.lastAppendBody).toBeNull()
       expect(server.engramCount).toBe(1) // only the seeded engram
-      const local = (yaml.load(readFileSync(join(root, '.plur', 'engrams.yaml'), 'utf8')) as any).engrams ?? []
+      const local = loadEngrams(join(root, '.plur', 'engrams.yaml')) as any[]
       const captured = local.find((x: any) => /contract dispute/.test(x.statement))
       expect(captured).toBeTruthy()
       expect(captured.scope).not.toBe(SCOPE)
@@ -207,7 +206,7 @@ describe('hook-auto-rate × remote store (#1318 review)', { timeout: 120_000 }, 
       trustDirectory(project, join(root, '.plur'))
       server.lastAppendBody = null
       await stop('cap-2', CAPTURE_REPLY, { PLUR_AUTO_CAPTURE: '1' })
-      expect(String(server.lastAppendBody?.statement ?? '')).toMatch(/contract dispute/)
+      expect(String((server.lastAppendBody as Record<string, unknown> | null)?.statement ?? '')).toMatch(/contract dispute/)
     }, 60_000)
   })
 

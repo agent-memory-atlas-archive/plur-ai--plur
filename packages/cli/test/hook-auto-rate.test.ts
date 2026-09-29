@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir, hostname } from 'os'
-import yaml from 'js-yaml'
+import { loadEngrams } from '@plur-ai/core'
 import { namespaceEngramId } from '../../core/src/engrams.js'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
@@ -93,8 +93,7 @@ function writeLargeStore(e: Env, n: number, extra: string): string {
 }
 
 function engrams(e: Env): Array<Record<string, any>> {
-  const doc = yaml.load(readFileSync(join(e.plurPath, 'engrams.yaml'), 'utf8')) as { engrams?: any[] }
-  return doc?.engrams ?? []
+  return loadEngrams(join(e.plurPath, 'engrams.yaml')) as Array<Record<string, any>>
 }
 
 function history(e: Env): Array<Record<string, any>> {
@@ -207,14 +206,15 @@ describe('hook-auto-rate (#1310)', { timeout: 120_000 }, () => {
       mkdirSync(teamDir, { recursive: true })
       const teamFile = join(teamDir, 'engrams.yaml')
       const B = 'Staging secrets live in the vault under the ops path'
-      writeFileSync(teamFile, yaml.dump({ engrams: [{
+      // JSON is valid YAML, so the fixtures need no YAML serializer.
+      writeFileSync(teamFile, JSON.stringify({ engrams: [{
         id: 'ENG-2026-0901-001', version: 2, status: 'active', consolidated: false, type: 'behavioral',
         scope: 'project:x', visibility: 'private', statement: B,
         activation: { retrieval_strength: 0.7, storage_strength: 1.0, frequency: 0, last_accessed: '2026-09-01' },
         feedback_signals: { positive: 0, negative: 0, neutral: 0 }, associations: [], derivation_count: 1,
         tags: [], pack: null, abstract: null, derived_from: null, reference_count: 1, sources: [],
       }] }))
-      writeFileSync(join(e.plurPath, 'config.yaml'), yaml.dump({ index: false, stores: [{ path: teamFile, scope: 'project:x', shared: false }] }))
+      writeFileSync(join(e.plurPath, 'config.yaml'), JSON.stringify({ index: false, stores: [{ path: teamFile, scope: 'project:x', shared: false }] }))
       const bId = namespaceEngramId('ENG-2026-0901-001', 'project:x')
       const rateDir = join(e.root, 'tmp', 'plur-auto-rate')
       mkdirSync(rateDir, { recursive: true, mode: 0o700 })
@@ -233,7 +233,7 @@ describe('hook-auto-rate (#1310)', { timeout: 120_000 }, () => {
       cli(e, ['hook-auto-rate', 'claude'], payload, { PLUR_AUTO_RATE_CEILING_MS: '2000' })
       const aEvents = history(e).filter(h => h.event === 'feedback_received' && h.engram_id === a)
       expect(aEvents).toHaveLength(1)
-      const bStored = (yaml.load(readFileSync(teamFile, 'utf8')) as any).engrams[0]
+      const bStored = loadEngrams(teamFile)[0] as any
       expect(bStored.feedback_signals.positive).toBe(1)
     }, 120_000)
   })
