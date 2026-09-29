@@ -58,6 +58,13 @@ twice** (#1267). Three separate faults:
   wrote, and a node-form entry whose `node.exe` or js entry no longer exists
   (after a Node upgrade or a version-manager switch); `plur doctor` reports
   such an entry as broken. A hand-written entry is never changed.
+  Codex keeps its registration in `config.toml`, which init does not edit by
+  hand: when that registration is exactly the old `plur-mcp.cmd` shim, re-running
+  `plur init --codex` replaces it through `codex mcp remove` + `codex mcp add`,
+  and `plur doctor` flags it (`codexCmdShimMcp`) until then.
+- The warning about committing `.cursor/hooks.json` with a machine-local path
+  fires again when that path is quoted, and `plur init --no-opencode` now says
+  it skipped opencode because of the flag.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
