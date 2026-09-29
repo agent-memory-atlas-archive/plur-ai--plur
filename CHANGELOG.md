@@ -57,7 +57,10 @@ Now:
   disk is never taken for `Proj`). `set` merges them into one entry in the
   on-disk case; it keeps only their mode (the most restrictive one, unless
   you set a mode), never a trust grant or scope that did not apply. `rm`
-  removes all of them, and `untrust` clears their grants.
+  removes all of them, and `untrust` clears their grants. The same holds
+  for two entries that spell one folder differently, such as `~/dup` and
+  its absolute path (both kept by the `trust.yaml` import): `set` merges
+  them, so `--no-trusted` revokes every grant, and `rm` removes both.
 
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
 

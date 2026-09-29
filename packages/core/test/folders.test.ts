@@ -183,6 +183,28 @@ describe('resolveFolderPolicy', () => {
     expect(loadFolderMap(root).folders).toEqual([{ path: other, plur: 'off', trusted: true }])
   })
 
+  it('two entries for one folder (`~/dup` and its absolute form) are both revoked, merged and removed', () => {
+    const d = mk('dup')
+    const two = () => writeMap([{ path: '~/dup', trusted: true }, { path: d, trusted: true, plur: 'off' }])
+    const trusted = () => isTrustedInMap(loadFolderMap(root).folders, d, home)
+
+    two()
+    expect(trusted()).toBe(true)
+    expect(setFolderEntry(root, d, { trusted: false }, { configuredScopes: [], home }))
+      .toEqual({ path: '~/dup', plur: 'off' })
+    expect(loadFolderMap(root).folders).toEqual([{ path: '~/dup', plur: 'off' }])
+    expect(trusted()).toBe(false)
+
+    two()
+    setFolderEntry(root, d, { scope: 'project:d' }, { configuredScopes: [], home })
+    expect(loadFolderMap(root).folders).toEqual([{ path: '~/dup', trusted: true, scope: 'project:d' }])
+
+    two()
+    expect(removeFolderEntry(root, d, home)).toBe(true)
+    expect(loadFolderMap(root).folders).toEqual([])
+    expect(trusted()).toBe(false)
+  })
+
   // #1357: `Ⓟ`/`ⓟ` and `Ⅱ`/`ⅱ` are cased but not letters (no \p{L}), so a
   // check that swaps only letters compared such a folder with itself. On a
   // case-sensitive filesystem they are sibling folders; no edit of one may
