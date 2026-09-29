@@ -12,6 +12,7 @@ import { tmpdir } from 'os'
 import { pathToFileURL } from 'url'
 import { execFileSync } from 'child_process'
 import { builtCliPath } from './helpers/built-cli.js'
+import { isolatedHomeEnv } from './helpers/isolated-env.js'
 
 const CLI = builtCliPath(join(__dirname, '..'))
 const WIN32_PRELOAD = pathToFileURL(join(__dirname, 'helpers', 'win32-platform.mjs')).href
@@ -45,7 +46,7 @@ describe('decision H3: string editors on win32', { timeout: 60000 }, () => {
     try {
       return execFileSync(process.execPath, ['--import', WIN32_PRELOAD, CLI, ...args], {
         encoding: 'utf-8', timeout: 30000, cwd: home,
-        env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${bin}:${process.env.PATH}` },
+        env: { ...isolatedHomeEnv(home), PATH: `${bin}:${process.env.PATH}` },
       })
     } catch (err: unknown) {
       return String((err as { stdout?: Buffer | string }).stdout ?? '')
