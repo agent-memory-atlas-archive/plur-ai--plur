@@ -4,6 +4,7 @@ import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { createPlur } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
+import { hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js' // decision H1
 
 /**
  * plur hook-session-end — Claude Code SessionEnd hook (shipped v1.0.85).
@@ -38,9 +39,15 @@ function sessionKeys(payloadSessionId?: string): string[] {
   // Mirror plur_session_end's key resolution (tools.ts): payload session_id
   // first, then CLAUDE_SESSION_ID, then ppid — sanitized the same way as
   // hook-learn-check writes them.
-  return [payloadSessionId, process.env.CLAUDE_SESSION_ID, String(process.ppid)]
+  //
+  // Owner decision H1 ("payload"): the writer's key is hookSessionKey; the
+  // shared legacyHookSessionKeys adds the forms older writers used (the
+  // env-first stripped key, including its 'default'). The per-candidate
+  // stripped forms below stay as a superset.
+  const perCandidate = [payloadSessionId, process.env.CLAUDE_SESSION_ID, String(process.ppid)]
     .filter(Boolean)
     .map(k => k!.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64))
+  return [...new Set([hookSessionKey(payloadSessionId), ...legacyHookSessionKeys(payloadSessionId), ...perCandidate])]
     .filter(Boolean)
 }
 

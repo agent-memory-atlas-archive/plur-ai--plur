@@ -4,6 +4,7 @@ import { tmpdir, homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
 import { ensureSessionDir, ticketCounter } from '../lib/codex-hook-io.js'
+import { hookSessionKey } from '../lib/session-key.js' // decision H1
 
 /**
  * plur hook-learn-check — Stop hook that prompts learning reflection
@@ -26,17 +27,24 @@ import { ensureSessionDir, ticketCounter } from '../lib/codex-hook-io.js'
 const LEARN_INTERVAL = 3 // Learning nudge every N stops
 const CHECKPOINT_INTERVAL = parseInt(process.env.PLUR_CHECKPOINT_INTERVAL || '10', 10)
 
-function sessionKey(): string {
-  const raw = process.env.CLAUDE_SESSION_ID || String(process.ppid || 'unknown')
-  return raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default'
+/**
+ * Owner decision H1 ("payload", 2026-09-29): the one shared helper —
+ * payload `session_id`, then CLAUDE_SESSION_ID, then ppid — so the checkpoint
+ * writer and every reader (hook-session-end, plur_session_end, the deferred
+ * wrap-up) agree. Readers also try the env-first stripped key this function
+ * used before (legacyHookSessionKeys). The stop counter is not migrated: an
+ * orphaned counter delays one nudge at most.
+ */
+function sessionKey(payloadSessionId?: unknown): string {
+  return hookSessionKey(payloadSessionId)
 }
 
-function counterPath(): string {
+function counterPath(key: string): string {
   const dir = join(tmpdir(), 'plur-sessions')
   // Vetted (formal r2, cli#8): a symlinked or foreign dir is refused and the
   // caller's fail-open branch passes the payload through untouched.
   if (!ensureSessionDir(dir)) throw new Error('session state dir refused')
-  return join(dir, `${sessionKey()}.stop-count`)
+  return join(dir, `${key}.stop-count`)
 }
 
 /**
@@ -67,8 +75,8 @@ function checkpointDir(flags: GlobalFlags): string {
   return dir
 }
 
-function writeCheckpoint(count: number, cwd: string, flags: GlobalFlags): void {
-  const id = sessionKey()
+function writeCheckpoint(id: string, count: number, cwd: string, flags: GlobalFlags): void {
+  // id: hookSessionKey of this Stop payload (H1)
   const dir = checkpointDir(flags)
   const path = join(dir, `${id}.checkpoint.json`)
 
@@ -140,10 +148,13 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
 
   // Parse stdin for cwd (provided by Claude Code hook payload)
   let cwd = process.cwd()
+  let payloadSessionId: unknown
   try {
     const data = JSON.parse(raw)
     if (data.cwd) cwd = data.cwd
+    payloadSessionId = data.session_id
   } catch { /* use process.cwd fallback */ }
+  const key = sessionKey(payloadSessionId)
 
   // Increment persistent counter (atomic append — see incrementCounter's docstring).
   // Fail-open: if the state dir is unwritable (read-only $TMPDIR, full disk),
@@ -152,7 +163,7 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   // throw on an unwritable filesystem, so wrap both.
   let count: number
   try {
-    count = incrementCounter(counterPath())
+    count = incrementCounter(counterPath(key))
   } catch {
     process.stdout.write(raw)
     return
@@ -160,7 +171,7 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
 
   // Write session checkpoint periodically (#215)
   if (count % CHECKPOINT_INTERVAL === 0) {
-    try { writeCheckpoint(count, cwd, flags) } catch { /* never block on checkpoint failure */ }
+    try { writeCheckpoint(key, count, cwd, flags) } catch { /* never block on checkpoint failure */ }
   }
 
   // Learning nudge every Nth stop

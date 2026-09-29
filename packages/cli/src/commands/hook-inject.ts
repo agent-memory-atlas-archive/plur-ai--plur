@@ -89,6 +89,7 @@ const REMINDER_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 // ignored .plur.yaml because the reader lived in this CLI-only file).
 import { claimHookDegradationLines, type Plur } from '@plur-ai/core'
 import { resolveProjectRemote, projectRemoteRefusalNotice, type ProjectRemote } from '../lib/project-remote.js'
+import { hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js' // decision H1
 
 /**
  * #776: the former `tryRemoteInject` remote-first POST /api/v1/inject path
@@ -144,6 +145,11 @@ function sessionDir(): string | null {
  * and skipped injection entirely. The payload id is the identity; ppid is the
  * fallback for payloads without one (and keeps those paths byte-identical to
  * before). The `sid-` prefix keeps the two key spaces disjoint.
+ *
+ * LEGACY since owner decision H1 ("payload", 2026-09-29): the hook keys its
+ * state with `hookSessionKey` (lib/session-key.ts). This is the key a pre-H1
+ * writer used — `legacyHookSessionKeys` produces it for readers — kept for
+ * its unit tests. Nothing writes under it.
  */
 export function injectSessionKey(input: Record<string, unknown>, ppid: number | string = process.ppid || 'unknown'): string {
   const sid = typeof input.session_id === 'string' ? input.session_id : ''
@@ -152,6 +158,22 @@ export function injectSessionKey(input: Record<string, unknown>, ppid: number | 
 
 function statePath(dir: string | null, key: string, ext: string): string | null {
   return dir ? join(dir, `${key}.${ext}`) : null
+}
+
+/**
+ * The state file for `key`, or — for a READER, when it does not exist — the
+ * same file under a key an older writer used (decision H1 upgrade path: the
+ * `sid-` key above, the uncapped or env-first forms), so a session started
+ * before the upgrade is not injected twice. Writers always use `key`.
+ */
+function readableStatePath(dir: string | null, input: Record<string, unknown>, key: string, ext: string): string | null {
+  const current = statePath(dir, key, ext)
+  if (!dir || !current || existsSync(current)) return current
+  for (const legacy of legacyHookSessionKeys(input.session_id)) {
+    const p = statePath(dir, legacy, ext)
+    if (p && existsSync(p)) return p
+  }
+  return current
 }
 
 function readStdinSync(): Record<string, unknown> {
@@ -480,8 +502,10 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Read the payload first: it carries the session identity (cli#7).
   const input = readStdinSync()
   const stateDir = sessionDir()
-  const key = injectSessionKey(input)
-  const marker = statePath(stateDir, key, 'marker')
+  // Owner decision H1 ("payload"): the one shared helper keys hook state; the
+  // marker reader also accepts a legacy-keyed marker (readableStatePath).
+  const key = hookSessionKey(input.session_id)
+  const marker = readableStatePath(stateDir, input, key, 'marker')
   const reminderPath = statePath(stateDir, key, 'reminded')
 
   // Contextual injection for specific events (plan_mode, skill, agent, subagent)
