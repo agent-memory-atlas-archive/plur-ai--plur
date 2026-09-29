@@ -28,7 +28,10 @@ Now:
   written when it could not be resolved. It now resolves the deepest existing
   folder above it and re-appends the rest, so `/var/…/missing` and
   `/private/var/…/missing` compare equal. The directory-trust checks use the
-  same helper.
+  same helper. A trust entry saved by an earlier version, for a folder that
+  did not exist yet under a symlinked parent, still grants trust (and
+  `plur untrust` still removes it). There is no migration step, and
+  `trust.yaml` is not rewritten.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 

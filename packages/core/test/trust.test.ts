@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, realpathSync } from 'fs'
-import { join } from 'path'
+import { join, resolve } from 'path'
+import yaml from 'js-yaml'
 import { tmpdir } from 'os'
 import {
   isDirectoryTrusted, trustDirectory, untrustDirectory, listTrustedDirectories, coveringTrustedAncestor,
@@ -163,5 +164,57 @@ describe('trust.ts (D2)', () => {
     } finally {
       rmSync(otherRoot, { recursive: true, force: true })
     }
+  })
+})
+
+/**
+ * Upgrade pin (#1319): before canonicalize resolved the existing ancestor of
+ * a missing path, `plur trust` on a folder that did not exist yet stored it
+ * plain-normalised — keeping a symlinked parent's spelling. Once the folder
+ * exists, the new code canonicalises the target to the real spelling. The old
+ * entry must still grant trust (and still be removable), with no rewrite of
+ * trust.yaml and no migration step.
+ */
+describe('trust.yaml entries written by the old canonicalize', () => {
+  let root: string
+  let base: string
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'plur-trust-old-root-'))
+    base = mkdtempSync(join(tmpdir(), 'plur-trust-old-base-'))
+    mkdirSync(join(base, 'real'))
+    symlinkSync(join(base, 'real'), join(base, 'link'), 'dir')
+  })
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(base, { recursive: true, force: true })
+  })
+
+  function writeOldEntry(): { oldEntry: string; text: string } {
+    // Exactly what the old `realpathSync(p) catch resolve(p)` stored for a
+    // folder that did not exist at trust time.
+    const oldEntry = resolve(join(base, 'link', 'later-project'))
+    const text = yaml.dump({ version: 1, trusted: [oldEntry] })
+    writeFileSync(join(root, 'trust.yaml'), text, 'utf8')
+    return { oldEntry, text }
+  }
+
+  it('still trusts the folder, and folders under it, once it exists', () => {
+    const { text } = writeOldEntry()
+    mkdirSync(join(base, 'real', 'later-project', 'sub'), { recursive: true })
+    expect(isDirectoryTrusted(join(base, 'link', 'later-project'), root)).toBe(true)
+    expect(isDirectoryTrusted(join(base, 'real', 'later-project'), root)).toBe(true)
+    expect(isDirectoryTrusted(join(base, 'real', 'later-project', 'sub'), root)).toBe(true)
+    expect(coveringTrustedAncestor(join(base, 'real', 'later-project', 'sub'), root)).not.toBeNull()
+    expect(isDirectoryTrusted(join(base, 'real'), root)).toBe(false)
+    expect(readFileSync(join(root, 'trust.yaml'), 'utf8')).toBe(text)
+  })
+
+  it('plur untrust removes the old entry', () => {
+    writeOldEntry()
+    mkdirSync(join(base, 'real', 'later-project'))
+    expect(untrustDirectory(join(base, 'real', 'later-project'), root)).toBe(true)
+    expect(isDirectoryTrusted(join(base, 'real', 'later-project'), root)).toBe(false)
   })
 })

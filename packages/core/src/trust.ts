@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
-import { join, sep } from 'path'
+import { join, resolve, sep } from 'path'
 import yaml from 'js-yaml'
 import { logger } from './logger.js'
 import { canonicalize } from './project-config.js'
@@ -54,6 +54,33 @@ function saveTrustFile(root: string, data: TrustFile): void {
 }
 
 /**
+ * The spellings a trust check compares (#1319). Entries written before
+ * canonicalize resolved the existing ancestor of a missing path kept a
+ * symlinked parent's spelling for a folder that did not exist at trust time.
+ * Comparing both the stored form and its canonical form — against both the
+ * target's canonical and plain-normalised forms — keeps those grants working
+ * after the upgrade with no rewrite of trust.yaml and no migration step.
+ */
+function targetForms(dir: string): string[] {
+  const canonical = canonicalize(dir)
+  const plain = resolve(dir)
+  return canonical === plain ? [canonical] : [canonical, plain]
+}
+
+function entryForms(entry: string): string[] {
+  const canonical = canonicalize(entry)
+  return canonical === entry ? [entry] : [entry, canonical]
+}
+
+function covers(entry: string, targets: string[]): boolean {
+  return entryForms(entry).some(f => targets.some(t => t === f || t.startsWith(f + sep)))
+}
+
+function sameDir(entry: string, targets: string[]): boolean {
+  return entryForms(entry).some(f => targets.includes(f))
+}
+
+/**
  * True when `dir` — or an ancestor of it — has been explicitly trusted.
  *
  * Hierarchical: trusting a repo root also trusts everything below it (VS
@@ -67,9 +94,9 @@ function saveTrustFile(root: string, data: TrustFile): void {
  * OPEN on a symlinked path component).
  */
 export function isDirectoryTrusted(dir: string, root: string): boolean {
-  const target = canonicalize(dir)
+  const targets = targetForms(dir)
   const { trusted } = loadTrustFile(root)
-  return trusted.some(t => target === t || target.startsWith(t + sep))
+  return trusted.some(t => covers(t, targets))
 }
 
 /**
@@ -93,11 +120,11 @@ export function trustDirectory(dir: string, root: string): string {
  * were never their own entries). Returns whether an entry was removed.
  */
 export function untrustDirectory(dir: string, root: string): boolean {
-  const target = canonicalize(dir)
+  const targets = targetForms(dir)
   const data = loadTrustFile(root)
-  const idx = data.trusted.indexOf(target)
-  if (idx === -1) return false
-  data.trusted.splice(idx, 1)
+  const kept = data.trusted.filter(t => !sameDir(t, targets))
+  if (kept.length === data.trusted.length) return false
+  data.trusted = kept
   saveTrustFile(root, data)
   return true
 }
@@ -124,7 +151,7 @@ export function listTrustedDirectories(root: string): string[] {
  * while claiming success.
  */
 export function coveringTrustedAncestor(dir: string, root: string): string | null {
-  const target = canonicalize(dir)
+  const targets = targetForms(dir)
   const { trusted } = loadTrustFile(root)
-  return trusted.find(t => target === t || target.startsWith(t + sep)) ?? null
+  return trusted.find(t => covers(t, targets)) ?? null
 }
