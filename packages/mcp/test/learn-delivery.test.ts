@@ -48,8 +48,8 @@ describe('plur_learn reports delivery (#1264)', () => {
       `index: false\nstores:\n  - url: https://store.example.test/sse\n    token: t\n    scope: ${TEAM}\n    shared: true\n    readonly: false\n`)
     globalThis.fetch = vi.fn(async (_u: string, init?: { method?: string }) => (
       (init?.method ?? 'GET') === 'POST'
-        ? { ok: true, status: 201, json: async () => ({ id: 'ENG-2026-09-28-901' }), text: async () => '' }
-        : { ok: true, status: 200, json: async () => ({ rows: [], total_count: 0 }), text: async () => '' }
+        ? ({ ok: true, status: 201, json: async () => ({ id: 'ENG-2026-09-28-901' }), text: async () => '' } as Response)
+        : ({ ok: true, status: 200, json: async () => ({ rows: [], total_count: 0 }), text: async () => '' } as Response)
     )) as any
     const plur = new Plur({ path: dir })
     const r = await learn(plur, { statement: 'team fact that reaches the store', scope: TEAM })
