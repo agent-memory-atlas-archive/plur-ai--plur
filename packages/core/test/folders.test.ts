@@ -90,18 +90,54 @@ describe('resolveFolderPolicy', () => {
     expect(policy(mk('notesX')).mode).toBe('ask')
   })
 
-  it('a .plur.yaml means on with its scope hint, unless a map entry sets scope', () => {
+  // Decision D1 (owner, 2026-09-29: "ignore-ask", matching #1228's E3): an
+  // UNTRUSTED .plur.yaml's scope/domain hints are ignored and the folder asks.
+  it('D1: an untrusted .plur.yaml that requests settings asks, with the reason and what it requests', () => {
     const repo = mk('src', 'repo')
     mkdirSync(join(repo, '.git'))
     writeFileSync(join(repo, '.plur.yaml'), 'scope: project:hint\ndomain: x.y\n')
+    expect(policy(repo)).toEqual({
+      mode: 'ask', remoteAllowed: false, source: 'plur-yaml',
+      reason: 'untrusted-plur-yaml', requested: { scope: 'project:hint', domain: 'x.y' },
+    })
+    // A remote request is named too (the URL, never the token).
+    writeFileSync(join(repo, '.plur.yaml'), 'remote_url: http://127.0.0.1:9\nremote_token: secret-token\n')
+    const p = policy(repo)
+    expect(p).toMatchObject({ mode: 'ask', reason: 'untrusted-plur-yaml', requested: { remote_url: 'http://127.0.0.1:9' } })
+    expect(JSON.stringify(p)).not.toContain('secret-token')
+  })
+
+  it('D1: a trusted .plur.yaml behaves exactly as before (on, its scope hint)', () => {
+    const repo = mk('src', 'repo')
+    mkdirSync(join(repo, '.git'))
+    writeFileSync(join(repo, '.plur.yaml'), 'scope: project:hint\ndomain: x.y\n')
+    writeMap([{ path: repo, trusted: true }])
     expect(policy(repo)).toEqual({ mode: 'on', scope: 'project:hint', remoteAllowed: false, source: 'plur-yaml' })
-
-    writeMap([{ path: '~/src/**', scope: 'project:mine' }])
+    // A map scope still beats the hint.
+    writeMap([{ path: repo, trusted: true }, { path: '~/src/**', scope: 'project:mine' }])
     expect(policy(repo)).toEqual({ mode: 'on', scope: 'project:mine', remoteAllowed: false, source: 'plur-yaml' })
-
-    // An explicit ask entry does not turn a .plur.yaml folder off (only off does).
-    writeMap([{ path: repo, plur: 'ask' }])
+    // An explicit ask entry does not turn a trusted .plur.yaml folder off (only off does).
+    writeMap([{ path: repo, trusted: true, plur: 'ask' }])
     expect(policy(repo).mode).toBe('on')
+  })
+
+  it('D1: an untrusted .plur.yaml under a map decision uses the map, never the hint', () => {
+    const repo = mk('src', 'repo')
+    mkdirSync(join(repo, '.git'))
+    writeFileSync(join(repo, '.plur.yaml'), 'scope: project:hint\n')
+    writeMap([{ path: '~/src/**', scope: 'project:mine' }])
+    expect(policy(repo)).toEqual({ mode: 'on', scope: 'project:mine', remoteAllowed: false, source: 'map' })
+    writeMap([{ path: repo, plur: 'on' }])
+    expect(policy(repo)).toEqual({ mode: 'on', remoteAllowed: false, source: 'map' })
+    writeMap([{ path: repo, plur: 'ask' }])
+    expect(policy(repo)).toMatchObject({ mode: 'ask', source: 'map' })
+  })
+
+  it('D1: a .plur.yaml that requests nothing still means on, trusted or not', () => {
+    const repo = mk('src', 'plain')
+    mkdirSync(join(repo, '.git'))
+    writeFileSync(join(repo, '.plur.yaml'), '# nothing here\n')
+    expect(policy(repo)).toEqual({ mode: 'on', remoteAllowed: false, source: 'plur-yaml' })
   })
 
   it('a project MCP config means on', () => {
@@ -115,7 +151,7 @@ describe('resolveFolderPolicy', () => {
     mkdirSync(join(repo, '.git'))
     writeFileSync(join(repo, '.plur.yaml'),
       'scope: project:r\nremote_url: http://127.0.0.1:9\nremote_token: t\nremote_scopes:\n  - project:r\n')
-    expect(policy(repo).remoteAllowed).toBe(false)
+    expect(policy(repo)).toMatchObject({ mode: 'ask', remoteAllowed: false, reason: 'untrusted-plur-yaml' })
 
     writeMap([{ path: repo, trusted: true }])
     expect(policy(repo)).toEqual({ mode: 'on', scope: 'project:r', remoteAllowed: true, source: 'plur-yaml' })

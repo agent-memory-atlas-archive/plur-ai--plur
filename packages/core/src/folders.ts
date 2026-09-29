@@ -18,7 +18,9 @@ import { isLocalOnlyScope } from './scope-target.js'
  *
  * `.plur.yaml` stays what it was: the repo's REQUEST. It cannot express map
  * entries; only this file, written only through the CLI, holds decisions.
- * Design note: docs/specs/2026-09-28-folder-map-design.md (r2).
+ * Design note: docs/specs/2026-09-28-folder-map-design.md (r3, approved), on
+ * the docs/field-report-triage branch; owner decision D1 ("ignore-ask") is in
+ * docs/audits/2026-09-29-formal-decisions.yaml there.
  *
  * ```yaml
  * version: 1
@@ -51,11 +53,19 @@ export type FolderPolicySource = 'map' | 'plur-yaml' | 'mcp-config' | 'default'
 
 export interface FolderPolicy {
   mode: FolderMode
-  /** Default write scope: a map entry's `scope`, else the `.plur.yaml` hint. */
+  /** Default write scope: a map entry's `scope`, else a TRUSTED `.plur.yaml`'s hint. */
   scope?: string
   /** True only when a `.plur.yaml` names a remote AND a covering entry is `trusted`. */
   remoteAllowed: boolean
   source: FolderPolicySource
+  /**
+   * Why the answer is `ask` when that is not simply "unmapped". Today only
+   * `untrusted-plur-yaml` (decision D1): the repo's `.plur.yaml` requests
+   * settings that need trust, and they are ignored until the user says yes.
+   */
+  reason?: 'untrusted-plur-yaml'
+  /** What that `.plur.yaml` requests, for the question. Never the token. */
+  requested?: { scope?: string; domain?: string; remote_url?: string }
 }
 
 const FolderEntrySchema = z.object({
@@ -391,9 +401,17 @@ export function isTrustedInMap(entries: FolderEntry[], dir: string, home: string
 }
 
 /**
- * Decide what PLUR does in `dir` (design r2 §Resolution):
+ * Decide what PLUR does in `dir` (design r2 §Resolution, with owner decision
+ * D1 "ignore-ask", 2026-09-29, matching #1228's E3):
  *  1. any matching `off` entry → off;
- *  2. a `.plur.yaml` → on; a map `scope` beats its hint; its remote only when trusted;
+ *  2. a `.plur.yaml`:
+ *     - TRUSTED (a covering `trusted: true` entry), or requesting nothing →
+ *       on, exactly as before; a map `scope` beats its hint; its remote only
+ *       when trusted;
+ *     - UNTRUSTED and requesting a scope, domain or remote → its hints are
+ *       ignored. A map decision for the folder applies (step 4); otherwise
+ *       ask, with `reason: 'untrusted-plur-yaml'` and what it `requested`.
+ *       The ask flow's "yes" writes `trusted: true` (plus a scope if chosen);
  *  3. a project MCP config → on;
  *  4. the most specific matching map entry;
  *  5. otherwise ask (including `$HOME`).
@@ -413,8 +431,22 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
 
   const configPath = findProjectConfigPath(dir)
   const marker = configPath ? 'plur-yaml' : findPlurMarker(dir, home)
-  if (marker) {
-    const config = readProjectConfigFromPath(configPath)
+  const deciding = matching.filter(c => c.e.plur !== undefined || c.e.scope !== undefined || c.e.trusted === true)
+  const config = readProjectConfigFromPath(configPath)
+  const requests = !!(config.scope || config.domain || config.remote_url)
+  const untrustedRequest = configPath !== null && requests &&
+    !isTrustedInMap(entries, dirname(configPath), home)
+  if (untrustedRequest && deciding.length === 0) {
+    return {
+      mode: 'ask', remoteAllowed: false, source: 'plur-yaml', reason: 'untrusted-plur-yaml',
+      requested: {
+        ...(config.scope ? { scope: config.scope } : {}),
+        ...(config.domain ? { domain: config.domain } : {}),
+        ...(config.remote_url ? { remote_url: config.remote_url } : {}),
+      },
+    }
+  }
+  if (marker && !untrustedRequest) {
     const remote = resolveProjectRemoteFromConfig(
       { isDirectoryTrusted: d => isTrustedInMap(entries, d, home) }, config, configPath,
     )
@@ -427,7 +459,6 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
     }
   }
 
-  const deciding = matching.filter(c => c.e.plur !== undefined || c.e.scope !== undefined || c.e.trusted === true)
   const best = mostSpecific(deciding, home)
   if (best) {
     const mode = best.plur ?? 'on'

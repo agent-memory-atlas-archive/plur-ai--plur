@@ -13,14 +13,26 @@ repo's request. Only the CLI writes the map.
 - **`resolveFolderPolicy(dir)`** (core, and `Plur.resolveFolderPolicy`) returns
   `{ mode, scope?, remoteAllowed, source }`, resolved in this order:
   1. Any matching `off` entry wins.
-  2. A `.plur.yaml` means on. A map `scope` beats its scope hint, and its remote
-     is allowed only under a `trusted` entry.
+  2. A **trusted** `.plur.yaml`, or one that requests nothing, means on, exactly
+     as before. A map `scope` beats its scope hint, and its remote is allowed
+     only under a `trusted` entry. An **untrusted** `.plur.yaml` that requests a
+     scope, domain or remote has those requests ignored. A map decision for the
+     folder applies if there is one; otherwise the answer is `ask`, with
+     `reason: 'untrusted-plur-yaml'` and what the repo `requested`.
   3. A project MCP config means on.
   4. Otherwise the most specific matching entry decides.
   5. Otherwise the answer is `ask`, and that includes `$HOME`.
 
   Paths may be globs (`*`, `**`, `?`) and may start with `~`. A plain folder
   also covers everything below it.
+
+  **This changes behaviour for anyone whose `.plur.yaml` is not trusted**
+  (owner decision D1, "ignore-ask"). A cloned repo can no longer choose where
+  your saves go. Once the hooks use this resolver (the next PR), such a repo
+  stops applying its scope hint and asks you once instead. Answering yes records
+  `trusted: true` (plus a scope if you choose one), and the repo then works as
+  it does today. Until that PR lands, the hooks behave exactly as before. To
+  keep a repo working without being asked, run `plur trust <repo>` now.
 - **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
   `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
   `--no-trusted`.
