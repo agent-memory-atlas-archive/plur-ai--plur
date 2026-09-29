@@ -19,6 +19,7 @@ import { tmpdir } from 'os'
 import { pathToFileURL } from 'url'
 import { execFileSync } from 'child_process'
 import { builtCliPath } from './helpers/built-cli.js'
+import { isolatedHomeEnv } from './helpers/isolated-env.js'
 
 const CLI = builtCliPath(join(__dirname, '..'))
 const WIN32_PRELOAD = pathToFileURL(join(__dirname, 'helpers', 'win32-platform.mjs')).href
@@ -47,7 +48,7 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     return execFileSync(process.execPath, [...nodeArgs, CLI, 'init', '--global', '--no-desktop', '--no-codex', '--no-antigravity', ...extra], {
       encoding: 'utf-8',
       timeout: 30000,
-      env: { ...process.env, HOME: home, USERPROFILE: home },
+      env: isolatedHomeEnv(home),
       cwd: home,
     })
   }
@@ -195,7 +196,7 @@ describe('plur doctor sees Windows hooks (#1267)', { timeout: 60000 }, () => {
     let stdout: string
     try {
       stdout = execFileSync(process.execPath, ['--import', WIN32_PRELOAD, CLI, 'doctor', '--no-handshake', '--json'], {
-        encoding: 'utf-8', timeout: 30000, env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home,
+        encoding: 'utf-8', timeout: 30000, env: isolatedHomeEnv(home), cwd: home,
       })
     } catch (err: any) {
       stdout = err.stdout?.toString() ?? ''
@@ -218,7 +219,7 @@ describe('plur doctor flags a broken node-form MCP entry (#1267)', { timeout: 60
     let stdout: string
     try {
       stdout = execFileSync(process.execPath, ['--import', WIN32_PRELOAD, CLI, 'doctor', '--no-handshake', '--json'], {
-        encoding: 'utf-8', timeout: 30000, env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home,
+        encoding: 'utf-8', timeout: 30000, env: isolatedHomeEnv(home), cwd: home,
       })
     } catch (err: any) {
       stdout = err.stdout?.toString() ?? ''
@@ -252,7 +253,7 @@ describe('plur init on darwin/linux output is unchanged (#1267)', { timeout: 600
 
   it.skipIf(process.platform === 'win32')('hook commands match the pre-#1267 snapshot', () => {
     execFileSync(process.execPath, [CLI, 'init', '--global', '--no-desktop', '--no-codex', '--no-antigravity', '--no-cursor'], {
-      encoding: 'utf-8', timeout: 30000, env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home,
+      encoding: 'utf-8', timeout: 30000, env: isolatedHomeEnv(home), cwd: home,
     })
     const raw = readFileSync(join(home, '.claude', 'settings.json'), 'utf-8')
     const settings = JSON.parse(raw) as Settings
