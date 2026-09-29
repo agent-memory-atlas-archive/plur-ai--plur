@@ -142,4 +142,34 @@ describe('hook-inject session marker keyed on session_id (#1278)', () => {
     expect(r.status).toBe(0)
     expect(r.stdout).toBe('')
   }, 60_000)
+
+  it('writes the marker once the injection has been printed', () => {
+    const session_id = 'aaaaaaaa-0000-4000-8000-000000000007'
+    const r = prompt({ session_id, prompt: 'first' })
+    expect(context(r.stdout)).toContain('session started')
+    expect(existsSync(join(sessions, `${session_id}.marker`))).toBe(true)
+    // The lock is released on success too.
+    expect(existsSync(join(sessions, `${session_id}.injecting`))).toBe(false)
+  }, 60_000)
+
+  // With the marker keyed correctly, one missed injection would otherwise
+  // mean no memory for the whole session: the marker must only be written
+  // after the context reached stdout, so a failed run is retried next prompt.
+  it('a failed injection writes no marker, and the next prompt injects in full', () => {
+    const session_id = 'aaaaaaaa-0000-4000-8000-000000000008'
+    const store = join(dir, 'broken-store')
+    mkdirSync(store, { recursive: true })
+    // Invalid YAML: the store refuses to load, so the injection step throws.
+    writeFileSync(join(store, 'engrams.yaml'), 'engrams: [\n  - {bad')
+    const failed = prompt({ session_id, prompt: 'first' }, { PLUR_PATH: store })
+    expect(context(failed.stdout)).toBe('')
+    expect(existsSync(join(sessions, `${session_id}.marker`))).toBe(false)
+    // The failed run must not leave its lock behind either, or the retry
+    // would bail silently for the next minute.
+    expect(existsSync(join(sessions, `${session_id}.injecting`))).toBe(false)
+
+    const retry = prompt({ session_id, prompt: 'second' })
+    expect(context(retry.stdout)).toContain('session started')
+    expect(existsSync(join(sessions, `${session_id}.marker`))).toBe(true)
+  }, 60_000)
 })

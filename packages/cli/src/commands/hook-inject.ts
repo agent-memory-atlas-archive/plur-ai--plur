@@ -147,6 +147,24 @@ function emitContext(hookEventName: string, additionalContext: string): void {
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } }))
 }
 
+/**
+ * emitContext that resolves true once the write has been handed to stdout
+ * without error (on macOS a pipe write is asynchronous), false otherwise.
+ * The session marker is written only after this resolves true (#1278).
+ */
+function emitContextConfirmed(hookEventName: string, additionalContext: string): Promise<boolean> {
+  return new Promise(resolvePromise => {
+    try {
+      process.stdout.write(
+        JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } }),
+        err => resolvePromise(!err),
+      )
+    } catch {
+      resolvePromise(false)
+    }
+  })
+}
+
 const REMINDER_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 
 // Project config (.plur.yaml) reading moved to @plur-ai/core/project-config
@@ -450,11 +468,25 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   } catch { /* no lock file — proceed */ }
   try { writeFileSync(injectLock, ''); injectLockAcquired = true } catch { /* fail-open */ }
 
-  const hookEventName = claudeHookEventName(input, { rehydrate: isRehydrate, event: null })
-  if (NO_CONTEXT_EVENTS.has(hookEventName)) {
+  // Release the lock on every exit, including a throw from the injection —
+  // a lock left behind would make the retry on the next prompt bail silently
+  // until it goes stale (#1278).
+  try {
+    await injectSession(input, key, marker, isRehydrate, flags)
+  } finally {
     if (injectLockAcquired) try { unlinkSync(injectLock) } catch {}
-    return
   }
+}
+
+async function injectSession(
+  input: Record<string, unknown>,
+  key: string,
+  marker: string,
+  isRehydrate: boolean,
+  flags: GlobalFlags,
+): Promise<void> {
+  const hookEventName = claudeHookEventName(input, { rehydrate: isRehydrate, event: null })
+  if (NO_CONTEXT_EVENTS.has(hookEventName)) return
   // Project remote routing is resolved with the Plur instance, below — see
   // lib/project-remote.ts. `scope`/`domain` are read here because they are
   // local filters and need no gate.
@@ -462,6 +494,9 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
 
   // Get task description from hook input
   let task: string
+  // First message: the marker to write once the context is on stdout.
+  let pendingMarker: string | null = null
+  let newSessionId: string | undefined
   if (isRehydrate) {
     const summary = (input.compact_summary as string) || ''
     let original = ''
@@ -481,11 +516,13 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     if (!task) {
       task = 'general session'
     }
-    // Auto session start: generate session ID and save with task.
-    // Fail-open: if the state dir is unwritable, skip the marker (the session
-    // header is read back defensively below) rather than crash the prompt.
-    const sessionId = randomUUID()
-    try { writeFileSync(marker, JSON.stringify({ task, sessionId })) } catch { /* fail-open */ }
+    // Auto session start: generate a session ID. The marker that records it
+    // is written only AFTER the context has reached stdout (#1278): with the
+    // marker keyed on session_id, one failed, timed-out or killed injection
+    // would otherwise leave the whole session without memory. Unmarked, the
+    // next prompt simply tries again.
+    newSessionId = randomUUID()
+    pendingMarker = JSON.stringify({ task, sessionId: newSessionId })
     const taskPath = sessionTaskPath(input)
     if (taskPath) try { writeFileSync(taskPath, task) } catch { /* fail-open */ }
     touchReminder(key) // Reset reminder timer on first message
@@ -503,8 +540,10 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   const projectConfig = projectRemote.config
   const remoteRefusedFrom = projectRemote.refusedFrom
 
-  let injectSessionId: string | undefined
-  try { injectSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
+  let injectSessionId: string | undefined = newSessionId
+  if (!injectSessionId) {
+    try { injectSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
+  }
   // #776: the remote leg rides INSIDE injectHybrid — at most one remote call
   // per host per prompt. `.plur.yaml`'s remote_url/remote_token pass through
   // as remote_project (project config wins for the hook path; its presence
@@ -585,8 +624,9 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     parts.push(context)
   }
 
-  if (injectLockAcquired) try { unlinkSync(injectLock) } catch {}
   if (parts.length === 0) return
 
-  emitContext(hookEventName, parts.join('\n'))
+  const delivered = await emitContextConfirmed(hookEventName, parts.join('\n'))
+  // Fail-open: an unwritable state dir just means the next prompt re-injects.
+  if (delivered && pendingMarker) try { writeFileSync(marker, pendingMarker) } catch { /* fail-open */ }
 }
