@@ -88,6 +88,18 @@ describe('#1319 primary store is never registered as a secondary store', () => {
       .toThrow(/primary store/)
   })
 
+  it('recognises a primary that does not exist yet (fresh install) under a symlinked home', async () => {
+    rmSync(join(realHome, '.plur', 'engrams.yaml'))
+    const configPath = join(realHome, '.plur', 'config.yaml')
+    const configText = yaml.dump({ stores: [{ path: join(realHome, '.plur', 'engrams.yaml'), scope: 'project:real-home', shared: true, readonly: false }] })
+    writeFileSync(configPath, configText)
+    const plur = new Plur({ cwd: projectDir, autoDiscover: false })
+    expect(plur.ignoredDuplicateStores().map(s => s.scope)).toEqual(['project:real-home'])
+    expect(() => plur.addStore(join(realHome, '.plur', 'engrams.yaml'), 'project:alias', { shared: true }))
+      .toThrow(/primary store/)
+    expect(readFileSync(configPath, 'utf8')).toBe(configText)
+  })
+
   it('addStore treats another spelling of a registered store as already registered', () => {
     const plur = new Plur({ cwd: projectDir, autoDiscover: false })
     const teamReal = join(realHome, 'team', 'engrams.yaml')

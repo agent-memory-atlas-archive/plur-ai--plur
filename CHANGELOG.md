@@ -23,6 +23,12 @@ Now:
   local store entry that is the primary file, or the same file as an earlier
   entry, is ignored with one warning. The entry stays in `config.yaml`, and
   writebacks start from the file on disk, so nothing is removed.
+- Path comparison also holds for files that do not exist yet, such as a fresh
+  install's `engrams.yaml`. `canonicalize` used to fall back to the path as
+  written when it could not be resolved. It now resolves the deepest existing
+  folder above it and re-appends the rest, so `/var/…/missing` and
+  `/private/var/…/missing` compare equal. The directory-trust checks use the
+  same helper.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
