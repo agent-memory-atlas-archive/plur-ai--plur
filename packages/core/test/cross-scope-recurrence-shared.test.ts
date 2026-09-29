@@ -116,8 +116,32 @@ describe('shared-scope saves and cross-scope recurrence (#1268)', () => {
     })
   })
 
-  describe('3: the ladder never broadens an engram bound for a team store', () => {
-    it('a queued (outbox) team engram stays in its team scope, and flushes as such', async () => {
+  // Owner decision (2026-09-29): what is in a team store stays there —
+  // url stores AND `shared: true` file-path stores. When the ladder would
+  // broaden a team-bound engram to global, it leaves the team engram untouched
+  // and creates ONE global copy in the local primary store instead
+  // (copy-on-promote). The copy links back via `derived_from`, carries a
+  // source with `promoted_from: <team scope>`, never locks, and is never
+  // queued for or pushed to a team store.
+  describe('3: copy-on-promote for an engram bound for a team store', () => {
+    const primaryRows = (): any[] =>
+      (yaml.load(readFileSync(join(dir, 'engrams.yaml'), 'utf8')) as any)?.engrams ?? []
+    const copiesOf = (statement: string) =>
+      primaryRows().filter(e => e.statement === statement && e.scope === 'global')
+
+    function expectCopy(statement: string, teamId: string, recurrence: number) {
+      const copies = copiesOf(statement)
+      expect(copies).toHaveLength(1)
+      const c = copies[0]
+      expect(c.derived_from).toBe(teamId)
+      expect(c.recurrence_count).toBe(recurrence)
+      expect(c.commitment).not.toBe('locked')
+      expect(c.structured_data?._outbox).toBeUndefined()
+      expect((c.sources ?? []).some((x: any) => x.promoted_from === TEAM)).toBe(true)
+      return c
+    }
+
+    it('a queued (outbox) team engram is left untouched; one global copy is made and never queued', async () => {
       writeFileSync(join(dir, 'config.yaml'), yaml.dump({
         index: false, stores: [{ url: URL, token: 't', scope: TEAM, shared: true, readonly: false }],
       }))
@@ -135,24 +159,32 @@ describe('shared-scope saves and cross-scope recurrence (#1268)', () => {
 
       const queued = await plur.learnRouted('pin node versions', { scope: TEAM })
       expect((queued as any).structured_data?._outbox).toBeDefined()
-      await plur.learnRouted('pin node versions', { scope: 'project:a' })   // recurrence 1
-      const after = await plur.learnRouted('pin node versions', { scope: 'project:b' }) // recurrence 2
-      expect(after.recurrence_count).toBe(2)
-      expect(after.scope).toBe(TEAM)                                         // NOT global
-      const onDisk = (yaml.load(readFileSync(join(dir, 'engrams.yaml'), 'utf8')) as any).engrams
-        .find((e: any) => e.statement === 'pin node versions')
-      expect(onDisk.scope).toBe(TEAM)
+      await plur.learnRouted('pin node versions', { scope: 'project:a' })   // recurrence 1 on the team engram
+      const promoted = await plur.learnRouted('pin node versions', { scope: 'project:b' })
+      expect(promoted.scope).toBe('global')
+      expect(promoted.id).not.toBe(queued.id)
 
+      const team = primaryRows().find(e => e.id === queued.id)
+      expect(team.scope).toBe(TEAM)
+      expect(team.recurrence_count).toBe(1)                // untouched by the promotion
+      expect(team.structured_data?._outbox).toBeDefined()   // still queued, as it was
+      expectCopy('pin node versions', queued.id, 2)
+
+      // Idempotent: a further recurrence credits the same copy.
+      await plur.learnRouted('pin node versions', { scope: 'project:c' })
+      expectCopy('pin node versions', queued.id, 3)
+      expect(primaryRows().find(e => e.id === queued.id).recurrence_count).toBe(1)
+
+      // Only the team engram is in the outbox, and it flushes with its team scope.
+      expect(await plur.outboxCount()).toBe(1)
       postOk = true
       await plur.flushOutbox()
       expect(posts).toHaveLength(1)
       expect(posts[0].scope).toBe(TEAM)
     })
 
-    it('an engram in a scope served by a url store stays in that scope', async () => {
-      // Written before the store was registered, so it lives locally — but its
-      // scope is now served by a remote team store.
-      await plur.learn('lint before commit', { scope: TEAM })
+    it('an engram in a scope served by a url store: team engram untouched, global copy made', async () => {
+      const seed = await plur.learn('lint before commit', { scope: TEAM })
       writeFileSync(join(dir, 'config.yaml'), yaml.dump({
         index: false, stores: [{ url: URL, token: 't', scope: TEAM, shared: true, readonly: false }],
       }))
@@ -160,48 +192,52 @@ describe('shared-scope saves and cross-scope recurrence (#1268)', () => {
         ({ ok: true, status: 200, json: async () => ({ rows: [], total_count: 0 }), text: async () => '' } as Response)) as any
       plur = new Plur({ path: dir })
       await plur.learn('lint before commit', { scope: 'project:a' })
-      const after = await plur.learn('lint before commit', { scope: 'project:b' })
-      expect(after.recurrence_count).toBe(2)
-      expect(after.scope).toBe(TEAM)
+      const promoted = await plur.learn('lint before commit', { scope: 'project:b' })
+      expect(promoted.scope).toBe('global')
+      expect(primaryRows().find(e => e.id === seed.id).scope).toBe(TEAM)
+      expectCopy('lint before commit', seed.id, 2)
     })
 
-    // Owner decision (2026-09-29, second round): what is in a team store stays
-    // there — shared FILE-PATH stores included, not only url stores.
-    it('an engram in a shared file-path store keeps its scope, on disk too', async () => {
+    it('an engram in a shared file-path store: the file is untouched, the copy is local', async () => {
       const storeDir = mkdtempSync(join(tmpdir(), 'plur-shared-path-'))
       const storePath = join(storeDir, 'engrams.yaml')
       try {
         // Seed the engram IN the shared store file (a teammate's write).
         await new Plur({ path: storeDir }).learn('review migrations in pairs', { scope: TEAM })
         plur.addStore(storePath, TEAM, { shared: true, readonly: false })
-        await plur.learn('review migrations in pairs', { scope: 'project:a' })
-        const after = await plur.learn('review migrations in pairs', { scope: 'project:b' })
-        expect(after.recurrence_count).toBe(2)
-        expect(after.scope).toBe(TEAM)
-        const onDisk = (yaml.load(readFileSync(storePath, 'utf8')) as any).engrams
-          .find((e: any) => e.statement === 'review migrations in pairs')
-        expect(onDisk.scope).toBe(TEAM)
-        expect(onDisk.recurrence_count).toBe(2)
+        const first = await plur.learn('review migrations in pairs', { scope: 'project:a' })
+        const teamId = first.id
+        const fileBefore = readFileSync(storePath, 'utf8')
+        const promoted = await plur.learn('review migrations in pairs', { scope: 'project:b' })
+        expect(promoted.scope).toBe('global')
+        expect(readFileSync(storePath, 'utf8')).toBe(fileBefore)   // team file untouched
+        expectCopy('review migrations in pairs', teamId, 2)
+        await plur.learn('review migrations in pairs', { scope: 'project:c' })
+        expectCopy('review migrations in pairs', teamId, 3)
+        expect(readFileSync(storePath, 'utf8')).toBe(fileBefore)
       } finally { rmSync(storeDir, { recursive: true, force: true }) }
     })
 
-    it('an engram in a NON-shared file-path store may still broaden (unchanged)', async () => {
+    it('an engram in a NON-shared file-path store still broadens in place (unchanged)', async () => {
       const storeDir = mkdtempSync(join(tmpdir(), 'plur-private-path-'))
       const storePath = join(storeDir, 'engrams.yaml')
       try {
         await new Plur({ path: storeDir }).learn('keep a changelog', { scope: 'project:mine' })
         plur.addStore(storePath, 'project:mine', { shared: false, readonly: false })
-        await plur.learn('keep a changelog', { scope: 'project:a' })
+        const first = await plur.learn('keep a changelog', { scope: 'project:a' })
         const after = await plur.learn('keep a changelog', { scope: 'project:b' })
+        expect(after.id).toBe(first.id)
         expect(after.scope).toBe('global')
       } finally { rmSync(storeDir, { recursive: true, force: true }) }
     })
 
-    it('without a team store the ladder still broadens (unchanged)', async () => {
-      await plur.learn('write the test first', { scope: TEAM })
+    it('without a team store the ladder still broadens in place (unchanged)', async () => {
+      const first = await plur.learn('write the test first', { scope: TEAM })
       await plur.learn('write the test first', { scope: 'project:a' })
       const after = await plur.learn('write the test first', { scope: 'project:b' })
+      expect(after.id).toBe(first.id)
       expect(after.scope).toBe('global')
+      expect(copiesOf('write the test first')).toHaveLength(1)
     })
   })
 

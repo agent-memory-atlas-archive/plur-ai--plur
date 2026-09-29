@@ -2189,6 +2189,82 @@ export class Plur {
     return false
   }
 
+  /**
+   * #1268 copy-on-promote. `hit` is a team-store-bound engram the ladder would
+   * broaden to global. Instead: leave it exactly as it is (scope, store, file,
+   * outbox marker) and credit a `global` copy in the LOCAL primary store,
+   * creating it once.
+   *
+   * The copy links back with `derived_from: <team engram id>` (the existing
+   * lineage field) and its first source carries `promoted_from: <team scope>`.
+   * Its commitment is escalated as the ladder would, but never to `locked`.
+   * It is appended directly — never given an `_outbox` marker — and its scope
+   * is `global`, which no team store serves, so it is never pushed anywhere.
+   * A later recurrence finds the same copy (same content hash, `global`,
+   * `derived_from` the team engram) and credits it instead of adding another.
+   */
+  private async _promoteTeamCopy(
+    hit: Engram,
+    engrams: Engram[],
+    scope: string,
+    context: LearnContext | undefined,
+  ): Promise<Engram> {
+    // Under delegation `engrams` is an empty stand-in; this rare path takes the
+    // corpus so the append/update below are ordinary whole-store operations.
+    const corpus = engrams.length ? engrams : await this._primaryStore.load()
+    const hash = (hit as any).content_hash ?? computeContentHash(hit.statement)
+    const capped = (c: Engram['commitment'] | undefined): Engram['commitment'] =>
+      c === 'exploring' ? 'leaning' : 'decided'
+    const source = this._buildSourceEntry(scope, context)
+
+    const existing = corpus.find(e => e.status === 'active'
+      && e.scope === 'global'
+      && (e as any).derived_from === hit.id
+      && (e as any).content_hash === hash)
+    if (existing) {
+      const e = existing as any
+      e.recurrence_count = (e.recurrence_count ?? 0) + 1
+      e.write_count = (e.write_count ?? 1) + 1
+      e.sources = [...(e.sources ?? []), source]
+      if (e.commitment !== 'locked') e.commitment = capped(e.commitment)
+      await this._updateEngrams(corpus, [existing])
+      await this._syncIndex()
+      return existing
+    }
+
+    const now = new Date().toISOString()
+    const id = generateEngramId(corpus, this._mintedTodayIds())
+    this._rememberMintedId(id)
+    const copy: Engram = {
+      ...this._buildEngramShape(hit.statement, 'global', {
+        scope: 'global',
+        type: hit.type,
+        domain: hit.domain,
+        tags: hit.tags,
+        rationale: (hit as any).rationale,
+        derived_from: hit.id,
+        commitment: capped(hit.commitment),
+      } as LearnContext, now, undefined, eid => this._ancestorsOf(corpus, eid), 'default'),
+      id,
+    }
+    const c = copy as any
+    c.recurrence_count = ((hit as any).recurrence_count ?? 0) + 1
+    c.write_count = ((hit as any).write_count ?? 1) + 1
+    c.sources = [
+      { scope: hit.scope, session_id: null, stored_at: now, promoted_from: hit.scope },
+      source,
+    ]
+    await this._appendEngram(corpus, copy)
+    await this._syncIndex()
+    this._appendHistory({
+      event: 'engram_created',
+      engram_id: id,
+      timestamp: now,
+      data: { type: copy.type, scope: 'global', source: copy.source, promoted_from: { engram_id: hit.id, scope: hit.scope } },
+    })
+    return copy
+  }
+
   /** Record a cross-scope recurrence: append source, increment counters,
    * escalate commitment, and broaden scope to 'global' once the threshold
    * is crossed. Returns the (possibly broadened) engram.
@@ -2211,6 +2287,15 @@ export class Plur {
     const previousScope = hit.scope
     const previousCommitment = hit.commitment
     const teamValidation = this._isTeamValidation(scope, hit)
+
+    // #1268 copy-on-promote (owner decision 2026-09-29): what is in a team
+    // store stays there. When this hit would broaden a team-bound engram to
+    // global, the team engram is left untouched and a global copy in the local
+    // primary store takes the promotion instead.
+    if (((hit as any).recurrence_count ?? 0) + 1 >= 2
+        && isSharedScope(hit.scope) && this._isTeamStoreBound(hit)) {
+      return await this._promoteTeamCopy(hit, engrams, scope, context)
+    }
 
     // Audit iter-4 fix (Critic + Data convergence): mutate ONCE on the canonical
     // writable target (primary or secondary store engram), then sync hit from
