@@ -2142,33 +2142,47 @@ export class Plur {
     // commitment. A false positive here is louder than a missed one.
     if (!isHashable(statement)) return null
     const hash = computeContentHash(statement)
-    // #1268: a shared-scope write is never absorbed into a personal engram.
-    // The recurrence path returns the hit INSTEAD of writing, so a team save
-    // whose text matched a personal note used to update the note and never
-    // reach the team scope. Only shared hits count for a shared write;
-    // shared↔shared and personal→(any) recurrence are unchanged.
-    //
-    // "Shared" includes an engram this ladder itself graduated: on the 2nd
-    // cross-scope hit a shared engram is broadened to 'global' (see
-    // `_recordCrossScopeRecurrence`), and later shared hits must keep landing
-    // on it or the ladder would restart with a duplicate at every new scope.
-    // It is recognisable by its ORIGIN — `sources[0]` is the scope it was first
-    // written at, and only a shared origin is ever broadened (#362 ceiling).
+    // #1268: for a SHARED write, a shared hit is preferred. Callers absorb a
+    // shared hit as before (shared↔shared recurrence), but a non-shared hit —
+    // `local`, `global`, `user:*`, `agent:*` — is only CREDITED: the team copy
+    // is still written. See `_isTeamValidation`.
     const sharedWrite = isSharedScope(currentScope)
-    const sharedOrGraduated = (e: Engram): boolean => {
-      if (isSharedScope(e.scope)) return true
-      const origin = (e as any).sources?.[0]?.scope
-      return e.scope === 'global' && typeof origin === 'string' && isSharedScope(origin)
-    }
+    let fallback: Engram | null = null
     for (const e of engrams) {
       if (e.status === 'active'
           && (e as any).content_hash === hash
-          && e.scope !== currentScope
-          && (!sharedWrite || sharedOrGraduated(e))) {
-        return e
+          && e.scope !== currentScope) {
+        if (!sharedWrite || isSharedScope(e.scope)) return e
+        fallback ??= e
       }
     }
-    return null
+    return fallback
+  }
+
+  /**
+   * #1268: a shared-scope save whose same-text match lives in a NON-shared
+   * scope. The match is credited as a recurrence (counted, a `validated_by`
+   * source, commitment escalated but never to `locked`) and the team copy is
+   * written anyway — a team save is never absorbed into a personal or global
+   * engram. The user may then hold two engrams; that is intended.
+   */
+  private _isTeamValidation(scope: string, hit: Engram): boolean {
+    return isSharedScope(scope) && !isSharedScope(hit.scope)
+  }
+
+  /**
+   * #1268 guard: an engram bound for a remote team store — queued in the
+   * outbox for one, served by one, or in a scope a url store is registered for
+   * — must never be rewritten to `global` by the recurrence ladder. Otherwise
+   * the outbox pushes `scope: global` into the team store.
+   */
+  private _isTeamStoreBound(e: Engram): boolean {
+    const a = e as any
+    if (a.structured_data?._outbox) return true
+    if (this._isRemoteBackedScope(e.scope)) return true
+    if (typeof a._storeScope === 'string'
+        && (this.config.stores ?? []).some(s => !!s.url && s.scope === a._storeScope)) return true
+    return false
   }
 
   /** Record a cross-scope recurrence: append source, increment counters,
@@ -2192,6 +2206,7 @@ export class Plur {
   ): Promise<Engram> {
     const previousScope = hit.scope
     const previousCommitment = hit.commitment
+    const teamValidation = this._isTeamValidation(scope, hit)
 
     // Audit iter-4 fix (Critic + Data convergence): mutate ONCE on the canonical
     // writable target (primary or secondary store engram), then sync hit from
@@ -2208,7 +2223,9 @@ export class Plur {
     // applyMutation is pure-ish: takes everything it needs as parameters,
     // returns the new recurrence count so callers don't need to read back via
     // unsafe cast.
-    const sourceEntry = this._buildSourceEntry(scope, context)
+    const sourceEntry: { scope: string; session_id: string | null; stored_at: string; validated_by?: string } =
+      this._buildSourceEntry(scope, context)
+    if (teamValidation) sourceEntry.validated_by = scope
     const lockTimestamp = new Date().toISOString()
     // #181 (audit #213 item 3): an engram in an unresolved persisted tension
     // must not escalate INTO 'locked' — contradicted knowledge freezing at
@@ -2225,15 +2242,17 @@ export class Plur {
         // Only promote SHARED scopes (project:*, space:*, etc.) to global —
         // personal-family scopes (local, user:*) stay within their family.
         // See issue #362 item (ii): personal-scope ceiling for cross-scope recurrence.
-        if (isSharedScope(e.scope)) e.scope = 'global'
+        // #1268 guard: never broaden an engram bound for a remote team store.
+        if (isSharedScope(e.scope) && !this._isTeamStoreBound(e)) e.scope = 'global'
         if (e.commitment !== 'locked') {
           // Forward-only ladder: exploring → leaning → decided → locked.
+          // A team validation (#1268) escalates but never locks.
           e.commitment = e.commitment === 'exploring'
             ? 'leaning'
             : e.commitment === 'leaning'
               ? 'decided'
               : e.commitment === 'decided'
-                ? (lockBlockedByTension ? 'decided' : 'locked')
+                ? (lockBlockedByTension || teamValidation ? 'decided' : 'locked')
                 : (e.commitment ?? 'leaning')
           if (lockBlockedByTension && e.commitment === 'decided') {
             logger.info(`[plur:tensions] lock escalation blocked for ${e.id} — unresolved tension (#181)`)
@@ -3055,7 +3074,12 @@ export class Plur {
       // `engrams` is empty under delegation, so `_recordCrossScopeRecurrence`
       // takes its secondary-store branch — which is where every match it can
       // still see actually lives.
-      if (crossMatch) return await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
+      if (crossMatch && !this._isTeamValidation(scope, crossMatch)) {
+        return await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
+      }
+      // #1268: a shared save matching a non-shared engram credits that engram
+      // and then falls through to write the team copy below.
+      if (crossMatch) await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
 
       const id = canDelegate
         ? await ps.nextEngramId!(engramIdDatePrefix())
@@ -3432,10 +3456,13 @@ export class Plur {
     // #176: cross-scope recurrence (same semantics as the local learn() path).
     const crossMatch = this._crossScopeRecurrenceDetect(statement, allEngrams, scope)
     if (crossMatch) {
-      return await this._withStoreLock(this.paths.engrams, async () => {
+      const credited = await this._withStoreLock(this.paths.engrams, async () => {
         const engrams = await this._primaryStore.load()
         return await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
       })
+      // #1268: a team validation of a non-shared engram does not stand in for
+      // the team write — fall through and POST the team copy.
+      if (!this._isTeamValidation(scope, crossMatch)) return credited
     }
     const now = new Date().toISOString()
     const localPlaceholder = this._buildEngramShape(statement, scope, context, now, undefined, undefined, guarded.scopeSource)

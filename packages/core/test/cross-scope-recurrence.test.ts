@@ -71,7 +71,10 @@ describe('cross-scope recurrence (#176)', () => {
       await plur.learn('repeated mistake', { scope: 'project:a' })
       await plur.learn('repeated mistake', { scope: 'project:b' })  // recurrence=1
       await plur.learn('repeated mistake', { scope: 'project:c' })  // recurrence=2: decided
-      const fourth = await plur.learn('repeated mistake', { scope: 'project:d' })  // recurrence=3: locked
+      // #1268: a 4th SHARED save would only credit the graduated global engram
+      // (never locking it) and write its own team copy, so the escalation to
+      // locked is driven by a personal save here.
+      const fourth = await plur.learn('repeated mistake', { scope: 'local' })  // recurrence=3: locked
 
       expect(fourth.recurrence_count).toBe(3)
       expect(fourth.commitment).toBe('locked')
@@ -83,9 +86,9 @@ describe('cross-scope recurrence (#176)', () => {
       await plur.learn('important rule', { scope: 'project:a' })
       await plur.learn('important rule', { scope: 'project:b' })
       await plur.learn('important rule', { scope: 'project:c' })
-      await plur.learn('important rule', { scope: 'project:d' })  // locked
+      await plur.learn('important rule', { scope: 'local' })  // locked (personal save, see #1268)
 
-      const fifth = await plur.learn('important rule', { scope: 'project:e' })
+      const fifth = await plur.learn('important rule', { scope: 'user:e' })
       expect(fifth.commitment).toBe('locked')  // still locked
       expect(fifth.recurrence_count).toBe(4)  // counter still increments
       // No additional locked_at updates after first lock
@@ -413,7 +416,7 @@ describe('cross-scope recurrence (#176)', () => {
       const first = await plur.learn('rule', { scope: 'project:a' })
       await plur.learn('rule', { scope: 'project:b' })  // recurrence_count=1, no event
       await plur.learn('rule', { scope: 'project:c' })  // recurrence_count=2, scope→global commit→decided EVENT
-      await plur.learn('rule', { scope: 'project:d' })  // recurrence_count=3, commit→locked EVENT
+      await plur.learn('rule', { scope: 'local' })  // recurrence_count=3, commit→locked EVENT (personal save, #1268)
 
       const eventsAfterLock = readHistoryForEngram(plur.getStorageRoot(), first.id)
         .filter(e => e.event === 'recurrence_detected')
@@ -421,8 +424,8 @@ describe('cross-scope recurrence (#176)', () => {
 
       // Subsequent learns at new scopes: counter increments, NO events
       // (engram already at global+locked, nothing further to escalate).
-      await plur.learn('rule', { scope: 'project:e' })
-      await plur.learn('rule', { scope: 'project:f' })
+      await plur.learn('rule', { scope: 'user:e' })
+      await plur.learn('rule', { scope: 'agent:f' })
 
       const finalEvents = readHistoryForEngram(plur.getStorageRoot(), first.id)
         .filter(e => e.event === 'recurrence_detected')

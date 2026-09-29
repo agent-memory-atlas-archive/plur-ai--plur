@@ -483,6 +483,8 @@ export const EngramSchema = z.object({
     scope: z.string(),
     session_id: z.string().nullable().default(null),
     stored_at: z.string().describe('ISO 8601 timestamp of this write.'),
+    validated_by: z.string().optional()
+      .describe('Set when this entry records a shared-scope save of the same text: the team scope that validated this engram (#1268). The team save itself is written separately.'),
   })).default([]).describe('Provenance of each write attempt; one entry per write.'),
 
   // === SP1: Cross-scope recurrence (issue #176) ===

@@ -12,10 +12,20 @@ something in `global`, `local`, `user:` or `agent:` bumped the personal note's
 recurrence count and nothing reached the team scope. Found while triaging an
 enterprise deployment's report of team saves that never reached the team store.
 
-A shared-scope write now only recurs onto a shared engram — or onto one the
-ladder itself graduated to `global` from a shared origin, so the #176 escalation
-keeps working. It otherwise becomes its own engram in the scope you named.
-Shared↔shared recurrence, personal→personal recurrence, and a personal write
+**A shared-scope save now always writes its team copy.** It is never absorbed
+into a non-shared engram — `local`, `global`, `user:`, `agent:` — including a
+`global` engram the recurrence ladder graduated. The personal counterpart is
+still credited: the team save is recorded on it as a recurrence (counted, with a
+source marked `validated_by` the team scope, and commitment escalated by the
+usual ladder, but never to `locked`). You may end up with two engrams — your own
+and the team's — and that is intended.
+
+**The ladder no longer broadens a team-bound engram to `global`.** An engram
+queued in the outbox for a url store, or in a scope a url store is registered
+for, keeps its team scope when it recurs. Before, it could be rewritten to
+`global` locally and then pushed to the team store as `scope: global`.
+
+Shared↔shared recurrence, personal→personal recurrence, and a personal save
 recurring onto a shared engram behave as before.
 
 ### An unscoped write can no longer land in a team store
