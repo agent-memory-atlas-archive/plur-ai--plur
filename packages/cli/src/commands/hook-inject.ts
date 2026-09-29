@@ -4,7 +4,7 @@ import { tmpdir, homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
-import { safeSessionKey, hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js'
+import { safeSessionKey } from '../lib/session-key.js'
 
 // Remote budget for the recall leg inside injectHybrid (#776). The hook is
 // on the hot path of every prompt; slow networks make this a perceptible
@@ -169,6 +169,7 @@ const REMINDER_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 // ignored .plur.yaml because the reader lived in this CLI-only file).
 import { readProjectConfig, claimHookDegradationLines, type Plur } from '@plur-ai/core'
 import { resolveProjectRemote, projectRemoteRefusalNotice, type ProjectRemote } from '../lib/project-remote.js'
+import { hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js' // decision H1
 
 /**
  * #776: the former `tryRemoteInject` remote-first POST /api/v1/inject path
