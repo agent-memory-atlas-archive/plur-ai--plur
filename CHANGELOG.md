@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### A refused write to one scope no longer pauses writes to the whole server
+
+**A few refused writes to one scope could stop queued writes to every other
+scope on the same server** (#1308). Each failed outbox push counted toward the
+per-host circuit breaker, including refusals: 401, 403 ("Cannot write to scope
+..."), 404 and 422. Three of those opened the breaker, and the next flush then
+skipped healthy writes to other scopes on that server for five minutes. A
+refusal says the request was wrong, not that the server is down.
+
+Now a 401/403/404/422 answer to an outbox push neither counts toward the
+breaker nor resets it. Network errors, timeouts and 5xx still count, so a
+server that is really down still opens it.
+
+### Queued writes that can never succeed now say so
+
+**A queued team write the store keeps refusing was silent** (#1299). On one
+developer store, ten writes had been refused with `403 Cannot write to scope`
+on every attempt for twelve days, one of them 103 times. Session start,
+`plur status`, `plur doctor` and the hooks said nothing. Only `plur outbox`
+listed them, and only to someone who knew to look.
+
+**Each outbox entry is now classified by its last failure.** `retrying` covers
+the network, 5xx, 429 and timeouts, and those are retried as before.
+`needs_action` covers 401, 403, 404, 422, an explicit "cannot write to scope"
+refusal, and a scope with no writable store: retrying cannot fix any of these.
+A failed push now records its HTTP status on the entry (`last_status`, an
+additive field). Entries queued before this are classified from their error
+text, and anything unclear counts as `retrying`.
+
+**The `needs_action` entries are reported**, with count, scope, a one-line
+reason and a next step, in the places below. There is one row for each scope
+and reason: a scope holding both a 403 and a 422 gets two rows, each with its
+own advice.
+- the MCP `plur_session_start` result (`outbox_needs_action`, plus a line in `guide`);
+- `plur status` and `plur_status` (`outbox_needs_action`, `outbox_attention`);
+- `plur doctor`, as a failing `outbox` check. A write that only failed on the
+  network does not trip it;
+- `plur outbox` / `plur_outbox`: `state`, `reason`, `next_step` and
+  `next_retry_at` on each entry, plus `retrying` / `needs_action` counts.
+
+The next step names real commands: get write access and run `plur outbox
+--flush`, check `plur stores list`, or move the entry with `plur rescope <id>
+--to <scope>`.
+
+**Back-off:** automatic flushes (session start and end, stop hooks,
+`plur sync`) retry a `needs_action` entry at most once a day. They return the
+number held back as `held`. `plur sync` (`outbox.held` in `--json`) and the
+hook's stderr line report it, including when every entry was held back.
+An explicit flush (`plur outbox --flush`,
+`plur_outbox { flush: true }`, or `flushOutbox({ force: true })`) retries it
+at once. **Nothing is dropped, rescoped or rewritten automatically.** Only the
+retry bookkeeping changes: `attempt_count`, `last_attempt`, `last_error` and
+`last_status`.
+
 ### SessionEnd finds the checkpoint for session ids with unusual characters
 
 **`plur hook-session-end` could miss the session checkpoint, so the session
@@ -69,9 +123,11 @@ have kept only the first write and reported the rest as delivered. Now:
   statement, because a teammate's engram with the same sentence was being
   taken as ours and ours deleted;
 - a write the server cannot confirm either way is kept, never deleted. After 5
-  checks it is marked *needs action* with the reason, instead of showing as
-  "retrying" forever. `plur outbox --resend <id>` posts it once you have
-  checked.
+  checks it is marked *needs action* (#1299's state), with the reason and the
+  next step, instead of showing as "retrying" forever. It is held, not retried.
+  A forced flush (`plur outbox --flush`) does not post it either, because no
+  fix made elsewhere answers "is it already there?". Once you have checked the
+  team store, `plur outbox --resend <id>` posts it.
 
 `docs/remote-store-contract.md` now states the key semantics exactly: unique
 per logical write, stable across retries, deduplicated by the server within a

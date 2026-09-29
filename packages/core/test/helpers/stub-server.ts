@@ -76,9 +76,16 @@ export class StubServer {
   /** When set, POST /engrams short-circuits to this error response BEFORE reading
    *  the body — to simulate a server that rejects the write (#912 sanitise test). */
   appendErrorResponse: { status: number; body: string } | null = null
+  /** Per-scope refusal for POST /engrams, keyed by the body's `scope` — to
+   *  simulate a server that refuses one scope while accepting another on the
+   *  same host (#1308). Checked after the body is read. */
+  appendErrorByScope: Record<string, { status: number; body: string }> = {}
   /** Delay before answering POST /engrams, ms — a slow-but-alive remote, for
    *  bounded-flush tests (#1269). The write is still applied when it answers. */
   appendDelayMs = 0
+  /** Number of POST /api/v1/engrams requests received, answered or refused
+   *  (#1299: proves a backed-off outbox entry did not dial the server). */
+  appendCalls = 0
   /** With `appendDelayMs`: store the engram only when the delayed answer is
    *  sent, so a client that gives up first leaves nothing on the server. */
   appendDropWhileDelayed = false
@@ -192,7 +199,9 @@ export class StubServer {
     this.idCounter = 0
     this.badAppendId = null
     this.appendErrorResponse = null
+    this.appendErrorByScope = {}
     this.appendDelayMs = 0
+    this.appendCalls = 0
     this.appendDropWhileDelayed = false
     this.lastAppendIdempotencyKey = null
     this.appendKeys = []
@@ -286,6 +295,7 @@ export class StubServer {
 
     // POST /api/v1/engrams — create
     if (method === 'POST' && path === '/api/v1/engrams') {
+      this.appendCalls++
       if (this.appendErrorResponse !== null) {
         const { status, body } = this.appendErrorResponse
         res.writeHead(status, { 'Content-Type': 'text/plain' })
@@ -304,6 +314,12 @@ export class StubServer {
           return
         }
         const { statement, scope, domain, type, source } = body
+        const refusal = typeof scope === 'string' ? this.appendErrorByScope[scope] : undefined
+        if (refusal) {
+          res.writeHead(refusal.status, { 'Content-Type': 'text/plain' })
+          res.end(refusal.body)
+          return
+        }
         const idempotency_key = this.ignoreIdempotencyKeys ? undefined : body.idempotency_key
         const id = `ENG-SRV-${String(++this.idCounter).padStart(3, '0')}`
         const now = new Date().toISOString()

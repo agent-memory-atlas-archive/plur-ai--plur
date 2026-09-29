@@ -200,7 +200,11 @@ describe('remote-write idempotency keys (audit follow-up to #1277)', () => {
     expect(await plur.outboxCount()).toBe(1)
     const [entry] = await plur.listOutbox()
     expect(entry.id).toBe(id)
-    expect(entry.needs_action).toMatch(/could not confirm/i)
+    expect(entry.state).toBe('needs_action')
+    expect(entry.reason).toMatch(/could not confirm/i)
+    expect(entry.next_step).toContain(`plur outbox --resend ${id}`)
+    // An explicit forced flush does not post it either: only a resend does.
+    expect((await plur.flushOutbox({ force: true })).flushed).toBe(0)
 
     // The explicit way out: resend it on purpose.
     const r = await plur.flushOutbox({ resend: [id] })
