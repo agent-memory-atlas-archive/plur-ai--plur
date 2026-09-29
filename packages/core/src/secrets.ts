@@ -141,6 +141,35 @@ function percentDecodedView(text: string): string | null {
   return out === text ? null : out
 }
 
+const ESCAPES: Record<string, string> = {
+  n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', '\\': '\\', '"': '"', '/': '/',
+}
+
+/**
+ * The text with literal backslash escapes unfolded, or null when there are none.
+ *
+ * JSON-escaped text and pasted logs carry a newline as the two characters `\`
+ * and `n`, so the character before a token on the next line is the letter
+ * `n`, and the vendor patterns' leading boundary rejects it (#1372). This view
+ * turns the JSON escapes (`\n`, `\t`, `\r`, `\b`, `\f`, `\\`, `\"`, `\/`)
+ * and ASCII `\u00XX` escapes (`\u000a` ends in a letter too) back into the
+ * characters they stand for. Like the percent-decoded view it is scanned IN
+ * ADDITION to the raw text, so nothing that matched before stops matching. Up
+ * to three passes cover JSON nested in JSON. Each pass is one linear
+ * `replace`.
+ */
+function escapeUnfoldedView(text: string): string | null {
+  if (!/\\(?:[nrtbf\\"/]|u00[0-7][0-9A-Fa-f])/.test(text)) return null
+  let out = text
+  for (let pass = 0; pass < 3; pass++) {
+    const next = out.replace(/\\(?:([nrtbf\\"/])|u00([0-7][0-9A-Fa-f]))/g, (_, c: string | undefined, hex: string | undefined) =>
+      c !== undefined ? ESCAPES[c] : String.fromCharCode(parseInt(hex as string, 16)))
+    if (next === out) break
+    out = next
+  }
+  return out === text ? null : out
+}
+
 /** Scan text for potential secrets. Returns empty array if clean. */
 export function detectSecrets(text: string): SecretMatch[] {
   if (typeof text !== 'string') {
@@ -148,8 +177,14 @@ export function detectSecrets(text: string): SecretMatch[] {
   }
   const matches: SecretMatch[] = []
   const found = new Set<string>()
+  // Raw text first, then the percent-decoded and escape-unfolded copies,
+  // each also folded (see scanViews).
+  const bases = [text]
   const decoded = percentDecodedView(text)
-  const views = decoded === null ? scanViews(text) : [...scanViews(text), ...scanViews(decoded)]
+  if (decoded !== null) bases.push(decoded)
+  const unescaped = escapeUnfoldedView(text)
+  if (unescaped !== null) bases.push(unescaped)
+  const views = bases.flatMap(scanViews)
   for (const view of views) {
     for (const { name, regex } of SECRET_PATTERNS) {
       if (found.has(name)) continue

@@ -32,7 +32,11 @@ one, does not get a credential past the scan.
 The credential patterns below are also matched against a percent-decoded copy
 (ASCII `%00`–`%7F`, up to three passes), so a token inside an encoded URL or
 query string, such as `access_token%3D` followed by the token, is still found.
-The infrastructure patterns are not matched against the decoded copy.
+They are also matched against a copy with JSON backslash escapes unfolded
+(`\n`, `\t`, `\r`, `\b`, `\f`, `\\`, `\"`, `\/` and ASCII `\u00XX`, up to three
+passes), so a token that follows a literal `\n` in JSON-escaped text or a
+pasted log is still found. The infrastructure patterns are not matched against
+the decoded or unfolded copies.
 
 ## Credentials — these refuse the install
 

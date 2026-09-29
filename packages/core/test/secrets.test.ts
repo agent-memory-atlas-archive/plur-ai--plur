@@ -264,6 +264,55 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     })
   })
 
+  describe('tokens after a literal backslash escape (#1372)', () => {
+    // JSON-escaped text and pasted logs carry `\n`, `\t` and `\r` as two
+    // characters, so the character before the token is a letter. Each string
+    // below holds a real backslash followed by the letter.
+    const gh = 'ghp' + '_' + body(36)
+    const asia = 'ASIA' + 'QQQQQQQQQQQQ2345'
+    for (const esc of ['\\n', '\\t', '\\r']) {
+      it(`flags a GitHub token after a literal ${esc}`, () => {
+        expect(detectSecrets('{"log":"line one' + esc + gh + '"}').map(h => h.pattern)).toContain('github_token')
+      })
+    }
+    it('flags a GitHub token after a JSON \\u000a escape', () => {
+      expect(detectSecrets('{"log":"one\\u000a' + gh + '"}').map(h => h.pattern)).toContain('github_token')
+    })
+    it('flags an ASIA key id after a literal \\n', () => {
+      expect(detectSecrets('"creds":"id\\n' + asia + '\\n"').map(h => h.pattern)).toContain('aws_access_key')
+    })
+    it('flags GitLab, Slack, npm and Stripe tokens after a literal \\n', () => {
+      const cases: [string, string][] = [
+        ['glpat' + '-' + body(20), 'gitlab_token'],
+        ['xoxb' + '-' + '1234567890' + '-' + '1234567890' + '-' + body(24), 'slack_token'],
+        ['npm' + '_' + body(36), 'npm_token'],
+        ['rk' + '_live_' + body(24), 'stripe_live_key'],
+      ]
+      for (const [token, pattern] of cases)
+        expect(detectSecrets('text\\n' + token).map(h => h.pattern), pattern).toContain(pattern)
+    })
+    it('flags a token after a double-escaped \\\\n', () => {
+      // JSON inside JSON: the newline became `\n`, then `\\n`.
+      expect(detectSecrets('"payload":"{\\"log\\":\\"a\\\\n' + gh + '\\"}"').map(h => h.pattern)).toContain('github_token')
+    })
+    it('stays clean on escaped prose that only names a prefix', () => {
+      expect(detectSecrets('first line\\nuse a ghp_ token\\tthen npm_config_registry')).toEqual([])
+    })
+    it('the write/pack guard (detectSensitive) sees the unescaped credential too', () => {
+      expect(detectSensitive('a\\n' + gh).map(h => h.pattern)).toContain('github_token')
+    })
+    it('scans 1 MiB of escapes and repeated prefixes in linear time', () => {
+      // Every view is built: raw, percent-decoded (`%41`), escape-unfolded
+      // (three passes over nested backslashes), each also folded (`é`).
+      for (const unit of ['\\nglpat-', '\\\\\\\\nglagent-', '\\ngh' + 'p_', '\\\\\\\\\\\\\\\\']) {
+        const text = unit.repeat(Math.ceil((1 << 20) / unit.length)) + '%41é'
+        const started = performance.now()
+        detectSecrets(text)
+        expect(performance.now() - started, unit).toBeLessThan(1_000)
+      }
+    })
+  })
+
   it('files the new token patterns under the secrets family', () => {
     for (const p of ['github_token', 'github_pat', 'gitlab_token', 'slack_token', 'npm_token', 'stripe_live_key'])
       expect(sensitivityCategory(p)).toBe('secrets')

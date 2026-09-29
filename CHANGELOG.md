@@ -32,8 +32,10 @@ Now flagged, each by the vendor's documented prefix, charset and length:
 
 Credentials are also matched against a percent-decoded copy of the text, so a
 token inside an encoded URL or query string (`access_token%3D` then the token,
-or an encoded `_` in the prefix) is found. A token glued after a digit is
-found too.
+or an encoded `_` in the prefix) is found, and against a copy with JSON
+backslash escapes unfolded, so a token after a literal `\n`, `\t` or `\r` in
+JSON-escaped text or a pasted log is found (#1372). A token glued after a
+digit is found too.
 
 The same patterns apply to the pack scanner, so a pack carrying one of these
 refuses to install (`docs/pack-scan-surface.md`). Text that only names a prefix,
