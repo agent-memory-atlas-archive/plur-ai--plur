@@ -69,6 +69,23 @@ when the prefix is glued onto the end of a longer word (a preceding digit or
 documented body length, so text that only names a prefix ("use a `ghp_` token")
 does not refuse an install.
 
+### Known limitations of the credential patterns
+
+- **A custom GitLab token prefix is not detected.** A self-managed GitLab
+  instance can configure its own personal-access-token prefix in place of
+  `glpat-`. `gitlab_token` knows only the documented prefixes, so a token with
+  a custom prefix scans clean.
+- **A placeholder with a real prefix is flagged.** A documentation placeholder
+  such as `glpat-` followed by twenty uppercase `X` characters, or `ghp_` or
+  `npm_` followed by 36 of them, has the prefix, length and charset of a real
+  token, so a pack whose README uses one is refused. Use a placeholder that is
+  visibly not a token, such as `glpat-<your-token>`.
+- **A few real legacy GitLab tokens are missed.** The structure check that
+  keeps hyphenated slugs out of `gitlab_token` also rejects a random legacy
+  20-character body that happens to have no mixed-case or digit structure.
+  Two measurements over 2 million random bodies each put that at about 1 in
+  38,000 and 1 in 60,000.
+
 ## Infrastructure — these also refuse the install
 
 A pack is an archive sent to a stranger, so the scanner treats deployment
