@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, rmSync, mkdirSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, rmSync, mkdirSync, lstatSync } from 'fs'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { homedir } from 'os'
 import { randomBytes } from 'crypto'
@@ -453,13 +453,36 @@ function entryIsFolder(e: FolderEntry, folder: string, raw: string, target: stri
 }
 
 /**
- * True when `target` (a canonical, existing path) sits on a case-insensitive
- * filesystem: the same path with every letter's case swapped also exists.
- * Only the checked folder is probed; no stored entry is resolved (#778).
+ * True when stored entry form `form` names the folder `target` (canonical,
+ * existing) and differs from it only in letter case (#1357).
+ *
+ * Every path component that differs is checked for IDENTITY, not existence:
+ * the target's own component and its case-swapped spelling must be the same
+ * directory entry (same device and inode, by lstat). On a case-sensitive
+ * filesystem `Proj` and `pROJ` can be two sibling folders, and treating one's
+ * entry as the other's would move an `off` or a trust grant to the wrong
+ * folder; a symlink at the swapped spelling has its own inode and does not
+ * match either. Only spellings built from the target's canonical path are
+ * probed — the stored entry is never resolved (#778). Any error: false.
  */
-function caseInsensitiveAt(target: string): boolean {
-  const swapped = target.replace(/\p{L}/gu, c => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()))
-  return swapped !== target && existsSync(target) && existsSync(swapped)
+function sameFolderIgnoringCase(form: string, target: string): boolean {
+  if (form === target || form.toLowerCase() !== target.toLowerCase()) return false
+  const a = form.split(sep)
+  const b = target.split(sep)
+  if (a.length !== b.length) return false
+  for (let i = 0; i < b.length; i++) {
+    if (a[i] === b[i]) continue
+    const prefix = b.slice(0, i)
+    const swapped = b[i].replace(/\p{L}/gu, c => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()))
+    try {
+      const x = lstatSync([...prefix, b[i]].join(sep) || sep)
+      const y = lstatSync([...prefix, swapped].join(sep) || sep)
+      if (x.dev !== y.dev || x.ino !== y.ino) return false
+    } catch {
+      return false
+    }
+  }
+  return true
 }
 
 /**
@@ -475,9 +498,8 @@ function findEntryIndex(entries: FolderEntry[], folder: string, home: string): {
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
   const exact = entries.findIndex(e => entryIsFolder(e, folder, raw, target, home))
-  if (exact >= 0 || !caseInsensitiveAt(target)) return { idx: exact, caseOnly: false }
-  const t = target.toLowerCase()
-  const idx = entries.findIndex(e => !hasGlob(e.path) && entryForms(e.path, home, false).some(f => f.toLowerCase() === t))
+  if (exact >= 0) return { idx: exact, caseOnly: false }
+  const idx = entries.findIndex(e => !hasGlob(e.path) && entryForms(e.path, home, false).some(f => sameFolderIgnoringCase(f, target)))
   return { idx, caseOnly: idx >= 0 }
 }
 

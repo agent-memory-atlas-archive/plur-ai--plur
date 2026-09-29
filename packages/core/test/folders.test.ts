@@ -158,6 +158,31 @@ describe('resolveFolderPolicy', () => {
     expect(at(join(realHome, 'proj')).mode).toBe('off')
   })
 
+  // #1357: on a CASE-SENSITIVE filesystem `Proj` and `pROJ` are two folders.
+  // Editing one must never take over the other's entry. Runs where the
+  // filesystem is case-sensitive (Linux CI); skipped on a case-insensitive one.
+  it('a sibling folder that differs only in case keeps its own entry (case-sensitive filesystem)', ({ skip }) => {
+    const w = mk('Sib')
+    const proj = join(w, 'Proj')
+    mkdirSync(proj)
+    const other = join(w, 'pROJ')
+    try { mkdirSync(other) } catch { skip() } // EEXIST: case-insensitive filesystem
+    writeMap([{ path: other, plur: 'off', trusted: true }])
+
+    expect(setFolderEntry(root, proj, { scope: 'project:x' }, { configuredScopes: [], home }))
+      .toEqual({ path: proj, scope: 'project:x' })
+    expect(loadFolderMap(root).folders).toEqual([
+      { path: other, plur: 'off', trusted: true },
+      { path: proj, scope: 'project:x' },
+    ])
+    expect(policy(other).mode).toBe('off')
+    expect(isTrustedInMap(loadFolderMap(root).folders, proj, home)).toBe(false)
+
+    expect(removeFolderEntry(root, proj, home)).toBe(true)
+    expect(removeFolderEntry(root, proj, home)).toBe(false)
+    expect(loadFolderMap(root).folders).toEqual([{ path: other, plur: 'off', trusted: true }])
+  })
+
   // #1357: canonicalize now folds letter case to the on-disk name. That must
   // never make an `off` entry stop matching. Skipped on a case-sensitive
   // filesystem, where differently-cased paths are different folders.
