@@ -93,11 +93,18 @@ const STOPWORDS = new Set([
   'under', 'until', 'using', 'where', 'which', 'while', 'would', 'without',
 ])
 
+/**
+ * Curly and modifier-letter apostrophes (U+2018, U+2019, U+02BC) count as
+ * straight ones, so "don’t" is "don't" and "that’s wrong" is a correction.
+ */
+function straightApostrophes(text: string): string {
+  return text.replace(/[\u2018\u2019\u02bc]/g, "'")
+}
+
 function tokens(text: string): string[] {
   // Inner apostrophes and hyphens belong to the word ("don't", "zebra-quartz");
   // leading/trailing ones are quote marks and dashes around it.
-  // Curly apostrophes count as straight ones ("don’t" is "don't").
-  return (text.toLowerCase().replace(/[\u2018\u2019]/g, "'").match(/[\p{L}\p{N}_'-]+/gu) ?? [])
+  return (straightApostrophes(text.toLowerCase()).match(/[\p{L}\p{N}_'-]+/gu) ?? [])
     .map(t => t.replace(/^['-]+|['-]+$/g, ''))
     .filter(Boolean)
 }
@@ -110,7 +117,8 @@ function trigrams(words: string[]): Set<string> {
 }
 
 function sentences(text: string): string[] {
-  return text
+  // Normalised here, before the correction regexes see the sentence.
+  return straightApostrophes(text)
     .split(/(?<=[.!?])\s+|\n+/)
     .map(s => s.trim().toLowerCase())
     .filter(s => s.length > 0)

@@ -175,6 +175,13 @@ describe('a match rejected where it sits is never positive (#1362)', () => {
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
   })
 
+  it('a correction written with a curly apostrophe counts (“that’s wrong”)', () => {
+    const reply = 'Your note says “use pnpm” — that’s wrong now.'
+    expect(detectInjectionSignal('Use pnpm', reply).signal).toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', reply.replace('’', 'ʼ')).signal).toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', reply.replace('’', "'")).signal).toBe('negative')
+  })
+
   it('a reply that follows the engram with an unrelated "not" stays positive', () => {
     expect(detectInjectionSignal('Use pnpm', 'Use pnpm, not npm.').signal).toBe('positive')
     expect(detectInjectionSignal('Use pnpm', 'If not sure, use pnpm.').signal).toBe('positive')
