@@ -13,6 +13,8 @@ import {
   claudeHookSpec,
   windowsHookCommand,
   resolveShortPath,
+  useClaudeExecForm,
+  claudeVersionOutput,
   type StringHookHost,
 } from '../lib/hook-command.js'
 import {
@@ -1391,12 +1393,6 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // the exec form (node + CLI js entry + subcommand, no shell); Codex, Cursor
   // and Antigravity get one unquoted forward-slash string (8.3 short path
   // when the path has whitespace; a reported per-editor fallback otherwise).
-  const hookLaunch: HookLaunch = (sub, ...extra) => claudeHookSpec({
-    plat: platform(),
-    shellCmd: cmd,
-    node: process.execPath,
-    cliEntry: shim.shimPath ? resolveCliEntrypoint() : null,
-  }, sub, ...extra)
   let shortPathMemo: string | null | undefined
   const shortPath = (p: string): string | null => {
     if (shortPathMemo === undefined) shortPathMemo = resolveShortPath(p)
@@ -1404,6 +1400,20 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   }
   const stringHookCmd = (host: StringHookHost): string =>
     win32 && shim.shimPath ? windowsHookCommand(shim.shimPath, host, shortPath).command : cmd
+  // Exec form needs Claude Code >= 2.1.139 (CLAUDE_EXEC_FORM_MIN); gate on
+  // `claude --version` when it can be read — see useClaudeExecForm for the
+  // unknown-version rule. The string form uses PowerShell's fallback when no
+  // short name exists, as for Codex.
+  const claudeString = win32 && shim.shimPath ? windowsHookCommand(shim.shimPath, 'codex', shortPath) : null
+  const claudeExecForm = claudeString ? useClaudeExecForm(claudeVersionOutput(), claudeString.fallback) : true
+  const hookLaunch: HookLaunch = (sub, ...extra) => claudeHookSpec({
+    plat: platform(),
+    shellCmd: cmd,
+    node: process.execPath,
+    cliEntry: shim.shimPath ? resolveCliEntrypoint() : null,
+    execForm: claudeExecForm,
+    stringCmd: claudeString?.command,
+  }, sub, ...extra)
 
   // Install local MCP shim — same fix pattern for MCP server launch (#234)
   const mcpShim = installMcpBinary()
@@ -1538,6 +1548,11 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo('PLUR installed for Claude Code.', flags)
   outputInfo('', flags)
   outputInfo(`Hook binary: ${shim.status}${shim.shimPath ? ` (${shim.shimPath})` : ''}`, flags)
+  if (claudeString) {
+    outputInfo(claudeExecForm
+      ? 'Claude Code hooks: exec form (node + CLI entry, no shell; needs Claude Code >= 2.1.139)'
+      : `Claude Code hooks: unquoted command string (${claudeString.command}) — exec form needs Claude Code >= 2.1.139`, flags)
+  }
   outputInfo(`MCP binary:  ${mcpShim.status}${mcpShim.shimPath ? ` (${mcpShim.shimPath})` : ''}`, flags)
   outputInfo('', flags)
   outputInfo('Architecture: One global engram store (~/.plur/), enforcement hooks global, injection hooks project-scoped.', flags)

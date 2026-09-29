@@ -67,6 +67,52 @@ export function resolveShortPath(path: string): string | null {
   }
 }
 
+/**
+ * The first Claude Code release with exec-form hooks: anthropics/claude-code
+ * CHANGELOG.md, 2.1.139 — "Added hook `args: string[]` field (exec form)
+ * that spawns the command directly without a shell". An older Claude Code
+ * ignores `args` and would run `node.exe` with no script.
+ */
+export const CLAUDE_EXEC_FORM_MIN = '2.1.139'
+
+/** The `X.Y.Z` in `claude --version` output, or null. */
+export function parseClaudeVersion(output: string): string | null {
+  return /(\d+)\.(\d+)\.(\d+)/.exec(output)?.[0] ?? null
+}
+
+/**
+ * Should Claude Code's hooks on Windows use the exec form? Yes when the
+ * installed Claude Code is known to support it (>= CLAUDE_EXEC_FORM_MIN);
+ * no when it is known to be older. When the version is unknown (`claude`
+ * not on PATH at init time), the unquoted short-path string is preferred,
+ * because it runs in every shell Claude Code may use (Git Bash or
+ * PowerShell) and in any version; exec form is used only when that string
+ * would itself be the fallback (no 8.3 short name).
+ */
+export function useClaudeExecForm(versionOutput: string | null, stringIsFallback: boolean): boolean {
+  const version = versionOutput === null ? null : parseClaudeVersion(versionOutput)
+  if (version === null) return stringIsFallback
+  const [a, b, c] = version.split('.').map(Number)
+  const [x, y, z] = CLAUDE_EXEC_FORM_MIN.split('.').map(Number)
+  return a !== x ? a > x : b !== y ? b > y : c >= z
+}
+
+/**
+ * `claude --version` output, or null when it cannot be had. On Windows the
+ * `claude` on PATH may be an npm `.cmd` shim, which Node cannot spawn
+ * directly, so it runs through `cmd.exe`.
+ */
+export function claudeVersionOutput(plat: NodeJS.Platform = process.platform): string | null {
+  try {
+    const r = plat === 'win32'
+      ? spawnSync('cmd.exe', ['/d', '/s', '/c', '"claude --version"'], { encoding: 'utf8', timeout: 10000, windowsVerbatimArguments: true, stdio: ['ignore', 'pipe', 'ignore'] })
+      : spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] })
+    return r.status === 0 && typeof r.stdout === 'string' && r.stdout.trim() ? r.stdout : null
+  } catch {
+    return null
+  }
+}
+
 /** What `claudeHookSpec` needs to build a Claude Code hook. */
 export interface ClaudeHookContext {
   plat: NodeJS.Platform
@@ -76,6 +122,10 @@ export interface ClaudeHookContext {
   node: string
   /** The CLI's js entry, or null when it could not be resolved. */
   cliEntry: string | null
+  /** Windows: use the exec form (default true); see useClaudeExecForm. */
+  execForm?: boolean
+  /** Windows, when `execForm` is false: the unquoted string prefix (windowsHookCommand). */
+  stringCmd?: string
 }
 
 /**
@@ -89,10 +139,14 @@ export interface ClaudeHookContext {
  * docs require `command` to be a real executable there, not a `.cmd`, and
  * recommend node plus the script path: so `node.exe <CLI js entry>
  * <subcommand>`. Without a js entry (the shim could not be installed), the
- * npx fallback is launched through `cmd.exe`, still in exec form.
+ * npx fallback is launched through `cmd.exe`, still in exec form. With
+ * `execForm: false` (a Claude Code older than CLAUDE_EXEC_FORM_MIN, or an
+ * unknown version with a usable short path) the hook is the unquoted
+ * short-path string instead.
  */
 export function claudeHookSpec(ctx: ClaudeHookContext, sub: string, ...extra: string[]): { command: string; args?: string[] } {
   if (ctx.plat !== 'win32') return { command: [ctx.shellCmd, sub, ...extra].join(' ') }
+  if (ctx.execForm === false && ctx.stringCmd) return { command: [ctx.stringCmd, sub, ...extra].join(' ') }
   if (ctx.cliEntry) return { command: ctx.node, args: [ctx.cliEntry, sub, ...extra] }
   return { command: 'cmd.exe', args: ['/c', ...ctx.shellCmd.split(/\s+/), sub, ...extra] }
 }
