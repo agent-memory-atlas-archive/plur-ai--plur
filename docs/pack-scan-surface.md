@@ -58,6 +58,11 @@ the decoded or unfolded copies.
 | `private_key` | a `-----BEGIN … PRIVATE KEY-----` header |
 | `bearer_token` | `Bearer` followed by 20 or more token characters |
 
+A credential finding names the pattern and shows only the matched value's
+prefix (the vendor prefix, the keyword of an assignment, or the URL scheme) and
+its last four characters, for example `github_token: ghp_...WXYZ`. A value
+shorter than 16 characters after the prefix, such as a password, is not shown.
+
 The vendor-prefixed patterns (`github_token` to `stripe_live_key`) do not match
 when the prefix is glued onto the end of a longer word (a preceding digit or
 `=` does not count), and each needs the vendor's

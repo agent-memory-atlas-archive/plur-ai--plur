@@ -170,6 +170,45 @@ function escapeUnfoldedView(text: string): string | null {
   return out === text ? null : out
 }
 
+/**
+ * The part of each credential match that is a label, not a secret: the
+ * vendor prefix, the keyword of an assignment, the URL scheme. A pattern
+ * missing here shows its first four characters.
+ */
+const FINDING_PREFIX: Record<string, RegExp> = {
+  aws_access_key: /^A[KS]IA/,
+  github_token: /^gh[pousr]_/,
+  github_pat: /^github_pat_/,
+  gitlab_token: /^gl[a-z]+-/,
+  slack_token: /^(?:xoxe(?:\.xox[bp])?|xox[a-z]|xapp)-/,
+  npm_token: /^npm_/,
+  stripe_live_key: /^[sr]k_live_/,
+  aws_secret_key: /^[^=:]*[=:]\s*/,
+  generic_api_key: /^[^a-z]?(?:sk|pk)[-_]/i,
+  api_key_assignment: /^[^=:]*[=:]\s*/,
+  password_assignment: /^[^=:]*[=:]\s*/,
+  connection_string: /^[a-z]+:\/\//,
+  jwt: /^eyJ/,
+  private_key: /^[\s\S]*/,
+  bearer_token: /^Bearer\s+/,
+}
+
+/**
+ * What a finding shows of the matched credential (#1373): its prefix, then
+ * `...`, then the last four characters when at least 16 follow the prefix.
+ * The finding reaches pack-scan issue details, and the old first-20-characters
+ * echo was the prefix plus 16 of a GitHub or npm token's 36 body characters.
+ * Four trailing characters tell a reader which credential it is, the way
+ * vendor dashboards identify keys; a value shorter than 16 characters, such as
+ * a password, is not shown at all.
+ */
+function maskFinding(name: string, matched: string): string {
+  const prefix = FINDING_PREFIX[name]?.exec(matched)?.[0] ?? matched.slice(0, 4)
+  const rest = matched.slice(prefix.length)
+  if (rest.length === 0) return prefix
+  return prefix + '...' + (rest.length >= 16 ? rest.slice(-4) : '')
+}
+
 /** Scan text for potential secrets. Returns empty array if clean. */
 export function detectSecrets(text: string): SecretMatch[] {
   if (typeof text !== 'string') {
@@ -191,7 +230,7 @@ export function detectSecrets(text: string): SecretMatch[] {
       const m = view.match(regex)
       if (m) {
         found.add(name)
-        matches.push({ pattern: name, match: m[0].slice(0, 20) + '...' })
+        matches.push({ pattern: name, match: maskFinding(name, m[0]) })
       }
     }
   }

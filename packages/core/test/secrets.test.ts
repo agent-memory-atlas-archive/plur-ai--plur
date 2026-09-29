@@ -313,6 +313,53 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     })
   })
 
+  describe('findings do not echo the token body (#1373)', () => {
+    // Each finding shows the non-secret prefix plus the last four characters,
+    // so a reader can tell which credential it is without the finding (which
+    // lands in pack-scan issue details) carrying a usable part of it.
+    for (const [label, token, pattern] of positives) {
+      it(`masks a ${label}`, () => {
+        const hit = detectSecrets('value: ' + token + ' end').find(h => h.pattern === pattern)!
+        // The last four of the MATCH: a routable GitLab token matches up to
+        // its `.xx.` routing suffix.
+        const tail = hit.match.slice(hit.match.indexOf('...') + 3)
+        expect(tail, hit.match).toHaveLength(4)
+        expect(token, hit.match).toContain(tail)
+        const prefix = hit.match.slice(0, hit.match.indexOf('...'))
+        expect(token.startsWith(prefix), hit.match).toBe(true)
+        // The prefix is the vendor's marker, never a stretch of the body.
+        expect(prefix.length, hit.match).toBeLessThanOrEqual(11)
+        expect(hit.match.length).toBeLessThanOrEqual(prefix.length + 7)
+      })
+    }
+    it('shows the GitHub prefix and last four characters', () => {
+      const token = 'ghp' + '_' + body(32) + 'WXYZ'
+      expect(detectSecrets(token)).toEqual([{ pattern: 'github_token', match: 'ghp_...WXYZ' }])
+    })
+    it('keeps a keyword assignment to its keyword, and a short value hidden entirely', () => {
+      const hits = detectSecrets('password = ' + 'hunter2' + 'hunter2')
+      expect(hits).toEqual([{ pattern: 'password_assignment', match: 'password = ...' }])
+    })
+    it('masks the other credential patterns too', () => {
+      const cases: [string, string, string][] = [
+        ['api_key=' + body(40), 'api_key_assignment', 'api_key=...' + body(40).slice(-4)],
+        ['Bearer ' + body(40), 'bearer_token', 'Bearer ...' + body(40).slice(-4)],
+        ['aws_secret_access_key=' + body(40), 'aws_secret_key', 'aws_secret_access_key=...' + body(40).slice(-4)],
+        ['sk' + '-ant-api03-' + body(40), 'generic_api_key', 'sk-...' + body(40).slice(-4)],
+        ['postgres' + '://app:' + body(20) + '@db/app', 'connection_string', 'postgres://...' + '/app'],
+        ['-----BEGIN RSA ' + 'PRIVATE KEY-----', 'private_key', '-----BEGIN RSA PRIVATE KEY-----'],
+      ]
+      for (const [text, pattern, expected] of cases)
+        expect(detectSecrets(text).find(h => h.pattern === pattern)?.match, pattern).toBe(expected)
+    })
+    it('pack-scan issue details carry only the masked finding', () => {
+      const token = 'npm' + '_' + body(36)
+      const hit = detectSensitive('x ' + token).find(h => h.pattern === 'npm_token')!
+      expect(hit.match).toBe('npm_...' + token.slice(-4))
+      expect(hit.match).not.toContain(body(36).slice(0, 8))
+    })
+  })
+
   it('files the new token patterns under the secrets family', () => {
     for (const p of ['github_token', 'github_pat', 'gitlab_token', 'slack_token', 'npm_token', 'stripe_live_key'])
       expect(sensitivityCategory(p)).toBe('secrets')

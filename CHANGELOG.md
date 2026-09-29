@@ -37,6 +37,13 @@ backslash escapes unfolded, so a token after a literal `\n`, `\t` or `\r` in
 JSON-escaped text or a pasted log is found (#1372). A token glued after a
 digit is found too.
 
+A credential finding no longer echoes the first 20 characters of the match,
+which for a GitHub or npm token was the prefix plus 16 of its 36 secret
+characters. It now shows the prefix (or the keyword of an assignment) and the
+last four characters, such as `ghp_...WXYZ`; a value shorter than 16
+characters after the prefix, such as a password, is not shown at all (#1373).
+This is the text pack-scan issue details carry.
+
 The same patterns apply to the pack scanner, so a pack carrying one of these
 refuses to install (`docs/pack-scan-surface.md`). Text that only names a prefix,
 such as "use a `ghp_` token", stays clean. No existing pattern changed except
