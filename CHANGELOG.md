@@ -24,8 +24,10 @@ A quote or paraphrase is positive only when neither its sentence nor the next
 one corrects it. "Your note says 'use npm for installs' — that is no longer
 true" is rated negative, not positive. A match is also negative when the word
 right before it negates it ("Do not use pnpm, use npm." against the engram "Use
-pnpm") or the words right after it reject it ('"use npm" is outdated'). A "not"
-elsewhere in the sentence ("Use pnpm, not npm.") leaves it positive, and
+pnpm"; also "no longer", "instead of", "rather than", "ignore") or the words
+right after it reject it ('"use npm" is outdated', "does not apply", "was
+dropped"). A "not" elsewhere in the sentence ("Use pnpm, not npm.", "Rather
+than npm, use pnpm.") leaves it positive, and
 "Why not use pnpm?" is not a negation. Each occurrence of the statement, and
 each run of matching trigrams, is judged on its own: the reply is negative only
 when every occurrence is rejected, and gets no verdict when it both rejects and

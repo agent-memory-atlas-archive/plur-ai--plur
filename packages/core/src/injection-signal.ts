@@ -24,7 +24,10 @@
  *
  * The match itself is also checked where it sits (#1362): a negation in the
  * word right before it ("Do not use pnpm" against "Use pnpm") or a
- * verdict right after it ('"use npm" is outdated') makes it negative too.
+ * verdict right after it ('"use npm" is outdated', '… does not apply here',
+ * '… was dropped') makes it negative too. "No longer", "instead of", "rather
+ * than" and "ignore" count as negations when they sit right before it. "Stop"
+ * does not: "Stop — use pnpm for installs" follows the engram.
  * Only the words next to the match count, so a reply that follows the engram
  * and says "not" about something else in the same sentence stays positive.
  * Each occurrence (each run of consecutive trigrams, under rule 2) is judged on
@@ -140,8 +143,14 @@ function sentences(text: string): string[] {
 /** Words that negate what directly follows them ("do not use pnpm"). */
 const NEGATORS = new Set([
   'not', 'never', "don't", 'dont', "doesn't", "didn't", "shouldn't",
-  "mustn't", "won't", "can't", 'cannot', 'avoid',
+  "mustn't", "won't", "can't", 'cannot', 'avoid', 'ignore',
 ])
+/**
+ * Two-word phrases that set aside what directly follows them: "we no longer
+ * use pnpm", "instead of 'use pnpm'", "rather than use pnpm". Only right
+ * before the match, so "Rather than npm, use pnpm" still follows it.
+ */
+const NEGATOR_PAIRS = new Set(['no longer', 'instead of', 'rather than'])
 /**
  * Filler a negator may sit behind ("don't ever use pnpm"). Only the word right
  * before the match is checked otherwise, so "If not sure, use pnpm" follows it.
@@ -152,7 +161,7 @@ const NEGATION_FILLER = new Set(['ever', 'just', 'really', 'even', 'actually', '
  * '"use npm" is outdated', "…, which is no longer true".
  */
 const TRAILING_VERDICT =
-  /^(?:which |that )?(?:is|was|are|were)(?: now| also)? (?:outdated|out of date|obsolete|deprecated|stale|wrong|incorrect|false|(?:not|no longer) (?:true|valid|correct|accurate|right|the case|needed|required|recommended))\b/
+  /^(?:which |that )?(?:(?:is|was|are|were|has been|have been)(?: now| also)? (?:outdated|out of date|obsolete|deprecated|stale|wrong|incorrect|false|dropped|removed|retired|replaced|reverted|superseded|(?:not|no longer) (?:true|valid|correct|accurate|right|the case|needed|required|recommended))|(?:does not|doesn't|do not|don't|no longer) apply|no longer (?:applies|holds))\b/
 
 function isCorrection(sentence: string): boolean {
   return LEADING_CORRECTION.test(sentence)
@@ -201,6 +210,7 @@ export function detectInjectionSignal(statement: string, reply: string): Injecti
       const whyNot = flat[k] === 'not' && k > 0 && sentOf[k - 1] === sentOf[k] && flat[k - 1] === 'why'
       if (!whyNot) return true
     }
+    if (k >= 1 && sentOf[k - 1] === sentOf[start] && NEGATOR_PAIRS.has(`${flat[k - 1]} ${flat[k]}`)) return true
     const after: string[] = []
     for (let k = end + 1; k < flat.length && after.length < 6 && sentOf[k] === sentOf[end]; k++) after.push(flat[k])
     return TRAILING_VERDICT.test(after.join(' '))

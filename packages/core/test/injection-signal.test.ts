@@ -235,6 +235,31 @@ describe('one rejected occurrence does not override a follow-through one (#1362)
   })
 })
 
+describe('more ways of setting a match aside (#1362)', () => {
+  const S = 'use pnpm for installs'
+  it.each([
+    'We no longer use pnpm for installs.',
+    'Instead of "use pnpm for installs", use npm.',
+    'Rather than use pnpm for installs, switch to npm.',
+    'The memory "use pnpm for installs" does not apply to this repo.',
+    "The memory \u201cuse pnpm for installs\u201d doesn\u2019t apply here.",
+    'The rule use pnpm for installs was dropped last month.',
+    'The rule use pnpm for installs has been removed.',
+    'Ignore "use pnpm for installs"; this repo uses npm.',
+  ])('%s is negative', reply => {
+    expect(detectInjectionSignal(S, reply).signal).toBe('negative')
+  })
+
+  it.each([
+    'Use pnpm for installs instead of npm.',
+    'Rather than npm, use pnpm for installs.',
+    'Use pnpm for installs; it no longer breaks on workspaces.',
+    'Stop \u2014 use pnpm for installs.',
+  ])('%s stays positive', reply => {
+    expect(detectInjectionSignal(S, reply).signal).toBe('positive')
+  })
+})
+
 describe('stays linear on long replies (#1362)', () => {
   const MIB = 1024 * 1024
   const time = (fn: () => unknown): number => { const t = performance.now(); fn(); return performance.now() - t }
