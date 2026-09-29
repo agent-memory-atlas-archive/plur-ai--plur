@@ -23,17 +23,31 @@ repo's request. Only the CLI writes the map.
   also covers everything below it.
 - **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
   `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
-  `--no-trusted`. From the ask flow it also takes `--nonce <n>`. A nonce names
-  one folder, works once, and expires when its session ends (after 24 hours at
-  most). `set` refuses:
-  - a shared scope that no store in `config.yaml` serves;
-  - a folders.yaml it cannot read (it is never overwritten).
+  `--no-trusted`.
+  - **Outside an interactive terminal, `set` and `rm` need `--nonce <n>`.** That
+    is how the ask flow calls them, and it stops an agent from writing any
+    folder, `--trusted` included, by leaving `--nonce` out. A person at a
+    terminal needs no nonce. `plur trust` is the explicit alias for a person
+    and still works in scripts.
+  - A nonce names one folder and works once. It is used up only after the map
+    is saved, so a failed write does not burn it. It expires when its session
+    ends, after 24 hours at most.
+  - `set` refuses a team scope (`group:`, `org:`, `team:`, `space:`, `public`)
+    that no store in `config.yaml` serves. `project:` scopes live in the local
+    store and need none.
+  - Neither command writes to a folders.yaml it cannot read; it is never
+    overwritten.
 - **Upgrade needs no steps.** The first read of a missing `folders.yaml` imports
-  the `trust.yaml` entries as `trusted: true` entries. `trust.yaml` is never
-  rewritten, so a downgrade still works.
+  the `trust.yaml` entries as `trusted: true` entries. Nothing is ever added to
+  `trust.yaml`. `plur untrust` removes the grant from both files, so neither a
+  downgrade (an older version reading `trust.yaml`) nor a fresh import brings a
+  revoked grant back.
 - **`plur trust`, `plur untrust` and `plur init-remote`** now set and clear
-  `trusted` in the map. Their output and exit codes are unchanged, except that
-  they now exit 1 instead of overwriting a folders.yaml they cannot read.
+  `trusted` in the map. Their output and exit codes are unchanged, with one
+  exception: `plur trust` and `plur untrust` exit 1 on a folders.yaml they
+  cannot read, rather than overwrite it. `plur init-remote` still writes
+  `.plur.yaml` and exits 0, but warns that it could not record trust and leaves
+  remote memory off until you run `plur trust`. It fails safe.
 - A folders.yaml that cannot be read counts as empty and logs one warning. It
   never throws.
 - **Trust matching is now in one place, the map, and it fails closed.** A
