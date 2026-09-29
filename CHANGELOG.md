@@ -51,9 +51,13 @@ Now:
   folder is compared in its on-disk case; an `off` entry still matches every
   spelling it matched before, and a `trusted` entry recorded in the on-disk
   case (as `plur trust` records it) now also covers other case spellings.
-  `plur folders set` and `plur folders rm` still find an entry recorded in
-  another case on such a filesystem: `set` rewrites it to the on-disk case
-  instead of adding a second entry, and `rm` removes it.
+  `plur folders set`, `plur folders rm` and `plur untrust` still find the
+  entries recorded for a folder in another case, when the filesystem shows
+  that spelling is the same folder (a sibling `pROJ` on a case-sensitive
+  disk is never taken for `Proj`). `set` merges them into one entry in the
+  on-disk case; it keeps only their mode (the most restrictive one, unless
+  you set a mode), never a trust grant or scope that did not apply. `rm`
+  removes all of them, and `untrust` clears their grants.
 
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
 

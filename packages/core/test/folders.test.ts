@@ -256,6 +256,44 @@ describe('resolveFolderPolicy', () => {
         .toEqual({ path: onDisk, plur: 'off', trusted: true })
     })
 
+    it('several entries for the folder in other letter cases merge into one; set --on takes effect', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      const w = mk('M')
+      const onDisk = join(w, 'Proj')
+      mkdirSync(onDisk)
+      const unrelated = { path: join(w, 'other'), plur: 'ask' as const }
+      const many = () => writeMap([
+        { path: join(w, 'proj'), plur: 'on' },
+        unrelated,
+        { path: join(w, 'PROJ'), plur: 'off' },
+        { path: join(w, 'pRoJ'), scope: 'project:old' },
+      ])
+
+      many()
+      expect(policy(onDisk).mode).toBe('off')
+      expect(setFolderEntry(root, onDisk, { mode: 'on' }, { configuredScopes: [], home }))
+        .toEqual({ path: onDisk, plur: 'on' })
+      expect(loadFolderMap(root).folders).toEqual([{ path: onDisk, plur: 'on' }, unrelated])
+      expect(policy(onDisk).mode).toBe('on')
+
+      // Without a mode in the change, the most restrictive old mode stays.
+      many()
+      expect(setFolderEntry(root, onDisk, { trusted: true }, { configuredScopes: [], home }))
+        .toEqual({ path: onDisk, plur: 'off', trusted: true })
+
+      // An exact entry plus a leftover mis-cased `off`: both merge.
+      writeMap([{ path: onDisk, plur: 'on' }, { path: join(w, 'proj'), plur: 'off' }])
+      expect(policy(onDisk).mode).toBe('off')
+      setFolderEntry(root, onDisk, { mode: 'on' }, { configuredScopes: [], home })
+      expect(loadFolderMap(root).folders).toEqual([{ path: onDisk, plur: 'on' }])
+      expect(policy(onDisk).mode).toBe('on')
+
+      // rm removes every entry for the folder.
+      many()
+      expect(removeFolderEntry(root, onDisk, home)).toBe(true)
+      expect(loadFolderMap(root).folders).toEqual([unrelated])
+    })
+
     it('a `trusted` entry covers every case spelling of its folder, and a mis-cased entry fails closed', ({ skip }) => {
       if (!caseInsensitive()) skip()
       const d = mk('Team')

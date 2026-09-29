@@ -493,14 +493,26 @@ function sameFolderIgnoringCase(form: string, target: string): boolean {
  * an edit or removal must find it rather than add a second entry beside it.
  * Compared as written apart from letter case — never resolved on disk.
  */
-function findEntryIndex(entries: FolderEntry[], folder: string, home: string): { idx: number; caseOnly: boolean } {
-  if (hasGlob(folder)) return { idx: entries.findIndex(e => e.path === folder), caseOnly: false }
+function findEntryIndex(entries: FolderEntry[], folder: string, home: string): { idx: number; caseOnly: number[] } {
+  if (hasGlob(folder)) return { idx: entries.findIndex(e => e.path === folder), caseOnly: [] }
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
-  const exact = entries.findIndex(e => entryIsFolder(e, folder, raw, target, home))
-  if (exact >= 0) return { idx: exact, caseOnly: false }
-  const idx = entries.findIndex(e => !hasGlob(e.path) && entryForms(e.path, home, false).some(f => sameFolderIgnoringCase(f, target)))
-  return { idx, caseOnly: idx >= 0 }
+  const idx = entries.findIndex(e => entryIsFolder(e, folder, raw, target, home))
+  // EVERY entry for this folder in another letter case, not just the first:
+  // a leftover mis-cased `off` would otherwise keep winning (through the loose
+  // `off` match) after the user set the folder on (#1357).
+  const caseOnly: number[] = []
+  entries.forEach((e, i) => {
+    if (i !== idx && !hasGlob(e.path) && !entryIsFolder(e, folder, raw, target, home) &&
+        entryForms(e.path, home, false).some(f => sameFolderIgnoringCase(f, target))) caseOnly.push(i)
+  })
+  return { idx, caseOnly }
+}
+
+/** The most restrictive of the modes: off, then ask, then on. */
+function mostRestrictive(modes: Array<FolderMode | undefined>): FolderMode | undefined {
+  for (const m of ['off', 'ask', 'on'] as const) if (modes.includes(m)) return m
+  return undefined
 }
 
 function loadForWrite(root: string): FolderMap {
@@ -536,17 +548,19 @@ export function setFolderEntry(root: string, folder: string, change: FolderChang
   const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
   const key = folderEntryKey(folder, home)
   const { idx, caseOnly } = findEntryIndex(map.folders, folder, home)
-  // A case-only match is rewritten to the on-disk spelling, so the strict
-  // (fail-closed) comparison matches it from now on (#1357). Only its `plur`
+  // Entries for this folder in another letter case merge into ONE entry,
+  // written in the on-disk spelling so the strict (fail-closed) comparison
+  // matches it from now on (#1357). From a case-only entry only its `plur`
   // mode carries over: `off`/`ask` already applied through the loose match,
   // but its `trusted` and `scope` never did, and rewriting the path must not
-  // bring a dormant grant (or one `plur untrust` just cleared) to life.
-  let entry: FolderEntry
-  if (idx < 0) entry = { path: key }
-  else if (caseOnly) {
-    const old = map.folders[idx]
-    entry = { path: key, ...(old.plur !== undefined ? { plur: old.plur } : {}) }
-  } else entry = { ...map.folders[idx] }
+  // bring a dormant grant (or one `plur untrust` just cleared) to life. Of
+  // several modes the most restrictive is kept — what applied until now —
+  // and a mode this change sets wins over all of them.
+  const entry: FolderEntry = idx >= 0 ? { ...map.folders[idx] } : { path: key }
+  if (caseOnly.length) {
+    const mode = mostRestrictive([entry.plur, ...caseOnly.map(i => map.folders[i].plur)])
+    if (mode !== undefined) entry.plur = mode
+  }
   if (change.scope !== undefined) {
     entry.scope = change.scope
     if (change.mode === undefined) delete entry.plur
@@ -554,8 +568,11 @@ export function setFolderEntry(root: string, folder: string, change: FolderChang
   if (change.mode !== undefined) entry.plur = change.mode
   if (change.trusted === true) entry.trusted = true
   if (change.trusted === false) delete entry.trusted
-  if (idx >= 0) map.folders[idx] = entry
-  else map.folders.push(entry)
+  const matched = [...(idx >= 0 ? [idx] : []), ...caseOnly]
+  if (matched.length) {
+    const at = Math.min(...matched)
+    map.folders = map.folders.flatMap((e, i) => (i === at ? [entry] : matched.includes(i) ? [] : [e]))
+  } else map.folders.push(entry)
   saveFolderMap(root, map)
   consume?.()
   return cleanEntry(entry)
@@ -571,9 +588,10 @@ export function removeFolderEntry(
 ): boolean {
   const map = loadForWrite(root)
   const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
-  const { idx } = findEntryIndex(map.folders, folder, home)
-  if (idx < 0) return false
-  map.folders.splice(idx, 1)
+  const { idx, caseOnly } = findEntryIndex(map.folders, folder, home)
+  const matched = [...(idx >= 0 ? [idx] : []), ...caseOnly]
+  if (matched.length === 0) return false
+  map.folders = map.folders.filter((_, i) => !matched.includes(i))
   saveFolderMap(root, map)
   consume?.()
   return true
