@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from 'fs'
 import { join } from 'path'
 import { hostname } from 'os'
+import { pendingStoreLockOps } from '@plur-ai/core'
 import { getLastPlurInstance } from '../plur.js'
 
 /**
@@ -15,6 +16,8 @@ import { getLastPlurInstance } from '../plur.js'
  * write had not — and core cannot tell who owns an empty lock, so every later
  * writer (the next hook, the MCP server) waits out its 60s stale threshold.
  *
+ * A disk check is not enough on its own: see {@link storeIdle}.
+ *
  * Every hook that force-exits goes through here: `hook-inject` (after an
  * abandoned hybrid, and on its watchdog) and `runCodexHook`, which is the exit
  * of every Codex and Antigravity hook.
@@ -24,23 +27,41 @@ import { getLastPlurInstance } from '../plur.js'
 export const EXIT_LOCK_WAIT_MS = 5_000
 
 /**
- * Wait (bounded) while this process may hold the lock at `lockPath`.
+ * Could this process hold the lock at `lockPath`, by what is on disk?
  *
  * Ours = the token names this host and pid. Empty and fresh = possibly ours,
  * mid-acquire. An empty lock older than 2s belongs to someone else.
  */
+function ownLockOnDisk(lockPath: string): boolean {
+  try {
+    const token = readFileSync(lockPath, 'utf8').trim()
+    return token === ''
+      ? Date.now() - statSync(lockPath).mtimeMs < 2_000
+      : token.startsWith(`${hostname()}:${process.pid}:`)
+  } catch {
+    return false // no lock file
+  }
+}
+
+/**
+ * Is this process clear of store lock work?
+ *
+ * The disk alone cannot say so. Between one in-process caller releasing the
+ * lock and the next caller's O_EXCL create landing there is no file — yet the
+ * create is already issued, and one that lands after `process.exit()` is an
+ * empty lock nobody will release. Core's count of lock operations in progress
+ * covers that gap; the file check covers a lock file this process owns
+ * regardless (review of #1349).
+ */
+function storeIdle(lockPath: string | null): boolean {
+  if (pendingStoreLockOps() > 0) return false
+  return lockPath ? !ownLockOnDisk(lockPath) : true
+}
+
+/** Wait (bounded) while this process may hold the lock at `lockPath`. */
 export async function waitForOwnStoreLock(lockPath: string, maxMs: number): Promise<void> {
   const until = Date.now() + maxMs
-  const ours = `${hostname()}:${process.pid}:`
-  while (Date.now() < until) {
-    let mayBeOurs = false
-    try {
-      const token = readFileSync(lockPath, 'utf8').trim()
-      mayBeOurs = token === ''
-        ? Date.now() - statSync(lockPath).mtimeMs < 2_000
-        : token.startsWith(ours)
-    } catch { /* no lock file — nothing to wait for */ }
-    if (!mayBeOurs) return
+  while (Date.now() < until && ownLockOnDisk(lockPath)) {
     await new Promise(r => setTimeout(r, 25))
   }
 }
@@ -59,8 +80,22 @@ export function ownStoreLockPath(): string | null {
   }
 }
 
-/** {@link waitForOwnStoreLock} on this process's store, if it opened one. */
-export async function waitForOwnStoreLocks(maxMs: number = EXIT_LOCK_WAIT_MS): Promise<void> {
-  const lockPath = ownStoreLockPath()
-  if (lockPath) await waitForOwnStoreLock(lockPath, maxMs)
+/**
+ * Wait (bounded) until this process has no store lock work in flight, then
+ * call `exit` — in the SAME synchronous step as the last check, so no lock
+ * operation can start between the check and the exit. Returns without calling
+ * `exit` only if `exit` itself returns (tests pass a no-op).
+ */
+export async function exitWhenStoreIdle(
+  maxMs: number = EXIT_LOCK_WAIT_MS,
+  exit: () => void = () => process.exit(0),
+): Promise<void> {
+  const until = Date.now() + maxMs
+  for (;;) {
+    if (storeIdle(ownStoreLockPath()) || Date.now() >= until) {
+      exit()
+      return
+    }
+    await new Promise(r => setTimeout(r, 25))
+  }
 }

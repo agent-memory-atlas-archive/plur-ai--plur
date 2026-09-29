@@ -2,7 +2,7 @@ import { readSync, readFileSync, mkdirSync, writeFileSync, existsSync, statSync,
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { safeSessionKey } from './session-key.js'
-import { waitForOwnStoreLocks, EXIT_LOCK_WAIT_MS } from './store-lock-exit.js'
+import { exitWhenStoreIdle, EXIT_LOCK_WAIT_MS } from './store-lock-exit.js'
 
 /**
  * Shared stdin-reading and sentinel helpers for the four hook-codex-*
@@ -277,11 +277,6 @@ export async function runCodexHook(
   } catch (err: unknown) {
     process.stderr.write(`[plur] ${name} failed: ${(err as Error)?.message ?? 'unknown error'}\n`)
   }
-  // Not while this process may be inside a store write (#1343): a missed
-  // hybrid deadline leaves that search running, and it records its injection
-  // under `engrams.yaml.lock`. Exiting mid-acquire leaves an empty lock that
-  // stalls every later writer for 60s. Bounded, and free when no lock is ours.
-  await waitForOwnStoreLocks(EXIT_LOCK_WAIT_MS)
   // Flush before exiting: process.exit() truncates a pipe that has buffered
   // writes pending, which would turn our valid JSON into a parse error —
   // the same failure by a different route.
@@ -295,11 +290,13 @@ export async function runCodexHook(
   // Tests, which call run() in-process, would take the whole runner down
   // with it — hence one explicit, purpose-named opt-out rather than
   // sniffing for a test runner.
-  if (process.env.PLUR_HOOK_NO_EXIT === '1') {
-    process.exitCode = 0
-    return
-  }
-  process.exit(0)
+  //
+  // Not while this process may be inside a store write (#1343): a missed
+  // hybrid deadline leaves that search running, and it records its injection
+  // under `engrams.yaml.lock`. Exiting mid-acquire leaves an empty lock that
+  // stalls every later writer for 60s. Bounded, and free when the store is idle.
+  const noExit = process.env.PLUR_HOOK_NO_EXIT === '1'
+  await exitWhenStoreIdle(EXIT_LOCK_WAIT_MS, noExit ? () => { process.exitCode = 0 } : () => process.exit(0))
 }
 
 const DEADLINE_MISSED = Symbol('plur.hybrid.deadline')

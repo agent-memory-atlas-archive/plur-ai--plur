@@ -6,7 +6,7 @@ import { createPlur, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
 import { safeSessionKey } from '../lib/session-key.js'
 import { injectWithFallback, hybridEnabled, type Injectable, type InjectOutcome } from '../lib/codex-hook-io.js'
-import { waitForOwnStoreLock, waitForOwnStoreLocks, EXIT_LOCK_WAIT_MS } from '../lib/store-lock-exit.js'
+import { waitForOwnStoreLock, exitWhenStoreIdle, EXIT_LOCK_WAIT_MS } from '../lib/store-lock-exit.js'
 
 // Remote budget for the recall leg inside injectHybrid (#776). The hook is
 // on the hot path of every prompt; slow networks make this a perceptible
@@ -413,7 +413,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // #1343: the watchdog can fire mid-way through a store write, and exiting
   // there leaves the lock behind. Wait (bounded) for our own lock first.
   const watchdog = setTimeout(() => {
-    void waitForOwnStoreLocks(WATCHDOG_LOCK_WAIT_MS).finally(() => process.exit(0))
+    void exitWhenStoreIdle(WATCHDOG_LOCK_WAIT_MS)
   }, HOOK_CEILING_MS)
   watchdog.unref()
 
@@ -512,8 +512,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // process may be inside a store write: exiting there leaves the lock file
   // behind, and every writer (the next hook, the MCP server) then waits on it.
   if (abandonedHybrid) {
-    await waitForOwnStoreLocks(EXIT_LOCK_WAIT_MS)
-    process.exit(0)
+    await exitWhenStoreIdle(EXIT_LOCK_WAIT_MS)
   }
 }
 

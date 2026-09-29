@@ -111,6 +111,25 @@ describe('force-exiting hooks leave no store lock behind (#1343)', () => {
     expect(locksLeft()).toEqual([])
   }, 60_000)
 
+  it('hook-codex-inject, exiting while its next lock acquisition is issued but not yet on disk', () => {
+    // BM25 holds the lock 6s; the abandoned hybrid search queues behind it in
+    // this process and is handed the lock the moment BM25 releases. Its O_EXCL
+    // create is then in flight for 1.5s with NO file on disk — a disk-only
+    // check passes, and exiting there lands an empty lock. Only an in-process
+    // count of lock operations can see it (core's pendingStoreLockOps).
+    const r = runHook('hook-codex-inject',
+      { session_id: 'codex-inject-inflight', hook_event_name: 'UserPromptSubmit', prompt: 'basalt-heron codeword' },
+      {
+        PLUR_HOOK_HYBRID_DEADLINE_MS: '1',
+        PLUR_TEST_LOCK_ACQUIRE_DELAYS_MS: '6000,0',
+        PLUR_TEST_LOCK_PRE_OPEN_DELAYS_MS: '0,1500',
+      })
+    expect(r.status).toBe(0)
+    expect(r.stderr).toContain('hybrid injection exceeded 1ms')
+    expect(JSON.parse(r.stdout).hookSpecificOutput.additionalContext).toContain('basalt-heron')
+    expect(locksLeft()).toEqual([])
+  }, 60_000)
+
   it('hook-inject, when its watchdog fires mid-write', () => {
     // BM25 only, so the one store write is the awaited injection counter —
     // and the watchdog (1s) fires while its lock is still empty (1.8s — under the

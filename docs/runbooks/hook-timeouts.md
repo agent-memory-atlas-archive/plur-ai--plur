@@ -85,7 +85,9 @@ that write leaves the lock behind — often empty, which core cannot attribute,
 so every later writer waits out the 60s stale threshold and the next prompts
 come back with no memory.
 
-So each of those exits first waits, bounded, while the lock may be its own
+So each of those exits first waits, bounded, until the process has no lock
+operation in flight (core's `pendingStoreLockOps()`, which also sees a create
+that is issued but not yet on disk) and no lock file of its own
 (`lib/store-lock-exit.ts`): 5s after a finished run, 3s once the Claude Code
 watchdog has fired (15s + 3s stays below the 20s budget). A lock left by a
 hook that was *killed* at the harness budget is not covered — that is case B
