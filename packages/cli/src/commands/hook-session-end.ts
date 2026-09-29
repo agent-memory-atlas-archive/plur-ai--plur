@@ -4,6 +4,7 @@ import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { createPlur } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
+import { safeSessionKey } from '../lib/session-key.js'
 import { flushOutboxForHook, HOOK_OUTBOX_BUDGET_MS } from '../lib/hook-outbox-flush.js'
 
 /**
@@ -41,11 +42,16 @@ import { flushOutboxForHook, HOOK_OUTBOX_BUDGET_MS } from '../lib/hook-outbox-fl
 
 function sessionKeys(payloadSessionId?: string): string[] {
   // Mirror plur_session_end's key resolution (tools.ts): payload session_id
-  // first, then CLAUDE_SESSION_ID, then ppid — sanitized the same way as
-  // hook-learn-check writes them.
+  // first, then CLAUDE_SESSION_ID, then ppid. hook-learn-check writes the
+  // checkpoint under safeSessionKey(id), which REPLACES unsafe characters with
+  // '_' — try that form first, then the stripped form older writers used
+  // (#1278 follow-up; #1301 fixed the same mismatch in plur_session_end).
   return [payloadSessionId, process.env.CLAUDE_SESSION_ID, String(process.ppid)]
     .filter(Boolean)
-    .map(k => k!.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64))
+    .flatMap(k => [
+      safeSessionKey(k!).slice(0, 64),
+      k!.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64),
+    ])
     .filter(Boolean)
 }
 
