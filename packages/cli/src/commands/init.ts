@@ -255,7 +255,7 @@ function installMcpBinary(): { shimPath: string; status: string } {
 // Installed into global ~/.claude/settings.json unconditionally (issue #95) so
 // they fire from any subdirectory project. Each hook silent-passes when
 // isPlurConfigured() is false, so projects without plur are unaffected.
-function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
+export function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
   return {
     SessionStart: [
       {
