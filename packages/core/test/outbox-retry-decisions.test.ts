@@ -14,7 +14,7 @@
  * Real-HTTP stub, temp store and HOME only.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir, hostname } from 'os'
 import yaml from 'js-yaml'
@@ -80,15 +80,17 @@ describe('outbox decisions C3 and C4', () => {
 
     // A second claimer arrives while the first is mid-takeover.
     let nested: any
+    let pathPresentMidTakeover: boolean | undefined
     const outer = plur._claimOutboxEntry(id, () => {
+      pathPresentMidTakeover = existsSync(claimPath)
       nested = plur._claimOutboxEntry(id, () => 'k-nested')
       return 'k-outer'
     })
 
-    // Never a FRESH claim taken in a gap: whoever gets it got it by taking
-    // over the stale one…
-    expect(nested.status === 'claimed' && nested.orphan === false, 'a second claimer found the path empty').toBe(false)
-    // …and never both.
+    // The claim path is never empty during a takeover, so a second claimer
+    // can only take over the stale claim, never slip a fresh one into a gap…
+    expect(pathPresentMidTakeover, 'the takeover left the claim path empty').toBe(true)
+    // …and never do both win.
     expect([outer.status, nested.status].filter(s => s === 'claimed')).toHaveLength(1)
   })
 

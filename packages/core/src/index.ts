@@ -4581,8 +4581,8 @@ export class Plur {
 
   /**
    * Take the claim on an outbox entry. `busy` when another live writer holds
-   * it. A lapsed claim (lease expired, or its process is gone) is taken over
-   * and reported as `orphan`, with the key it carried offered to `keyFor`.
+   * it. A lapsed claim (lease expired, or its process is gone) is taken over.
+   * `keyFor` supplies the key recorded in the claim.
    *
    * Decision C3: the takeover is ATOMIC. The stale claim file is never
    * removed; a fresh one is written beside it and renamed over it, so the
@@ -4596,8 +4596,8 @@ export class Plur {
    */
   private _claimOutboxEntry(
     id: string,
-    keyFor: (orphanKey: string | undefined) => string,
-  ): { status: 'busy' } | { status: 'claimed'; key: string; orphan: boolean } {
+    keyFor: () => string,
+  ): { status: 'busy' } | { status: 'claimed'; key: string } {
     const path = this._outboxClaimPath(id)
     const readRaw = (): string | undefined => {
       try { return fs.readFileSync(path, 'utf8') } catch (err) {
@@ -4605,8 +4605,6 @@ export class Plur {
         throw err
       }
     }
-    let orphanKey: string | undefined
-    let orphan = false
     try {
       fs.mkdirSync(this.outboxClaimsDir(), { recursive: true })
       const stale = readRaw()
@@ -4619,17 +4617,15 @@ export class Plur {
           && held.until - now <= 2 * OUTBOX_CLAIM_LEASE_MS
         const ownerLive = held.host !== hostname() || (typeof held.pid === 'number' && pidAlive(held.pid))
         if (leaseLive && ownerLive) return { status: 'busy' }
-        orphanKey = typeof held.key === 'string' ? held.key : undefined
-        orphan = true
       }
-      const key = keyFor(orphanKey)
+      const key = keyFor()
       const token = randomUUID()
       const body = JSON.stringify({
         key, token, pid: process.pid, host: hostname(), until: Date.now() + OUTBOX_CLAIM_LEASE_MS,
       })
       if (stale === undefined) {
         fs.writeFileSync(path, body, { flag: 'wx' }) // EEXIST: someone else got it first
-        return { status: 'claimed', key, orphan }
+        return { status: 'claimed', key }
       }
       // Atomic takeover (C3): rename over the stale file, never remove it.
       const tmp = `${path}.${process.pid}.${token}.tmp`
@@ -4643,11 +4639,11 @@ export class Plur {
       try {
         if ((JSON.parse(readRaw() ?? '{}') as { token?: string }).token !== token) return { status: 'busy' }
       } catch { return { status: 'busy' } }
-      return { status: 'claimed', key, orphan }
+      return { status: 'claimed', key }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'EEXIST') return { status: 'busy' } // lost the race
       logger.warning(`[plur:outbox] could not record a push claim for ${id}: ${(err as Error).message}`)
-      return { status: 'claimed', key: keyFor(orphanKey), orphan }
+      return { status: 'claimed', key: keyFor() }
     }
   }
 
