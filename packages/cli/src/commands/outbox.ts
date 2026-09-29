@@ -22,6 +22,7 @@ function usage(): never {
     'Usage:',
     '  plur outbox             Show team-scoped writes queued for an unreachable store',
     '  plur outbox --flush     Retry them now',
+    '  plur outbox --resend <id>  Post one entry that is waiting on a manual check, then flush',
     '',
     'Writes to a remote scope queue locally when their store cannot be reached.',
     'They also retry automatically on session start and end, and on `plur sync`.',
@@ -30,7 +31,12 @@ function usage(): never {
 
 export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) usage()
-  const flush = args.includes('--flush')
+  // --resend <id>: the user checked the team store and the write is missing,
+  // so post it even though an earlier attempt may have landed (audit follow-up).
+  const resendAt = args.indexOf('--resend')
+  const resend = resendAt !== -1 ? args[resendAt + 1] : undefined
+  if (resendAt !== -1 && (!resend || resend.startsWith('--'))) usage()
+  const flush = args.includes('--flush') || resend !== undefined
 
   // Read-only unless flushing — a command people run to LOOK at a queue must
   // not be able to modify the store it is reporting on.
@@ -58,14 +64,15 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       const age = e.age_days === 0 ? 'today' : `${e.age_days}d ago`
       lines.push(`  ${e.id}  →  ${e.target_scope}`)
       lines.push(`      queued ${age}, ${e.attempt_count} attempt(s)`
-        + (e.last_error ? `, last error: ${e.last_error}` : ''))
+        + (e.last_error && !e.needs_action ? `, last error: ${e.last_error}` : ''))
+      if (e.needs_action) lines.push(`      needs action: ${e.needs_action}`)
     }
     lines.push('', 'Run `plur outbox --flush` to retry now. They also retry on session start and end, and on `plur sync`.')
     outputText(lines.join('\n'))
     return
   }
 
-  const result = await plur.flushOutbox()
+  const result = await plur.flushOutbox(resend ? { resend: [resend] } : {})
   const stillPending = await plur.outboxCount()
 
   if (shouldOutputJson(flags)) {
