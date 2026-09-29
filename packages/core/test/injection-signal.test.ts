@@ -44,6 +44,13 @@ describe('detectInjectionSignal — positive rules', () => {
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
   })
 
+  it('a paraphrase sharing 5 of 8 trigrams (62%) is not positive (#1365)', () => {
+    // "run the migration script before deploying the" holds five of the
+    // statement's eight trigrams; the rest of the reply is about something else.
+    const reply = 'I will run the migration script before deploying the new mailer.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
+  })
+
   it('an empty statement or reply yields nothing', () => {
     expect(detectInjectionSignal('', 'anything').signal).toBeNull()
     expect(detectInjectionSignal(STATEMENT, '').signal).toBeNull()
@@ -63,6 +70,15 @@ describe('detectInjectionSignal — negative rule (same sentence)', () => {
     const reply =
       'I ran the migration script and deployed billing. ' +
       'Actually, the CSS bug you mentioned was in the header.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
+  })
+
+  it('a correction in one sentence and the engram words in another is nothing (#1365)', () => {
+    // Taken together the reply has both a correction phrase and every
+    // distinctive word; no single sentence has both.
+    const reply =
+      'Deploying billing needed the migration script first. ' +
+      'The header colour you mentioned, that is wrong: it is blue.'
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
   })
 
