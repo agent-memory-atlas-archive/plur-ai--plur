@@ -16,6 +16,10 @@ skips it.
   other host since #1267 — `node.exe` plus `@plur-ai/mcp`'s js entry, or the
   pinned `cmd.exe /c npx` form when the entry cannot be resolved. It is never
   a bare `npx`. darwin/linux keep the pinned `npx -y @plur-ai/mcp@<version>`.
+  Upgrading needs no manual step: re-running init on Windows replaces the
+  `command` of the bare-`npx` entry older versions wrote (exactly
+  `npx -y @plur-ai/mcp@<version>`), keeping its other fields. Any other
+  `mcp.plur` entry is left alone.
 - Re-running init is idempotent, and an existing `opencode.json` keeps its
   other keys. An existing `mcp.plur` is still left as it is, and an
   `opencode.jsonc` with comments is still reported and left byte-for-byte

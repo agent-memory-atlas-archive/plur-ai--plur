@@ -142,4 +142,58 @@ describe('plur init sets up opencode by default (#1311)', { timeout: 60000 }, ()
     runInit([], true)
     expect(readFileSync(ocJson(), 'utf-8')).toBe(first)
   })
+
+  // Upgrades need zero manual steps: a Windows user who ran an older
+  // `plur init --opencode` has the bare-npx entry that init wrote then.
+  describe('win32 upgrade of the bare-npx entry an older init wrote', () => {
+    const legacy = (extra: Record<string, unknown> = {}) => ({
+      type: 'local', command: ['npx', '-y', '@plur-ai/mcp@0.20.0'], enabled: true, ...extra,
+    })
+    const seed = (plur: unknown) => {
+      mkdirSync(ocDir(), { recursive: true })
+      writeFileSync(ocJson(), JSON.stringify({ model: 'provider/some-model', plugin: ['@plur-ai/opencode'], mcp: { plur } }, null, 2))
+    }
+
+    it('replaces the command with node.exe + js entry and keeps every other field', () => {
+      seed(legacy({ environment: { PLUR_PATH: '/some/store' }, timeout: 5000 }))
+      const out = runInit([], true)
+      const cfg = readOc()
+      expect(cfg.mcp.plur.command[0]).toBe(process.execPath)
+      expect(cfg.mcp.plur.command[1]).toMatch(/index\.js$/)
+      expect(cfg.mcp.plur.type).toBe('local')
+      expect(cfg.mcp.plur.enabled).toBe(true)
+      expect(cfg.mcp.plur.environment).toEqual({ PLUR_PATH: '/some/store' })
+      expect(cfg.mcp.plur.timeout).toBe(5000)
+      expect(cfg.model).toBe('provider/some-model')
+      expect(out).toContain('mcp.plur: upgraded')
+      expect(out).not.toContain('left as-is')
+    })
+
+    it('a re-run after the upgrade changes nothing', () => {
+      seed(legacy())
+      runInit([], true)
+      const first = readFileSync(ocJson(), 'utf-8')
+      const out = runInit([], true)
+      expect(readFileSync(ocJson(), 'utf-8')).toBe(first)
+      expect(out).toContain('Opencode: config already up to date')
+    })
+
+    it.each([
+      ['a custom launcher', { type: 'local', command: ['my-launcher'], enabled: true }],
+      ['extra args after the package', legacy({ command: ['npx', '-y', '@plur-ai/mcp@0.20.0', '--flag'] })],
+      ['another package', legacy({ command: ['npx', '-y', '@someone/mcp@0.20.0'] })],
+      ['an unpinned package', legacy({ command: ['npx', '-y', '@plur-ai/mcp'] })],
+      ['a remote entry', { type: 'remote', url: 'https://example.invalid/mcp', enabled: true }],
+    ])('never touches %s', (_label, plur) => {
+      seed(plur)
+      runInit([], true)
+      expect(readOc().mcp.plur).toEqual(plur)
+    })
+
+    it('leaves the bare-npx entry alone on darwin/linux, where it works', () => {
+      seed(legacy())
+      runInit()
+      expect(readOc().mcp.plur).toEqual(legacy())
+    })
+  })
 })

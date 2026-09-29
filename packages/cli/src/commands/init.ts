@@ -1164,7 +1164,10 @@ function installOpencode(cliVersion: string): string {
   }
 
   const status = result.created ? 'created' : result.changed ? 'updated' : 'already up to date'
-  const mcpNote = result.mcpPlurPreserved
+  const mcpNote = result.mcpPlurUpgraded
+    // #1311: PLUR's own older bare-npx entry on Windows, command replaced.
+    ? '\n  mcp.plur: upgraded to the Windows launcher (node.exe + @plur-ai/mcp), other fields kept'
+    : result.mcpPlurPreserved
     // B2 (0.20.0 audit): an existing mcp.plur (possibly a non-default
     // PLUR_PATH, or an enterprise remote store with bearer headers) is left
     // completely untouched rather than overwritten with PLUR's own local

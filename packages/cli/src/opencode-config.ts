@@ -104,6 +104,13 @@ export interface WriteOpencodeConfigResult {
    * way; a stale pin is a much smaller cost than a lost store pointer.
    */
   mcpPlurPreserved: boolean
+  /**
+   * True when `mcp.plur` was the bare-`npx` entry an older `plur init` wrote
+   * on win32 and its `command` was replaced with today's Windows form
+   * (#1311). Every other field of that entry is kept. Always false off
+   * win32 and for any entry PLUR did not write.
+   */
+  mcpPlurUpgraded: boolean
 }
 
 /**
@@ -228,6 +235,28 @@ export function opencodeMcpCommand(cliVersion: string): string[] {
 }
 
 /**
+ * Is this the win32 `mcp.plur` entry an older `plur init` wrote (#1311)?
+ * Before #1311 it was `{ type: 'local', command: ['npx', '-y',
+ * '@plur-ai/mcp@<version>'], enabled: true }` on every platform, and a
+ * shell-less spawn on Windows cannot resolve a bare `npx` to `npx.cmd`.
+ *
+ * Scoped as tightly as `isOwnWin32CmdShimEntry` in mcp-config.ts (#1267): a
+ * local entry whose command is exactly those three elements with a pinned
+ * version. Any other command (another launcher, extra args, another package,
+ * an unpinned spec) or a remote entry is the user's and is never touched.
+ * Other fields (`environment`, `timeout`, …) do not disqualify the entry:
+ * the upgrade replaces `command` only, so they are kept.
+ */
+function isOwnLegacyWin32NpxEntry(entry: unknown): entry is Record<string, unknown> {
+  if (platform() !== 'win32' || !isPlainObject(entry)) return false
+  if (entry.type !== 'local') return false
+  const cmd = entry.command
+  return Array.isArray(cmd) && cmd.length === 3 &&
+    cmd[0] === 'npx' && cmd[1] === '-y' &&
+    typeof cmd[2] === 'string' && /^@plur-ai\/mcp@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(cmd[2])
+}
+
+/**
  * Resolve the real path to write to. `writeFileSync` used to write THROUGH a
  * symlink (open the target, truncate, write); `atomicWrite`'s rename instead
  * REPLACES whatever sits at the given path — including a symlink itself,
@@ -271,12 +300,12 @@ export function writeOpencodeConfig(
     try {
       parsed = JSON.parse(readFileSync(configPath, 'utf8'))
     } catch {
-      return { created: false, changed: false, ok: false, mcpPlurPreserved: false }
+      return { created: false, changed: false, ok: false, mcpPlurPreserved: false, mcpPlurUpgraded: false }
     }
     // Valid JSON, wrong shape (most commonly `[]`) — refuse rather than let
     // every property set below land as a silently-dropped non-index prop.
     // See WriteOpencodeConfigResult.ok for the full failure mode this closes.
-    if (!isPlainObject(parsed)) return { created: false, changed: false, ok: false, mcpPlurPreserved: false }
+    if (!isPlainObject(parsed)) return { created: false, changed: false, ok: false, mcpPlurPreserved: false, mcpPlurUpgraded: false }
     cfg = parsed
   }
 
@@ -287,10 +316,10 @@ export function writeOpencodeConfig(
   // the (uncommon but real) case of a user writing `null` to mean "nothing
   // here yet." Neither is refused.
   if (cfg.plugin !== undefined && cfg.plugin !== null && !Array.isArray(cfg.plugin)) {
-    return { created: false, changed: false, ok: false, mcpPlurPreserved: false }
+    return { created: false, changed: false, ok: false, mcpPlurPreserved: false, mcpPlurUpgraded: false }
   }
   if (cfg.mcp !== undefined && cfg.mcp !== null && !isPlainObject(cfg.mcp)) {
-    return { created: false, changed: false, ok: false, mcpPlurPreserved: false }
+    return { created: false, changed: false, ok: false, mcpPlurPreserved: false, mcpPlurUpgraded: false }
   }
 
   const before = JSON.stringify(cfg)
@@ -303,8 +332,16 @@ export function writeOpencodeConfig(
   // B2 (0.20.0 audit): see WriteOpencodeConfigResult.mcpPlurPreserved for the
   // full rationale. A PRESENT, non-null `mcp.plur` is left completely alone;
   // PLUR's entry is written only when there is nothing there to lose.
-  const mcpPlurPreserved = mcp.plur !== undefined && mcp.plur !== null
-  if (!mcpPlurPreserved) {
+  // #1311: the one exception is PLUR's own older win32 entry, whose
+  // `command` is replaced (field-level, the rest kept) so an upgrade needs no
+  // manual step.
+  let mcpPlurUpgraded = false
+  if (isOwnLegacyWin32NpxEntry(mcp.plur)) {
+    mcp.plur = { ...mcp.plur, command: opencodeMcpCommand(cliVersion) }
+    mcpPlurUpgraded = true
+  }
+  const mcpPlurPreserved = !mcpPlurUpgraded && mcp.plur !== undefined && mcp.plur !== null
+  if (!mcpPlurPreserved && !mcpPlurUpgraded) {
     mcp.plur = {
       type: 'local',
       command: opencodeMcpCommand(cliVersion),
@@ -323,5 +360,5 @@ export function writeOpencodeConfig(
     // keeps this a write-through when configPath is itself a symlink.
     atomicWrite(resolveWriteTarget(configPath), JSON.stringify(cfg, null, 2) + '\n')
   }
-  return { created, changed, ok: true, mcpPlurPreserved }
+  return { created, changed, ok: true, mcpPlurPreserved, mcpPlurUpgraded }
 }
