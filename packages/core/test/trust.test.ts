@@ -211,6 +211,20 @@ describe('trust.yaml entries written by the old canonicalize', () => {
     expect(readFileSync(join(root, 'trust.yaml'), 'utf8')).toBe(text)
   })
 
+  it('a trusted folder later replaced by a symlink to another folder is NOT trusted (#778)', () => {
+    const proj = join(base, 'real', 'proj')
+    mkdirSync(proj)
+    mkdirSync(join(base, 'real', 'evil'))
+    trustDirectory(proj, root)
+    const text = readFileSync(join(root, 'trust.yaml'), 'utf8')
+    rmSync(proj, { recursive: true })
+    symlinkSync(join(base, 'real', 'evil'), proj, 'dir')
+    expect(isDirectoryTrusted(proj, root)).toBe(false)
+    expect(isDirectoryTrusted(join(base, 'real', 'evil'), root)).toBe(false)
+    expect(coveringTrustedAncestor(proj, root)).toBeNull()
+    expect(readFileSync(join(root, 'trust.yaml'), 'utf8')).toBe(text)
+  })
+
   it('plur untrust removes the old entry', () => {
     writeOldEntry()
     mkdirSync(join(base, 'real', 'later-project'))
