@@ -14,8 +14,13 @@ Now flagged, each by the vendor's documented prefix, charset and length:
 - GitHub `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` (`github_token`) and
   `github_pat_` (`github_pat`).
 - GitLab `glpat-`, `gloas-`, `gldt-`, `glrt-`, `glrtr-`, `glcbt-`, `glptt-`,
-  `glft-`, `glimt-`, `glagent-`, `glsoat-`, `glffct-` (`gitlab_token`).
-- Slack `xoxb-`, `xoxp-`, `xoxa-`, `xoxr-`, `xoxs-` (`slack_token`).
+  `glft-`, `glimt-`, `glagent-`, `glwt-`, `glsoat-`, `glffct-`
+  (`gitlab_token`). GitLab bodies may legitimately contain `-` and `_`, so
+  the body must also look random (mixed case or digits); a hyphenated slug
+  after the prefix, as in a GitLab docs URL, stays clean.
+- Slack `xoxb-`, `xoxp-`, `xoxs-` (with their 8+ digit workspace id) and
+  `xoxa-`, `xoxr-` (`slack_token`); a prefix followed by a short
+  number and hyphenated words stays clean.
 - npm `npm_` (`npm_token`).
 - Stripe `sk_live_` and `rk_live_` (`stripe_live_key`).
 - AWS temporary access key ids, `ASIA…`, under the existing `aws_access_key`.

@@ -36,8 +36,8 @@ one, does not get a credential past the scan.
 | `aws_access_key` | `AKIA` (long-term) or `ASIA` (temporary) followed by 16 uppercase letters or digits |
 | `github_token` | `ghp_`, `gho_`, `ghu_`, `ghs_` or `ghr_`, then 36 or more letters or digits |
 | `github_pat` | `github_pat_`, 22 or more letters or digits, `_`, then 40 or more letters or digits |
-| `gitlab_token` | a documented GitLab prefix (`glpat-`, `gloas-`, `gldt-`, `glrt-`, `glrtr-`, `glcbt-`, `glptt-`, `glft-`, `glimt-`, `glagent-`, `glsoat-`, `glffct-`), then 20 or more letters, digits, `_` or `-` |
-| `slack_token` | `xoxb-`, `xoxp-`, `xoxa-`, `xoxr-` or `xoxs-`, a numeric segment and `-`, then 10 or more token characters |
+| `gitlab_token` | a documented GitLab prefix (`glpat-`, `gloas-`, `gldt-`, `glrt-`, `glrtr-`, `glcbt-`, `glptt-`, `glft-`, `glimt-`, `glagent-`, `glwt-`, `glsoat-`, `glffct-`), then 20 or more letters, digits, `_` or `-`, where the body has random-token structure: a lowercase letter or digit followed by an uppercase letter, an uppercase letter followed by an uppercase letter or digit, or four digits. A lowercase or Title-Case hyphenated slug after the prefix, as in a docs URL, does not match |
+| `slack_token` | `xoxb-`, `xoxp-` or `xoxs-`, a numeric id of 8 or more digits and `-`, then 10 or more token characters; or `xoxa-` / `xoxr-`, an optional digit and `-`, then an unbroken run of 16 or more letters and digits containing both |
 | `npm_token` | `npm_` followed by 36 or more letters or digits |
 | `stripe_live_key` | `sk_live_` or `rk_live_` followed by 24 or more letters or digits |
 | `aws_secret_key` | `aws_secret_access_key` or `secret_access_key`, then `=` or `:`, then 40 base64 characters |

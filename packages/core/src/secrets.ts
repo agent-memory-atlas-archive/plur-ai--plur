@@ -17,22 +17,40 @@ const SECRET_PATTERNS: { name: string; regex: RegExp }[] = [
   { name: 'github_token', regex: /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}/ },
   // GitHub fine-grained PAT: `github_pat_`, 22 base62, `_`, 59 base62.
   { name: 'github_pat', regex: /(?<![A-Za-z0-9])github_pat_[A-Za-z0-9]{22,}_[A-Za-z0-9]{40,}/ },
-  // GitLab's documented token prefixes: personal/project/group access
-  // (`glpat-`), OAuth application secret (`gloas-`), deploy (`gldt-`), runner
-  // authentication (`glrt-`) and registration (`glrtr-`), CI job (`glcbt-`),
-  // pipeline trigger (`glptt-`), feed (`glft-`), incoming mail (`glimt-`),
-  // Kubernetes agent (`glagent-`), SCIM (`glsoat-`), feature-flag client
-  // (`glffct-`). Legacy bodies are 20 characters; routable ones are longer and
-  // may carry dots.
+  // GitLab's documented token prefixes (docs.gitlab.com, "Token prefixes"):
+  // personal/project/group/impersonation access (`glpat-`), OAuth application
+  // secret (`gloas-`), deploy (`gldt-`), runner authentication (`glrt-`, or
+  // `glrtr-` when created by registration), CI/CD job (`glcbt-`), trigger
+  // (`glptt-`), feed (`glft-`), incoming mail (`glimt-`), Kubernetes agent
+  // (`glagent-`), workspace (`glwt-`), SCIM (`glsoat-`), feature-flag client
+  // (`glffct-`).
+  //
+  // Legacy bodies are 20 base64url characters, so `-` and `_` are legitimate
+  // inside a token and cannot be excluded; routable bodies are longer and end
+  // in `.xx.xxxxxxx`, which the 20-character run still matches before the dot.
+  // Because hyphens are allowed, a docs slug such as `glrt-` followed by
+  // "runner-authentication-tokens" has the right length, and prose URLs like
+  // it are common (#1340 review). What a
+  // random body has and a slug does not is case or digit structure, so the
+  // body must also contain a lower-or-digit followed by an upper, an upper
+  // followed by an upper or digit, or four digits. A lowercase or Title-Case
+  // slug has none of these; a seeded sample of 12,000 random 20-character
+  // bodies in the test suite checks that real tokens still match.
   {
     name: 'gitlab_token',
-    regex: /(?<![A-Za-z0-9])(?:glpat|gloas|gldt|glrtr|glrt|glcbt|glptt|glft|glimt|glagent|glsoat|glffct)-[A-Za-z0-9_-]{20,}/,
+    regex: /(?<![A-Za-z0-9])(?:glpat|gloas|gldt|glrtr|glrt|glcbt|glptt|glft|glimt|glagent|glwt|glsoat|glffct)-(?=[A-Za-z0-9_-]*(?:[a-z0-9][A-Z]|[A-Z][A-Z0-9])|(?:[A-Za-z_-]*[0-9]){4})[A-Za-z0-9_-]{20,}/,
   },
-  // Slack: `xoxb-` bot, `xoxp-` user, `xoxa-` app, `xoxr-` refresh, `xoxs-`
-  // session. Every documented shape has a numeric segment right after the
-  // prefix (a team id, or the `2` of `xoxa-2-`), which keeps `xoxb-style`
-  // prose out.
-  { name: 'slack_token', regex: /(?<![A-Za-z0-9])xox[abprs]-[0-9]+-[A-Za-z0-9-]{10,}/ },
+  // Slack. Bot (`xoxb-`), user (`xoxp-`) and legacy session (`xoxs-`) tokens
+  // open with a numeric workspace id of eight or more digits, then more ids
+  // and a random tail. Legacy workspace/app (`xoxa-`) and refresh (`xoxr-`)
+  // tokens are an optional single digit and `-`, then an unbroken
+  // alphanumeric run. Requiring the long numeric id, or an unbroken run with
+  // both letters and digits, keeps prose out (#1340
+  // review): a short number followed by hyphenated words is not a token.
+  {
+    name: 'slack_token',
+    regex: /(?<![A-Za-z0-9])(?:xox[bps]-[0-9]{8,}-[A-Za-z0-9-]{10,}|xox[ar]-(?:[0-9]-)?(?=[A-Za-z]*[0-9])(?=[0-9]*[A-Za-z])[A-Za-z0-9]{16,})/,
+  },
   // npm access token: `npm_` plus 36 base62 characters.
   { name: 'npm_token', regex: /(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36,}/ },
   // Stripe live secret (`sk_live_`) and restricted (`rk_live_`) keys. The

@@ -99,6 +99,9 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     ['GitLab CI job token', 'glcbt' + '-' + body(20), 'gitlab_token'],
     ['GitLab pipeline trigger token', 'glptt' + '-' + body(40), 'gitlab_token'],
     ['GitLab OAuth app secret', 'gloas' + '-' + body(64), 'gitlab_token'],
+    ['GitLab workspace token', 'glwt' + '-' + body(20), 'gitlab_token'],
+    ['GitLab routable runner token', 'glrt' + '-t1_' + body(27) + '.01.' + body(9), 'gitlab_token'],
+    ['GitLab token with legacy separators', 'glpat' + '-' + 'aB3d' + '-' + 'eF6h' + '_' + 'iJ9kLmN0pQ', 'gitlab_token'],
     ['Slack bot token', 'xoxb' + '-' + '1234567890' + '-' + '1234567890' + '-' + body(24), 'slack_token'],
     ['Slack user token', 'xoxp' + '-' + '1234567890' + '-' + '1234567890' + '-' + '1234567890' + '-' + body(32), 'slack_token'],
     ['Slack app token', 'xoxa' + '-2-' + body(40), 'slack_token'],
@@ -133,6 +136,27 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     'Stripe secret keys start sk_live_ in production and sk_test_ in test mode',
     'rotate any rk_live_ key that leaked',
     'the variable github_pat_expiry holds a date',
+    // Review of #1340: hyphenated words after a GitLab prefix are prose, not a
+    // token body. One URL/path per documented prefix family. Split at the
+    // prefix so repository scanners with the same weakness do not flag them.
+    'see gitlab.com/help/glrt' + '-runner-authentication-tokens',
+    'the glft' + '-feed-token-for-calendar setting',
+    'docs/security/glpat' + '-personal-access-token-prefix.md',
+    'https://docs.example.com/gloas' + '-oauth-application-secret-rotation',
+    'runbooks/gldt' + '-deploy-token-for-registry-pulls',
+    'help/glrtr' + '-runner-registration-token-deprecation',
+    'guide/glcbt' + '-ci-job-token-allowlist-settings',
+    'api/glptt' + '-pipeline-trigger-token-endpoints',
+    'admin/glimt' + '-incoming-mail-token-configuration',
+    'clusters/glagent' + '-kubernetes-agent-token-rotation',
+    'settings/glsoat' + '-scim-token-for-group-sync',
+    'flags/glffct' + '-feature-flags-client-token-reset',
+    'workspaces/glwt' + '-workspace-token-lifecycle-notes',
+    'Title case too: glft' + '-Feed-Token-For-Calendar-Sync',
+    // The same weakness for Slack: a short number then hyphenated words.
+    'read the xoxb' + '-2-step-guide-for-bot-installs page',
+    'wiki/xoxp' + '-1-user-token-scopes-and-permissions',
+    'see xoxa' + '-2-app-level-tokens-explained',
   ]
 
   for (const text of prose) {
@@ -149,6 +173,24 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
   it('still flags a GitHub token split by a zero-width joiner', () => {
     const token = 'ghp' + '_' + body(18) + '‍' + body(18)
     expect(detectSecrets(token).map(h => h.pattern)).toContain('github_token')
+  })
+
+  it('flags every random GitLab-shaped body (seeded, 2000 samples per prefix)', () => {
+    // GitLab bodies are base64url; legacy ones are 20 characters and may
+    // include '-' and '_'. The prose filter must not cost real tokens.
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+    let seed = 1317
+    const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+    const misses: string[] = []
+    for (const prefix of ['glpat', 'gldt', 'glrt', 'glft', 'glsoat', 'glffct']) {
+      for (let i = 0; i < 2000; i++) {
+        let b = ''
+        for (let j = 0; j < 20; j++) b += alphabet[Math.floor(rnd() * 64)]
+        const tok = prefix + '-' + b
+        if (!detectSecrets(tok).some(h => h.pattern === 'gitlab_token')) misses.push(tok)
+      }
+    }
+    expect(misses.length).toBeLessThanOrEqual(1)
   })
 
   it('files the new token patterns under the secrets family', () => {
