@@ -205,6 +205,44 @@ describe('resolveFolderPolicy', () => {
     expect(trusted()).toBe(false)
   })
 
+  it('a merge never activates the grant or scope of an entry spelled through a symlink (#778)', () => {
+    const real = join(base, 'real')
+    mkdirSync(join(real, 'proj'), { recursive: true })
+    const link = join(base, 'link')
+    symlinkSync(real, link)
+    writeMap([
+      { path: join(real, 'proj'), plur: 'ask' },
+      { path: join(link, 'proj'), trusted: true, scope: 'project:dormant' },
+    ])
+    const trusted = () => isTrustedInMap(loadFolderMap(root).folders, join(real, 'proj'), home)
+    expect(trusted()).toBe(false)
+    expect(policy(join(real, 'proj'))).toEqual({ mode: 'ask', remoteAllowed: false, source: 'map' })
+
+    expect(setFolderEntry(root, join(link, 'proj'), { mode: 'ask' }, { configuredScopes: [], home }))
+      .toEqual({ path: join(real, 'proj'), plur: 'ask' })
+    expect(trusted()).toBe(false)
+    expect(policy(join(real, 'proj')).scope).toBeUndefined()
+
+    // With no applied entry at all, the dormant grant is dropped, not revived.
+    writeMap([{ path: join(link, 'proj'), trusted: true, scope: 'project:dormant' }])
+    expect(setFolderEntry(root, join(link, 'proj'), { mode: 'on' }, { configuredScopes: [], home }))
+      .toEqual({ path: join(real, 'proj'), plur: 'on' })
+    expect(trusted()).toBe(false)
+  })
+
+  it('a merge that sets no scope keeps the scope the resolver applied', () => {
+    const d = mk('dup')
+    const two = () => writeMap([{ path: '~/dup', scope: 'group:team' }, { path: d, scope: 'project:local' }])
+    two()
+    expect(policy(d).scope).toBe('project:local')
+    setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], home })
+    expect(policy(d).scope).toBe('project:local')
+    expect(loadFolderMap(root).folders).toEqual([{ path: '~/dup', scope: 'project:local', plur: 'on' }])
+    two()
+    trustDirectory(d, root)
+    expect(policy(d).scope).toBe('project:local')
+  })
+
   // #1357: `Ⓟ`/`ⓟ` and `Ⅱ`/`ⅱ` are cased but not letters (no \p{L}), so a
   // check that swaps only letters compared such a folder with itself. On a
   // case-sensitive filesystem they are sibling folders; no edit of one may
@@ -344,6 +382,20 @@ describe('resolveFolderPolicy', () => {
       many()
       expect(removeFolderEntry(root, onDisk, home)).toBe(true)
       expect(loadFolderMap(root).folders).toEqual([unrelated])
+    })
+
+    it('a merge never activates the grant or scope of an entry matched only in another case', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      const w = mk('R1')
+      const onDisk = join(w, 'Proj')
+      mkdirSync(onDisk)
+      writeMap([{ path: onDisk, plur: 'ask' }, { path: join(w, 'PROJ'), trusted: true, scope: 'project:dormant' }])
+      expect(isTrustedInMap(loadFolderMap(root).folders, onDisk, home)).toBe(false)
+      expect(setFolderEntry(root, join(w, 'PROJ'), { mode: 'on' }, { configuredScopes: [], home }))
+        .toEqual({ path: onDisk, plur: 'on' })
+      expect(isTrustedInMap(loadFolderMap(root).folders, onDisk, home)).toBe(false)
+      expect(isDirectoryTrusted(onDisk, root)).toBe(false)
+      expect(policy(onDisk)).toEqual({ mode: 'on', remoteAllowed: false, source: 'map' })
     })
 
     it('a `trusted` entry covers every case spelling of its folder, and a mis-cased entry fails closed', ({ skip }) => {
