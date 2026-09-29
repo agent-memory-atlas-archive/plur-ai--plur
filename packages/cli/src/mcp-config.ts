@@ -414,16 +414,35 @@ export function mergePlurMcp(config: Record<string, unknown>, opts?: { env?: Rec
  * Returns true when the entry was rewritten (caller persists the config).
  */
 export function upgradePlurMcpEntry(config: Record<string, unknown>, opts?: { env?: Record<string, string> }): boolean {
+  return healPlurMcpEntry(config, opts) !== null
+}
+
+/**
+ * `upgradePlurMcpEntry`, returning what was healed for init's status line,
+ * or null when nothing was rewritten. The three shapes have nothing in
+ * common but the rewrite, so the line names the one that applied (#1304):
+ *
+ *   - `upgraded stale npx entry` — the @latest/bare npx entry (#1069);
+ *   - `healed the old plur-mcp.cmd entry …` — Windows (#1267);
+ *   - `repaired the node.exe entry …` — Windows, the node binary or js entry
+ *     it named is gone or differs from the one resolved now (#1267).
+ *
+ * The Windows lines also name what was written: the node.exe launcher, or
+ * the pinned `cmd.exe /c npx` fallback.
+ */
+export function healPlurMcpEntry(config: Record<string, unknown>, opts?: { env?: Record<string, string> }): string | null {
   const servers = (config.mcpServers ?? {}) as Record<string, McpServerEntry | undefined>
   const existing = servers.plur
-  if (!existing) return false
+  if (!existing) return null
   const ownNodeEntry = isOwnWin32NodeEntry(existing)
-  if (!isRaceyPlurNpxEntry(existing) && !isOwnWin32CmdShimEntry(existing) && !ownNodeEntry) return false
-  if (ownNodeEntry && !nodeEntryNeedsHealing(existing)) return false
+  const racey = isRaceyPlurNpxEntry(existing)
+  const cmdShim = isOwnWin32CmdShimEntry(existing)
+  if (!racey && !cmdShim && !ownNodeEntry) return null
+  if (ownNodeEntry && !nodeEntryNeedsHealing(existing)) return null
   const effectiveOpts = opts ?? (existing.env ? { env: existing.env } : undefined)
   const recommended = buildMcpServerEntry(effectiveOpts)
   if (recommended.command === existing.command &&
-      JSON.stringify(recommended.args) === JSON.stringify(existing.args ?? [])) return false
+      JSON.stringify(recommended.args) === JSON.stringify(existing.args ?? [])) return null
   // Field-level MERGE, not object replacement (0.19.1 data-loss audit,
   // finding 2): a user entry can carry keys we never modeled — type, cwd,
   // timeout, disabled, envFile — and `servers.plur = recommended` silently
@@ -435,7 +454,12 @@ export function upgradePlurMcpEntry(config: Record<string, unknown>, opts?: { en
     ...(recommended.env ? { env: recommended.env } : {}),
   }
   config.mcpServers = servers as Record<string, unknown>
-  return true
+  if (racey) return 'upgraded stale npx entry'
+  const now = recommended.command.toLowerCase() === 'cmd.exe'
+    ? 'the pinned cmd.exe /c npx fallback (@plur-ai/mcp\'s js entry could not be resolved)'
+    : 'node.exe + @plur-ai/mcp'
+  if (cmdShim) return `healed the old plur-mcp.cmd entry (current Node cannot start a .cmd); now ${now}`
+  return `repaired the node.exe entry (the node binary or @plur-ai/mcp path it named was stale); now ${now}`
 }
 
 /**

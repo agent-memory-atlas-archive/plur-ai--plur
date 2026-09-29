@@ -20,7 +20,7 @@ import {
   claudeDesktopConfigPath,
   hasPlurMcp,
   mergePlurMcp,
-  upgradePlurMcpEntry,
+  healPlurMcpEntry,
   readConfigForWrite,
   writeConfig,
   cursorProjectMcpConfigPath,
@@ -779,9 +779,10 @@ function installDesktopMcp(args: string[]): string {
     // "Exists" is not "correct": heal an @latest/stale-pin npx entry init
     // itself wrote — leaving it is what kept the #1069 race armed through
     // every re-run of plur init on an affected machine.
-    if (upgradePlurMcpEntry(config)) {
+    const healed = healPlurMcpEntry(config)
+    if (healed) {
       writeConfig(desktopPath, config)
-      return `upgraded stale npx entry in ${desktopPath}`
+      return `${healed} in ${desktopPath}`
     }
     return `already registered in ${desktopPath}`
   }
@@ -825,7 +826,7 @@ function installCursor(cmd: string): string {
     // "entry exists" as "entry is correctly configured for Cursor."
     // #1069 heal, which this branch was the LAST leg to receive — its own
     // env-patch comment above is the canonical statement of the class.
-    const healed = upgradePlurMcpEntry(mcpConfig, { env: { PLUR_TOOL_PROFILE: 'cursor' } })
+    const healed = healPlurMcpEntry(mcpConfig, { env: { PLUR_TOOL_PROFILE: 'cursor' } })
     const servers = (mcpConfig.mcpServers ?? {}) as Record<string, { env?: Record<string, string> }>
     const existing = servers.plur
     if (existing?.env?.PLUR_TOOL_PROFILE !== 'cursor') {
@@ -833,11 +834,11 @@ function installCursor(cmd: string): string {
       mcpConfig.mcpServers = servers
       writeConfig(mcpPath, mcpConfig)
       mcpStatus = healed
-        ? 'upgraded stale npx entry (and set PLUR_TOOL_PROFILE=cursor)'
+        ? `${healed} (and set PLUR_TOOL_PROFILE=cursor)`
         : 'patched (added missing PLUR_TOOL_PROFILE=cursor to an existing entry)'
     } else if (healed) {
       writeConfig(mcpPath, mcpConfig)
-      mcpStatus = 'upgraded stale npx entry'
+      mcpStatus = healed
     } else {
       mcpStatus = 'already registered'
     }
@@ -1128,9 +1129,10 @@ function installAntigravity(cmd: string): string {
   if (!mcpParses) {
     mcpStatus = `skipped — ${mcpPath} exists but is not valid JSON; writing would discard your other MCP servers. Fix it by hand, then re-run \`plur init --antigravity\``
   } else if (hasPlurMcp(mcpConfig)) {
-    if (upgradePlurMcpEntry(mcpConfig)) {
+    const healed = healPlurMcpEntry(mcpConfig)
+    if (healed) {
       writeConfig(mcpPath, mcpConfig)
-      mcpStatus = 'upgraded stale npx entry'
+      mcpStatus = healed
     } else {
       mcpStatus = 'already registered'
     }
@@ -1440,9 +1442,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
         mergePlurMcp(settings as Record<string, unknown>)
         mcpStatus = 'registered'
       } else {
-        mcpStatus = upgradePlurMcpEntry(settings as Record<string, unknown>)
-          ? 'upgraded stale npx entry'
-          : 'already registered'
+        mcpStatus = healPlurMcpEntry(settings as Record<string, unknown>) ?? 'already registered'
       }
 
       writeSettings(enforcementPath, settings)
@@ -1480,10 +1480,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       if (!projectMcpAlready) {
         mergePlurMcp(projectSettings as Record<string, unknown>)
         mcpStatus = 'registered'
-      } else if (upgradePlurMcpEntry(projectSettings as Record<string, unknown>)) {
-        mcpStatus = 'upgraded stale npx entry'
       } else {
-        mcpStatus = 'already registered'
+        mcpStatus = healPlurMcpEntry(projectSettings as Record<string, unknown>) ?? 'already registered'
       }
 
       writeSettings(injectionPath, projectSettings)

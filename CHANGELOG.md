@@ -90,7 +90,8 @@ twice** (#1267). Three separate faults:
   the fallback. Re-running init heals an existing `plur-mcp.cmd` entry that init
   wrote, and a node-form entry whose `node.exe` or js entry no longer exists
   (after a Node upgrade or a version-manager switch); `plur doctor` reports
-  such an entry as broken. A hand-written entry is never changed. An entry
+  such an entry as broken. Init's status line names which of these it healed
+  and what it wrote, instead of "upgraded stale npx entry". A hand-written entry is never changed. An entry
   whose command is a bare `node` or `node.exe` is resolved through PATH, so
   doctor never reports it as missing, and init neither pins it to the
   version-specific node path nor replaces it with the npx fallback; this holds
