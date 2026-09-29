@@ -537,8 +537,16 @@ export function setFolderEntry(root: string, folder: string, change: FolderChang
   const key = folderEntryKey(folder, home)
   const { idx, caseOnly } = findEntryIndex(map.folders, folder, home)
   // A case-only match is rewritten to the on-disk spelling, so the strict
-  // (fail-closed) comparison matches it from now on (#1357).
-  const entry: FolderEntry = idx >= 0 ? { ...map.folders[idx], ...(caseOnly ? { path: key } : {}) } : { path: key }
+  // (fail-closed) comparison matches it from now on (#1357). Only its `plur`
+  // mode carries over: `off`/`ask` already applied through the loose match,
+  // but its `trusted` and `scope` never did, and rewriting the path must not
+  // bring a dormant grant (or one `plur untrust` just cleared) to life.
+  let entry: FolderEntry
+  if (idx < 0) entry = { path: key }
+  else if (caseOnly) {
+    const old = map.folders[idx]
+    entry = { path: key, ...(old.plur !== undefined ? { plur: old.plur } : {}) }
+  } else entry = { ...map.folders[idx] }
   if (change.scope !== undefined) {
     entry.scope = change.scope
     if (change.mode === undefined) delete entry.plur
@@ -581,8 +589,11 @@ export function clearFolderTrust(root: string, folder: string, home: string = ho
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
   map.folders = map.folders.filter(e => {
-    const hit = e.trusted === true && (e.path === folder ||
-      (!hasGlob(e.path) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false).includes(target))))
+    // Also an entry for this folder recorded in another letter case, checked
+    // for identity like findEntryIndex's fallback (#1357). Its grant never
+    // applied, but `plur untrust` must still clear it and say so.
+    const hit = e.trusted === true && (entryIsFolder(e, folder, raw, target, home) ||
+      (!hasGlob(e.path) && entryForms(e.path, home, false).some(f => sameFolderIgnoringCase(f, target))))
     if (!hit) return true
     changed = true
     delete e.trusted

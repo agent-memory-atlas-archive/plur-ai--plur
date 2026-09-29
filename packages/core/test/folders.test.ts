@@ -13,7 +13,7 @@ import { tmpdir } from 'os'
 import {
   resolveFolderPolicy, loadFolderMap, saveFolderMap, folderMapPath, setFolderEntry, removeFolderEntry,
   folderPatternMatches, folderPatternSpecificity, issueFolderNonce, consumeFolderNonce,
-  endFolderNonceSession, FolderMapError, isTrustedInMap, FOLDER_NONCE_TTL_MS, type FolderEntry,
+  endFolderNonceSession, FolderMapError, isTrustedInMap, clearFolderTrust, FOLDER_NONCE_TTL_MS, type FolderEntry,
 } from '../src/folders.js'
 import { isDirectoryTrusted, trustDirectory, untrustDirectory, listTrustedDirectories } from '../src/trust.js'
 import { logger } from '../src/logger.js'
@@ -231,6 +231,29 @@ describe('resolveFolderPolicy', () => {
       writeMap([{ path: misCased, plur: 'off' }])
       expect(removeFolderEntry(root, onDisk, home)).toBe(true)
       expect(loadFolderMap(root).folders).toEqual([])
+    })
+
+    it('a mis-cased grant is cleared by untrust and never revived by a later edit', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      const w = mk('G')
+      const onDisk = join(w, 'Proj')
+      mkdirSync(onDisk)
+      const misCased = join(w, 'proj')
+
+      writeMap([{ path: misCased, trusted: true }])
+      expect(clearFolderTrust(root, onDisk, home)).toBe(true)
+      expect(loadFolderMap(root).folders).toEqual([])
+      expect(setFolderEntry(root, onDisk, { scope: 'project:x' }, { configuredScopes: [], home }))
+        .toEqual({ path: onDisk, scope: 'project:x' })
+      expect(isTrustedInMap(loadFolderMap(root).folders, onDisk, home)).toBe(false)
+
+      // An edit that finds a dormant mis-cased grant keeps only its mode.
+      writeMap([{ path: misCased, plur: 'ask', trusted: true, scope: 'project:old' }])
+      expect(setFolderEntry(root, onDisk, { mode: 'on' }, { configuredScopes: [], home }))
+        .toEqual({ path: onDisk, plur: 'on' })
+      writeMap([{ path: misCased, plur: 'off', trusted: true, scope: 'project:old' }])
+      expect(setFolderEntry(root, onDisk, { trusted: true }, { configuredScopes: [], home }))
+        .toEqual({ path: onDisk, plur: 'off', trusted: true })
     })
 
     it('a `trusted` entry covers every case spelling of its folder, and a mis-cased entry fails closed', ({ skip }) => {
