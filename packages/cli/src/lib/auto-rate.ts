@@ -353,14 +353,24 @@ export async function autoRateTurn(opts: {
       if (statements.length > 0) {
         // Where captured text may go (#1318 audit, adversarial M3). This is an
         // unattended write of the agent's own reply text, so a repository must
-        // not choose its destination: a `.plur.yaml` scope/domain is honoured
-        // only when its folder is trusted (`plur trust`). Otherwise — and
-        // whenever no scope is set — the statement goes to the local store
+        // not choose its destination. A scope is used only when the user set
+        // it: a folder-map entry's scope (`plur folders`), or a `.plur.yaml`
+        // scope/domain in a trusted folder (`plur trust`). Otherwise — and
+        // whenever no scope applies — the statement goes to the local store
         // via `learn()`, which never routes, so it can never be auto-routed
-        // into a shared scope either.
-        const configPath = findProjectConfigPath(opts.cwd ?? process.cwd())
+        // into a shared scope either. A folder the map turns off gets nothing.
+        const dir = opts.cwd ?? process.cwd()
+        const policy = plur.resolveFolderPolicy(dir)
+        const configPath = findProjectConfigPath(dir)
+        const hint = configPath ? readProjectConfigFromPath(configPath) : {}
         const trusted = configPath !== null && plur.isDirectoryTrusted(dirname(configPath))
-        const project = trusted ? readProjectConfigFromPath(configPath) : {}
+        const mapScope = policy.scope && policy.scope !== hint.scope ? policy.scope : undefined
+        const project: { scope?: string; domain?: string } = policy.mode === 'off'
+          ? {}
+          : trusted
+            ? { ...(policy.scope ? { scope: policy.scope } : {}), ...(hint.domain ? { domain: hint.domain } : {}) }
+            : (mapScope ? { scope: mapScope } : {})
+        if (policy.mode === 'off') statements.length = 0
         const base = {
           type: 'behavioral' as const,
           source: `${opts.editor}:auto-capture`,
