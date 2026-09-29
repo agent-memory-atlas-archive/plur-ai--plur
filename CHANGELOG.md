@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### A refused write to one scope no longer pauses writes to the whole server
+
+**A few refused writes to one scope could stop queued writes to every other
+scope on the same server** (#1308). Each failed outbox push counted toward the
+per-host circuit breaker, including refusals: 401, 403 ("Cannot write to scope
+..."), 404 and 422. Three of those opened the breaker, and the next flush then
+skipped healthy writes to other scopes on that server for five minutes. A
+refusal says the request was wrong, not that the server is down.
+
+Now a 401/403/404/422 answer to an outbox push neither counts toward the
+breaker nor resets it. Network errors, timeouts and 5xx still count, so a
+server that is really down still opens it.
+
 ### Queued writes that can never succeed now say so
 
 **A queued team write the store keeps refusing was silent** (#1299). On one
@@ -36,11 +49,13 @@ The next step names real commands: get write access and run `plur outbox
 **Back-off:** automatic flushes (session start and end, stop hooks,
 `plur sync`) retry a `needs_action` entry at most once a day. They return the
 number held back as `held`. `plur sync` (`outbox.held` in `--json`) and the
-hook's stderr line report it, including when every entry was held back. An explicit flush (`plur outbox --flush`,
+hook's stderr line report it, including when every entry was held back.
+An explicit flush (`plur outbox --flush`,
 `plur_outbox { flush: true }`, or `flushOutbox({ force: true })`) retries it
 at once. **Nothing is dropped, rescoped or rewritten automatically.** Only the
 retry bookkeeping changes: `attempt_count`, `last_attempt`, `last_error` and
 `last_status`.
+
 ### SessionEnd finds the checkpoint for session ids with unusual characters
 
 **`plur hook-session-end` could miss the session checkpoint, so the session
