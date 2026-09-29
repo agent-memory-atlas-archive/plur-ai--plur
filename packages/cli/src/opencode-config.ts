@@ -1,7 +1,8 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
+import { homedir, platform } from 'os'
 import { atomicWrite } from '@plur-ai/core'
+import { buildMcpServerEntry } from './mcp-config.js'
 
 /**
  * Support for opencode's config file: `~/.config/opencode/opencode.json`
@@ -9,8 +10,9 @@ import { atomicWrite } from '@plur-ai/core'
  *
  * Structurally unlike every other host `plur init` writes into: there is no
  * hooks section to merge. opencode reads memory through two separate
- * top-level keys instead, and `plur init --opencode` writes BOTH,
- * deliberately:
+ * top-level keys instead, and `plur init` writes BOTH, deliberately —
+ * by default whenever `opencodeConfigDir()` exists (#1311), or forced with
+ * `--opencode`:
  *
  *   - `plugin: ["@plur-ai/opencode"]` — the automatic layer (recall injected
  *     each turn, learning harvested after it), which needs no tool calls
@@ -206,6 +208,26 @@ export function readOpencodeConfig(configPath: string): OpencodeConfigSnapshot {
 }
 
 /**
+ * The `mcp.plur.command` array PLUR writes for opencode (a single argv, not
+ * `command` + `args` like the other hosts).
+ *
+ * darwin/linux: `npx -y @plur-ai/mcp@<cliVersion>` — pinned, never floating
+ * (#1069).
+ *
+ * win32 (#1311): the same entry `buildMcpServerEntry` builds for every other
+ * host since #1267 — `<node.exe> <@plur-ai/mcp js entry>` when the entry is
+ * resolvable, else the pinned `cmd.exe /c npx …` fallback. Never a bare
+ * `npx`: a shell-less spawn on Windows does not resolve it to `npx.cmd`.
+ */
+export function opencodeMcpCommand(cliVersion: string): string[] {
+  if (platform() === 'win32') {
+    const entry = buildMcpServerEntry()
+    return [entry.command, ...(entry.args ?? [])]
+  }
+  return ['npx', '-y', `@plur-ai/mcp@${cliVersion}`]
+}
+
+/**
  * Resolve the real path to write to. `writeFileSync` used to write THROUGH a
  * symlink (open the target, truncate, write); `atomicWrite`'s rename instead
  * REPLACES whatever sits at the given path — including a symlink itself,
@@ -285,7 +307,7 @@ export function writeOpencodeConfig(
   if (!mcpPlurPreserved) {
     mcp.plur = {
       type: 'local',
-      command: ['npx', '-y', `@plur-ai/mcp@${cliVersion}`],
+      command: opencodeMcpCommand(cliVersion),
       enabled: true,
     }
   }
