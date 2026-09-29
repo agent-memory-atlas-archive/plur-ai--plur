@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### The primary store is no longer registered a second time as a project store
+
+**On some installs every engram was injected twice, under two ids** (#1319).
+Store auto-discovery walks up from the working directory looking for
+`.plur/engrams.yaml`, and skipped the primary store by comparing path strings.
+When the primary path and the walk spelled the same directory differently —
+a symlinked home, or `/var` versus `/private/var` — the check missed, and the
+primary `engrams.yaml` was written into `config.yaml` as `project:<home>`. It
+was then loaded once as the primary and once as a secondary with namespaced
+ids, costing injection budget and splitting feedback between the two copies.
+
+Now:
+
+- Discovery and `addStore` compare canonical paths. `addStore` refuses the
+  primary file under any spelling, and a second spelling of an
+  already-registered local store returns `already_registered` with the
+  existing scope.
+- A `config.yaml` that already holds such an entry needs no edit: at load, a
+  local store entry that is the primary file, or the same file as an earlier
+  entry, is ignored with one warning. The entry stays in `config.yaml`, and
+  writebacks start from the file on disk, so nothing is removed.
+
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
 **The Stop hook's "did you learn something?" nudge was never shown to the
