@@ -13,14 +13,22 @@ against the assistant's reply, and sends a verdict only when it is at least 0.6
 confident:
 
 - the engram's statement appears in the reply: positive;
-- most of its word trigrams appear in the reply: positive;
-- one sentence of the reply both corrects something ("Actually, …", "no
-  longer needed", "is wrong") and contains at least two of the engram's
-  distinctive words: negative. The Python version looked at a window of 100 to
-  200 characters around any correction word, which marked unrelated engrams
-  negative. The TypeScript version lives in `@plur-ai/core`
-  (`detectInjectionSignal`, `rateInjectedEngrams`), so the heuristic has one
-  implementation.
+- most of its word trigrams appear in the reply: positive. This rule applies
+  only to statements of three words or more; shorter ones must appear verbatim;
+- one sentence of the reply both corrects something and contains at least two
+  of the engram's distinctive words: negative. The Python version looked at a
+  window of 100 to 200 characters around any correction word, which marked
+  unrelated engrams negative.
+
+A quote or paraphrase is positive only when neither its sentence nor the next
+one corrects it. "Your note says 'use npm for installs' — that is no longer
+true" is rated negative, not positive. Correction phrases are ones aimed at a
+prior claim ("Actually, …", "that is wrong", "is no longer true"). A bare "is
+wrong" doesn't count, because ordinary prose ("check what is wrong with the
+deploy") uses it all the time.
+
+The heuristic lives in `@plur-ai/core` (`detectInjectionSignal`,
+`rateInjectedEngrams`), so it has one implementation.
 
 **Automatic feedback changes ranking only.** It moves `retrieval_strength`
 and the feedback counters, and never advances `commitment`. It is recorded
@@ -41,7 +49,22 @@ process: at most one extra `/me`, never one per rating. `RemoteStore.me()`
 now returns `capabilities` (`[]` for older servers). Contract:
 `docs/specs/2026-09-29-feedback-source-contract.md`.
 
-Each injected engram gets at most one automatic verdict per session.
+A hook runs in a fresh process, where the remote cache is empty. So the hook
+fetches an injected remote engram by id, with one bounded request per id and at
+most 20 per store. It asks only servers that list the capability; a server
+without it is never asked for the engram. The new
+`Plur.getByIds(ids, { remoteCapability })` does this. Without the option,
+`getByIds` never touches the network.
+
+Each injected engram gets at most one automatic verdict per session, and is
+checked against at most three replies. After that it is settled with no
+verdict, and later turns take the fast path without opening the store. Each
+verdict is recorded as soon as it is sent. If the hook is cut off part-way, the
+verdicts already sent are not repeated on the next turn.
+
+Measured on a 5,000-engram store with 10 injected engrams that the reply never
+mentions, on a heavily loaded machine: from the fourth turn on, the hook takes
+about 100–340 ms. Without the three-reply cap it took 900–1,600 ms on every turn.
 
 | Editor | End-of-turn event | Where the reply comes from |
 |---|---|---|

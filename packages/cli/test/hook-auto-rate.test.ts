@@ -150,6 +150,31 @@ describe('hook-auto-rate (#1310)', () => {
     expect(engrams(e).find(x => x.id === id)!.feedback_signals?.positive).toBe(1)
   })
 
+  describe('pending window (#1318 review)', () => {
+    const MISS = 'Done. The build is green and nothing else changed.'
+    const stopWith = (sid: string, reply: string) =>
+      cli(e, ['hook-auto-rate', 'claude'], { hook_event_name: 'Stop', session_id: sid, cwd: e.project, last_assistant_message: reply })
+
+    it('an engram used on a later turn inside the window is still rated', () => {
+      const id = seed(e)
+      cli(e, ['hook-inject'], { hook_event_name: 'UserPromptSubmit', session_id: 'pw-1', prompt: 'zebra-quartz migration invoice service' })
+      stopWith('pw-1', MISS)
+      stopWith('pw-1', QUOTING_REPLY)
+      expect(engrams(e).find(x => x.id === id)!.feedback_signals?.positive).toBe(1)
+    })
+
+    it('an engram with no verdict for three turns is settled and no longer pending', () => {
+      const id = seed(e)
+      cli(e, ['hook-inject'], { hook_event_name: 'UserPromptSubmit', session_id: 'pw-2', prompt: 'zebra-quartz migration invoice service' })
+      stopWith('pw-2', MISS)
+      stopWith('pw-2', MISS)
+      stopWith('pw-2', MISS)
+      // Settled: the fourth turn takes the fast path and does not rate it.
+      stopWith('pw-2', QUOTING_REPLY)
+      expect(engrams(e).find(x => x.id === id)!.feedback_signals?.positive ?? 0).toBe(0)
+    })
+  })
+
   it('writes nothing when nothing was injected this session', () => {
     const id = seed(e)
     const before = readFileSync(join(e.plurPath, 'engrams.yaml'), 'utf8')

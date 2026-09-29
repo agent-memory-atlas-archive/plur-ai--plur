@@ -13,9 +13,18 @@
  *   1. The statement appears verbatim in the reply (case, whitespace and
  *      punctuation ignored)                                  → positive, 0.95
  *   2. At least 80% of the statement's word trigrams appear
- *      in the reply                                          → positive, 0.7–0.9
+ *      in the reply (statements of three words or more)      → positive, 0.7–0.9
  *   3. One sentence of the reply holds BOTH a correction
  *      phrase AND the statement's distinctive words          → negative, 0.65
+ *
+ * A match under rule 1 or 2 is only positive when neither the sentence(s)
+ * holding it nor the sentence right after carry a correction phrase. A reply
+ * that quotes a memory in order to correct it ("your note says 'use npm' —
+ * that is no longer true") is rated negative, never positive (#1318 review).
+ *
+ * Statements under three words have no trigrams; comparing bare words would
+ * rate "Prefer pnpm" positive for any short reply containing both words, so
+ * they are matched verbatim only.
  *
  * Rule 3 used to look at a ±100–200 character window around any correction
  * word. A reply that fixed an unrelated thing next to a shared word therefore
@@ -58,9 +67,13 @@ const NEGATIVE_MIN_SHARED_WORDS = 2
 
 /** Correction phrases that open a sentence. */
 const LEADING_CORRECTION = /^(?:actually,|no,|correction:|wrong,|incorrect,)/
-/** Correction phrases anywhere in a sentence. */
+/**
+ * Correction phrases anywhere in a sentence — constructions aimed at a prior
+ * claim ("that is wrong", "is no longer true"), not a bare "is wrong", which
+ * ordinary prose uses all the time ("check what is wrong with the deploy").
+ */
 const INLINE_CORRECTION =
-  /\b(?:that's wrong|that is wrong|is wrong|was wrong|is incorrect|was incorrect|not correct|is outdated|no longer (?:true|valid|applies|correct|needed|required))\b/
+  /\b(?:(?:that|this|it)(?:'s| is| was) (?:wrong|incorrect|outdated|out of date|not true|not correct|not accurate|no longer (?:true|valid|correct|accurate|the case))|(?:is|was|are|were) no longer (?:true|valid|correct|accurate|the case|needed|required)|no longer (?:applies|holds)|not correct anymore)\b/
 
 /**
  * Longer words that carry no topic of their own. Kept small on purpose: a
@@ -75,7 +88,11 @@ const STOPWORDS = new Set([
 ])
 
 function tokens(text: string): string[] {
-  return text.toLowerCase().match(/[\p{L}\p{N}_'-]+/gu) ?? []
+  // Inner apostrophes and hyphens belong to the word ("don't", "zebra-quartz");
+  // leading/trailing ones are quote marks and dashes around it.
+  return (text.toLowerCase().match(/[\p{L}\p{N}_'-]+/gu) ?? [])
+    .map(t => t.replace(/^['-]+|['-]+$/g, ''))
+    .filter(Boolean)
 }
 
 function trigrams(words: string[]): Set<string> {
@@ -92,26 +109,58 @@ function sentences(text: string): string[] {
     .filter(s => s.length > 0)
 }
 
+function isCorrection(sentence: string): boolean {
+  return LEADING_CORRECTION.test(sentence) || INLINE_CORRECTION.test(sentence)
+}
+
 /** Rate one injected engram against the assistant's reply. */
 export function detectInjectionSignal(statement: string, reply: string): InjectionSignalResult {
   const stmtWords = tokens(statement)
-  const replyWords = tokens(reply)
-  if (stmtWords.length === 0 || replyWords.length === 0) return { signal: null, confidence: 0 }
+  const sents = sentences(reply)
+  // The reply's tokens, each tagged with the sentence it sits in, so a match
+  // can be traced back to the sentences that hold it.
+  const flat: string[] = []
+  const sentOf: number[] = []
+  sents.forEach((s, i) => { for (const t of tokens(s)) { flat.push(t); sentOf.push(i) } })
+  if (stmtWords.length === 0 || flat.length === 0) return { signal: null, confidence: 0 }
+
+  /** Is the match in these sentences corrected there or in the next sentence? */
+  const corrected = (idxs: Iterable<number>): boolean => {
+    for (const i of idxs) {
+      if (isCorrection(sents[i])) return true
+      if (i + 1 < sents.length && isCorrection(sents[i + 1])) return true
+    }
+    return false
+  }
+  const quotedThenCorrected: InjectionSignalResult = { signal: 'negative', confidence: NEGATIVE_CONFIDENCE }
 
   // 1. Verbatim, on token boundaries.
-  if (` ${replyWords.join(' ')} `.includes(` ${stmtWords.join(' ')} `)) {
-    return { signal: 'positive', confidence: EXACT_CONFIDENCE }
+  const n = stmtWords.length
+  const exactAt = new Set<number>()
+  for (let k = 0; k + n <= flat.length; k++) {
+    let hit = true
+    for (let j = 0; j < n; j++) if (flat[k + j] !== stmtWords[j]) { hit = false; break }
+    if (hit) for (let j = 0; j < n; j++) exactAt.add(sentOf[k + j])
+  }
+  if (exactAt.size > 0) {
+    return corrected(exactAt) ? quotedThenCorrected : { signal: 'positive', confidence: EXACT_CONFIDENCE }
   }
 
-  // 2. Trigram overlap.
-  const stmtTris = trigrams(stmtWords)
-  if (stmtTris.size > 0) {
-    const replyTris = trigrams(replyWords)
-    let shared = 0
-    for (const t of stmtTris) if (replyTris.has(t)) shared++
-    const overlap = shared / stmtTris.size
+  // 2. Trigram overlap — only for statements that have trigrams.
+  if (n >= 3) {
+    const stmtTris = trigrams(stmtWords)
+    const triSentences = new Map<string, number[]>()
+    for (let k = 0; k + 2 < flat.length; k++) {
+      const t = `${flat[k]} ${flat[k + 1]} ${flat[k + 2]}`
+      if (!stmtTris.has(t)) continue
+      const list = triSentences.get(t) ?? []
+      list.push(sentOf[k], sentOf[k + 2])
+      triSentences.set(t, list)
+    }
+    const overlap = triSentences.size / stmtTris.size
     if (overlap >= TRIGRAM_MIN_OVERLAP) {
-      return { signal: 'positive', confidence: 0.7 + 0.2 * overlap }
+      const where = new Set([...triSentences.values()].flat())
+      return corrected(where) ? quotedThenCorrected : { signal: 'positive', confidence: 0.7 + 0.2 * overlap }
     }
   }
 
@@ -121,8 +170,8 @@ export function detectInjectionSignal(statement: string, reply: string): Injecti
   )
   if (distinctive.length > 0) {
     const needed = Math.min(NEGATIVE_MIN_SHARED_WORDS, distinctive.length)
-    for (const sentence of sentences(reply)) {
-      if (!LEADING_CORRECTION.test(sentence) && !INLINE_CORRECTION.test(sentence)) continue
+    for (const sentence of sents) {
+      if (!isCorrection(sentence)) continue
       const words = new Set(tokens(sentence))
       const hits = distinctive.filter(w => words.has(w)).length
       if (hits >= needed) return { signal: 'negative', confidence: NEGATIVE_CONFIDENCE }

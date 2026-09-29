@@ -6,6 +6,7 @@ import {
   extractSelfReportedLearnings,
   readProjectConfig,
   bareEngramId,
+  FEEDBACK_SOURCE_CAPABILITY,
   type RatedEngram,
 } from '@plur-ai/core'
 import { createPlur, type GlobalFlags } from '../plur.js'
@@ -58,7 +59,15 @@ export function autoCaptureEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return v === '1' || v === 'true' || v === 'on'
 }
 
-function fileFor(editor: AutoRateEditor, sessionId: string, kind: 'injected' | 'rated'): string {
+/**
+ * How many end-of-turn replies an injected engram is checked against before
+ * it is settled without a verdict (#1318 review). Without a cap, an engram
+ * the reply never mentions stays pending all session and every turn's hook
+ * opens the store; with it, the fast path returns after this many turns.
+ */
+export const AUTO_RATE_MAX_TURNS = 3
+
+function fileFor(editor: AutoRateEditor, sessionId: string, kind: 'injected' | 'rated' | 'tries'): string {
   return join(DIR, `${editor}-${safeSessionKey(sessionId)}.${kind}`)
 }
 
@@ -93,10 +102,16 @@ export function recordInjected(editor: AutoRateEditor, sessionId: unknown, ids: 
   } catch { /* fail-open */ }
 }
 
-/** Ids injected in this session that have not had an automatic verdict yet. */
+/**
+ * Ids injected in this session that have neither had an automatic verdict
+ * nor been checked against {@link AUTO_RATE_MAX_TURNS} replies already.
+ */
 export function pendingInjected(editor: AutoRateEditor, sessionId: string): string[] {
   const rated = new Set(readIds(fileFor(editor, sessionId, 'rated')))
-  return [...new Set(readIds(fileFor(editor, sessionId, 'injected')))].filter(id => !rated.has(id))
+  const tries = new Map<string, number>()
+  for (const id of readIds(fileFor(editor, sessionId, 'tries'))) tries.set(id, (tries.get(id) ?? 0) + 1)
+  return [...new Set(readIds(fileFor(editor, sessionId, 'injected')))]
+    .filter(id => !rated.has(id) && (tries.get(id) ?? 0) < AUTO_RATE_MAX_TURNS)
 }
 
 export interface AutoRateOutcome {
@@ -130,7 +145,10 @@ export async function autoRateTurn(opts: {
     const plur = createPlur(opts.flags)
 
     if (pending.length > 0) {
-      const engrams = await plur.getByIds(pending)
+      // Remote ids are fetched by id (the remote cache is empty in a fresh
+      // hook process), and only from servers that advertise feedback.source —
+      // a server that would not receive the verdict is never asked (#1318).
+      const engrams = await plur.getByIds(pending, { remoteCapability: FEEDBACK_SOURCE_CAPABILITY })
       // One record can be injected under two ids — its own and a store-
       // namespaced alias (ENG-XYZ-…) when the same file is also mounted as a
       // secondary store. Rate each record once: same bare id and statement
@@ -146,7 +164,14 @@ export async function autoRateTurn(opts: {
         unique.map(e => ({ id: e.id, statement: e.statement })),
         reply,
       )
-      const done: string[] = []
+      const ratedFile = fileFor(opts.editor, opts.sessionId, 'rated')
+      // Aliases skipped above, and ids that no longer exist anywhere, will
+      // never be rated on their own; stop loading them.
+      const kept = new Set(unique.map(e => e.id))
+      appendIds(ratedFile, pending.filter(id => !kept.has(id)))
+      // This reply counts as one of the turns each remaining engram gets.
+      const withVerdict = new Set(verdicts.map(v => v.id))
+      appendIds(fileFor(opts.editor, opts.sessionId, 'tries'), [...kept].filter(id => !withVerdict.has(id)))
       for (const v of verdicts) {
         try {
           await plur.feedback(v.id, v.signal, undefined, { source: 'auto' })
@@ -154,15 +179,12 @@ export async function autoRateTurn(opts: {
         } catch (err) {
           process.stderr.write(`[plur] auto-rate: ${v.id} not rated (${(err as Error)?.message ?? 'unknown'})\n`)
         }
-        // Rated or refused (remote, readonly): either way, do not retry it
-        // on every later turn of this session.
-        done.push(v.id)
+        // Recorded per id, the moment it is settled (#1318 review): a
+        // watchdog or editor timeout later in this loop must not lose the
+        // verdicts already sent and rate them again next turn. Rated or
+        // refused (remote without the capability, readonly) alike.
+        appendIds(ratedFile, [v.id])
       }
-      // Aliases skipped above, and ids that no longer exist anywhere, will
-      // never be rated on their own; stop loading them.
-      const kept = new Set(unique.map(e => e.id))
-      for (const id of pending) if (!kept.has(id)) done.push(id)
-      appendIds(fileFor(opts.editor, opts.sessionId, 'rated'), done)
     }
 
     // `auto_learn: false` in config.yaml is the store-wide kill switch for

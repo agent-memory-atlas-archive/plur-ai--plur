@@ -94,3 +94,45 @@ describe('rateInjectedEngrams', () => {
     expect(rateInjectedEngrams([{ id: 'ENG-A', statement: '' }], 'text')).toEqual([])
   })
 })
+
+describe('review fixes (#1318)', () => {
+  it('a reply that quotes a memory in order to correct it is never positive', () => {
+    const statement = 'use npm for installs'
+    const reply = "Your note says 'use npm for installs' — that is no longer true, this repo uses pnpm."
+    const r = detectInjectionSignal(statement, reply)
+    expect(r.signal).not.toBe('positive')
+    expect(r.signal).toBe('negative')
+  })
+
+  it('a quote followed by a correction in the NEXT sentence is never positive', () => {
+    const reply = `Memory says: ${STATEMENT}. Actually, the migration script was retired last month.`
+    expect(detectInjectionSignal(STATEMENT, reply).signal).not.toBe('positive')
+  })
+
+  it('a paraphrase (trigram match) that is then corrected is never positive', () => {
+    const reply = 'You said to run the migration script before deploying the billing services. That is outdated now.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).not.toBe('positive')
+  })
+
+  it('a quote with an unrelated correction two sentences later stays positive', () => {
+    const reply = `${STATEMENT}. I did that. The tests passed. Actually, the CSS bug was in the header.`
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('positive')
+  })
+
+  it('a statement under three words needs the words adjacent, not just present', () => {
+    expect(detectInjectionSignal('Prefer pnpm', 'I prefer to keep pnpm out of this one.').signal).toBeNull()
+    // A short reply degrades to bare words too — the words, in any order, matched.
+    expect(detectInjectionSignal('Prefer pnpm', 'pnpm? prefer').signal).toBeNull()
+    expect(detectInjectionSignal('Prefer pnpm', 'As noted: prefer pnpm. Done.').signal).toBe('positive')
+  })
+
+  it('"what is wrong" in ordinary prose is not a correction', () => {
+    const reply = 'Let me check what is wrong with the migration script before deploying.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
+  })
+
+  it('a correction aimed at a prior claim still counts', () => {
+    const reply = 'That is wrong now: the migration script before deploying billing was dropped.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
+  })
+})
