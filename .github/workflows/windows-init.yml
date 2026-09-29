@@ -6,6 +6,8 @@ name: Windows init hooks
 # Claude Code's exec form with no shell, and each Cursor/Codex/Antigravity
 # string through bash -c, pwsh -NoProfile -Command and cmd /C — and checks
 # that each one reached the CLI with its subcommand (scripts/windows-hook-probe.mjs).
+# It then re-runs init and requires unchanged hook counts per editor, and
+# `plur doctor` to report hasPlurHooks for each editor's hooks file.
 # Actions are pinned by commit SHA.
 
 on:

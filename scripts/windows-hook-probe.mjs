@@ -23,6 +23,13 @@
  *   - a stand-in `claude` reporting 2.1.200: Claude Code gets the exec form
  *     (it needs >= 2.1.139).
  *
+ * Re-init: after probing, `plur init` runs a second time with the same
+ * arguments, and the hook count per editor must be unchanged. The shim's
+ * 8.3 short path (`.../PLUR~1/bin/PLUR-H~1.CMD`) once went unrecognised,
+ * and every re-run appended another set. `plur doctor` must then report
+ * `hasPlurHooks` for each editor's hooks file, not only the aggregate
+ * `hooksInstalled`.
+ *
  * Exits 1 when any run fails.
  */
 import { mkdtempSync, mkdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'fs'
@@ -70,11 +77,23 @@ function scenario(name, { fakeClaude, expectClaudeExec }) {
   }
   console.log(`HOME: ${home}`)
 
-  const init = spawnSync(process.execPath, [CLI, 'init', '--global', '--no-desktop', '--no-opencode', '--cursor', '--codex', '--antigravity', '--no-prompt'], {
+  const runInit = () => spawnSync(process.execPath, [CLI, 'init', '--global', '--no-desktop', '--no-opencode', '--cursor', '--codex', '--antigravity', '--no-prompt'], {
     cwd: project, env, encoding: 'utf8', timeout: 120000,
   })
+  const init = runInit()
   console.log(init.stdout)
   if (init.status !== 0) { console.error(init.stderr); failures.push(`${name}: init`); return }
+
+  const hookFiles = {
+    'Claude Code': join(home, '.claude', 'settings.json'),
+    Cursor: join(project, '.cursor', 'hooks.json'),
+    Codex: join(home, '.codex', 'hooks.json'),
+    Antigravity: join(home, '.gemini', 'config', 'hooks.json'),
+  }
+  const hookCounts = () => Object.fromEntries(Object.entries(hookFiles).map(([editor, file]) => [
+    editor, collect(editor === 'Antigravity' ? readJson(file) : readJson(file).hooks).length,
+  ]))
+  const countsBefore = hookCounts()
 
   function probe(label, expected, file, args, opts) {
     const out = join(home, `probe-${++n}.txt`)
@@ -120,11 +139,31 @@ function scenario(name, { fakeClaude, expectClaudeExec }) {
     }
   }
 
+  const reinit = runInit()
+  if (reinit.status !== 0) {
+    console.error(reinit.stderr)
+    failures.push(`${name}: second init`)
+  } else {
+    const countsAfter = hookCounts()
+    for (const editor of Object.keys(hookFiles)) {
+      const ok = countsAfter[editor] === countsBefore[editor]
+      console.log(`${ok ? 'PASS' : 'FAIL'}  re-init ${editor}: ${countsBefore[editor]} -> ${countsAfter[editor]} hooks`)
+      if (!ok) failures.push(`${name}: re-init changed the ${editor} hook count (${countsBefore[editor]} -> ${countsAfter[editor]})`)
+    }
+  }
+
   const doctor = spawnSync(process.execPath, [CLI, 'doctor', '--no-handshake', '--json'], { cwd: project, env, encoding: 'utf8', timeout: 120000 })
   try {
     const report = JSON.parse(doctor.stdout)
     console.log(`plur doctor: hooksInstalled=${report.hooksInstalled} windowsHookFallback=${JSON.stringify(report.windowsHookFallback)}`)
     if (!report.hooksInstalled) failures.push(`${name}: doctor hooksInstalled false`)
+    const perFile = ['Claude Code (global)', 'Cursor (.cursor/hooks.json)', 'Codex (~/.codex/hooks.json)', 'Antigravity (~/.gemini/config/hooks.json)']
+    for (const label of perFile) {
+      const c = (report.configs ?? []).find((x) => x.label === label)
+      const ok = c?.exists === true && c.hasPlurHooks === true
+      console.log(`${ok ? 'PASS' : 'FAIL'}  doctor ${label}: exists=${c?.exists} hasPlurHooks=${c?.hasPlurHooks}`)
+      if (!ok) failures.push(`${name}: doctor ${label} hasPlurHooks not true`)
+    }
   } catch {
     console.log(`plur doctor output was not JSON: ${doctor.stdout.slice(0, 500)}`)
     failures.push(`${name}: doctor`)
