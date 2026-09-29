@@ -136,3 +136,33 @@ describe('review fixes (#1318)', () => {
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
   })
 })
+
+describe('a match rejected where it sits is never positive (#1362)', () => {
+  it('a quoted statement called outdated right after the quote is negative', () => {
+    const r = detectInjectionSignal(STATEMENT, `"${STATEMENT}" is outdated.`)
+    expect(r.signal).toBe('negative')
+    expect(r.confidence).toBeGreaterThanOrEqual(AUTO_FEEDBACK_MIN_CONFIDENCE)
+  })
+
+  it('"Your note says X, but that is wrong since v3" is negative', () => {
+    const reply = `Your note says ${STATEMENT}, but that is wrong since v3.`
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
+  })
+
+  it('"Do not use pnpm, use npm." against the engram "Use pnpm" is negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Do not use pnpm, use npm.').signal).toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', 'Don’t ever use pnpm here; use npm.').signal).toBe('negative')
+  })
+
+  it('a negated paraphrase (trigram match) is negative', () => {
+    const reply = 'You should never run the migration script before deploying the billing services now.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
+  })
+
+  it('a reply that follows the engram with an unrelated "not" stays positive', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Use pnpm, not npm.').signal).toBe('positive')
+    expect(detectInjectionSignal('Use pnpm', 'If not sure, use pnpm.').signal).toBe('positive')
+    const reply = `I did not skip anything: ${STATEMENT}, which is not optional.`
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('positive')
+  })
+})
