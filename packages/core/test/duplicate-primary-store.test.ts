@@ -16,8 +16,9 @@
  * never touched.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdirSync, rmSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'fs'
 import { join } from 'path'
+import { tmpdir } from 'os'
 import { fileURLToPath } from 'url'
 import yaml from 'js-yaml'
 import { Plur } from '../src/index.js'
@@ -132,5 +133,59 @@ describe('#1319 primary store is never registered as a secondary store', () => {
     expect(scopes).toContain('project:team')
     expect(scopes).not.toContain('project:team-alias')
     expect(readFileSync(configPath, 'utf8')).toBe(configText)
+  })
+})
+
+describe('#1319 persistScopeMetadata writeback keeps ignored duplicate entries', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'plur-1319-meta-'))
+    writeFileSync(join(dir, 'engrams.yaml'), 'engrams: []\n')
+  })
+
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('changes only the synced metadata and loses no entry or field', () => {
+    const url = 'https://memory.example.test'
+    const other = join(dir, 'other', 'engrams.yaml')
+    mkdirSync(join(dir, 'other'), { recursive: true })
+    writeFileSync(other, 'engrams: []\n')
+    const original = {
+      index: false,
+      custom_top_level: { keep: true },
+      stores: [
+        { url, token: 'tok', scope: 'group:acme/eng', shared: true, readonly: false, future_field: 'kept' },
+        // The primary file under another spelling: ignored at load (#1319).
+        { path: `${dir}/./engrams.yaml`, scope: 'project:dup-primary', shared: true, readonly: false, note: 'dup' },
+        { path: other, scope: 'project:other', shared: true, readonly: false },
+        // The same file as the entry above under another spelling: also ignored.
+        { path: `${dir}/other/./engrams.yaml`, scope: 'project:dup-other', shared: false, readonly: true },
+      ],
+    }
+    const configPath = join(dir, 'config.yaml')
+    const dump = (o: unknown) => yaml.dump(o, { lineWidth: 120, noRefs: true })
+    writeFileSync(configPath, dump(original))
+
+    const plur = new Plur({ path: dir, autoDiscover: false })
+    expect(plur.ignoredDuplicateStores().map(s => s.scope).sort()).toEqual(['project:dup-other', 'project:dup-primary'])
+
+    plur.persistScopeMetadata([{
+      url, ok: true, authorized: ['group:acme/eng'], registered: ['group:acme/eng'], unregistered: [],
+      metadata: [{ scope: 'group:acme/eng', description: 'Engineering', covers: ['acme.engineering'] }],
+    } as any])
+
+    const after = yaml.load(readFileSync(configPath, 'utf8')) as typeof original
+    // The intended change landed.
+    expect(after.stores[0]).toMatchObject({ covers: ['acme.engineering'], description: 'Engineering' })
+    // No entry lost, order kept, every field of every entry preserved.
+    const expected = structuredClone(original)
+    Object.assign(expected.stores[0], { covers: ['acme.engineering'], description: 'Engineering' })
+    expect(after).toEqual(expected)
+    // Untouched entries and top-level keys are byte-identical in the written file.
+    for (const i of [1, 2, 3]) expect(dump(after.stores[i])).toBe(dump(original.stores[i]))
+    expect(dump(after.custom_top_level)).toBe(dump(original.custom_top_level))
+    // Still ignored after the writeback.
+    expect(plur.ignoredDuplicateStores().map(s => s.scope).sort()).toEqual(['project:dup-other', 'project:dup-primary'])
   })
 })
