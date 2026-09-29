@@ -2275,6 +2275,7 @@ export class Plur {
       ;(hit as any).recurrence_count = (mutated as any).recurrence_count
       hit.write_count = mutated.write_count
       ;(hit as any).sources = (mutated as any).sources
+      ;(hit as any).structured_data = (mutated as any).structured_data
       if (mutated.locked_at !== undefined) hit.locked_at = mutated.locked_at
       if (mutated.locked_reason !== undefined) hit.locked_reason = mutated.locked_reason
     }

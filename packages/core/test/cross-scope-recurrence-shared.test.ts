@@ -188,6 +188,21 @@ describe('shared-scope saves and cross-scope recurrence (#1268)', () => {
       expect(b.recurrence_count).toBe(1)
     })
 
+    // From the review of the earlier carve-out: `rescope` leaves `sources`
+    // untouched, so a user who moved a project engram to their personal global
+    // scope must still get the team copy written, not absorbed.
+    it('a shared-origin engram the user rescoped to global is credited, and the team copy is written', async () => {
+      const mine = await plur.learn('rotate deploy keys monthly', { scope: 'project:x' })
+      const moved = await plur.rescope([mine.id], 'global')
+      expect(moved.results[0].status).toBe('rescoped')
+      const team = await plur.learn('rotate deploy keys monthly', { scope: TEAM })
+      expect(team.id).not.toBe(mine.id)
+      expect(team.scope).toBe(TEAM)
+      const stored = (await plur.list()).find(e => e.id === mine.id)!
+      expect(stored.scope).toBe('global')
+      expect(stored.recurrence_count).toBe(1)
+    })
+
     it('a personal save recurs onto a shared engram as before', async () => {
       const a = await plur.learn('lint first', { scope: TEAM })
       const b = await plur.learn('lint first', { scope: 'global' })
