@@ -55,8 +55,11 @@ Now:
   entries recorded for a folder in another case, when the filesystem shows
   that spelling is the same folder (a sibling `pROJ` on a case-sensitive
   disk is never taken for `Proj`). `set` merges them into one entry in the
-  on-disk case; it keeps only their mode (the most restrictive one, unless
-  you set a mode), never a trust grant or scope that did not apply. `rm`
+  on-disk case. Of such an entry only an `off` ever applied, through the
+  loose match that only `off` uses; its `ask` or `on`, trust grant and
+  scope did not. `set` keeps their mode (the most restrictive one, unless
+  you set a mode), never their trust grant or scope. `--scope` without a
+  mode means `on`, also when it replaces a merged mis-cased `off`. `rm`
   removes all of them, and `untrust` clears their grants. The same holds
   for two entries that spell one folder differently, such as `~/dup` and
   its absolute path (both kept by the `trust.yaml` import): `set` merges
