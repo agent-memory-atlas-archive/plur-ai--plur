@@ -52,6 +52,7 @@ Commands:
   migrate [up|down|status] Run schema migrations
   stores list             List configured stores
   stores add <path>       Add a knowledge store
+  stores prune            Remove config.yaml store entries that name the primary store file (#1356)
   trust [dir]             Trust a directory's .plur.yaml scope/domain (default: cwd) [--list]
   untrust [dir]           Revoke a directory's trust grant (default: cwd)
   folders list            Your per-folder decisions (~/.plur/folders.yaml, #1347)

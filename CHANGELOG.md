@@ -26,6 +26,14 @@ Now:
   primary file, or when both its file and its scope repeat an earlier entry.
   The entry stays in `config.yaml`, and writebacks start from the file on
   disk, so nothing is removed.
+- `plur doctor` lists the store entries that are ignored at load (also in
+  `--json`, as `ignoredDuplicateStores`), and the new `plur stores prune`
+  removes the ones that name the primary store file, which stops the
+  warning (#1356). It removes only those entries, leaves every other byte of
+  `config.yaml` as it was (comments included), and writes atomically. If the
+  `stores:` list is not in plain block style it changes nothing and says so.
+  An entry that repeats another store's file and scope is still left for you
+  to remove by hand.
 - One file registered under two different scopes keeps loading under both,
   as before, because each scope admits different engrams. A warning says the
   two entries share a file, and that engrams scoped `global` in it appear
