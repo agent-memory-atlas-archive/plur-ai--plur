@@ -145,7 +145,13 @@ function sessionKey(input: Record<string, unknown>): string {
   return safeSessionKey(raw)
 }
 
+// Set when the watchdog fires (#1343). The watchdog then waits, bounded, for
+// any store write in flight before exiting; the run it stopped must not print
+// or mark the session during that wait — a stopped run is a failed attempt.
+let stopping = false
+
 function emitContext(hookEventName: string, additionalContext: string): void {
+  if (stopping) return
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } }))
 }
 
@@ -155,6 +161,7 @@ function emitContext(hookEventName: string, additionalContext: string): void {
  * The session marker is written only after this resolves true (#1278).
  */
 function emitContextConfirmed(hookEventName: string, additionalContext: string): Promise<boolean> {
+  if (stopping) return Promise.resolve(false)
   return new Promise(resolvePromise => {
     try {
       process.stdout.write(
@@ -383,13 +390,45 @@ const HOOK_CEILING_MS = parseInt(process.env.PLUR_HOOK_CEILING_MS ?? '', 10) || 
  * turn when it is missed or hybrid throws — the same bound the Codex and
  * Antigravity hooks use.
  */
-export function injectForHook<O, R>(
+export async function injectForHook<O, R>(
   plur: Injectable<O, R>,
   task: string,
   opts: O,
   deadlineMs?: number,
-): Promise<InjectOutcome<R>> {
-  return injectWithFallback(plur, task, opts, deadlineMs)
+): Promise<InjectOutcome<R> & { hybrid: Promise<unknown> | null }> {
+  // Keep hold of the hybrid search: when it misses the deadline it is still
+  // running, and the exit must wait for it to finish its store write (#1313).
+  let hybrid: Promise<unknown> | null = null
+  const tracked: Injectable<O, R> = {
+    inject: (t, o) => plur.inject(t, o),
+    injectHybrid: (t, o) => {
+      const p = plur.injectHybrid(t, o)
+      hybrid = p.catch(() => undefined)
+      return p
+    },
+  }
+  const outcome = await injectWithFallback(tracked, task, opts, deadlineMs)
+  return { ...outcome, hybrid }
+}
+
+/**
+ * Before force-exiting past a missed hybrid deadline, how long to wait for
+ * the abandoned search to settle (#1313). When it is near the end it records
+ * its injection under `engrams.yaml.lock`; exiting while that lock's O_EXCL
+ * create is in flight leaves an empty lock core honours for 60s. When it is
+ * still embedding a store with no cache it will not settle in time, and it is
+ * not writing, so exiting at the bound is safe. Also capped by what is left
+ * of the watchdog budget, so the hook still ends before Claude Code's 20s kill.
+ */
+export const ABANDONED_HYBRID_WAIT_MS = 5_000
+
+/** Resolve when `p` settles or after `ms`, whichever comes first. */
+export function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined
+  return Promise.race([
+    p.then(() => undefined, () => undefined),
+    new Promise<void>(r => { timer = setTimeout(r, Math.max(0, ms)) }),
+  ]).finally(() => { if (timer) clearTimeout(timer) })
 }
 
 // How long before an inject lock is considered stale (defaults to HOOK_CEILING_MS).
@@ -399,6 +438,26 @@ const LOCK_STALE_MS =
   process.env.PLUR_LOCK_STALE_MS !== undefined
     ? parseInt(process.env.PLUR_LOCK_STALE_MS, 10)
     : HOOK_CEILING_MS
+
+// The inject lock this run holds, if any. The watchdog removes it before its
+// process.exit(): exit skips every `finally`, and a lock left behind would make
+// every prompt for the next LOCK_STALE_MS bail silently (#1278 review).
+let heldInjectLock: string | null = null
+
+// Full first-message injections allowed per session before the hook stops
+// trying (#1278 review). Each attempt that does not finish — it threw, the
+// watchdog stopped it, or the editor killed it at its hook timeout — leaves no
+// marker, so without a cap a store that always overruns the timeout would run
+// the full injection on every prompt of the session.
+const MAX_INJECT_ATTEMPTS = 2
+
+function attemptsPath(key: string): string {
+  return join(sessionDir(), `${key}.attempts`)
+}
+
+function readAttempts(key: string): number {
+  try { return parseInt(readFileSync(attemptsPath(key), 'utf8'), 10) || 0 } catch { return 0 }
+}
 
 export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Silent pass-through for projects without plur configured (#247).
@@ -410,9 +469,12 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // is the ceiling on the WHOLE run (embedder load, fs stalls, stray async).
   // Installed after isPlurConfigured() so it only fires for
   // sessions that actually do work. unref() prevents it from delaying clean exit.
+  runStartedAt = Date.now()
   // #1343: the watchdog can fire mid-way through a store write, and exiting
-  // there leaves the lock behind. Wait (bounded) for our own lock first.
+  // there leaves the lock behind. Wait (bounded) until the store is idle first.
   const watchdog = setTimeout(() => {
+    stopping = true
+    if (heldInjectLock) try { unlinkSync(heldInjectLock) } catch { /* fail-open */ }
     void exitWhenStoreIdle(WATCHDOG_LOCK_WAIT_MS)
   }, HOOK_CEILING_MS)
   watchdog.unref()
@@ -444,8 +506,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     // burning CPU and injecting nothing. BM25 completes in a few seconds,
     // and event task strings ("skill: X", "agent: Y") are short keyword-ish
     // queries where BM25 holds its own against embeddings anyway. The main
-    // first-message injection keeps full hybrid — it runs async with room
-    // to breathe.
+    // first-message injection keeps hybrid, but it is sync too since #1313:
+    // hybrid on an 8s soft deadline, then BM25, under a 20s hook timeout.
     // Attribute the retrieval to this session when the marker is readable, so
     // the memory receipt can count (engram, session) pairs from hook traffic —
     // which is the large majority of all injections.
@@ -497,30 +559,69 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     if (Date.now() - s.mtimeMs < LOCK_STALE_MS) return
   } catch { /* no lock file — proceed */ }
   try { writeFileSync(injectLock, ''); injectLockAcquired = true } catch { /* fail-open */ }
+  if (injectLockAcquired) heldInjectLock = injectLock
 
   // Release the lock on every exit, including a throw from the injection —
   // a lock left behind would make the retry on the next prompt bail silently
   // until it goes stale (#1278).
   try {
+    if (!isRehydrate) {
+      const attempts = readAttempts(key)
+      if (attempts >= MAX_INJECT_ATTEMPTS) {
+        await skipCappedSession(input, key, marker)
+        return
+      }
+      // Counted BEFORE the heavy work: a run that is killed never gets to
+      // record anything afterwards.
+      try { writeFileSync(attemptsPath(key), String(attempts + 1)) } catch { /* fail-open */ }
+    }
     await injectSession(input, key, marker, isRehydrate, flags)
   } finally {
     if (injectLockAcquired) try { unlinkSync(injectLock) } catch {}
+    heldInjectLock = null
   }
   // #1313: the output (if any) has been flushed — emitContextConfirmed waits
   // for it. Exit now rather than let the abandoned hybrid search keep a
   // synchronous hook, and the user's prompt, waiting. But not while this
   // process may be inside a store write: exiting there leaves the lock file
   // behind, and every writer (the next hook, the MCP server) then waits on it.
+  // Checking for the lock file alone is not enough — the abandoned search's
+  // O_EXCL create can be in flight at the check and land after it — so wait
+  // for the search itself, bounded, then for any lock of ours still on disk.
   if (abandonedHybrid) {
-    await exitWhenStoreIdle(EXIT_LOCK_WAIT_MS)
+    const left = () => Math.max(0, runStartedAt + HOOK_CEILING_MS - 1_000 - Date.now())
+    await settleWithin(abandonedHybrid, Math.min(ABANDONED_HYBRID_WAIT_MS, left()))
+    // Then the general guard (#1343): no lock operation of this process in
+    // flight and no lock file of ours on disk, checked in the same step as
+    // the exit.
+    await exitWhenStoreIdle(Math.min(EXIT_LOCK_WAIT_MS, left()))
   }
 }
 
-// Set when the hybrid leg missed its deadline and is still running (#1313).
-let abandonedHybrid = false
+// The hybrid search that missed its deadline and is still running (#1313).
+let abandonedHybrid: Promise<unknown> | null = null
+let runStartedAt = Date.now()
 
 // Moved to lib/store-lock-exit.ts (#1343) so every force-exiting hook shares it.
 export { waitForOwnStoreLock }
+
+/**
+ * The cap is reached: mark the session so later prompts take the cheap
+ * reminder path, and say once that automatic memory was skipped. Nothing here
+ * touches the store — whatever made the full injection fail (a store too large
+ * for the hook timeout, a store that does not load) would make a keyword-only
+ * fallback fail the same way, so none is attempted.
+ */
+async function skipCappedSession(input: Record<string, unknown>, key: string, marker: string): Promise<void> {
+  const task = (typeof input.prompt === 'string' && input.prompt) || 'general session'
+  try { writeFileSync(marker, JSON.stringify({ task, sessionId: randomUUID(), injection: 'skipped' })) } catch { /* fail-open */ }
+  touchReminder(key)
+  await emitContextConfirmed(
+    claudeHookEventName(input, { rehydrate: false, event: null }),
+    `[PLUR Memory — automatic injection skipped: the last ${MAX_INJECT_ATTEMPTS} attempts in this session did not finish] ` +
+      'Call plur_session_start or plur_recall to load memory for this session.',
+  )
+}
 
 async function injectSession(
   input: Record<string, unknown>,
@@ -611,10 +712,10 @@ async function injectSession(
   // #1313: bounded, because the hook is sync. On a missed deadline or a
   // hybrid failure, BM25 (local-only by design — inject() never dials)
   // serves the turn.
-  const { result, mode } = await injectForHook(plur, task, injectOpts)
+  const { result, mode, hybrid } = await injectForHook(plur, task, injectOpts)
   // A missed deadline leaves the hybrid search running; it must not hold
   // the process (and so the prompt) open until the watchdog.
-  abandonedHybrid = mode === 'bm25' && hybridEnabled()
+  abandonedHybrid = mode === 'bm25' && hybridEnabled() ? hybrid : null
   if (result.count > 0) {
     const parts: string[] = []
     if (result.directives) parts.push(result.directives)

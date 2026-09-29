@@ -138,9 +138,9 @@ describe('force-exiting hooks leave no store lock behind (#1343)', () => {
       { session_id: 'claude-watchdog-1', hook_event_name: 'UserPromptSubmit', prompt: 'basalt-heron codeword' },
       { PLUR_HOOK_HYBRID: '0', PLUR_HOOK_CEILING_MS: '1000', PLUR_TEST_LOCK_ACQUIRE_DELAYS_MS: '1800' })
     expect(r.status).toBe(0)
-    // No stdout assertion: before the fix the watchdog exited with nothing
-    // printed; now its bounded wait lets the write — and so the turn's
-    // context — finish first. Either is a clean exit; only the lock matters.
+    // A stopped run prints nothing, even though the watchdog now waits for the
+    // write in flight before exiting.
+    expect(r.stdout).toBe('')
     expect(locksLeft()).toEqual([])
   }, 60_000)
 })
