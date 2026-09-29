@@ -183,6 +183,36 @@ describe('resolveFolderPolicy', () => {
     expect(loadFolderMap(root).folders).toEqual([{ path: other, plur: 'off', trusted: true }])
   })
 
+  // #1357: `Ⓟ`/`ⓟ` and `Ⅱ`/`ⅱ` are cased but not letters (no \p{L}), so a
+  // check that swaps only letters compared such a folder with itself. On a
+  // case-sensitive filesystem they are sibling folders; no edit of one may
+  // touch the other's entry. Runs on Linux CI; skipped where they collide.
+  for (const [upper, lower] of [['Ⓟ', 'ⓟ'], ['Ⅱ', 'ⅱ']]) {
+    it(`a sibling folder ${upper} keeps its own entry when ${lower} is edited (case-sensitive filesystem)`, ({ skip }) => {
+      const w = mk('Cased')
+      const kept = join(w, upper)
+      const edited = join(w, lower)
+      mkdirSync(kept)
+      try { mkdirSync(edited) } catch { skip() } // EEXIST: case-insensitive filesystem
+      const theirs = { path: kept, plur: 'off' as const, trusted: true }
+      writeMap([theirs])
+
+      expect(removeFolderEntry(root, edited, home)).toBe(false)
+      expect(loadFolderMap(root).folders).toEqual([theirs])
+
+      setFolderEntry(root, edited, { mode: 'on' }, { configuredScopes: [], home })
+      expect(loadFolderMap(root).folders).toEqual([theirs, { path: edited, plur: 'on' }])
+
+      writeMap([theirs])
+      trustDirectory(edited, root)
+      expect(loadFolderMap(root).folders).toEqual([theirs, { path: edited, trusted: true }])
+      expect(untrustDirectory(edited, root)).toBe(true)
+      expect(loadFolderMap(root).folders).toEqual([theirs])
+      expect(policy(kept).mode).toBe('off')
+      expect(isTrustedInMap(loadFolderMap(root).folders, kept, home)).toBe(true)
+    })
+  }
+
   // #1357: canonicalize now folds letter case to the on-disk name. That must
   // never make an `off` entry stop matching. Skipped on a case-sensitive
   // filesystem, where differently-cased paths are different folders.

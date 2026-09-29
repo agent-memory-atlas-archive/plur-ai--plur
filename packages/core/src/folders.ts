@@ -457,13 +457,16 @@ function entryIsFolder(e: FolderEntry, folder: string, raw: string, target: stri
  * existing) and differs from it only in letter case (#1357).
  *
  * Every path component that differs is checked for IDENTITY, not existence:
- * the target's own component and its case-swapped spelling must be the same
- * directory entry (same device and inode, by lstat). On a case-sensitive
- * filesystem `Proj` and `pROJ` can be two sibling folders, and treating one's
- * entry as the other's would move an `off` or a trust grant to the wrong
- * folder; a symlink at the swapped spelling has its own inode and does not
- * match either. Only spellings built from the target's canonical path are
- * probed — the stored entry is never resolved (#778). Any error: false.
+ * under the target's canonical parent, the target's component and the
+ * entry's own spelling of it must be the same directory entry (same device
+ * and inode, by lstat). On a case-sensitive filesystem `Proj` and `pROJ` —
+ * or `Ⓟ` and `ⓟ`, which are cased but not letters — can be two sibling
+ * folders, and treating one's entry as the other's would move an `off` or a
+ * trust grant to the wrong folder. lstat does not follow a symlink, so a
+ * link at the entry's spelling has its own inode and never matches, and the
+ * parent is the target's canonical one: the stored entry is never resolved
+ * through a link (#778). Device and inode are compared as bigints (a 64-bit
+ * NTFS file id can exceed 2^53). Any error: false.
  */
 function sameFolderIgnoringCase(form: string, target: string): boolean {
   if (form === target || form.toLowerCase() !== target.toLowerCase()) return false
@@ -473,10 +476,9 @@ function sameFolderIgnoringCase(form: string, target: string): boolean {
   for (let i = 0; i < b.length; i++) {
     if (a[i] === b[i]) continue
     const prefix = b.slice(0, i)
-    const swapped = b[i].replace(/\p{L}/gu, c => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()))
     try {
-      const x = lstatSync([...prefix, b[i]].join(sep) || sep)
-      const y = lstatSync([...prefix, swapped].join(sep) || sep)
+      const x = lstatSync([...prefix, b[i]].join(sep) || sep, { bigint: true })
+      const y = lstatSync([...prefix, a[i]].join(sep) || sep, { bigint: true })
       if (x.dev !== y.dev || x.ino !== y.ino) return false
     } catch {
       return false
