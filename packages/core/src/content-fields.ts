@@ -102,8 +102,19 @@ export function learnContextContent(context: LearnContext | undefined): Record<s
  * set `structured_data` on an update could name one.
  */
 export const PLUR_BOOKKEEPING_KEYS: ReadonlySet<string> = new Set([
-  '_outbox', '_routed', '_demoted', '_rescoped_from', '_expiry_extracted',
+  '_outbox', '_routed', '_demoted', '_rescoped_from', '_expiry_extracted', '_graduated_from',
 ])
+
+/**
+ * True when the cross-scope recurrence ladder (#176) broadened this engram from
+ * a shared scope to 'global' and nothing has rescoped it since (#1268).
+ */
+export function isLadderGraduated(engram: { structured_data?: unknown }): boolean {
+  const sd = engram.structured_data
+  if (sd == null || typeof sd !== 'object' || Array.isArray(sd)) return false
+  const g = (sd as Record<string, unknown>)._graduated_from
+  return g != null && typeof g === 'object' && typeof (g as { scope?: unknown }).scope === 'string'
+}
 
 /** `structured_data` with PLUR's own bookkeeping removed, or undefined if nothing else is in it. */
 export function userStructuredData(sd: unknown): unknown {

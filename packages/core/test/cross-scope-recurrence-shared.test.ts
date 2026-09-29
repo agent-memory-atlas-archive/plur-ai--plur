@@ -63,6 +63,48 @@ describe('cross-scope recurrence never absorbs a shared write into a personal en
     expect(next.recurrence_count).toBe(3)
   })
 
+  it('a graduated engram keeps taking shared hits after a reload (marker persists)', async () => {
+    const a = await plur.learn('sign release tags', { scope: 'project:a' })
+    await plur.learn('sign release tags', { scope: 'project:b' })
+    await plur.learn('sign release tags', { scope: 'project:c' })
+    const reloaded = new Plur({ path: dir })
+    const stored = (await reloaded.list()).find(e => e.id === a.id)!
+    expect(stored.scope).toBe('global')
+    expect((stored as any).structured_data?._graduated_from?.scope).toBe('project:a')
+    const next = await reloaded.learn('sign release tags', { scope: 'group:example/eng' })
+    expect(next.id).toBe(a.id)
+  })
+
+  // Review finding on #1275: the carve-out inferred "graduated" from a shared
+  // `sources[0]`, and `rescope` leaves `sources` untouched — so a user who
+  // moved a project engram to their personal global scope got team writes
+  // absorbed into it again.
+  it('a shared-origin engram the USER rescoped to global does not absorb a shared write', async () => {
+    const mine = await plur.learn('rotate deploy keys monthly', { scope: 'project:x' })
+    const moved = await plur.rescope([mine.id], 'global')
+    expect(moved.results[0].status).toBe('rescoped')
+    const team = await plur.learn('rotate deploy keys monthly', { scope: 'group:acme/eng' })
+    expect(team.id).not.toBe(mine.id)
+    expect(team.scope).toBe('group:acme/eng')
+    const stored = (await plur.list()).find(e => e.id === mine.id)!
+    expect(stored.scope).toBe('global')
+    expect((stored as any).recurrence_count ?? 0).toBe(0)
+  })
+
+  it('a rescope clears the graduation marker, even when the engram is moved back to global', async () => {
+    const a = await plur.learn('freeze deps on release branches', { scope: 'project:a' })
+    await plur.learn('freeze deps on release branches', { scope: 'project:b' })
+    await plur.learn('freeze deps on release branches', { scope: 'project:c' })
+    await plur.rescope([a.id], 'local')
+    await plur.rescope([a.id], 'global')
+    const stored = (await plur.list()).find(e => e.id === a.id)!
+    expect(stored.scope).toBe('global')
+    expect((stored as any).structured_data?._graduated_from).toBeUndefined()
+    const team = await plur.learn('freeze deps on release branches', { scope: 'group:acme/eng' })
+    expect(team.id).not.toBe(a.id)
+    expect(team.scope).toBe('group:acme/eng')
+  })
+
   it('personal→personal recurrence is unchanged', async () => {
     const a = await plur.learn('prefer tabs', { scope: 'local' })
     const b = await plur.learn('prefer tabs', { scope: 'user:alice' })

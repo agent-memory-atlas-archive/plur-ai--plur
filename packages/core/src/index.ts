@@ -31,7 +31,7 @@ import { recallAuto, type AutoSearchResult } from './search-orchestrator.js'
 import { autoSummary } from './summary.js'
 import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack, containsEmail } from './packs.js'
 import type { ExportOptions } from './packs.js'
-import { learnContextContent, engramContentFields } from './content-fields.js'
+import { learnContextContent, engramContentFields, isLadderGraduated } from './content-fields.js'
 export { LEARN_CONTEXT_FIELD_ROLES, LEARN_CONTENT_FIELDS, learnContextContent, engramContentFields } from './content-fields.js'
 // SP5 imports (deferred — vault-export, registry not yet merged)
 // import { exportVault, type VaultExportOptions, type VaultExportResult } from './vault-export.js'
@@ -2152,13 +2152,21 @@ export class Plur {
     // cross-scope hit a shared engram is broadened to 'global' (see
     // `_recordCrossScopeRecurrence`), and later shared hits must keep landing
     // on it or the ladder would restart with a duplicate at every new scope.
-    // It is recognisable by its ORIGIN — `sources[0]` is the scope it was first
-    // written at, and only a shared origin is ever broadened (#362 ceiling).
+    // It is recognised by the explicit `structured_data._graduated_from` marker
+    // the ladder stamps at that moment — NOT by a shared `sources[0]`: a user's
+    // `rescope([id], 'global')` leaves `sources` untouched, so origin alone
+    // would let a personal global engram absorb team writes again. Any explicit
+    // rescope clears the marker. Engrams graduated before the marker existed
+    // carry none and so stop taking shared hits: the cost is a duplicate at
+    // the shared scope, never a shared write absorbed into a personal engram.
+    //
+    // Only the local primary store is affected in practice: graduated 'global'
+    // engrams in secondary stores are narrowed back to the store's scope when
+    // they load.
     const sharedWrite = isSharedScope(currentScope)
     const sharedOrGraduated = (e: Engram): boolean => {
       if (isSharedScope(e.scope)) return true
-      const origin = (e as any).sources?.[0]?.scope
-      return e.scope === 'global' && typeof origin === 'string' && isSharedScope(origin)
+      return e.scope === 'global' && isLadderGraduated(e)
     }
     for (const e of engrams) {
       if (e.status === 'active'
@@ -2225,7 +2233,18 @@ export class Plur {
         // Only promote SHARED scopes (project:*, space:*, etc.) to global —
         // personal-family scopes (local, user:*) stay within their family.
         // See issue #362 item (ii): personal-scope ceiling for cross-scope recurrence.
-        if (isSharedScope(e.scope)) e.scope = 'global'
+        if (isSharedScope(e.scope)) {
+          // #1268: mark the graduation so later shared writes may still recur
+          // onto this engram (see `_crossScopeRecurrenceDetect`). A PLUR
+          // bookkeeping key: unscanned, stripped from pack exports and from
+          // remote rescope copies.
+          const sd = (e as any).structured_data
+          ;(e as any).structured_data = {
+            ...(sd && typeof sd === 'object' && !Array.isArray(sd) ? sd : {}),
+            _graduated_from: { scope: e.scope, at: lockedAt },
+          }
+          e.scope = 'global'
+        }
         if (e.commitment !== 'locked') {
           // Forward-only ladder: exploring → leaning → decided → locked.
           e.commitment = e.commitment === 'exploring'
@@ -2256,6 +2275,7 @@ export class Plur {
       ;(hit as any).recurrence_count = (mutated as any).recurrence_count
       hit.write_count = mutated.write_count
       ;(hit as any).sources = (mutated as any).sources
+      ;(hit as any).structured_data = (mutated as any).structured_data
       if (mutated.locked_at !== undefined) hit.locked_at = mutated.locked_at
       if (mutated.locked_reason !== undefined) hit.locked_reason = mutated.locked_reason
     }
@@ -7078,6 +7098,10 @@ export class Plur {
         ...(tsd && typeof tsd === 'object' && !Array.isArray(tsd) ? tsd : {}),
         _rescoped: { from_scope: from, at: now },
       }
+      // #1268: an explicit move is the user's scope, not the recurrence
+      // ladder's — the engram no longer counts as ladder-graduated, so a
+      // rescope to 'global' cannot make it absorb shared writes.
+      delete nextSd._graduated_from
       // #848: CANCEL any pending delivery to the store we are moving away from.
       //
       // A failed remote write leaves `_outbox` naming the original url + scope.
