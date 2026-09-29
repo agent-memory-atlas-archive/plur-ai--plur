@@ -180,6 +180,22 @@ export const PLUR_OPENCODE_PLUGIN = '@plur-ai/opencode'
 const PLUGIN = PLUR_OPENCODE_PLUGIN
 
 /**
+ * Is this `plugin: [...]` element PLUR's plugin, in any form opencode
+ * accepts: the bare name, a version- or tag-pinned spec
+ * (`@plur-ai/opencode@0.1.1`, `@plur-ai/opencode@latest`), or the tuple form
+ * `["@plur-ai/opencode", { ...options }]`. Compared by package name, the way
+ * opencode deduplicates plugins, so a user's pin or options are recognised
+ * and never shadowed by a second, bare entry appended after them (#1335).
+ * Another package (`@plur-ai/opencode-extra`) does not match.
+ */
+export function isPlurOpencodePluginEntry(entry: unknown): boolean {
+  const spec = Array.isArray(entry) ? entry[0] : entry
+  if (typeof spec !== 'string') return false
+  const at = spec.indexOf('@', 1)
+  return (at === -1 ? spec : spec.slice(0, at)) === PLUGIN
+}
+
+/**
  * A read-only snapshot of what an opencode config file currently declares for
  * PLUR — no writes, no side effects. Exists so `plur doctor`'s opencode leg
  * can report on the SAME file `writeOpencodeConfig` would write, using the
@@ -198,7 +214,7 @@ export interface OpencodeConfigSnapshot {
    * when the file doesn't exist — there is nothing unsafe about "not there".
    */
   ok: boolean
-  /** `plugin` is an array containing `PLUR_OPENCODE_PLUGIN`. False when `ok` is false. */
+  /** `plugin` is an array containing `PLUR_OPENCODE_PLUGIN` in any form (`isPlurOpencodePluginEntry`). False when `ok` is false. */
   pluginDeclared: boolean
   /** `mcp.plur` is present (any non-null value). False when `ok` is false. */
   mcpPlurDeclared: boolean
@@ -240,7 +256,7 @@ export function readOpencodeConfig(configPath: string): OpencodeConfigSnapshot {
     return { exists: true, ok: false, pluginDeclared: false, mcpPlurDeclared: false, mcpPlurMissingPaths: [] }
   }
 
-  const pluginDeclared = Array.isArray(parsed.plugin) && (parsed.plugin as unknown[]).includes(PLUGIN)
+  const pluginDeclared = Array.isArray(parsed.plugin) && (parsed.plugin as unknown[]).some(isPlurOpencodePluginEntry)
   const mcpPlurDeclared = isPlainObject(parsed.mcp) && parsed.mcp.plur !== undefined && parsed.mcp.plur !== null
   let mcpPlurMissingPaths: string[] = []
   const entry = mcpPlurDeclared ? (parsed.mcp as Record<string, unknown>).plur : null
@@ -399,7 +415,9 @@ export function writeOpencodeConfig(
   const before = JSON.stringify(cfg)
 
   const plugins = Array.isArray(cfg.plugin) ? cfg.plugin as unknown[] : []
-  if (!plugins.includes(PLUGIN)) plugins.push(PLUGIN)
+  // An existing PLUR entry — pinned, tagged or a tuple with options — is the
+  // user's choice and is left exactly as it is (#1335).
+  if (!plugins.some(isPlurOpencodePluginEntry)) plugins.push(PLUGIN)
   cfg.plugin = plugins
 
   const mcp: Record<string, unknown> = isPlainObject(cfg.mcp) ? cfg.mcp : {}

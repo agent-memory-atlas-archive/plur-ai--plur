@@ -34,7 +34,11 @@ skips it.
 - Re-running init is idempotent, and an existing `opencode.json` keeps its
   other keys. An existing `mcp.plur` is still left as it is, and an
   `opencode.jsonc` with comments is still reported and left byte-for-byte
-  untouched.
+  untouched. An existing `@plur-ai/opencode` plugin entry is recognised by
+  package name, so a pinned (`@plur-ai/opencode@0.1.1`), tagged
+  (`@plur-ai/opencode@latest`) or tuple (`["@plur-ai/opencode", {…}]`) entry is
+  left as it is; init no longer appends a second, bare entry that opencode
+  would load in its place.
 
 ### `plur init` works on Windows, including home directories with a space
 
