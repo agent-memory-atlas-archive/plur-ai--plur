@@ -13,8 +13,12 @@ recurrence count and nothing reached the team scope. Found while triaging an
 enterprise deployment's report of team saves that never reached the team store.
 
 A shared-scope write now only recurs onto a shared engram — or onto one the
-ladder itself graduated to `global` from a shared origin, so the #176 escalation
-keeps working. It otherwise becomes its own engram in the scope you named.
+ladder itself graduated to `global` from a shared scope, so the #176 escalation
+keeps working. It otherwise becomes its own engram in the scope you named. An
+engram you moved to `global` yourself with `rescope` is personal and does not
+count as graduated, whatever scope it started in. An engram the ladder graduated
+before this release is not recognised as graduated either, so a later team save
+of the same text becomes a separate team engram rather than recurring onto it.
 Shared↔shared recurrence, personal→personal recurrence, and a personal write
 recurring onto a shared engram behave as before.
 
