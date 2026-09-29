@@ -4,7 +4,7 @@ import { tmpdir, homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
-import { safeSessionKey } from '../lib/session-key.js'
+import { safeSessionKey, hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js'
 
 // Remote budget for the recall leg inside injectHybrid (#776). The hook is
 // on the hot path of every prompt; slow networks make this a perceptible
@@ -135,12 +135,8 @@ function sessionTaskPath(input: Record<string, unknown>): string | null {
  * for callers that send no session id at all.
  */
 function sessionKey(input: Record<string, unknown>): string {
-  const id = input.session_id
-  const raw =
-    (typeof id === 'string' && id) ||
-    process.env.CLAUDE_SESSION_ID ||
-    String(process.ppid || 'unknown')
-  return safeSessionKey(raw)
+  // Owner decision H1 ("payload", 2026-09-29): the one shared helper.
+  return hookSessionKey(input.session_id)
 }
 
 function emitContext(hookEventName: string, additionalContext: string): void {
@@ -216,6 +212,22 @@ function sessionDir(): string {
 
 function sessionMarkerPath(key: string): string {
   return join(sessionDir(), `${key}.marker`)
+}
+
+/**
+ * The marker to READ for this session: the current key's, or — when it does
+ * not exist — one an older writer left under a legacy key (H1 upgrade path:
+ * #1228's `sid-` prefix, the uncapped or env-first forms), so a session that
+ * started before the upgrade is not injected twice. Writers use `key` only.
+ */
+function readableMarkerPath(key: string, input: Record<string, unknown>): string {
+  const current = sessionMarkerPath(key)
+  if (existsSync(current)) return current
+  for (const legacy of legacyHookSessionKeys(input.session_id)) {
+    const p = sessionMarkerPath(legacy)
+    if (existsSync(p)) return p
+  }
+  return current
 }
 
 function lastReminderPath(key: string): string {
@@ -394,7 +406,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // `session_id`. Reading stdin is a single synchronous read.
   const input = readStdinSync()
   const key = sessionKey(input)
-  const marker = sessionMarkerPath(key)
+  const marker = readableMarkerPath(key, input)
 
   // Contextual injection for specific events (plan_mode, skill, agent, subagent)
   if (event) {
