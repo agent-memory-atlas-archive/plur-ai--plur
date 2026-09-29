@@ -61,6 +61,10 @@ still injects. A refused directory is never written to. The file is written 0600
 through an exclusive, no-follow temp file and a rename, so a symlink at its path
 is replaced, never followed. It keeps only the first 1000 characters, and the
 SessionEnd hook deletes it. On Linux `$TMPDIR` is usually the shared `/tmp`.
+The Stop hook's counter follows the same rule, and so does its session
+checkpoint in `<PLUR root>/sessions`. An empty `PLUR_PATH` now means "unset"
+wherever the hooks resolve the PLUR root, so it never resolves against the
+working directory.
 
 `UserPromptSubmit` stays `async: true`. Async context does arrive, but at the
 next safe point (after a tool result, or before the next prompt), not on the

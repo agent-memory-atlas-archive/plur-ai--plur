@@ -22,7 +22,8 @@ import { safeSessionKey } from './session-key.js'
 export function hookSessionDir(): string | null {
   const shared = join(tmpdir(), 'plur-sessions')
   if (ensureSessionDir(shared)) return shared
-  const fallback = join(process.env.PLUR_PATH ?? join(homedir(), '.plur'), 'hook-sessions')
+  // `||`, not `??`: an empty PLUR_PATH means unset, never "the cwd" (H3).
+  const fallback = join(process.env.PLUR_PATH || join(homedir(), '.plur'), 'hook-sessions')
   return ensureSessionDir(fallback) ? fallback : null
 }
 

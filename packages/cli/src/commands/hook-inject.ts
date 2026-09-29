@@ -305,7 +305,7 @@ function extractEventTask(input: Record<string, unknown>, event: string): string
  * Does not attempt LLM-quality summaries — that context is gone.
  */
 function processDeferredWrapups(): string | null {
-  const plurDir = process.env.PLUR_PATH ?? join(homedir(), '.plur')
+  const plurDir = process.env.PLUR_PATH || join(homedir(), '.plur') // `||`: empty means unset (H3)
   const sessionsDir = join(plurDir, 'sessions')
   if (!existsSync(sessionsDir)) return null
 
