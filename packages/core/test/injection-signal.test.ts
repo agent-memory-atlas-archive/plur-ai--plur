@@ -44,6 +44,14 @@ describe('detectInjectionSignal — positive rules', () => {
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
   })
 
+  it('a paraphrase sharing 4 or 5 of 7 trigrams (57%, 71%) is not positive (#1365)', () => {
+    // The statement has nine words, so seven trigrams. "run the migration
+    // script before deploying" holds four of them, "... deploying the" five;
+    // the rest of each reply is about something else.
+    expect(detectInjectionSignal(STATEMENT, 'I will run the migration script before deploying today.').signal).toBeNull()
+    expect(detectInjectionSignal(STATEMENT, 'I will run the migration script before deploying the new mailer.').signal).toBeNull()
+  })
+
   it('an empty statement or reply yields nothing', () => {
     expect(detectInjectionSignal('', 'anything').signal).toBeNull()
     expect(detectInjectionSignal(STATEMENT, '').signal).toBeNull()
@@ -63,6 +71,15 @@ describe('detectInjectionSignal — negative rule (same sentence)', () => {
     const reply =
       'I ran the migration script and deployed billing. ' +
       'Actually, the CSS bug you mentioned was in the header.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
+  })
+
+  it('a correction in one sentence and the engram words in another is nothing (#1365)', () => {
+    // Taken together the reply has both a correction phrase and every
+    // distinctive word; no single sentence has both.
+    const reply =
+      'Deploying billing needed the migration script first. ' +
+      'The header colour you mentioned, that is wrong: it is blue.'
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
   })
 
@@ -146,5 +163,74 @@ describe('review fixes (#1318)', () => {
   it('a correction aimed at a prior claim still counts', () => {
     const reply = 'That is wrong now: the migration script before deploying billing was dropped.'
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
+  })
+})
+
+describe('a match rejected where it sits is never positive (#1362)', () => {
+  it('a quoted statement called outdated right after the quote is negative', () => {
+    const r = detectInjectionSignal(STATEMENT, `"${STATEMENT}" is outdated.`)
+    expect(r.signal).toBe('negative')
+    expect(r.confidence).toBeGreaterThanOrEqual(AUTO_FEEDBACK_MIN_CONFIDENCE)
+  })
+
+  it('"Your note says X, but that is wrong since v3" is negative', () => {
+    const reply = `Your note says ${STATEMENT}, but that is wrong since v3.`
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
+  })
+
+  it('"Do not use pnpm, use npm." against the engram "Use pnpm" is negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Do not use pnpm, use npm.').signal).toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', 'Don’t ever use pnpm here; use npm.').signal).toBe('negative')
+  })
+
+  it('a negated paraphrase (trigram match) is negative', () => {
+    const reply = 'You should never run the migration script before deploying the billing services now.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')
+  })
+
+  it('a correction written with a curly apostrophe counts (“that’s wrong”)', () => {
+    const reply = 'Your note says “use pnpm” — that’s wrong now.'
+    expect(detectInjectionSignal('Use pnpm', reply).signal).toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', reply.replace('’', 'ʼ')).signal).toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', reply.replace('’', "'")).signal).toBe('negative')
+  })
+
+  it('a reply that follows the engram with an unrelated "not" stays positive', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Use pnpm, not npm.').signal).toBe('positive')
+    expect(detectInjectionSignal('Use pnpm', 'If not sure, use pnpm.').signal).toBe('positive')
+    const reply = `I did not skip anything: ${STATEMENT}, which is not optional.`
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('positive')
+  })
+})
+
+describe('one rejected occurrence does not override a follow-through one (#1362)', () => {
+  it('a statement first negated, then carried out, gets no verdict', () => {
+    const reply = `I did not ${STATEMENT.toLowerCase()} yet \u2014 doing it now: ${STATEMENT}.`
+    // Mixed occurrences get no verdict: neither negative nor positive.
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
+  })
+
+  it('following the engram and then ruling out a variant of it is not negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Use pnpm. Never use pnpm with sudo, though.').signal).not.toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', 'Use pnpm. Do not use pnpm dlx for this script.').signal).not.toBe('negative')
+  })
+
+  it('each run of trigrams is judged on its own', () => {
+    const reply =
+      "Don't run the migration script now. " +
+      'Later, run the migration script before deploying the billing services.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).not.toBe('negative')
+  })
+
+  it('a negator ending the previous sentence does not negate the match (#1365)', () => {
+    expect(detectInjectionSignal('Use pnpm', 'I will not. Use pnpm.').signal).toBe('positive')
+  })
+
+  it('"Why not use pnpm?" recommends it, so it is not negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Why not use pnpm?').signal).not.toBe('negative')
+  })
+
+  it('every occurrence rejected is still negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Do not use pnpm. Never use pnpm here.').signal).toBe('negative')
   })
 })

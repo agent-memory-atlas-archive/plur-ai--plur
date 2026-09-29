@@ -22,6 +22,15 @@
  * that quotes a memory in order to correct it ("your note says 'use npm' —
  * that is no longer true") is rated negative, never positive (#1318 review).
  *
+ * The match itself is also checked where it sits (#1362): a negation in the
+ * word right before it ("Do not use pnpm" against "Use pnpm") or a
+ * verdict right after it ('"use npm" is outdated') makes it negative too.
+ * Only the words next to the match count, so a reply that follows the engram
+ * and says "not" about something else in the same sentence stays positive.
+ * Each occurrence (each run of consecutive trigrams, under rule 2) is judged on
+ * its own. The reply is negative only when every occurrence is rejected, and
+ * gets no verdict when some are rejected and some are not.
+ *
  * Statements under three words have no trigrams; comparing bare words would
  * rate "Prefer pnpm" positive for any short reply containing both words, so
  * they are matched verbatim only.
@@ -97,10 +106,18 @@ const STOPWORDS = new Set([
   'under', 'until', 'using', 'where', 'which', 'while', 'would', 'without',
 ])
 
+/**
+ * Curly and modifier-letter apostrophes (U+2018, U+2019, U+02BC) count as
+ * straight ones, so "don’t" is "don't" and "that’s wrong" is a correction.
+ */
+function straightApostrophes(text: string): string {
+  return text.replace(/[\u2018\u2019\u02bc]/g, "'")
+}
+
 function tokens(text: string): string[] {
   // Inner apostrophes and hyphens belong to the word ("don't", "zebra-quartz");
   // leading/trailing ones are quote marks and dashes around it.
-  return (text.toLowerCase().match(/[\p{L}\p{N}_'-]+/gu) ?? [])
+  return (straightApostrophes(text.toLowerCase()).match(/[\p{L}\p{N}_'-]+/gu) ?? [])
     .map(t => t.replace(/^['-]+|['-]+$/g, ''))
     .filter(Boolean)
 }
@@ -113,11 +130,29 @@ function trigrams(words: string[]): Set<string> {
 }
 
 function sentences(text: string): string[] {
-  return text
+  // Normalised here, before the correction regexes see the sentence.
+  return straightApostrophes(text)
     .split(/(?<=[.!?])\s+|\n+/)
     .map(s => s.trim().toLowerCase())
     .filter(s => s.length > 0)
 }
+
+/** Words that negate what directly follows them ("do not use pnpm"). */
+const NEGATORS = new Set([
+  'not', 'never', "don't", 'dont', "doesn't", "didn't", "shouldn't",
+  "mustn't", "won't", "can't", 'cannot', 'avoid',
+])
+/**
+ * Filler a negator may sit behind ("don't ever use pnpm"). Only the word right
+ * before the match is checked otherwise, so "If not sure, use pnpm" follows it.
+ */
+const NEGATION_FILLER = new Set(['ever', 'just', 'really', 'even', 'actually', 'always'])
+/**
+ * A verdict on the matched text, read from the words right after it:
+ * '"use npm" is outdated', "…, which is no longer true".
+ */
+const TRAILING_VERDICT =
+  /^(?:which |that )?(?:is|was|are|were)(?: now| also)? (?:outdated|out of date|obsolete|deprecated|stale|wrong|incorrect|false|(?:not|no longer) (?:true|valid|correct|accurate|right|the case|needed|required|recommended))\b/
 
 function isCorrection(sentence: string): boolean {
   return LEADING_CORRECTION.test(sentence)
@@ -146,33 +181,75 @@ export function detectInjectionSignal(statement: string, reply: string): Injecti
   }
   const quotedThenCorrected: InjectionSignalResult = { signal: 'negative', confidence: NEGATIVE_CONFIDENCE }
 
+  /**
+   * Is the matched span flat[start..end] negated right before it or given a
+   * wrong/outdated verdict right after it, within its own sentence? (#1362)
+   */
+  const rejectedInPlace = (start: number, end: number): boolean => {
+    let k = start - 1
+    if (k >= 0 && sentOf[k] === sentOf[start] && NEGATION_FILLER.has(flat[k])) k--
+    if (k >= 0 && sentOf[k] === sentOf[start] && NEGATORS.has(flat[k])) {
+      // "Why not use pnpm?" recommends it.
+      const whyNot = flat[k] === 'not' && k > 0 && sentOf[k - 1] === sentOf[k] && flat[k - 1] === 'why'
+      if (!whyNot) return true
+    }
+    const after: string[] = []
+    for (let k = end + 1; k < flat.length && after.length < 6 && sentOf[k] === sentOf[end]; k++) after.push(flat[k])
+    return TRAILING_VERDICT.test(after.join(' '))
+  }
+
+  /**
+   * One verdict from every occurrence of the match (#1362): negative only when
+   * each occurrence is rejected or corrected, positive only when none is. A
+   * reply that both rejects and follows the engram ("I did not X yet — doing
+   * it now: X") gets no verdict, so one rejected occurrence never overrides a
+   * follow-through one, and one clean occurrence never hides a rejection.
+   */
+  const verdict = (rejected: boolean[], positive: InjectionSignalResult): InjectionSignalResult => {
+    if (rejected.every(r => !r)) return positive
+    if (rejected.every(r => r)) return quotedThenCorrected
+    return { signal: null, confidence: 0 }
+  }
+  /** Is the span flat[start..end] rejected in place or corrected around it? */
+  const spanRejected = (start: number, end: number): boolean => {
+    const where = new Set<number>()
+    for (let k = start; k <= end; k++) where.add(sentOf[k])
+    return rejectedInPlace(start, end) || corrected(where)
+  }
+
   // 1. Verbatim, on token boundaries.
   const n = stmtWords.length
-  const exactAt = new Set<number>()
+  const exactRejected: boolean[] = []
   for (let k = 0; k + n <= flat.length; k++) {
     let hit = true
     for (let j = 0; j < n; j++) if (flat[k + j] !== stmtWords[j]) { hit = false; break }
-    if (hit) for (let j = 0; j < n; j++) exactAt.add(sentOf[k + j])
+    if (hit) exactRejected.push(spanRejected(k, k + n - 1))
   }
-  if (exactAt.size > 0) {
-    return corrected(exactAt) ? quotedThenCorrected : { signal: 'positive', confidence: EXACT_CONFIDENCE }
+  if (exactRejected.length > 0) {
+    return verdict(exactRejected, { signal: 'positive', confidence: EXACT_CONFIDENCE })
   }
 
   // 2. Trigram overlap — only for statements that have trigrams.
   if (n >= 3) {
     const stmtTris = trigrams(stmtWords)
-    const triSentences = new Map<string, number[]>()
+    const matched = new Set<string>()
+    // Runs of consecutive matching trigrams, each judged on its own: a
+    // negation before one run says nothing about another run elsewhere.
+    const runs: Array<[number, number]> = []
     for (let k = 0; k + 2 < flat.length; k++) {
       const t = `${flat[k]} ${flat[k + 1]} ${flat[k + 2]}`
       if (!stmtTris.has(t)) continue
-      const list = triSentences.get(t) ?? []
-      list.push(sentOf[k], sentOf[k + 2])
-      triSentences.set(t, list)
+      matched.add(t)
+      const run = runs[runs.length - 1]
+      if (run && run[1] === k + 1) run[1] = k + 2
+      else runs.push([k, k + 2])
     }
-    const overlap = triSentences.size / stmtTris.size
+    const overlap = matched.size / stmtTris.size
     if (overlap >= TRIGRAM_MIN_OVERLAP) {
-      const where = new Set([...triSentences.values()].flat())
-      return corrected(where) ? quotedThenCorrected : { signal: 'positive', confidence: 0.7 + 0.2 * overlap }
+      return verdict(
+        runs.map(([start, end]) => spanRejected(start, end)),
+        { signal: 'positive', confidence: 0.7 + 0.2 * overlap },
+      )
     }
   }
 
