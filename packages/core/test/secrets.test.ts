@@ -182,6 +182,23 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     expect(detectSecrets('myghp' + '_' + body(36)).map(h => h.pattern)).not.toContain('github_token')
   })
 
+  describe('does not flag a vendor prefix glued onto a longer identifier (#1374)', () => {
+    // One per vendor pattern with a leading-letter lookbehind; each fails if
+    // that pattern's lookbehind is removed.
+    const glued: [string, string][] = [
+      ['my' + 'glpat' + '-' + body(20), 'gitlab_token'],
+      ['my' + 'xoxb' + '-' + '1234567890' + '-' + '1234567890' + '-' + body(24), 'slack_token'],
+      ['my' + 'npm' + '_' + body(36), 'npm_token'],
+      ['my' + 'rk' + '_live_' + body(24), 'stripe_live_key'],
+      ['my' + 'github' + '_pat_' + body(22) + '_' + body(59), 'github_pat'],
+    ]
+    for (const [text, pattern] of glued) {
+      it(pattern, () => {
+        expect(detectSecrets(text).map(h => h.pattern)).not.toContain(pattern)
+      })
+    }
+  })
+
   it('still flags a GitHub token split by a zero-width joiner', () => {
     const token = 'ghp' + '_' + body(18) + '‍' + body(18)
     expect(detectSecrets(token).map(h => h.pattern)).toContain('github_token')
