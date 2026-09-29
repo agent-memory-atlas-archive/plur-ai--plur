@@ -12,7 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, symlinkSyn
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { Plur } from '../src/index.js'
-import { removePrimaryStoreEntries, classifyStoreDuplicates } from '../src/store-duplicates.js'
+import { removePrimaryStoreEntries, classifyStoreDuplicates, removeSequenceItems } from '../src/store-duplicates.js'
 
 describe('#1356 removePrimaryStoreEntries', () => {
   let base: string
@@ -109,6 +109,26 @@ describe('#1356 removePrimaryStoreEntries', () => {
     writeFileSync(config, body)
     expect(() => removePrimaryStoreEntries(config, primary)).toThrow(/not in plain block style/)
     expect(readFileSync(config, 'utf8')).toBe(body)
+  })
+
+  it('refuses, changing nothing, when the removed entry is an anchor aliased elsewhere', () => {
+    // Cutting the anchored item would leave `*p` dangling (or change what
+    // `backup` means): the re-parse must not equal the original minus the entry.
+    const body = `stores:\n  - &p\n    path: ${primary}\n    scope: project:home\n  - path: ${other()}\n    scope: project:o\nbackup: *p\n`
+    writeFileSync(config, body)
+    expect(() => removePrimaryStoreEntries(config, primary)).toThrow(/not in plain block style/)
+    expect(readFileSync(config, 'utf8')).toBe(body)
+  })
+
+  it('the text edit refuses when the `stores:` it finds does not hold the parsed number of items', () => {
+    // A multi-line quoted scalar can hold a `stores:` line with dash lines at
+    // column 0. The first `stores:` line the text scan finds is inside it, and
+    // holds 2 "items" while the real list holds 1.
+    const text = `note: "x\nstores:\n- a\n- b"\nstores:\n  - path: ${primary}\n    scope: project:home\n`
+    expect(removeSequenceItems(text, 1, new Set([0]))).toBeNull()
+    writeFileSync(config, text)
+    expect(() => removePrimaryStoreEntries(config, primary)).toThrow(/not in plain block style/)
+    expect(readFileSync(config, 'utf8')).toBe(text)
   })
 
   it('keeps the file mode and leaves no temp file behind', () => {

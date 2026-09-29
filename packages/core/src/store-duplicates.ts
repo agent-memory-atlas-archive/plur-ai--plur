@@ -108,7 +108,7 @@ export function removePrimaryStoreEntries(configPath: string, primaryEngramsPath
  * lines and comments at or left of the dash stay. Returns null when the list
  * is not a block sequence with exactly `count` items.
  */
-function removeSequenceItems(text: string, count: number, remove: Set<number>): string | null {
+export function removeSequenceItems(text: string, count: number, remove: Set<number>): string | null {
   const lines = text.split('\n')
   const indentOf = (l: string) => /^ */.exec(l)![0].length
   const blankOrComment = (l: string) => /^\s*(#.*)?\r?$/.test(l)
