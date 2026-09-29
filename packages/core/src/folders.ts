@@ -567,15 +567,21 @@ export function setFolderEntry(root: string, folder: string, change: FolderChang
   //  - entries matched only by name (typed spelling, symlink, letter case)
   //    contribute their mode at most. Their grant and scope never applied,
   //    and a merge must not bring them to life (#778, #1357).
-  //  - the mode is the most restrictive of all matched modes (the fail-closed
-  //    side); a mode this change sets wins, and `--scope` without a mode means
-  //    `on` — also when it replaces a merged `off`.
+  //  - the mode is the most restrictive of the applied modes and the
+  //    name-only `off`/`ask` (never a name-only `on`); a mode this change sets
+  //    wins, and `--scope` without a mode means `on` — also when it replaces a
+  //    merged `off`.
   const appliedEntries = applied.map(i => ({ e: map.folders[i], i }))
   const entry: FolderEntry = { path: appliedEntries[0]?.e.path ?? key }
   if (appliedEntries.some(c => c.e.trusted === true)) entry.trusted = true
   const scope = mostSpecific(appliedEntries.filter(c => c.e.scope !== undefined), home)?.scope
   if (scope !== undefined) entry.scope = scope
-  const mode = mostRestrictive([...applied, ...nameOnly].map(i => map.folders[i].plur))
+  // A name-only entry can only make the mode MORE restrictive: its `on` never
+  // applied (only `off` matches loosely), so it must not become the mode.
+  const mode = mostRestrictive([
+    ...applied.map(i => map.folders[i].plur),
+    ...nameOnly.map(i => map.folders[i].plur).filter(m => m !== 'on'),
+  ])
   if (mode !== undefined) entry.plur = mode
   if (change.scope !== undefined) {
     entry.scope = change.scope

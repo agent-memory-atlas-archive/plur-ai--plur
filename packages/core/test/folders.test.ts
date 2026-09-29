@@ -230,6 +230,29 @@ describe('resolveFolderPolicy', () => {
     expect(trusted()).toBe(false)
   })
 
+  it('a name-only `on` (spelled through a symlink) never becomes the mode through trust/untrust or a merge', () => {
+    const real = join(base, 'real-on')
+    mkdirSync(join(real, 'proj'), { recursive: true })
+    const link = join(base, 'link-on')
+    symlinkSync(real, link)
+    const target = join(real, 'proj')
+    writeMap([{ path: join(link, 'proj'), plur: 'on' }])
+    expect(policy(target).mode).toBe('ask')
+
+    trustDirectory(target, root)
+    expect(untrustDirectory(target, root)).toBe(true)
+    expect(policy(target).mode).toBe('ask')
+
+    writeMap([{ path: join(link, 'proj'), plur: 'on' }])
+    setFolderEntry(root, join(link, 'proj'), { trusted: false }, { configuredScopes: [], home })
+    expect(policy(target).mode).toBe('ask')
+
+    // A name-only `off` still carries over: it applied through the loose match.
+    writeMap([{ path: join(link, 'proj'), plur: 'off' }])
+    expect(setFolderEntry(root, join(link, 'proj'), { trusted: true }, { configuredScopes: [], home }))
+      .toEqual({ path: target, plur: 'off', trusted: true })
+  })
+
   it('a merge that sets no scope keeps the scope the resolver applied', () => {
     const d = mk('dup')
     const two = () => writeMap([{ path: '~/dup', scope: 'group:team' }, { path: d, scope: 'project:local' }])
@@ -382,6 +405,18 @@ describe('resolveFolderPolicy', () => {
       many()
       expect(removeFolderEntry(root, onDisk, home)).toBe(true)
       expect(loadFolderMap(root).folders).toEqual([unrelated])
+    })
+
+    it('a mis-cased `on` never becomes the mode through trust then untrust', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      const w = mk('R6')
+      const onDisk = join(w, 'Proj')
+      mkdirSync(onDisk)
+      writeMap([{ path: join(w, 'pROJ'), plur: 'on' }])
+      expect(policy(onDisk).mode).toBe('ask')
+      trustDirectory(onDisk, root)
+      expect(untrustDirectory(onDisk, root)).toBe(true)
+      expect(policy(onDisk).mode).toBe('ask')
     })
 
     it('a merge never activates the grant or scope of an entry matched only in another case', ({ skip }) => {

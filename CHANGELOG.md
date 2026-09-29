@@ -62,8 +62,9 @@ Now:
   scope come only from entries that applied to the folder, and the scope
   kept is the one the resolver was using. An entry that matched only by
   its spelling never applied its grant or scope (only an `off` applies
-  that loosely), so it contributes its mode at most; of all the modes the
-  most restrictive is kept unless you set one. `--scope` without a mode
+  that loosely), so it can only make the mode more restrictive: its `off`
+  or `ask` counts, its `on` does not. The most restrictive mode is kept
+  unless you set one. `--scope` without a mode
   means `on`, also when it replaces a merged `off`.
 
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
