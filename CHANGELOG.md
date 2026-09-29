@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Claude Code: memory is in place for the first reply
+
+**The first reply of a Claude Code session had no memory unless it called a
+tool, and a one-shot `claude -p` never had any** (#1313). `plur init`
+registered the `UserPromptSubmit` injection as `async: true`, and Claude Code
+delivers async context only at the next safe point. The rehydrate after
+compaction (`SessionStart`, matcher `compact`) had the same problem.
+
+Both are now registered synchronously with a 20s timeout. **Re-run
+`plur init`** to move an existing registration; it replaces the old entries.
+The hook bounds its own work below the timeout: hybrid search gets 8s
+(`PLUR_HOOK_HYBRID_DEADLINE_MS`), then BM25 serves the turn, and the hook
+exits by itself after 15s (`PLUR_HOOK_CEILING_MS`, was 55s). The inject lock
+goes stale on the same clock, so a lock left by a killed run blocks for 15s,
+not 55s.
+
+Later prompts do not re-run the injection, so they add little. Measured on a
+10,000-engram store (10.6 MB of YAML), each run a fresh process: the first
+prompt took 2.3 to 2.5s, the rehydrate 2.3 to 2.7s, and a later prompt 68 to
+101ms, against 34ms for a bare `node -e 0`. With no embedding cache, the
+hybrid deadline is missed and BM25 answers in 9.1 to 9.3s.
+
+When the hook exits past a hybrid search that missed its deadline, it first
+waits, for up to 5s, for that search to finish, and then for any store lock
+of its own still on disk. Without the wait, 10 of 12 runs on the same store
+left an empty `engrams.yaml.lock` behind. Core cannot tell who owns an empty
+lock, so every writer, including the next prompt's hook, waited out the 60s
+stale threshold. Checking for the lock file alone was not enough: the
+search's lock create can already be under way when the hook looks, and land
+after it.
+
 ### Claude Code: one full injection per session, and the reminder fires
 
 **Every prompt in a Claude Code session re-ran the full "session started"
