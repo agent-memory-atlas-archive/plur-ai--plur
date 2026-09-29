@@ -6,6 +6,12 @@ classification, store configuration) are abstracted as oracles and parameters:
 theorems hold for every oracle.
 
 Findings and replays: spec/formal/findings/r2-corea.md.
+
+Checked against the outbox lease (decision D2, PR #1231): index.ts gains a lease on outbox
+rows (`_outboxLease` bookkeeping, taken and released around each push) and `listOutbox` reports
+`leased_until`. No section here models the flush's claim logic — the team-write, egress,
+refcount and retire-kind theorems concern which rows are queued and what they carry, and a
+lease changes neither — so every theorem still holds. The lease itself: WritePath §1c.
 -/
 
 namespace PlurSpec.R2CoreA

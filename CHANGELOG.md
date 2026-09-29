@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Two processes flushing one store no longer both push the same engram
+
+The outbox claim that stops a write being delivered twice was in-memory, so two
+processes sharing a store (say the MCP server and a CLI hook) could each flush
+the same queued write and the team store received it twice. A flush now takes
+an on-disk lease on each row before it pushes (`structured_data._outboxLease`:
+holder id and expiry, recorded under the store lock); another process skips a
+row with a live lease, the lease is released when the flush records its
+outcome, and an expired lease is taken over, so a crashed process holds its
+rows for at most ten minutes. The same applies to queued remote retirements.
+The field is additive: rows without it behave as before, and an older client
+ignores it. (Decision D2.)
+
+A flush reads the clock for its lease after it gets the store lock, not before
+waiting for it, so a long wait can no longer make another process's fresh
+lease look bogus. A push starts only while five minutes of the lease remain
+(was two): enough for the request, a wait for the store lock up to its own
+timeout, and the write that hands the row off, so a flush that queues behind a
+long lock holder at the end of its batch no longer lets another process
+deliver the same rows again. A flush with nothing it can send right now (every
+queued row's host in cooldown, or no store configured) leases nothing and
+leaves the store file untouched, as before the lease; and a flush that fails
+part-way releases the leases it took instead of holding them for ten minutes.
+
+Each lease also carries a `nonce`, and a push releases only the exact lease it
+wrote. Before, release matched the holder id, so when `learn()`'s immediate
+push failed it could remove the lease that a flush in the same process had just
+taken for its own retry. Another process then saw the row unleased and
+delivered it a second time. `learn()` now also keeps its in-process claim on
+the row until it has recorded the failure. A lease without a `nonce`, written
+by a client that predates the field, still blocks other processes until it
+expires.
+
 ### PGLite recall reports its fusion score
 
 With `PLUR_BACKEND=pglite`, hybrid recall returned no top score, and the opt-in

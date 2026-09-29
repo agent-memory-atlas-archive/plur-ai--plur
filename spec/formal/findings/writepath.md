@@ -271,3 +271,74 @@ counterexamples kept.
 | 6 rescope per-id reporting | a | `_rescopeOne` / `_retireRescopedSource` unchanged (only a comment added in `rescope`) |
 
 `lake env lean PlurSpec/WritePath.lean`: clean.
+
+## Decision D2 applied (2026-09-27, branch `formal/outbox-lease`) — on-disk outbox lease
+
+The owner first accepted the cross-process gap of candidate 1 (2026-09-26, "a full fix changes the outbox row's persisted format"), then chose to ship format changes as separate PRs. This is that PR (`spec/formal/issues/outbox-lease.md`).
+
+- Format (additive): `structured_data._outboxLease = { holder, expires_at }`. New module `packages/core/src/outbox-lease.ts` (`leaseFree`, `canStartPush`, `dropOwnLease`, TTL 10 min, margin 2 min). Rows without the field are unleased; older clients ignore it.
+- `_flushOutboxClaimed` (index.ts): selection now happens UNDER the store lock and records a lease on every row it will push or retire (`_retireRemote` too); rows with a live foreign lease are skipped; a push/retire starts only while `canStartPush`; the merge-back releases this flush's own leases (success, failure, or not attempted) and runs whenever anything was leased. The pushed copy never carries the lease.
+- `learn()` remote branch: the row is written already leased (the push starts at once); the failure bookkeeping and the cancelled-during-push hand-off release it.
+- `content-fields.ts`: `_outboxLease` added to `PLUR_BOOKKEEPING_KEYS` (never scanned as content, stripped from pack exports). `_reconcileQueuedScope` keeps the stored lease and drops a caller-supplied one.
+
+Model (§1c of `PlurSpec/WritePath.lean`): processes of any type with decidable equality; events take / start / finish ok|fail / abandon / crash / tick. Invariant `LInv` (`linv_init`, `linv_step`, `linv_run`), `pushing_unique`.
+- `leased_at_most_once_across_processes` — for any number of processes, any TTL, any margin > 0 and every interleaving, the remote receives the engram at most once.
+- `live_foreign_lease_blocks`, `expired_lease_taken_over` (a crashed holder does not block forever), `finish_releases_lease`.
+- `leased_delivers` (non-vacuity: delivery; takeover after a crash; retry after a failed push).
+- `pre_lease_cross_process_double_delivery` — the pre-lease counterexample (two processes, two deliveries). `guarded_at_most_once` (§1b) is kept and now says "per process".
+- Assumptions, stated in the model and in `outbox-lease.ts`: one clock (skew within the margin); a push unanswered for the margin has failed (requests are bounded at 30 s); `finish` (remote accept + merge-back) is atomic — a kill between the two re-delivers after the TTL, the at-least-once edge the single-process path already had.
+
+Replay: `npx vitest run packages/core/test/formal-outbox-lease.test.ts` — two `Plur` instances on one directory (separate in-memory claims, one store file), the in-process HTTP stub counting POSTs/DELETEs, one POST held open on the stub while the other instance runs.
+```
+# before (base verify/formal-lean):
+#  × two processes flushing concurrently push a queued row at most once — B pushed a row A holds a live lease on: expected 1 to be +0
+#  × a flush in another process skips a row whose learn() push is in flight — expected undefined to be truthy
+#  × a crashed holder does not block forever … — expected 1 to be +0
+#  × retire-on-remote entries honour a live foreign lease … — expected 1 to be +0
+#  × the lease is bookkeeping, never content … — expected false to be true
+#  Tests 5 failed | 3 passed (8)
+# after: Tests 8 passed (8)
+```
+
+Mutation checks:
+- Model (scratch copies): `leaseFree` ignoring the lease ⇒ `linv_step`, `live_foreign_lease_blocks`, `leased_delivers` fail; no expiry takeover ⇒ `expired_lease_taken_over` (and `linv_step`, `leased_delivers`) fail; no margin check on `start` ⇒ `linv_step` fails; an overdue push not timed out ⇒ `linv_step` fails; `finish` keeping the lease ⇒ `finish_releases_lease`, `linv_step`, `leased_delivers` fail.
+- Code: the flush's lease filter disabled (`true || leaseFree(…)`) ⇒ 4 of 8 lease tests fail; restored ⇒ 8 passed.
+
+Not done: an older client that does not know the lease still pushes a leased row (the lease protects between clients that know it). `listOutbox()` does not show who holds a lease.
+
+## Audit fixes for #1231 (2026-09-27, branch `formal/outbox-lease`)
+
+An independent review of the lease PR confirmed three findings and raised four unconfirmed ones. Each fix has a failing test first (`packages/core/test/formal-outbox-lease.test.ts`, "finding N"); replays use the reviewer's scripts (real processes, a fast shared clock where noted, the in-process HTTP stub).
+
+1. **HIGH — stale clock for the lease.** `_flushOutboxClaimed` read `Date.now()` for the lease BEFORE waiting for the store lock. After a long wait, a lease another process wrote meanwhile looked more than `TTL + M` away, and `leaseFree`'s far-future clause treated it as free: both processes POSTed. Fix: the clock is read inside the lock, after the load. Replay `repro-stale-now.ts` (a 130 s lock hold, the other process waiting on the file lock): before 2 POSTs, after 1 POST. Model: the far-future clause is now in `leaseFree` (§1c); `take` carries the clock reading; `stale_clock_double_delivery` is the counterexample for a reading taken before the lock.
+2. **MEDIUM — merge-back after the lease.** The flush hands rows off once, at the end of the batch; the margin (2 min) covered one request but not the wait for the store lock, so a merge-back queued behind a long lock holder landed after the lease had expired and another process re-pushed rows the remote had already accepted. Chosen fix: widen the margin to cover everything between a push's start and the hand-off — request (30 s) + store-lock wait (the file lock's own acquire timeout, 180 s) + write (30 s) + skew (60 s) = 5 min (`OUTBOX_LEASE_MARGIN_MS`, built from those constants). Per-row hand-off was rejected: it needs the same lock wait, so the same bound, and costs a full store write per pushed row (finding 3). Replay `repro-merge-late.ts` (17 rows, 29 s POSTs, fast clock ×5, the lock held 175 s from the batch's last push): before 34 POSTs, 17 statements delivered twice; after 11 POSTs, each delivered once, 6 rows left queued for the next flush ("lease ran short"). Model: `finish` is split into `respond` (the remote accepts: one delivery, a hand-off owed) and `merge` (the merge-back), with the bound `R + W ≤ M`; `short_margin_double_delivery` is the counterexample for the old margin.
+   - Not fixed, by design: the reviewer's literal scenario holds the store lock for the whole 10-minute lease, past the lock's 180 s acquire timeout. The merge-back then fails ("Failed to acquire lock") and the rows it owed are delivered again once the lease expires (after: 11 statements twice, and the flush reports the failure; before: 17 twice, silently). A lock held past its acquire timeout already fails every other writer; the model names this `lost` and `lost_handoff_double_delivery` shows the edge. The merge-back now also warns when it finds another holder's lease on a row it delivered.
+3. **MEDIUM (perf) — a flush that attempted nothing rewrote the store twice.** Rows are routed before they are leased: a row held back (scope mismatch), with no configured store, or whose host is in cooldown is reported exactly as before but neither leased nor claimed, and a flush that leased nothing skips the merge-back. Replay `perf-cooldown.ts` (5,000 engrams, one queued row, breaker open): before 785–849 ms and 2 full-corpus writes per flush; after 197–221 ms and 0 writes (base `verify/formal-lean`: 190–220 ms, 0 writes).
+4. Unconfirmed items:
+   - A throw between leasing and the merge-back left the leases on disk for a TTL. Fixed: `flushOutbox()` releases, best effort, the leases of rows the remote had not accepted (`_releaseOutboxLeases`); a row it had accepted keeps its lease, which is what stops another process re-delivering it. Test: "finding 4".
+   - A short-lived process whose `learn()` exits during its immediate push leaves the row leased. Replayed (`repro-cli-learn.ts`: a child process learns into a slow remote and exits at once): the row stays leased, another process's flush skips it — and the remote DID receive the child's POST, which was on the wire. Releasing the lease would have duplicated it. Kept, documented: delivery by another process waits up to the TTL, never duplicates within it. (`plur learn` itself uses `learnRouted`, which awaits the POST and writes no lease.)
+   - The forged-lease test used a 2099 expiry, which the far-future clause ignores anyway, so its `flushed === 1` held vacuously. It now forges `now + 9 min`.
+   - `listOutbox()` reported `leased_until` for this instance's own in-progress push while the comment said "another flush". Kept the behaviour (a push this instance has on the wire is in progress too) and fixed the comment; a test pins it.
+
+Model (§1c, `PlurSpec/WritePath.lean`): phases idle / leased / pushing / handing / lost; events take (with clock lag) / start / respond ok|fail / merge / abandon / crash / tick; config `LCfg` (leased, fresh, T, M, R, W). Invariant `LCore` under `NoLost` (`linv_init`, `lost_persists`, `linv_step`, `linv_run`). `leased_at_most_once_across_processes` — lease honoured, fresh clock, `0 < R`, `R + W ≤ M`: at most one delivery in every run with no lost hand-off. Also `live_foreign_lease_blocks`, `far_future_lease_ignored`, `expired_lease_taken_over`, `merge_releases_lease`, `abandon_releases_lease`, `leased_delivers` (non-vacuity), and the counterexamples `pre_lease_cross_process_double_delivery`, `stale_clock_double_delivery`, `short_margin_double_delivery`, `lost_handoff_double_delivery`.
+
+Mutation checks (scratch copies):
+- Model: clock always stale ⇒ `linv_step`, `live_foreign_lease_blocks`, `far_future_lease_ignored`, `expired_lease_taken_over` fail; lease not honoured ⇒ `linv_step`, `live_foreign_lease_blocks`, `leased_delivers` fail; no margin check on `start` ⇒ `linv_step` fails; an overdue hand-off never lost ⇒ `linv_step` fails; `merge` keeping the lease ⇒ `merge_releases_lease`, `linv_step` fail; a crash owing a hand-off not lost ⇒ `linv_step`, `lost_handoff_double_delivery` fail; no expiry takeover ⇒ `expired_lease_taken_over`, `leased_delivers` and two counterexamples fail; no far-future clause ⇒ `far_future_lease_ignored`, `stale_clock_double_delivery` fail; hypothesis `R + W ≤ M` dropped ⇒ `linv_step` fails.
+- Code: margin back to 2 min ⇒ "finding 2" and the margin guard fail; the lease clock read before the lock ⇒ "finding 1" fails. On the pre-fix code, findings 1, 2, 3 and 4 fail (1 POST instead of 0; 4 POSTs instead of 2; 3 store writes instead of 0; a lease left on disk).
+
+## Review of #1231 (2026-09-28): release is per lease, not per holder
+
+Blocking finding: when `learn()`'s immediate push failed, it released the in-process claim before its bookkeeping write, and that write then dropped the row's lease by holder id (`dropOwnLease`). A flush in the same instance could take the store lock in the gap. It found the row free (the lease was its own holder's), wrote a new lease and put its POST on the wire, and the failed push's bookkeeping then deleted that lease. Another process saw the row unleased and delivered it again. The reviewer replayed this with two instances and a stub remote, and the remote accepted the engram twice.
+
+Fix:
+- Every lease carries a `nonce` (`makeLease`). `dropLease(sd, lease)` removes it only when holder, nonce and expiry all match the lease that push wrote. `learn()` keeps its lease object, and a flush records the one lease it wrote for its batch (`OutboxFlushLeases.lease`). Both the merge-back and `_releaseOutboxLeases` release exactly that lease.
+- `learn()` holds its `_outboxInFlight` claim until the failure bookkeeping has been written. The IIFE's `finally` releases it, so a flush in the same instance cannot take the row in between.
+- `assertLeaseMarginFits` runs at module load and throws unless `OUTBOX_LEASE_MARGIN_MS < OUTBOX_LEASE_TTL_MS`. Without it, raising `DEFAULT_ACQUIRE_TIMEOUT` to about 8.5 min would silently stop every push.
+
+Model: the §1c text now says that `P` ranges over pushes (one lease each), which matches per-lease release. No definition or proof changed. `lake` is not installed on the machine that made this change, so the Lean build was not re-run. The edit touches comments only.
+
+Tests (`formal-outbox-lease.test.ts`): "a failed learn() push does not release the lease a flush in the same instance just took" is the reviewer's interleaving. The store lock is held so that the flush queues ahead of the failed push's bookkeeping, and B flushes afterwards. "a flush whose lease runs short mid-batch does not start the remaining pushes / retirements" covers the two in-flush margin gates, which no integration test reached before. There are also unit tests for `dropLease` and `assertLeaseMarginFits`.
+
+Mutation checks: reverting both `learn()` fixes makes the interleaving test fail (the remote accepts two copies). Reverting only the early claim release, with the nonce kept, leaves it green, because either fix alone closes this interleaving. Removing either margin gate fails its own test. `dropLease` matching by holder only fails the unit test.
+
+Not done: #1248 (the in-process mutex queue in front of the file lock has no bound, so the margin's lock-wait budget covers only the file-lock part). Bounding it changes every store writer, not only the outbox, so it stays filed.

@@ -10,6 +10,7 @@ models:
       - packages/core/src/scope-routing.ts
       - packages/core/src/index.ts
       - packages/core/src/store/remote-store.ts
+      - packages/core/src/outbox-lease.ts
   - model: PlurSpec/ScopeInject.lean
     covers:
       - packages/core/src/scope-util.ts
