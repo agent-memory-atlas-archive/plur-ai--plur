@@ -205,6 +205,18 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     expect(misses.length).toBeLessThanOrEqual(1)
   })
 
+  it('scans 1 MiB of repeated GitLab prefixes in linear time (#1340 review)', () => {
+    // An unbounded lookahead made every `glpat-` in the run scan to its end:
+    // 400 KB took 28 s. The trailing `%41` adds the percent-decoded view, so
+    // the run is scanned twice, as a crafted pack would make it.
+    for (const prefix of ['glpat-', 'glagent-']) {
+      const text = prefix.repeat(Math.ceil((1 << 20) / prefix.length)) + '%41'
+      const started = performance.now()
+      detectSecrets(text)
+      expect(performance.now() - started, prefix).toBeLessThan(1_000)
+    }
+  })
+
   describe('AWS access key id boundaries (audit of #1340)', () => {
     const asia = (tail: string) => 'ASIA' + tail
     it('flags an exact 20-character ASIA key id between delimiters', () => {

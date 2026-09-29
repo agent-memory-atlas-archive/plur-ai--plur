@@ -48,9 +48,15 @@ const SECRET_PATTERNS: { name: string; regex: RegExp }[] = [
   // followed by an upper or digit, or four digits. A lowercase or Title-Case
   // slug has none of these; a seeded sample of 12,000 random 20-character
   // bodies in the test suite checks that real tokens still match.
+  //
+  // Both lookahead runs are bounded to 64 characters (#1340 review). Unbounded,
+  // every repeated prefix scanned to the end of the run, so input such as
+  // `glpat-glpat-glpat-…` took quadratic time: 400 KB took 28 s, and packs and
+  // engrams are scanned up to 1 MiB. The structure check now looks at the first
+  // 64 characters of the body, which covers every legacy 20-character body.
   {
     name: 'gitlab_token',
-    regex: /(?<![A-Za-z])(?:glpat|gloas|gldt|glrtr|glrt|glcbt|glptt|glft|glimt|glagent|glwt|glsoat|glffct)-(?=[A-Za-z0-9_-]*(?:[a-z0-9][A-Z]|[A-Z][A-Z0-9])|(?:[A-Za-z_-]*[0-9]){4})[A-Za-z0-9_-]{20,}/,
+    regex: /(?<![A-Za-z])(?:glpat|gloas|gldt|glrtr|glrt|glcbt|glptt|glft|glimt|glagent|glwt|glsoat|glffct)-(?=[A-Za-z0-9_-]{0,64}(?:[a-z0-9][A-Z]|[A-Z][A-Z0-9])|(?:[A-Za-z_-]{0,64}[0-9]){4})[A-Za-z0-9_-]{20,}/,
   },
   // Slack. Bot (`xoxb-`), user (`xoxp-`) and legacy session (`xoxs-`) tokens
   // open with a numeric workspace id of eight or more digits, then more ids
