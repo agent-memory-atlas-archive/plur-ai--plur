@@ -218,6 +218,7 @@ describe('doctor --quiet (#730)', () => {
     const text = out.join('')
     expect(text).toContain('config.yaml lists 1 store entry that is ignored at load')
     expect(text).toContain('"project:h" (/h/.plur/engrams.yaml): the same file as the primary store')
+    expect(text).toContain('Loading it would inject the same engrams twice, so plur skips it')
     expect(text).toContain('run `plur stores prune`')
     expect(text).not.toContain('by hand')
   })

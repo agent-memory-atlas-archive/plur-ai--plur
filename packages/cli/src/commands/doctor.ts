@@ -1218,7 +1218,9 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
     for (const d of report.ignoredDuplicateStores) {
       outputText(`   - "${d.scope}" (${d.path}): the same file as ${d.duplicateOf}`)
     }
-    outputText('   Loading them would inject the same engrams twice, so plur skips them and warns on every run.')
+    outputText(n === 1
+      ? '   Loading it would inject the same engrams twice, so plur skips it and warns on every run.'
+      : '   Loading them would inject the same engrams twice, so plur skips them and warns on every run.')
     if (report.ignoredDuplicateStores.some(d => d.primary)) {
       outputText('   Fix: run `plur stores prune` to remove the entries that name the primary store file.')
     }
