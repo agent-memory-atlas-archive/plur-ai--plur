@@ -74,6 +74,10 @@ const ALWAYS_ASYNC = new Set([
   // corpus through the async PrimaryStore seam, so it could never have been
   // sync; new in this release, so there is no pre-0.16 call site to rewrite.
   'pinnedQuota',
+  // Born async (#1299) — counts outbox entries by state and lists the scopes
+  // that need action. Wraps the async listOutbox, so it could never have been
+  // sync; new in this release, so there is no pre-0.16 call site to rewrite.
+  'outboxSummary',
 ])
 
 /** Public methods of `Plur`, mapped to whether they are declared `async`. */
