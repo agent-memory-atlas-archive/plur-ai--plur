@@ -1,5 +1,5 @@
 import { createPlur, type GlobalFlags } from '../plur.js'
-import { shouldOutputJson, outputJson, outputText, outputInfo } from '../output.js'
+import { shouldOutputJson, outputJson, outputText, outputInfo, exit } from '../output.js'
 import { findProjectConfigPath, readProjectConfigFromPath } from '@plur-ai/core'
 
 /**
@@ -36,7 +36,14 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   }
 
   const dir = args[0] || process.cwd()
-  const trusted = plur.trustDirectory(dir)
+  // #1347: the grant is `trusted: true` in the folder map. A map that cannot
+  // be read is refused rather than overwritten.
+  let trusted: string
+  try {
+    trusted = plur.trustDirectory(dir)
+  } catch (err) {
+    return exit(1, (err as Error).message)
+  }
 
   // E7 (2026-09 audit): this is the one moment a human is in the loop before
   // a `.plur.yaml`'s scope/domain (and, if it declares one, a REMOTE store
@@ -73,5 +80,5 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   } else {
     outputInfo('No .plur.yaml found here (or above, within this project) — nothing for an adapter to adopt yet. This grant takes effect if one is added later.', flags)
   }
-  outputInfo('A .plur.yaml scope/domain in this directory (or below it) will now be honored by adapters that check trust (e.g. the opencode plugin).', flags)
+  outputInfo('Recorded in folders.yaml, and in trust.yaml for adapters on an older core (the opencode plugin). A .plur.yaml in this directory (or below it) may now use the remote it names, and adapters that check trust honour its scope/domain.', flags)
 }

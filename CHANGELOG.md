@@ -121,6 +121,88 @@ turn that triggered it. A first message that needs no tools is answered
 without memory. In a one-shot `claude -p` run, that means no memory at all.
 
 An unknown `--event` no longer echoes the hook payload back to stdout.
+### A folder map records your per-folder decisions, and `trust.yaml` folds into it
+
+**First half of #1347: core and CLI only. No hook reads the map yet.** A new
+file, `~/.plur/folders.yaml`, holds your own decisions about folders: `on`,
+`off` or `ask`, a default write `scope`, and `trusted`. `trusted` is the grant
+that used to live in `trust.yaml`. `.plur.yaml` is unchanged and stays the
+repo's request. Only the CLI writes the map.
+
+- **`resolveFolderPolicy(dir)`** (core, and `Plur.resolveFolderPolicy`) returns
+  `{ mode, scope?, remoteAllowed, source }`, resolved in this order:
+  1. Any matching `off` entry wins.
+  2. A **trusted** `.plur.yaml`, or one that requests nothing, means on, exactly
+     as before. A map `scope` beats its scope hint, and its remote is allowed
+     only under a `trusted` entry. An **untrusted** `.plur.yaml` that requests a
+     scope, domain or remote has those requests ignored. A map decision for the
+     folder applies if there is one; otherwise the answer is `ask`, with
+     `reason: 'untrusted-plur-yaml'` and what the repo `requested`.
+  3. A project MCP config means on.
+  4. Otherwise the most specific matching entry decides.
+  5. Otherwise the answer is `ask`, and that includes `$HOME`.
+
+  Paths may be globs (`*`, `**`, `?`) and may start with `~`. A plain folder
+  also covers everything below it.
+
+  **This changes behaviour for anyone whose `.plur.yaml` is not trusted**
+  (owner decision D1, "ignore-ask"). A cloned repo can no longer choose where
+  your saves go. Once the hooks use this resolver (the next PR), such a repo
+  stops applying its scope hint and asks you once instead. Answering yes records
+  `trusted: true` (plus a scope if you choose one), and the repo then works as
+  it does today. Until that PR lands, the hooks behave exactly as before. To
+  keep a repo working without being asked, run `plur trust <repo>` now.
+- **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
+  `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
+  `--no-trusted`.
+  - **Outside an interactive terminal, `set` and `rm` need `--nonce <n>`.** That
+    is how the ask flow calls them, and it stops an agent from writing any
+    folder, `--trusted` included, by leaving `--nonce` out. A person at a
+    terminal needs no nonce. `plur trust` is the explicit alias for a person
+    and still works in scripts.
+  - A nonce names one folder and works once. It is used up only after the map
+    is saved, so a failed write does not burn it. It expires when its session
+    ends, after 24 hours at most.
+  - `set` refuses a team scope (`group:`, `org:`, `team:`, `space:`, `public`)
+    that no store in `config.yaml` serves. `project:` scopes live in the local
+    store and need none.
+  - Neither command writes to a folders.yaml it cannot read; it is never
+    overwritten.
+- **Upgrade needs no steps.** The first read of a missing `folders.yaml` imports
+  the `trust.yaml` entries as `trusted: true` entries.
+- **Trust is written to both files, for now.** The published opencode plugin
+  still reads only `trust.yaml`. So until every adapter is on this core, each
+  grant and each revocation updates both `folders.yaml` and `trust.yaml`. This
+  covers `plur trust`, `plur untrust`, `plur folders set --trusted` and
+  `--no-trusted`.
+  - A revocation lands in both files, so neither an older reader, a downgrade
+    nor a fresh import brings it back.
+  - Glob grants are recorded only in the map, because the old reader cannot
+    express them.
+  - A grant that an older core adds to `trust.yaml` after the import is not
+    seen by this core until you run `plur trust` again.
+- **Writes are serialised.** Every change to `folders.yaml`, `trust.yaml` and
+  the nonce files is made under one lock. Before this, 12 parallel
+  `plur folders set` runs all reported success but only 5 entries were saved.
+- **`plur trust`, `plur untrust` and `plur init-remote`** now set and clear
+  `trusted` in the map. Their output and exit codes are unchanged, with one
+  exception: `plur trust` and `plur untrust` exit 1 on a folders.yaml they
+  cannot read, rather than overwrite it. `plur init-remote` still writes
+  `.plur.yaml` and exits 0, but warns that it could not record trust and leaves
+  remote memory off until you run `plur trust`. It fails safe.
+- A folders.yaml that cannot be read counts as empty and logs one warning. It
+  never throws.
+- **Trust matching is now in one place, the map, and it fails closed.** A
+  stored entry is compared exactly as written with the checked folder's
+  canonical path. It is never resolved on disk, and neither is its parent. So a
+  trusted folder, or its parent, later replaced by a symlink does not pass its
+  trust on to wherever the link points.
+  - An entry imported from `trust.yaml` keeps its spelling. If an older version
+    stored an entry under a symlinked parent for a folder that did not exist
+    yet, run `plur trust` again once that folder exists.
+  - `plur untrust` also removes an entry stored under the plain spelling of
+    the folder you give it.
+  - A `~` in the map expands to your home as written and to its canonical path.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
