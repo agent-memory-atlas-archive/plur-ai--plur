@@ -21,9 +21,16 @@ skips it.
   `npx -y @plur-ai/mcp@<version>`), keeping its other fields. Any other
   `mcp.plur` entry is left alone. The node.exe entry itself is repaired the
   same way #1267 repairs the Claude Code one: when the node binary or
-  `@plur-ai/mcp` js entry it names no longer exists, or differs from what
-  resolves now (after a Node upgrade or a version-manager switch), init
-  rewrites its `command` and keeps its other fields.
+  `@plur-ai/mcp` js entry it names no longer exists (after a Node upgrade or a
+  version-manager switch), or the js entry differs from the one resolved now,
+  init rewrites its `command` and keeps its other fields. A different node
+  binary that still exists is left alone, so switching between Node installs
+  does not rewrite the entry on every run. Init prints what it wrote: the
+  node.exe launcher, or the `cmd.exe /c npx` fallback.
+- **Where:** the config directory is resolved the way opencode resolves it:
+  `OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else
+  `~/.config/opencode`. A leftover `~/.config/opencode` no longer receives a
+  config opencode never reads.
 - Re-running init is idempotent, and an existing `opencode.json` keeps its
   other keys. An existing `mcp.plur` is still left as it is, and an
   `opencode.jsonc` with comments is still reported and left byte-for-byte

@@ -55,6 +55,7 @@ import {
   opencodeConfigPath,
   opencodeConfigDir,
   opencodeMcpCommand,
+  opencodeMcpNote,
 } from '../opencode-config.js'
 
 /**
@@ -1182,21 +1183,7 @@ function installOpencode(cliVersion: string): string {
   }
 
   const status = result.created ? 'created' : result.changed ? 'updated' : 'already up to date'
-  const mcpNote = result.mcpPlurUpgraded
-    // #1311: PLUR's own older bare-npx entry on Windows, command replaced.
-    ? '\n  mcp.plur: upgraded to the Windows launcher (node.exe + @plur-ai/mcp), other fields kept'
-    : result.mcpPlurRepaired
-    // #1311: PLUR's own node-form entry on Windows had gone stale.
-    ? '\n  mcp.plur: repaired (the node.exe or @plur-ai/mcp path it named was stale), other fields kept'
-    : result.mcpPlurPreserved
-    // B2 (0.20.0 audit): an existing mcp.plur (possibly a non-default
-    // PLUR_PATH, or an enterprise remote store with bearer headers) is left
-    // completely untouched rather than overwritten with PLUR's own local
-    // entry. Say so explicitly — the user should know this from the init
-    // output, not discover it later from where their memory writes landed.
-    ? '\n  mcp.plur: left as-is (an entry already existed — not overwritten)'
-    : ''
-  return `Opencode: config ${status} (${configPath})${mcpNote}`
+  return `Opencode: config ${status} (${configPath})${opencodeMcpNote(result)}`
 }
 
 function writeSettings(path: string, settings: Settings): void {
@@ -1500,7 +1487,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     ? containLeg('Opencode', () => installOpencode(CLI_VERSION))
     : args.includes('--no-opencode')
       ? 'Opencode: skipped (--no-opencode)'
-      : 'Opencode: skipped (no ~/.config/opencode found — pass --opencode to force, --no-opencode to silence this)'
+      : `Opencode: skipped (no ${opencodeConfigDir()} found — pass --opencode to force, --no-opencode to silence this)`
 
   // Contained like the harness legs: an unwritable skills dir must not abort
   // the hooks and MCP registration that are the point of `plur init`.
