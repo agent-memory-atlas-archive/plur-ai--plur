@@ -14,9 +14,12 @@ twice** (#1267). Three separate faults:
   space is written byte-for-byte as before (pinned by a snapshot test).
 - **Re-running init did not recognise its own hooks.** The matcher looked for
   `.plur/bin/plur-hook` with forward slashes only, so every re-run on Windows
-  appended another hook set. It now normalises slashes, quotes and case. Re-run
-  `plur init` once: it removes the duplicated, unquoted hooks older versions
-  wrote and leaves exactly one set per event. Your own hooks are untouched.
+  appended another hook set. It now normalises slashes, quotes and case, and
+  claims a hook only when it runs PLUR's shim (or the `npx @plur-ai/cli`
+  fallback) with one of the subcommands init writes. Re-run `plur init` once:
+  it removes the duplicated, unquoted hooks older versions wrote and leaves
+  exactly one set per event. Your own hooks are untouched, including one that
+  shares an entry with a PLUR hook.
   `plur doctor` uses the same matcher, so it no longer reports Windows hooks
   as missing.
 - **The MCP entry launched a `.cmd`.** Current Node refuses to spawn a `.cmd`
@@ -25,7 +28,9 @@ twice** (#1267). Three separate faults:
   Claude Desktop, Cursor, Codex and Antigravity alike. When the js entry cannot
   be resolved (a CLI-only install), the pinned `cmd.exe /c npx` form remains
   the fallback. Re-running init heals an existing `plur-mcp.cmd` entry that init
-  wrote; a hand-written entry is never changed.
+  wrote, and a node-form entry whose `node.exe` or js entry no longer exists
+  (after a Node upgrade or a version-manager switch); `plur doctor` reports
+  such an entry as broken. A hand-written entry is never changed.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 

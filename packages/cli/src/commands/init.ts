@@ -690,7 +690,7 @@ function settingsRefusal(path: string): string {
 }
 
 function isPlurHook(entry: HookEntry): boolean {
-  // Both slash styles, quoted or not (#1267) — see isPlurHookCommand.
+  // The shim or npx fallback plus a known subcommand (#1267) — see isPlurHookCommand.
   return (entry.hooks ?? []).some((h) => isPlurHookCommand(h.command ?? ''))
 }
 
@@ -702,10 +702,21 @@ function hasPlurHooks(settings: Settings): boolean {
   return false
 }
 
+/**
+ * Remove PLUR's own hooks, hook by hook. An entry that also holds a user's
+ * hook keeps it (with its matcher); only an entry left with no hooks is
+ * dropped. Dropping the whole entry whenever one hook in it matched deleted
+ * the user's hook alongside a legacy PLUR one (#1267 review).
+ */
 function stripPlurHooks(settings: Settings): Settings {
   const hooks = { ...(settings.hooks ?? {}) }
   for (const [event, entries] of Object.entries(hooks)) {
-    const kept = entries.filter((e) => !isPlurHook(e))
+    const kept: HookEntry[] = []
+    for (const e of entries) {
+      if (!isPlurHook(e)) { kept.push(e); continue }
+      const own = e.hooks.filter((h) => !isPlurHookCommand(h.command ?? ''))
+      if (own.length > 0) kept.push({ ...e, hooks: own })
+    }
     if (kept.length > 0) {
       hooks[event] = kept
     } else {

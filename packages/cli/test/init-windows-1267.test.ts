@@ -110,6 +110,54 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     expect(commands).toContain('C:\\tools\\my-own-hook.exe')
   })
 
+  it('removes only PLUR hooks from an entry and keeps hooks PLUR did not write', () => {
+    // The #1267 review reproduced all three deletions under the first matcher.
+    const legacy = 'C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd hook-inject'
+    const backup = 'C:\\Users\\Me\\.plur\\bin\\plur-hook-backup.ps1'
+    const logger = 'C:\\Users\\Me\\.PLUR\\BIN\\Plur-Hook-logger.bat'
+    const audit = 'C:\\tools\\my-audit.exe'
+    const cmd = (command: string) => ({ type: 'command', command, timeout: 5 })
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    writeFileSync(settingsPath(), JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [{ hooks: [cmd(legacy), cmd(audit)] }],
+        PreToolUse: [{ matcher: 'Bash', hooks: [cmd(backup)] }],
+        Stop: [{ hooks: [cmd(logger)] }],
+        SessionStart: [{ hooks: [cmd('npx @plur-ai/cli hook-session-remind')] }],
+      },
+    }, null, 2))
+
+    runInit()
+    const settings = readSettings()
+    const commands = allCommands(settings)
+    for (const own of [backup, logger, audit]) expect(commands).toContain(own)
+    // The user's hook keeps its entry; only the legacy PLUR hook left it.
+    const auditEntry = settings.hooks?.UserPromptSubmit?.find((e) => e.hooks.some((h) => h.command === audit))
+    expect(auditEntry?.hooks.map((h) => h.command)).toEqual([audit])
+    expect(settings.hooks?.PreToolUse?.find((e) => e.hooks[0].command === backup)?.matcher).toBe('Bash')
+    // Legacy PLUR hooks are gone: no unquoted shim, no npx form.
+    expect(commands).not.toContain(legacy)
+    expect(commands.some((c) => c.includes('npx @plur-ai/cli'))).toBe(false)
+    const shim = join(home, '.plur', 'bin', 'plur-hook.cmd')
+    expect(commands.filter((c) => c === `"${shim}" hook-inject`)).toHaveLength(1)
+  })
+
+  it('heals a node-form MCP entry whose node.exe and js entry no longer exist', () => {
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    writeFileSync(settingsPath(), JSON.stringify({
+      mcpServers: { plur: {
+        command: 'C:\\Program Files\\nodejs-22.1.0\\node.exe',
+        args: ['C:\\old\\node_modules\\@plur-ai\\mcp\\dist\\index.js'],
+      } },
+    }, null, 2))
+    const out = runInit()
+    expect(out).not.toMatch(/already registered/)
+    const plur = readSettings().mcpServers?.plur
+    expect(plur?.command).toBe(process.execPath)
+    expect(plur?.args).toHaveLength(1)
+    expect(plur?.args[0]).toMatch(/[\\/]mcp[\\/]dist[\\/]index\.js$/)
+  })
+
   it('registers the MCP server as node.exe + the @plur-ai/mcp js entry, never a .cmd', () => {
     runInit()
     const plur = readSettings().mcpServers?.plur
@@ -153,6 +201,47 @@ describe('plur doctor sees Windows hooks (#1267)', { timeout: 60000 }, () => {
       stdout = err.stdout?.toString() ?? ''
     }
     expect(JSON.parse(stdout).hooksInstalled).toBe(true)
+  })
+})
+
+describe('plur doctor flags a broken node-form MCP entry (#1267)', { timeout: 60000 }, () => {
+  let home: string
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'Test User-')) })
+  afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+
+  function doctor(plur: { command: string; args: string[] }): { brokenNodeMcp: Array<{ missing: string[] }>; overall: string } {
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
+      mcpServers: { plur },
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: '"C:\\x\\.plur\\bin\\plur-hook.cmd" hook-inject' }] }] },
+    }, null, 2))
+    let stdout: string
+    try {
+      stdout = execFileSync(process.execPath, ['--import', WIN32_PRELOAD, CLI, 'doctor', '--no-handshake', '--json'], {
+        encoding: 'utf-8', timeout: 30000, env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home,
+      })
+    } catch (err: any) {
+      stdout = err.stdout?.toString() ?? ''
+    }
+    return JSON.parse(stdout)
+  }
+
+  it('reports the missing node.exe and js entry and fails overall', () => {
+    const plur = {
+      command: 'C:\\Program Files\\nodejs-22.1.0\\node.exe',
+      args: ['C:\\old\\node_modules\\@plur-ai\\mcp\\dist\\index.js'],
+    }
+    const report = doctor(plur)
+    expect(report.brokenNodeMcp).toHaveLength(1)
+    expect(report.brokenNodeMcp[0].missing).toEqual([plur.command, plur.args[0]])
+    expect(report.overall).toBe('fail')
+  })
+
+  it('reports nothing for an entry whose paths exist', () => {
+    const entry = join(home, 'node_modules', '@plur-ai', 'mcp', 'dist', 'index.js')
+    mkdirSync(join(home, 'node_modules', '@plur-ai', 'mcp', 'dist'), { recursive: true })
+    writeFileSync(entry, '')
+    expect(doctor({ command: process.execPath, args: [entry] }).brokenNodeMcp).toEqual([])
   })
 })
 

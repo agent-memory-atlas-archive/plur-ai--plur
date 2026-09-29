@@ -59,11 +59,15 @@ export function findMcpShim(): string | null {
  * was moved or uninstalled since).
  */
 export function findMcpJsEntry(): string | null {
+  const recorded = recordedMcpJsEntry()
+  return recorded && existsSync(recorded) ? recorded : null
+}
+
+/** The entry path plur-mcp.meta.json records, whether or not it still exists. */
+function recordedMcpJsEntry(): string | null {
   try {
     const meta = JSON.parse(readFileSync(join(homedir(), '.plur', 'bin', 'plur-mcp.meta.json'), 'utf8')) as { entrypoint?: unknown }
-    if (typeof meta.entrypoint === 'string' && meta.entrypoint.length > 0 && existsSync(meta.entrypoint)) {
-      return meta.entrypoint
-    }
+    if (typeof meta.entrypoint === 'string' && meta.entrypoint.length > 0) return meta.entrypoint
   } catch { /* no metadata — caller falls back */ }
   return null
 }
@@ -403,13 +407,19 @@ export function mergePlurMcp(config: Record<string, unknown>, opts?: { env?: Rec
  * we would write today (shim, or the current version pin). The existing
  * entry's env is preserved when the caller doesn't supply one.
  *
+ * Windows also heals PLUR's own entries of the two shapes it wrote there: the
+ * `plur-mcp.cmd` shim entry, and the node-form entry when its node binary or
+ * js entry is gone or the js entry differs from the one resolved now (#1267).
+ *
  * Returns true when the entry was rewritten (caller persists the config).
  */
 export function upgradePlurMcpEntry(config: Record<string, unknown>, opts?: { env?: Record<string, string> }): boolean {
   const servers = (config.mcpServers ?? {}) as Record<string, McpServerEntry | undefined>
   const existing = servers.plur
   if (!existing) return false
-  if (!isRaceyPlurNpxEntry(existing) && !isOwnWin32CmdShimEntry(existing)) return false
+  const ownNodeEntry = isOwnWin32NodeEntry(existing)
+  if (!isRaceyPlurNpxEntry(existing) && !isOwnWin32CmdShimEntry(existing) && !ownNodeEntry) return false
+  if (ownNodeEntry && !nodeEntryNeedsHealing(existing)) return false
   const effectiveOpts = opts ?? (existing.env ? { env: existing.env } : undefined)
   const recommended = buildMcpServerEntry(effectiveOpts)
   if (recommended.command === existing.command &&
@@ -439,6 +449,57 @@ function isOwnWin32CmdShimEntry(entry: McpServerEntry): boolean {
   if (platform() !== 'win32') return false
   const cmd = (entry.command ?? '').replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
   return cmd.endsWith('/.plur/bin/plur-mcp.cmd') && (entry.args ?? []).length === 0
+}
+
+/** Windows paths compare without regard to slash style or case. */
+function sameWin32Path(a: string, b: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
+  return norm(a) === norm(b)
+}
+
+/**
+ * Is this the Windows node-form MCP entry `plur init` writes (#1267):
+ * `{ command: <node.exe>, args: [<@plur-ai/mcp js entry>] }`? Scoped as
+ * tightly as isOwnWin32CmdShimEntry: the command must be a `node`/`node.exe`
+ * binary and the single argument must be an `@plur-ai/mcp/dist/index.js`
+ * path, or the exact entry plur-mcp.meta.json recorded (the workspace
+ * layout). Anything else — extra args, another script, another launcher — is
+ * the user's own entry and is never rewritten.
+ */
+export function isOwnWin32NodeEntry(entry: McpServerEntry): boolean {
+  if (platform() !== 'win32') return false
+  const args = entry.args ?? []
+  if (typeof entry.command !== 'string' || args.length !== 1 || typeof args[0] !== 'string') return false
+  const command = entry.command.replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
+  if (!/(^|\/)node(\.exe)?$/.test(command)) return false
+  const script = args[0].replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
+  if (script.endsWith('/@plur-ai/mcp/dist/index.js')) return true
+  const recorded = recordedMcpJsEntry()
+  return recorded !== null && sameWin32Path(recorded, args[0])
+}
+
+/**
+ * The paths a PLUR node-form entry names that no longer exist. The node
+ * binary is version-specific (`process.execPath`), so a Node upgrade or a
+ * version-manager switch removes it, and the @plur-ai/mcp entry goes with
+ * an uninstall or a move. Empty for a healthy entry and for any entry that is
+ * not PLUR's own node form.
+ */
+export function missingNodeEntryPaths(entry: McpServerEntry): string[] {
+  if (!isOwnWin32NodeEntry(entry)) return []
+  return [entry.command, entry.args[0]].filter((p) => !existsSync(p))
+}
+
+/**
+ * Does PLUR's own node-form entry need rewriting? Yes when the node binary or
+ * the js entry it names is gone, or when the js entry differs from the one
+ * `plur init` resolved this run (plur-mcp.meta.json). A working entry is left
+ * alone when nothing resolves now.
+ */
+function nodeEntryNeedsHealing(entry: McpServerEntry): boolean {
+  if (missingNodeEntryPaths(entry).length > 0) return true
+  const resolvedNow = findMcpJsEntry()
+  return resolvedNow !== null && !sameWin32Path(resolvedNow, entry.args[0])
 }
 
 /**

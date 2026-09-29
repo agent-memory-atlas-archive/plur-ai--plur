@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { hookCommandPrefix, isPlurHookCommand } from '../src/lib/hook-command.js'
-import { buildMcpServerEntry, upgradePlurMcpEntry } from '../src/mcp-config.js'
+import { buildMcpServerEntry, isOwnWin32NodeEntry, missingNodeEntryPaths, upgradePlurMcpEntry } from '../src/mcp-config.js'
 import { CLI_VERSION } from '../src/version.js'
 import { buildCursorHooks, mergeCursorHooks, hasPlurCursorHooks } from '../src/cursor-hooks.js'
 import { buildCodexHooks, mergeCodexHooks } from '../src/codex-hooks.js'
@@ -49,10 +49,37 @@ describe('isPlurHookCommand (#1267)', () => {
     expect(isPlurHookCommand(cmd)).toBe(true)
   })
 
+  // Every legacy form an earlier `plur init` wrote must still be recognised,
+  // or re-init would leave it behind next to the new set.
+  it.each([
+    ['npx @plur-ai/cli hook-inject'],
+    ['npx @plur-ai/cli hook-inject --rehydrate'],
+    ['npx @plur-ai/cli hook-observe --post'],
+    ['npx -y @plur-ai/cli@0.9.1 hook-learn-check'],
+    ['/Users/a/.plur/bin/plur-hook hook-session-remind'],
+    ['/Users/a/.plur/bin/plur-hook hook-session-guard'],
+    ['/Users/a/.plur/bin/plur-hook hook-session-mark'],
+    ['/Users/a/.plur/bin/plur-hook hook-session-end'],
+    [`${WIN_SHIM} hook-inject --event plan_mode`],
+    [`"${WIN_SHIM}" hook-observe --post`],
+  ])('recognises the legacy form %s', (cmd) => {
+    expect(isPlurHookCommand(cmd)).toBe(true)
+  })
+
   it.each([
     ['C:\\tools\\my-own-hook.exe'],
     ['/usr/local/bin/lint.sh'],
     ['echo plur'],
+    // The #1267 review's reproductions: a bare substring test claimed these.
+    ['C:\\Users\\Me\\.plur\\bin\\plur-hook-backup.ps1'],
+    ['C:\\Users\\Me\\.plur\\bin\\plur-hook-backup.ps1 hook-inject'],
+    ['C:\\Users\\Me\\.PLUR\\BIN\\Plur-Hook-logger.bat'],
+    ['"C:\\Users\\Me\\.PLUR\\BIN\\Plur-Hook-logger.bat" hook-inject'],
+    // PLUR's binary, but not a subcommand init writes.
+    [`"${WIN_SHIM}" my-own-subcommand`],
+    ['/Users/a/.plur/bin/plur-hook'],
+    ['npx @plur-ai/cli doctor'],
+    ['npx @plur-ai/cli-extras hook-inject'],
   ])('does not claim %s', (cmd) => {
     expect(isPlurHookCommand(cmd)).toBe(false)
   })
@@ -139,6 +166,79 @@ describe('buildMcpServerEntry (#1267)', () => {
     expect((config.mcpServers as Record<string, unknown>).plur).toEqual({ command: process.execPath, args: [entry], cwd: 'keep' })
     // Idempotent.
     expect(upgradePlurMcpEntry(config)).toBe(false)
+  })
+
+  describe('win32: the node-form entry this init writes', () => {
+    function resolvedEntry(): string {
+      const entry = join(home, 'node_modules', '@plur-ai', 'mcp', 'dist', 'index.js')
+      mkdirSync(join(home, 'node_modules', '@plur-ai', 'mcp', 'dist'), { recursive: true })
+      writeFileSync(entry, '')
+      writeWinShim(entry)
+      return entry
+    }
+
+    it('heals it when node.exe and the js entry no longer exist (Node upgrade)', () => {
+      const entry = resolvedEntry()
+      setPlatform('win32')
+      const stale = {
+        command: 'C:\\Program Files\\nodejs-22.1.0\\node.exe',
+        args: ['C:\\old\\node_modules\\@plur-ai\\mcp\\dist\\index.js'],
+        cwd: 'keep',
+      }
+      expect(missingNodeEntryPaths(stale)).toEqual([stale.command, stale.args[0]])
+      const config: Record<string, unknown> = { mcpServers: { plur: stale } }
+      expect(upgradePlurMcpEntry(config)).toBe(true)
+      expect((config.mcpServers as Record<string, unknown>).plur).toEqual({ command: process.execPath, args: [entry], cwd: 'keep' })
+      expect(upgradePlurMcpEntry(config)).toBe(false)
+    })
+
+    it('heals it when only node.exe is gone', () => {
+      const entry = resolvedEntry()
+      setPlatform('win32')
+      const config: Record<string, unknown> = { mcpServers: { plur: { command: 'C:\\gone\\node.exe', args: [entry] } } }
+      expect(upgradePlurMcpEntry(config)).toBe(true)
+      expect((config.mcpServers as Record<string, unknown>).plur).toEqual({ command: process.execPath, args: [entry] })
+    })
+
+    it('heals it when its js entry differs from the one resolved now', () => {
+      const entry = resolvedEntry()
+      const older = join(home, 'older', 'node_modules', '@plur-ai', 'mcp', 'dist', 'index.js')
+      mkdirSync(join(home, 'older', 'node_modules', '@plur-ai', 'mcp', 'dist'), { recursive: true })
+      writeFileSync(older, '')
+      setPlatform('win32')
+      const config: Record<string, unknown> = { mcpServers: { plur: { command: process.execPath, args: [older] } } }
+      expect(upgradePlurMcpEntry(config)).toBe(true)
+      expect((config.mcpServers as Record<string, unknown>).plur).toEqual({ command: process.execPath, args: [entry] })
+    })
+
+    it('leaves a healthy, current entry alone', () => {
+      const entry = resolvedEntry()
+      setPlatform('win32')
+      const config: Record<string, unknown> = { mcpServers: { plur: { command: process.execPath, args: [entry] } } }
+      expect(missingNodeEntryPaths({ command: process.execPath, args: [entry] })).toEqual([])
+      expect(upgradePlurMcpEntry(config)).toBe(false)
+    })
+
+    it.each([
+      ['a node entry running another script', { command: 'C:\\gone\\node.exe', args: ['C:\\gone\\my-server.js'] }],
+      ['a node entry with extra arguments', { command: 'C:\\gone\\node.exe', args: ['--inspect', 'C:\\gone\\node_modules\\@plur-ai\\mcp\\dist\\index.js'] }],
+      ['another launcher running the entry', { command: 'C:\\gone\\bun.exe', args: ['C:\\gone\\node_modules\\@plur-ai\\mcp\\dist\\index.js'] }],
+      ['a fork package', { command: 'C:\\gone\\node.exe', args: ['C:\\gone\\node_modules\\@plur-ai\\mcp-fork\\dist\\index.js'] }],
+    ])('never rewrites %s', (_label, plur) => {
+      resolvedEntry()
+      setPlatform('win32')
+      const config: Record<string, unknown> = { mcpServers: { plur: { ...plur } } }
+      expect(isOwnWin32NodeEntry(plur)).toBe(false)
+      expect(missingNodeEntryPaths(plur)).toEqual([])
+      expect(upgradePlurMcpEntry(config)).toBe(false)
+      expect((config.mcpServers as Record<string, unknown>).plur).toEqual(plur)
+    })
+
+    it('is not recognised off Windows', () => {
+      resolvedEntry()
+      setPlatform('linux')
+      expect(isOwnWin32NodeEntry({ command: '/gone/node', args: ['/gone/node_modules/@plur-ai/mcp/dist/index.js'] })).toBe(false)
+    })
   })
 
   it('win32: never touches a hand-rolled custom entry', () => {
