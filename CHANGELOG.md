@@ -56,7 +56,10 @@ recurrence:
 
 A config without the key behaves as `locked`, which is what the ladder has
 always done. An unresolved tension still blocks the step into `locked` either
-way.
+way — on the engram itself, on the promoted `global` copy, and on an existing
+`global` engram the ladder credits instead. The ladder only moves the four rungs
+`exploring → leaning → decided → locked`; a `draft` engram (pending approval)
+or any other value is never advanced.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
