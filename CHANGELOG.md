@@ -28,6 +28,24 @@ runs on the same store left an empty `engrams.yaml.lock` behind. Core cannot
 tell who owns an empty lock, so every writer, including the next prompt's
 hook, waited out the 60s stale threshold.
 
+### Codex and Antigravity hooks no longer leave a stale store lock
+
+**The Codex `SessionStart` / `UserPromptSubmit` hooks and the Antigravity
+pre-invocation hook could exit in the middle of a store write and leave
+`engrams.yaml.lock` behind** (#1343), the same leak #1313 fixed for Claude
+Code. They force-exit as soon as the turn is served, while a hybrid search
+that missed its deadline is still recording its injection. With lock
+acquisition slowed in a test, all three left an empty lock on every run;
+the Claude Code hook did the same when its 15s watchdog fired mid-write.
+
+Every force-exit now goes through one bounded wait for the process's own
+store lock (`lib/store-lock-exit.ts`, moved out of `hook-inject`): the shared
+Codex/Antigravity exit waits up to 5s, and the Claude Code watchdog up to 3s,
+so it still exits before Claude Code's 20s timeout. Hooks that never open the
+store (Codex guard, post-tool and session-end; Antigravity guard) share the
+exit, so they are covered if they ever start writing. Cursor hooks do not
+force-exit and were not affected.
+
 ### Claude Code: one full injection per session, and the reminder fires
 
 **Every prompt in a Claude Code session re-ran the full "session started"

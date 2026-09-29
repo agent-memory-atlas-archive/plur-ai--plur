@@ -2,6 +2,7 @@ import { readSync, readFileSync, mkdirSync, writeFileSync, existsSync, statSync,
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { safeSessionKey } from './session-key.js'
+import { waitForOwnStoreLocks, EXIT_LOCK_WAIT_MS } from './store-lock-exit.js'
 
 /**
  * Shared stdin-reading and sentinel helpers for the four hook-codex-*
@@ -276,6 +277,11 @@ export async function runCodexHook(
   } catch (err: unknown) {
     process.stderr.write(`[plur] ${name} failed: ${(err as Error)?.message ?? 'unknown error'}\n`)
   }
+  // Not while this process may be inside a store write (#1343): a missed
+  // hybrid deadline leaves that search running, and it records its injection
+  // under `engrams.yaml.lock`. Exiting mid-acquire leaves an empty lock that
+  // stalls every later writer for 60s. Bounded, and free when no lock is ours.
+  await waitForOwnStoreLocks(EXIT_LOCK_WAIT_MS)
   // Flush before exiting: process.exit() truncates a pipe that has buffered
   // writes pending, which would turn our valid JSON into a parse error —
   // the same failure by a different route.
@@ -369,7 +375,8 @@ export interface Injectable<O, R> {
  * injects NOTHING, which is strictly worse than BM25 results. The race bounds
  * the worst case at deadline + BM25 (~10s here) while keeping the typical case
  * at hybrid speed. The abandoned hybrid promise is harmless: `runCodexHook`
- * force-exits the process immediately afterwards.
+ * force-exits the process afterwards — once any store write it is inside has
+ * finished (bounded; #1343).
  */
 export async function injectWithFallback<O, R>(
   plur: Injectable<O, R>,

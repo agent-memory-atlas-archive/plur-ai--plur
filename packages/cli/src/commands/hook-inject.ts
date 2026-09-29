@@ -1,11 +1,12 @@
 import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync } from 'fs'
 import { dirname, join, resolve } from 'path'
-import { tmpdir, homedir, hostname } from 'os'
+import { tmpdir, homedir } from 'os'
 import { randomUUID } from 'crypto'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
 import { safeSessionKey } from '../lib/session-key.js'
 import { injectWithFallback, hybridEnabled, type Injectable, type InjectOutcome } from '../lib/codex-hook-io.js'
+import { waitForOwnStoreLock, waitForOwnStoreLocks, EXIT_LOCK_WAIT_MS } from '../lib/store-lock-exit.js'
 
 // Remote budget for the recall leg inside injectHybrid (#776). The hook is
 // on the hot path of every prompt; slow networks make this a perceptible
@@ -369,6 +370,10 @@ function processDeferredWrapups(): string | null {
 // Claude Code kills the hook and shows an error. Override via env.
 // The timer is unref()ed so a normal clean exit isn't delayed.
 export const HOOK_CEILING_DEFAULT_MS = 15_000
+// How long the watchdog, once fired, waits for this process's own store lock
+// before exiting (#1343). Ceiling + this must still land before Claude Code's
+// 20s kill, or the user sees a hook error instead of a quiet exit.
+export const WATCHDOG_LOCK_WAIT_MS = 3_000
 const HOOK_CEILING_MS = parseInt(process.env.PLUR_HOOK_CEILING_MS ?? '', 10) || HOOK_CEILING_DEFAULT_MS
 
 /**
@@ -405,7 +410,11 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // is the ceiling on the WHOLE run (embedder load, fs stalls, stray async).
   // Installed after isPlurConfigured() so it only fires for
   // sessions that actually do work. unref() prevents it from delaying clean exit.
-  const watchdog = setTimeout(() => process.exit(0), HOOK_CEILING_MS)
+  // #1343: the watchdog can fire mid-way through a store write, and exiting
+  // there leaves the lock behind. Wait (bounded) for our own lock first.
+  const watchdog = setTimeout(() => {
+    void waitForOwnStoreLocks(WATCHDOG_LOCK_WAIT_MS).finally(() => process.exit(0))
+  }, HOOK_CEILING_MS)
   watchdog.unref()
 
   const isRehydrate = args.includes('--rehydrate')
@@ -503,43 +512,16 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // process may be inside a store write: exiting there leaves the lock file
   // behind, and every writer (the next hook, the MCP server) then waits on it.
   if (abandonedHybrid) {
-    if (storeLockPath) await waitForOwnStoreLock(storeLockPath, 5_000)
+    await waitForOwnStoreLocks(EXIT_LOCK_WAIT_MS)
     process.exit(0)
   }
 }
 
 // Set when the hybrid leg missed its deadline and is still running (#1313).
 let abandonedHybrid = false
-let storeLockPath: string | null = null
 
-/**
- * Wait (bounded) while this process may hold the store's cross-process lock.
- *
- * The abandoned hybrid search still records its injection, under
- * `engrams.yaml.lock`. Measured on a 10,000-engram store: force-exiting right
- * after the BM25 answer left an EMPTY lock file — the O_EXCL open had
- * happened, the token write had not — and core cannot tell who owns an empty
- * lock, so it waits out its 60s stale threshold. Every following first prompt
- * hit the 15s watchdog and injected nothing.
- *
- * Ours = the token names this host and pid. Empty and fresh = possibly ours,
- * mid-acquire. An empty lock older than 2s belongs to someone else.
- */
-export async function waitForOwnStoreLock(lockPath: string, maxMs: number): Promise<void> {
-  const until = Date.now() + maxMs
-  const ours = `${hostname()}:${process.pid}:`
-  while (Date.now() < until) {
-    let mayBeOurs = false
-    try {
-      const token = readFileSync(lockPath, 'utf8').trim()
-      mayBeOurs = token === ''
-        ? Date.now() - statSync(lockPath).mtimeMs < 2_000
-        : token.startsWith(ours)
-    } catch { /* no lock file — nothing to wait for */ }
-    if (!mayBeOurs) return
-    await new Promise(r => setTimeout(r, 25))
-  }
-}
+// Moved to lib/store-lock-exit.ts (#1343) so every force-exiting hook shares it.
+export { waitForOwnStoreLock }
 
 async function injectSession(
   input: Record<string, unknown>,
@@ -634,7 +616,6 @@ async function injectSession(
   // A missed deadline leaves the hybrid search running; it must not hold
   // the process (and so the prompt) open until the watchdog.
   abandonedHybrid = mode === 'bm25' && hybridEnabled()
-  storeLockPath = join(plur.storageRoot, 'engrams.yaml.lock')
   if (result.count > 0) {
     const parts: string[] = []
     if (result.directives) parts.push(result.directives)
