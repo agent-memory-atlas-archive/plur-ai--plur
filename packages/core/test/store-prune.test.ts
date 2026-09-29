@@ -131,6 +131,12 @@ describe('#1356 removePrimaryStoreEntries', () => {
     expect(readFileSync(config, 'utf8')).toBe(text)
   })
 
+  it('edits a config.yaml that starts with a UTF-8 byte-order mark and keeps the mark', () => {
+    writeFileSync(config, `\uFEFFstores:\n  - path: ${primary}\n    scope: project:home\n  - path: ${other()}\n    scope: project:o\n`)
+    expect(removePrimaryStoreEntries(config, primary).map(s => s.scope)).toEqual(['project:home'])
+    expect(readFileSync(config, 'utf8')).toBe(`\uFEFFstores:\n  - path: ${other()}\n    scope: project:o\n`)
+  })
+
   it('keeps the file mode and leaves no temp file behind', () => {
     writeFileSync(config, `stores:\n  - path: ${primary}\n    scope: project:home\n`)
     chmodSync(config, 0o600)

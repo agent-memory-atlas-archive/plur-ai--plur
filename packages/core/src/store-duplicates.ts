@@ -87,7 +87,12 @@ export function removePrimaryStoreEntries(configPath: string, primaryEngramsPath
     })
     if (remove.size === 0) return []
 
-    const edited = removeSequenceItems(text, stores.length, remove)
+    // A leading UTF-8 byte-order mark is not part of the YAML (loadConfig and
+    // js-yaml skip it), but it would hide a `stores:` on the first line from
+    // the text scan. Edit without it and put it back on write.
+    const bom = text.startsWith('\uFEFF') ? '\uFEFF' : ''
+    const body = removeSequenceItems(text.slice(bom.length), stores.length, remove)
+    const edited = body === null ? null : bom + body
     const expected = { ...before, stores: stores.filter((_, i) => !remove.has(i)) }
     let after: unknown
     try { after = edited === null ? undefined : yaml.load(edited) } catch { after = undefined }
