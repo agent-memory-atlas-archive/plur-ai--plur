@@ -160,37 +160,49 @@ export function expandHome(p: string, home: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The spellings of a stored entry a check accepts. The target is always
- * compared in its canonical form only.
+ * The spellings of a stored entry a check accepts. The checked folder is
+ * always compared in its canonical form only.
  *
- * Matches PR #1334's trust matching (fail closed): the entry as written, plus
- * the entry with its PARENT canonicalised and its last literal segment
- * re-appended. The last segment is deliberately not resolved: resolving it
- * would follow a symlink swapped in for a trusted folder after the grant and
- * trust wherever it points (#778). For a glob, the same is applied to the
- * literal directory before the first wildcard, and the wildcard tail is kept.
+ * Fails CLOSED (the #1334 trust rule; this module is now its single home): a
+ * stored entry is compared exactly as written — made absolute, `.`/`..`
+ * normalised, never resolved on disk. Resolving it at compare time, or even
+ * its parent, would follow a symlink planted after the decision was recorded
+ * (a trusted folder, or its parent, swapped for a link elsewhere) and apply
+ * the decision to wherever it now points (#778).
+ *
+ * `~` is the user's home, not a stored path, so it expands against both the
+ * home as given and its canonical form (a symlinked home, /var vs
+ * /private/var). Nothing after `~` is resolved.
  *
  * `lax` (used only for `off`, where matching MORE is the safe direction) also
- * accepts the fully canonicalised literal part.
+ * accepts the entry with its parent, or all of it, canonicalised.
  */
 function entryForms(entryPath: string, home: string, lax: boolean): string[] {
-  const expanded = expandHome(entryPath, home)
-  const g = firstGlobIndex(expanded)
-  let literal: string
-  let tail: string
-  if (g === -1) {
-    literal = resolve(expanded)
-    tail = ''
-  } else {
-    const cut = Math.max(expanded.lastIndexOf('/', g), expanded.lastIndexOf(sep, g))
-    if (cut <= 0) return [expanded]
-    literal = resolve(expanded.slice(0, cut))
-    tail = expanded.slice(cut)
+  const homes = entryPath === '~' || entryPath.startsWith('~/') || entryPath.startsWith('~\\')
+    ? [...new Set([home, canonicalize(home)])]
+    : [home]
+  const forms = new Set<string>()
+  for (const h of homes) {
+    const expanded = expandHome(entryPath, h)
+    const g = firstGlobIndex(expanded)
+    let literal: string
+    let tail: string
+    if (g === -1) {
+      literal = resolve(expanded)
+      tail = ''
+    } else {
+      const cut = Math.max(expanded.lastIndexOf('/', g), expanded.lastIndexOf(sep, g))
+      if (cut <= 0) { forms.add(expanded); continue }
+      literal = resolve(expanded.slice(0, cut))
+      tail = expanded.slice(cut)
+    }
+    forms.add(literal + tail)
+    if (lax) {
+      const parent = dirname(literal)
+      if (parent !== literal) forms.add(join(canonicalize(parent), basename(literal)) + tail)
+      forms.add(canonicalize(literal) + tail)
+    }
   }
-  const forms = new Set<string>([literal + tail])
-  const parent = dirname(literal)
-  if (parent !== literal) forms.add(join(canonicalize(parent), basename(literal)) + tail)
-  if (lax) forms.add(canonicalize(literal) + tail)
   return [...forms]
 }
 

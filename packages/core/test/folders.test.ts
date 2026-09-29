@@ -139,16 +139,22 @@ describe('resolveFolderPolicy', () => {
     expect(policy(link)).toEqual({ mode: 'on', scope: 'project:real', remoteAllowed: false, source: 'map' })
   })
 
-  it('an entry under a symlinked parent (e.g. a symlinked home) still matches', () => {
+  it('an absolute entry under a symlinked parent fails closed; `~` and `off` still match', () => {
     const realHome = join(base, 'real-home')
     mkdirSync(join(realHome, 'proj'), { recursive: true })
     const linkHome = join(base, 'link-home')
     symlinkSync(realHome, linkHome)
-    writeMap([{ path: join(linkHome, 'proj'), scope: 'project:p' }])
-    expect(resolveFolderPolicy(join(realHome, 'proj'), { root, home: linkHome }).scope).toBe('project:p')
-    // And `~` expands against the (symlinked) home.
-    writeMap([{ path: '~/proj', plur: 'off' }])
-    expect(resolveFolderPolicy(join(realHome, 'proj'), { root, home: linkHome }).mode).toBe('off')
+    const at = (d: string) => resolveFolderPolicy(d, { root, home: linkHome })
+    // Stored entries are never resolved at compare time (#1334 rule), so the
+    // symlinked spelling does not cover the canonical folder.
+    writeMap([{ path: join(linkHome, 'proj'), scope: 'project:p', trusted: true }])
+    expect(at(join(realHome, 'proj')).mode).toBe('ask')
+    // `~` is the user's home, expanded against its canonical form too.
+    writeMap([{ path: '~/proj', scope: 'project:p' }])
+    expect(at(join(realHome, 'proj')).scope).toBe('project:p')
+    // `off` matches loosely: the safe direction.
+    writeMap([{ path: join(linkHome, 'proj'), plur: 'off' }])
+    expect(at(join(realHome, 'proj')).mode).toBe('off')
   })
 })
 

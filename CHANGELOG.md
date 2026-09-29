@@ -36,6 +36,17 @@ repo's request. Only the CLI writes the map.
   they now exit 1 instead of overwriting a folders.yaml they cannot read.
 - A folders.yaml that cannot be read counts as empty and logs one warning. It
   never throws.
+- **Trust matching is now in one place, the map, and it fails closed.** A
+  stored entry is compared exactly as written with the checked folder's
+  canonical path. It is never resolved on disk, and neither is its parent. So a
+  trusted folder, or its parent, later replaced by a symlink does not pass its
+  trust on to wherever the link points.
+  - An entry imported from `trust.yaml` keeps its spelling. If an older version
+    stored an entry under a symlinked parent for a folder that did not exist
+    yet, run `plur trust` again once that folder exists.
+  - `plur untrust` also removes an entry stored under the plain spelling of
+    the folder you give it.
+  - A `~` in the map expands to your home as written and to its canonical path.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
