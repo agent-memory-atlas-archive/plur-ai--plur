@@ -161,10 +161,10 @@ export async function flushOutboxForHook(
       // #1299: `held` counts too — when every entry is held back, nothing else
       // moves, and staying silent is exactly the failure being fixed.
       const held = result.held ?? 0
-      if (result.flushed > 0 || result.failed > 0 || result.deferred > 0 || held > 0) {
+      if (result.flushed > 0 || result.failed > 0 || result.deferred > 0 || result.skipped > 0 || held > 0) {
         process.stderr.write(
           `[plur] ${opts.hook}: outbox — ${result.flushed} delivered, ${result.failed} failed, `
-          + `${result.deferred} left for next time`
+          + `${result.deferred} left for next time, ${result.skipped} skipped (host paused)`
           + (held > 0 ? `, ${held} held back (needs action — run \`plur outbox\`)` : '')
           + '.\n',
         )

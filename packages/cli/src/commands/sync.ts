@@ -46,16 +46,19 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       : null
 
   // #1269: flush after the repository sync, same order as MCP plur_sync.
-  let outbox: { flushed: number; held: number; pending: number; warnings: string[] } | undefined
+  let outbox: { flushed: number; skipped: number; held: number; pending: number; warnings: string[] } | undefined
   let outboxError: string | undefined
   try {
     const flushed = await plur.flushOutbox()
-    // #1299: a flush that held every entry back did nothing else, and must
-    // still be reported — those are the writes that need a person.
+    // `skipped` is an open circuit breaker: nothing was attempted, the writes
+    // are still queued, and the reason is in the warnings (review of #1277).
+    // #1299: `held` — needs_action entries backed off — must be reported too:
+    // a flush that held every entry back did nothing else.
     const held = flushed.held ?? 0
-    if (flushed.flushed > 0 || flushed.failed > 0 || flushed.deferred > 0 || held > 0) {
+    if (flushed.flushed > 0 || flushed.failed > 0 || flushed.deferred > 0 || flushed.skipped > 0 || held > 0) {
       outbox = {
         flushed: flushed.flushed,
+        skipped: flushed.skipped,
         held,
         pending: await plur.outboxCount(),
         warnings: flushed.expired_warnings,

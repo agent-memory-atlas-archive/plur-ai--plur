@@ -7829,13 +7829,22 @@ export class Plur {
    * After 7 days: includes warning in expired_warnings.
    *
    * `timeoutMs` (#1269) bounds the NETWORK part of the flush, for callers that
-   * run under a harness timeout (editor session-end and stop hooks). When it
-   * runs out, the in-flight push is cut and nothing further is started; every
-   * entry not delivered is counted in `deferred` and left queued exactly as it
-   * was — no attempt recorded, no strike against the host, because running out
-   * of OUR time says nothing about THEIRS. The local load before and the
-   * merge-back after are not covered: the merge-back must run to completion or
-   * a delivered entry would be pushed again next time.
+   * run under a harness timeout (editor session-end and stop hooks). The clock
+   * starts after the local store load, so a large store does not spend the
+   * budget on disk. When it runs out, the in-flight push is cut and nothing
+   * further is started; every entry not delivered is counted in `deferred`
+   * and left queued. A cut is not a strike against the host — running out of
+   * OUR time says nothing about THEIRS. The merge-back after is not covered:
+   * it must run to completion or a delivered entry would be pushed again.
+   *
+   * A push cut MID-FLIGHT may already be stored on the server. It is recorded
+   * as an attempt and marked `in_doubt`; before it is posted again, the flush
+   * looks for it on the server and treats a match as delivered. The POST also
+   * carries an `Idempotency-Key` (the local engram id) for servers that honour
+   * one (docs/remote-store-contract.md).
+   *
+   * `skipped` counts entries not attempted because their host's circuit
+   * breaker is open; the reason is in `expired_warnings`.
    *
    * #1299: an entry whose last failure retrying cannot fix (`needs_action`:
    * 401/403/404/422 or a write refusal) is re-dialled at most once per
@@ -7846,24 +7855,29 @@ export class Plur {
    * dropped or rescoped for being `needs_action`.
    */
   async flushOutbox(options: { timeoutMs?: number; force?: boolean } = {}): Promise<{
-    flushed: number; failed: number; deferred: number; held: number; expired_warnings: string[]
+    flushed: number; failed: number; deferred: number; skipped: number; held: number; expired_warnings: string[]
   }> {
     this._assertWritable()
     const budget = new AbortController()
-    const budgetTimer = options.timeoutMs !== undefined
-      ? setTimeout(() => budget.abort(), Math.max(0, options.timeoutMs))
-      : undefined
+    let budgetTimer: NodeJS.Timeout | undefined
+    const startBudget = () => {
+      if (options.timeoutMs !== undefined && !budgetTimer) {
+        budgetTimer = setTimeout(() => budget.abort(), Math.max(0, options.timeoutMs))
+      }
+    }
     try {
-      return await this._flushOutbox(budget.signal, options.force === true)
+      return await this._flushOutbox(budget.signal, startBudget, options.force === true)
     } finally {
       if (budgetTimer) clearTimeout(budgetTimer)
     }
   }
 
-  private async _flushOutbox(budget: AbortSignal, force: boolean): Promise<{
-    flushed: number; failed: number; deferred: number; held: number; expired_warnings: string[]
+  private async _flushOutbox(budget: AbortSignal, startBudget: () => void, force: boolean): Promise<{
+    flushed: number; failed: number; deferred: number; skipped: number; held: number; expired_warnings: string[]
   }> {
     const engrams = await this._primaryStore.load()
+    // The network budget starts NOW, after the local load (review of #1277).
+    startBudget()
     // #766: skip retired engrams — a retired engram must not be pushed to the
     // remote and resurrected. The cancel-outbox path in forget() strips _outbox
     // on retirement; this guard is belt-and-suspenders for any path that retires
@@ -7871,7 +7885,7 @@ export class Plur {
     const pending = engrams.filter(e =>
       (e as any).structured_data?._outbox && e.status !== 'retired'
     )
-    if (pending.length === 0) return { flushed: 0, failed: 0, deferred: 0, held: 0, expired_warnings: [] }
+    if (pending.length === 0) return { flushed: 0, failed: 0, deferred: 0, skipped: 0, held: 0, expired_warnings: [] }
 
     // #863: push supersedes TARGETS before the engrams that supersede them.
     //
@@ -7916,6 +7930,8 @@ export class Plur {
     let deferred = 0
     let held = 0
     let skipped = 0
+    /** Outbox metadata changed without a delivery or a failure (a cut). */
+    let metadataDirty = false
     /** Warn once per host, not once per queued engram (#785). */
     const cooldownSkippedHosts = new Set<string>()
     /**
@@ -7940,6 +7956,8 @@ export class Plur {
         target_url: string; target_scope: string; queued_at: string
         last_attempt: string; attempt_count: number; last_error: string
         last_status?: number
+        /** The last push was cut mid-flight: the server may already have it. */
+        in_doubt?: boolean
       }
 
       // Check TTL warning
@@ -8102,7 +8120,24 @@ export class Plur {
       }
 
       try {
-        const pushed = await driver.appendAndGetServerId(cleanEngram, { signal: budget })
+        let pushed: { id: string } | undefined
+        if (outbox.in_doubt) {
+          // The previous push was cut mid-flight. Look before posting again,
+          // or a server slower than the budget gains a copy per retry.
+          const probe = await driver.findByStatement(cleanEngram.statement, { signal: budget })
+          if (probe.status === 'found') {
+            pushed = { id: probe.id }
+          } else if (probe.status === 'unknown') {
+            // Could not tell. Posting now risks a duplicate; wait for a flush
+            // that can see the server.
+            deferred++
+            continue
+          } else {
+            delete outbox.in_doubt
+            metadataDirty = true
+          }
+        }
+        pushed ??= await driver.appendAndGetServerId(cleanEngram, { signal: budget })
         // #863: remember the mapping so a later engram in this same flush can
         // point at the server id rather than the local one.
         if (pushed?.id) {
@@ -8129,8 +8164,18 @@ export class Plur {
         // have applied the write before the cut; that is the same exposure a
         // request timeout already has, and the entry is retried as before.
         if (err instanceof RemoteAbortedError) {
+          // Recorded, so `plur outbox` shows it, and marked in doubt, so the
+          // next flush checks the server before posting again.
+          outbox.last_attempt = now.toISOString()
+          outbox.attempt_count += 1
+          outbox.last_error = 'cut at the flush time budget before the remote answered — delivery unknown, checked before the next push'
+          outbox.in_doubt = true
+          // #1299: this attempt got no status; an older 403 must not keep
+          // classifying the entry as needs_action.
+          delete outbox.last_status
+          metadataDirty = true
           deferred++
-          logger.warning(`[plur:outbox] ${engram.id}: flush budget ran out mid-push — left queued`)
+          logger.warning(`[plur:outbox] ${engram.id}: flush budget ran out mid-push — left queued, in doubt`)
           continue
         }
         outbox.last_attempt = now.toISOString()
@@ -8169,7 +8214,7 @@ export class Plur {
     // a pin, a local rescope. The flush only ever mutates outbox metadata, the
     // demotion marker, and (for a demotion) scope/visibility — so those are
     // what it writes back, and nothing else.
-    if (flushed > 0 || failed > 0) {
+    if (flushed > 0 || failed > 0 || metadataDirty) {
       const consideredIds = new Set(pending.map(e => e.id))
       const survivorsById = new Map(
         engrams.filter(e => consideredIds.has(e.id)).map(e => [e.id, e] as const),
@@ -8213,7 +8258,7 @@ export class Plur {
     // the file on every no-op flush.
     if (idMapDirty) this._writeOutboxIdMap(persistedIdMap)
 
-    return { flushed, failed, deferred, held, expired_warnings }
+    return { flushed, failed, deferred, skipped, held, expired_warnings }
   }
 
   /**
