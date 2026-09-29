@@ -52,7 +52,8 @@ import { engramDate } from './tensions.js'
 import { resolveValidity, buildTemporal, normalizeIsoDate, type ResolvedValidity } from './expiry.js'
 import { isCurrentlyValid } from './validity.js'
 import { decodeJwtExpiry, decodeJwtPayload } from './jwt.js'
-import { RemoteStore, RemoteAbortedError, normalizeEndpointUrl } from './store/remote-store.js'
+import { RemoteStore, RemoteAbortedError, RemoteHttpError, normalizeEndpointUrl } from './store/remote-store.js'
+import { classifyOutboxFailure, NEEDS_ACTION_RETRY_MS, NEEDS_ACTION_STATUSES, summarizeOutbox, type OutboxState, type OutboxSummary } from './outbox-health.js'
 import {
   remoteRecall, isRemoteRecallDisabled, resolveRemoteRecallTimeoutMs, scopeOrg,
   REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES,
@@ -165,6 +166,12 @@ import { gatherReceipt } from './receipt-io.js'
 export { computeContentHash, normalizeStatement, isHashable } from './content-hash.js'
 export { isLocalOnlyScope, assertScopeNamesATarget } from './scope-target.js'
 export { orderBySupersedes } from './outbox-order.js'
+export {
+  classifyOutboxFailure, summarizeOutbox, describeNeedsAction, statusFromErrorText,
+  NEEDS_ACTION_RETRY_MS, NEEDS_ACTION_STATUSES,
+  type OutboxState, type OutboxVerdict, type OutboxSummary, type OutboxFailureInput,
+} from './outbox-health.js'
+export { RemoteHttpError } from './store/remote-store.js'
 export { parseDedupResponse, buildDedupPrompt, buildBatchDedupPrompt } from './dedup.js'
 export { runMigrations, rollbackMigrations, getSchemaVersion, setSchemaVersion, ALL_MIGRATIONS, CURRENT_SCHEMA_VERSION, type Migration, type MigrationResult } from './migrations/index.js'
 export { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory } from './secrets.js'
@@ -407,6 +414,10 @@ export interface StatusResult {
   tension_count?: number
   versioned_engram_count?: number
   outbox_count?: number
+  /** Queued writes a retry cannot deliver (401/403/404/422, refusal, no store) (#1299). */
+  outbox_needs_action?: number
+  /** Present when `outbox_needs_action` > 0: one row per scope and reason, with its next step. */
+  outbox_attention?: OutboxSummary['scopes']
   /** Present when the most recent background index pass failed (#272). */
   index_error?: IndexSyncError
   /** Injection-provenance event/label counts (#452) — feeds #202's volume gate. */
@@ -3178,6 +3189,9 @@ export class Plur {
               if (target?.structured_data?._outbox) {
                 target.structured_data._outbox.last_error = (err as Error).message
                 target.structured_data._outbox.attempt_count = 1
+                // #1299: the status, when the remote gave one — it is what
+                // tells a refusal from a blip.
+                if (err instanceof RemoteHttpError) target.structured_data._outbox.last_status = err.status
                 // Incremental write (#740): only the outbox bookkeeping changed.
                 await this._updateEngrams(fresh, [target as Engram])
               }
@@ -3460,6 +3474,9 @@ export class Plur {
               last_attempt: now,
               attempt_count: 1,
               last_error: (err as Error).message,
+              // #1299: recorded so the outbox can be classified without
+              // parsing the message.
+              ...(err instanceof RemoteHttpError ? { last_status: err.status } : {}),
               // #295: flag auth failures distinctly so the queue isn't read as a
               // transient network blip — a 401/403 means the token needs reauth,
               // and surfacing it (session_start/doctor) is the actionable signal.
@@ -7728,7 +7745,20 @@ export class Plur {
     queued_at: string
     attempt_count: number
     last_error?: string
+    /** HTTP status of the last failed push, when the remote gave one (#1299). */
+    last_status?: number
     age_days: number
+    /**
+     * #1299: `retrying` — the next flush may succeed; `needs_action` — it
+     * cannot (401/403/404/422, a write refusal, no writable store).
+     */
+    state: OutboxState
+    /** One line, `needs_action` only: why retrying will not help. */
+    reason?: string
+    /** One line, `needs_action` only: what would. */
+    next_step?: string
+    /** `needs_action` only: the earliest time an automatic flush retries it. */
+    next_retry_at?: string
   }>> {
     const engrams = await this._loadCached(this.paths.engrams)
     const now = Date.now()
@@ -7736,16 +7766,31 @@ export class Plur {
     for (const e of engrams) {
       const ob = (e as any).structured_data?._outbox as {
         target_scope?: string; queued_at?: string; attempt_count?: number; last_error?: string
+        last_status?: unknown; last_attempt?: string
       } | undefined
       if (!ob || e.status === 'retired') continue
       const queued_at = typeof ob.queued_at === 'string' ? ob.queued_at : ''
       const queuedMs = queued_at ? Date.parse(queued_at) : NaN
+      const target_scope = ob.target_scope ?? '(unknown)'
+      const last_status = typeof ob.last_status === 'number' ? ob.last_status : undefined
+      const verdict = classifyOutboxFailure({
+        last_status,
+        last_error: ob.last_error,
+        has_store: this._hasWritableStoreFor(target_scope),
+        scope: target_scope,
+      })
+      const nextRetry = verdict.state === 'needs_action' ? this._needsActionRetryAt(ob) : undefined
       out.push({
         id: e.id,
-        target_scope: ob.target_scope ?? '(unknown)',
+        target_scope,
         queued_at,
         attempt_count: typeof ob.attempt_count === 'number' ? ob.attempt_count : 0,
         ...(ob.last_error ? { last_error: ob.last_error } : {}),
+        ...(last_status !== undefined ? { last_status } : {}),
+        state: verdict.state,
+        ...(verdict.reason ? { reason: verdict.reason } : {}),
+        ...(verdict.next_step ? { next_step: verdict.next_step } : {}),
+        ...(nextRetry !== undefined && nextRetry > now ? { next_retry_at: new Date(nextRetry).toISOString() } : {}),
         // A malformed or missing timestamp reports 0, not NaN: this number is
         // rendered, and NaN in a report reads as a bug in the reporter rather
         // than as the missing data it actually is.
@@ -7753,6 +7798,26 @@ export class Plur {
       })
     }
     return out
+  }
+
+  /** Counts by state plus one line per needs_action scope (#1299). */
+  async outboxSummary(): Promise<OutboxSummary> {
+    return summarizeOutbox(await this.listOutbox())
+  }
+
+  /** A url store accepting writes for exactly this scope — the flush's own lookup. */
+  private _hasWritableStoreFor(scope: string): boolean {
+    return (this.config.stores ?? []).some(s => s.url && s.scope === scope && !s.readonly)
+  }
+
+  /**
+   * When an automatic flush may next dial a `needs_action` entry (#1299):
+   * one attempt per NEEDS_ACTION_RETRY_MS, counted from the last attempt.
+   * An entry with no readable last attempt is due now.
+   */
+  private _needsActionRetryAt(ob: { last_attempt?: string }): number | undefined {
+    const last = typeof ob.last_attempt === 'string' ? Date.parse(ob.last_attempt) : NaN
+    return Number.isFinite(last) ? last + NEEDS_ACTION_RETRY_MS : undefined
   }
 
   /**
@@ -7780,9 +7845,17 @@ export class Plur {
    *
    * `skipped` counts entries not attempted because their host's circuit
    * breaker is open; the reason is in `expired_warnings`.
+   *
+   * #1299: an entry whose last failure retrying cannot fix (`needs_action`:
+   * 401/403/404/422 or a write refusal) is re-dialled at most once per
+   * NEEDS_ACTION_RETRY_MS by this automatic path. Those skipped are counted in
+   * `held` and left exactly as they were. `force: true` — the explicit
+   * `plur outbox --flush` / `plur_outbox { flush: true }` — retries them
+   * anyway, for the user who has just fixed the cause. Nothing is ever
+   * dropped or rescoped for being `needs_action`.
    */
-  async flushOutbox(options: { timeoutMs?: number } = {}): Promise<{
-    flushed: number; failed: number; deferred: number; skipped: number; expired_warnings: string[]
+  async flushOutbox(options: { timeoutMs?: number; force?: boolean } = {}): Promise<{
+    flushed: number; failed: number; deferred: number; skipped: number; held: number; expired_warnings: string[]
   }> {
     this._assertWritable()
     const budget = new AbortController()
@@ -7793,14 +7866,14 @@ export class Plur {
       }
     }
     try {
-      return await this._flushOutbox(budget.signal, startBudget)
+      return await this._flushOutbox(budget.signal, startBudget, options.force === true)
     } finally {
       if (budgetTimer) clearTimeout(budgetTimer)
     }
   }
 
-  private async _flushOutbox(budget: AbortSignal, startBudget: () => void): Promise<{
-    flushed: number; failed: number; deferred: number; skipped: number; expired_warnings: string[]
+  private async _flushOutbox(budget: AbortSignal, startBudget: () => void, force: boolean): Promise<{
+    flushed: number; failed: number; deferred: number; skipped: number; held: number; expired_warnings: string[]
   }> {
     const engrams = await this._primaryStore.load()
     // The network budget starts NOW, after the local load (review of #1277).
@@ -7812,7 +7885,7 @@ export class Plur {
     const pending = engrams.filter(e =>
       (e as any).structured_data?._outbox && e.status !== 'retired'
     )
-    if (pending.length === 0) return { flushed: 0, failed: 0, deferred: 0, skipped: 0, expired_warnings: [] }
+    if (pending.length === 0) return { flushed: 0, failed: 0, deferred: 0, skipped: 0, held: 0, expired_warnings: [] }
 
     // #863: push supersedes TARGETS before the engrams that supersede them.
     //
@@ -7855,6 +7928,7 @@ export class Plur {
     let flushed = 0
     let failed = 0
     let deferred = 0
+    let held = 0
     let skipped = 0
     /** Outbox metadata changed without a delivery or a failure (a cut). */
     let metadataDirty = false
@@ -7881,6 +7955,7 @@ export class Plur {
       const outbox = (engram as any).structured_data._outbox as {
         target_url: string; target_scope: string; queued_at: string
         last_attempt: string; attempt_count: number; last_error: string
+        last_status?: number
         /** The last push was cut mid-flight: the server may already have it. */
         in_doubt?: boolean
       }
@@ -7901,6 +7976,19 @@ export class Plur {
         expired_warnings.push(`${engram.id}: no matching remote store for scope ${outbox.target_scope}`)
         failed++
         continue
+      }
+      // #1299: back off an entry the store has already refused in a way a
+      // retry cannot fix. Nothing about it changes; it is only not dialled.
+      if (!force) {
+        const verdict = classifyOutboxFailure({
+          last_status: typeof outbox.last_status === 'number' ? outbox.last_status : undefined,
+          last_error: outbox.last_error,
+        })
+        const retryAt = verdict.state === 'needs_action' ? this._needsActionRetryAt(outbox) : undefined
+        if (retryAt !== undefined && retryAt > now.getTime()) {
+          held++
+          continue
+        }
       }
       // #785: consult the per-host breaker the RECALL leg maintains before
       // spending a full fetch timeout on a host already known to be down.
@@ -8082,6 +8170,9 @@ export class Plur {
           outbox.attempt_count += 1
           outbox.last_error = 'cut at the flush time budget before the remote answered — delivery unknown, checked before the next push'
           outbox.in_doubt = true
+          // #1299: this attempt got no status; an older 403 must not keep
+          // classifying the entry as needs_action.
+          delete outbox.last_status
           metadataDirty = true
           deferred++
           logger.warning(`[plur:outbox] ${engram.id}: flush budget ran out mid-push — left queued, in doubt`)
@@ -8090,9 +8181,21 @@ export class Plur {
         outbox.last_attempt = now.toISOString()
         outbox.attempt_count += 1
         outbox.last_error = (err as Error).message
+        // #1299: the status when the remote gave one; cleared when it did not,
+        // so a stale 403 cannot outlive a later network failure.
+        if (err instanceof RemoteHttpError) outbox.last_status = err.status
+        else delete outbox.last_status
         // #785: and a write failure counts toward the same breaker, so a host
         // that only ever fails on writes still opens one.
-        recordWriteOutcome(storeEntry.url!, false, Date.now(), this.remoteHealthStatePath())
+        //
+        // #1308: except a refusal (401/403/404/422). The host answered; it
+        // said the REQUEST was wrong — no access to this scope, an unknown
+        // scope, an invalid engram. Counting it let a few refused writes to
+        // one scope open the breaker for every scope on the host. It neither
+        // counts nor resets: it says nothing about reachability either way.
+        // Network errors, timeouts and 5xx still count.
+        const refused = err instanceof RemoteHttpError && NEEDS_ACTION_STATUSES.has(err.status)
+        if (!refused) recordWriteOutcome(storeEntry.url!, false, Date.now(), this.remoteHealthStatePath())
         failed++
         logger.warning(`[plur:outbox] retry failed for ${engram.id}: ${(err as Error).message}`)
       }
@@ -8163,7 +8266,7 @@ export class Plur {
     // the file on every no-op flush.
     if (idMapDirty) this._writeOutboxIdMap(persistedIdMap)
 
-    return { flushed, failed, deferred, skipped, expired_warnings }
+    return { flushed, failed, deferred, skipped, held, expired_warnings }
   }
 
   /**
@@ -8508,6 +8611,14 @@ Generate an improved version of the procedure that prevents this failure. Return
       tension_count: unresolvedTensions,
       versioned_engram_count: versionedCount,
       outbox_count: await readOrAsync('outbox', () => this.outboxCount(), 0),
+      ...(await (async () => {
+        const summary = await readOrAsync('outbox', () => this.outboxSummary(), undefined as OutboxSummary | undefined)
+        if (!summary) return {}
+        return {
+          outbox_needs_action: summary.needs_action,
+          ...(summary.needs_action > 0 ? { outbox_attention: summary.scopes } : {}),
+        }
+      })()),
       history_events: readOr('history', () => countInjectionEvents(this.paths.root), undefined as any),
       ...(this._lastIndexError ? { index_error: this._lastIndexError } : {}),
       ...(Object.keys(storeErrors).length > 0 ? { store_errors: storeErrors } : {}),
