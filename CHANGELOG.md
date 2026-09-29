@@ -109,9 +109,10 @@ Switches, both environment variables:
 - `PLUR_AUTO_CAPTURE=1` (or `true`, `on`) turns on automatic capture of the reply's
   `🧠 I learned:` block, stored as `claim_class: inferred`. It is off by default and writes
   nothing unless you opt in. `auto_learn: false` in `config.yaml` still wins. Captured text
-  goes to the local store. A `.plur.yaml` scope is honoured only when its folder is trusted
-  (`plur trust`), so a cloned repository cannot choose to publish the agent's reply text to
-  a team store. Captured text is never auto-routed into a shared scope.
+  goes to the local store unless you chose a scope: a folder-map entry's scope
+  (`plur folders`), or a `.plur.yaml` scope in a trusted folder (`plur trust`). A cloned
+  repository cannot choose to publish the agent's reply text to a team store. Captured text
+  is never auto-routed into a shared scope, and a folder the map turns off captures nothing.
 
 Run `plur init` again to install the new hook entries.
 
