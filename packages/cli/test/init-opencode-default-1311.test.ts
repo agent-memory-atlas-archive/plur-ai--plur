@@ -196,4 +196,75 @@ describe('plur init sets up opencode by default (#1311)', { timeout: 60000 }, ()
       expect(readOc().mcp.plur).toEqual(legacy())
     })
   })
+
+  // A node-form entry this branch wrote goes stale after a Node upgrade or a
+  // version-manager switch (the node path is version-specific), or when
+  // @plur-ai/mcp moves. Re-running init repairs it, like #1270 does for the
+  // Claude Code entry.
+  describe('win32 repair of a stale node.exe entry PLUR wrote', () => {
+    const current = (): string[] => { runInit([], true); return readOc().mcp.plur.command }
+    const reseed = (plur: unknown) => {
+      const cfg = readOc()
+      cfg.mcp.plur = plur
+      writeFileSync(ocJson(), JSON.stringify(cfg, null, 2))
+    }
+    const staleJs = '/old/prefix/node_modules/@plur-ai/mcp/dist/index.js'
+
+    beforeEach(() => { mkdirSync(ocDir(), { recursive: true }) })
+
+    it('repairs a node path that no longer exists, keeping other fields', () => {
+      const [node, js] = current()
+      reseed({ type: 'local', command: ['/gone/nodejs-22.1.0/node.exe', js], enabled: true, environment: { PLUR_PATH: '/some/store' } })
+      const out = runInit([], true)
+      const plur = readOc().mcp.plur
+      expect(plur.command).toEqual([node, js])
+      expect(plur.environment).toEqual({ PLUR_PATH: '/some/store' })
+      expect(plur.enabled).toBe(true)
+      expect(out).toContain('mcp.plur: repaired')
+    })
+
+    it('repairs a js entry that differs from the one resolved now', () => {
+      const [node, js] = current()
+      reseed({ type: 'local', command: [node, staleJs], enabled: true })
+      runInit([], true)
+      expect(readOc().mcp.plur.command).toEqual([node, js])
+    })
+
+    it('repairs a node path that exists but is not the node resolved now', () => {
+      const [node, js] = current()
+      const otherNode = join(home, 'other-node', 'node.exe')
+      mkdirSync(join(home, 'other-node'), { recursive: true })
+      writeFileSync(otherNode, '')
+      reseed({ type: 'local', command: [otherNode, js], enabled: true })
+      runInit([], true)
+      expect(readOc().mcp.plur.command).toEqual([node, js])
+    })
+
+    it('a current entry is left byte-for-byte alone', () => {
+      current()
+      const before = readFileSync(ocJson(), 'utf-8')
+      const out = runInit([], true)
+      expect(readFileSync(ocJson(), 'utf-8')).toBe(before)
+      expect(out).not.toContain('mcp.plur: repaired')
+    })
+
+    it.each([
+      ['another script', ['/gone/node.exe', '/my/own/server.js']],
+      ['extra args', ['/gone/node.exe', staleJs, '--flag']],
+      ['another launcher', ['/gone/bun.exe', staleJs]],
+    ])('never touches %s', (_label, command) => {
+      current()
+      const plur = { type: 'local', command, enabled: true }
+      reseed(plur)
+      runInit([], true)
+      expect(readOc().mcp.plur).toEqual(plur)
+    })
+
+    it('leaves a node.exe entry alone off win32', () => {
+      const plur = { type: 'local', command: ['/gone/node.exe', staleJs], enabled: true }
+      writeFileSync(ocJson(), JSON.stringify({ mcp: { plur } }))
+      runInit()
+      expect(readOc().mcp.plur).toEqual(plur)
+    })
+  })
 })

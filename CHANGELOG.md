@@ -19,7 +19,11 @@ skips it.
   Upgrading needs no manual step: re-running init on Windows replaces the
   `command` of the bare-`npx` entry older versions wrote (exactly
   `npx -y @plur-ai/mcp@<version>`), keeping its other fields. Any other
-  `mcp.plur` entry is left alone.
+  `mcp.plur` entry is left alone. The node.exe entry itself is repaired the
+  same way #1267 repairs the Claude Code one: when the node binary or
+  `@plur-ai/mcp` js entry it names no longer exists, or differs from what
+  resolves now (after a Node upgrade or a version-manager switch), init
+  rewrites its `command` and keeps its other fields.
 - Re-running init is idempotent, and an existing `opencode.json` keeps its
   other keys. An existing `mcp.plur` is still left as it is, and an
   `opencode.jsonc` with comments is still reported and left byte-for-byte
