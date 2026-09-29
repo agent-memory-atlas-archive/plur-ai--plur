@@ -52,7 +52,10 @@ operations that are queued, acquiring, held or releasing. The exit waits
 until that count is zero and no lock file of its own is left, and it checks
 both in the same step that calls `process.exit()`. The shared
 Codex/Antigravity exit waits up to 5s, and the Claude Code watchdog up to 3s,
-so it still exits before Claude Code's 20s timeout. Hooks that never open the
+so it still exits before Claude Code's 20s timeout. The run the watchdog stopped
+prints nothing and does not mark the session during that wait. After an
+abandoned hybrid search, the Claude Code hook first waits for that search to
+finish and then runs this check, both inside the watchdog budget. Hooks that never open the
 store (Codex guard, post-tool and session-end; Antigravity guard) share the
 exit, so they are covered if they ever start writing. Cursor hooks do not
 force-exit and were not affected.
