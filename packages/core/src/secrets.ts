@@ -219,7 +219,8 @@ const FINDING_PREFIX: Record<string, RegExp> = {
   npm_token: /^npm_/,
   stripe_live_key: /^[sr]k_live_/,
   aws_secret_key: /^[^=:]*[=:]\s*/,
-  generic_api_key: /^[^a-z]?(?:sk|pk)[-_]/i,
+  // The match includes the separator before `sk`/`pk`; group 1 leaves it out.
+  generic_api_key: /^[^a-z]?((?:sk|pk)[-_])/i,
   api_key_assignment: /^[^=:]*[=:]\s*/,
   password_assignment: /^[^=:]*[=:]\s*/,
   connection_string: /^[a-z]+:\/\//,
@@ -238,8 +239,11 @@ const FINDING_PREFIX: Record<string, RegExp> = {
  * a password, is not shown at all.
  */
 function maskFinding(name: string, matched: string): string {
-  const prefix = FINDING_PREFIX[name]?.exec(matched)?.[0] ?? matched.slice(0, 4)
-  const rest = matched.slice(prefix.length)
+  // A prefix pattern with a capture group shows only the group; the whole
+  // match is still what is withheld from the tail.
+  const m = FINDING_PREFIX[name]?.exec(matched)
+  const prefix = m ? (m[1] ?? m[0]) : matched.slice(0, 4)
+  const rest = matched.slice(m ? m[0].length : 4)
   if (rest.length === 0) return prefix
   return prefix + '...' + (rest.length >= 16 ? rest.slice(-4) : '')
 }

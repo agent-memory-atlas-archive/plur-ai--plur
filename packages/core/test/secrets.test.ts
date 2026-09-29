@@ -413,6 +413,16 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
       for (const [text, pattern, expected] of cases)
         expect(detectSecrets(text).find(h => h.pattern === pattern)?.match, pattern).toBe(expected)
     })
+    it('does not show the separator before an sk/pk key', () => {
+      // generic_api_key matches the character before `sk`/`pk`; a finding
+      // that starts with a space or, from the escape-unfolded view, a raw
+      // newline breaks a pack-scan detail line.
+      const key = 'sk' + '-' + body(40)
+      for (const text of ['key ' + key, 'line\\n' + key, '"' + key]) {
+        const hit = detectSecrets(text).find(h => h.pattern === 'generic_api_key')!
+        expect(hit.match, JSON.stringify(text)).toBe('sk-...' + key.slice(-4))
+      }
+    })
     it('pack-scan issue details carry only the masked finding', () => {
       const token = 'npm' + '_' + body(36)
       const hit = detectSensitive('x ' + token).find(h => h.pattern === 'npm_token')!
