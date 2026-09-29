@@ -25,7 +25,9 @@ cannot hang a turn.
 The auto-rate hook opens the store only when the session injected something
 that has not been rated yet; otherwise its cost is a Node start and one small
 file read. When it does open the store, it reads the pending ids and writes one
-feedback signal per verdict. It dials no remote store. `PLUR_AUTO_RATE=0` turns
+feedback signal per verdict. It dials a remote store only to rate one of its
+engrams. That costs at most one bounded `/me` call per process, to check for the
+`feedback.source` capability, plus the feedback call if the server has it. `PLUR_AUTO_RATE=0` turns
 it off, and `PLUR_AUTO_RATE_CEILING_MS` moves its self-cap.
 
 ## What actually consumes the budget

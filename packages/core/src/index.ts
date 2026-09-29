@@ -52,7 +52,7 @@ import { engramDate } from './tensions.js'
 import { resolveValidity, buildTemporal, normalizeIsoDate, type ResolvedValidity } from './expiry.js'
 import { isCurrentlyValid } from './validity.js'
 import { decodeJwtExpiry, decodeJwtPayload } from './jwt.js'
-import { RemoteStore, normalizeEndpointUrl } from './store/remote-store.js'
+import { RemoteStore, normalizeEndpointUrl, FEEDBACK_SOURCE_CAPABILITY } from './store/remote-store.js'
 import {
   remoteRecall, isRemoteRecallDisabled, resolveRemoteRecallTimeoutMs, scopeOrg,
   REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES,
@@ -267,7 +267,7 @@ export type { SyncResult, SyncStatus, SyncRemoteType } from './sync.js'
  * the two drift, and the drift is always in the unsafe direction.
  */
 export { atomicWrite, withLock } from './sync.js'
-export { markRemoteHostDown, remoteHostDownRemainingMs, clearRemoteHostDown, _resetRemoteHostBreaker, salvageRemoteRow } from './store/remote-store.js'
+export { markRemoteHostDown, remoteHostDownRemainingMs, clearRemoteHostDown, _resetRemoteHostBreaker, salvageRemoteRow, FEEDBACK_SOURCE_CAPABILITY, _resetRemoteCapabilityCache } from './store/remote-store.js'
 export { checkForUpdate, settleVersionChecks, getCachedUpdateCheck, clearVersionCache, minorVersionsBehind, VERSION_CHECK_SUCCESS_TTL_MS, VERSION_CHECK_FAILURE_TTL_MS, type VersionCheckResult } from './version-check.js'
 export { scanForTensions, getCandidatePairs, getCandidatePairsDetailed, measuredUnderDiffers, measuredUnderGateApplies, engramOrigin, MEASURED_UNDER_DIMENSIONS, MEASURED_UNDER_CONFIDENCE_CAP, type CandidatePairs, scopesOverlap, domainSegmentsOverlap, subjectsOverlap, statementOverlap, buildContradictionPrompt, parseContradictionResponse, buildBatchContradictionPrompt, parseBatchContradictionResponse, engramDate, daysApart, inTemporalDomain, temporalDiscountFactor, SNAPSHOT_CONFIDENCE_CAP, type ContradictionVerdict, type TensionPair, type TensionScanResult, type TensionScanOptions, type TemporalGateOptions, type CandidatePairOptions, type JudgeStatement } from './tensions.js'
 // Tension lifecycle persistence (#181)
@@ -5683,10 +5683,11 @@ export class Plur {
    *
    * `options.source: 'auto'` (#1310) marks a verdict an editor hook inferred
    * from the reply text. It adjusts ranking only — `commitment` is never
-   * advanced — and it stays local: it is never sent to a remote store (the
-   * server applies its own feedback rule, which this client cannot hold to
-   * "ranking only"), and the ambiguity guard below does not dial a cold
-   * remote for it, because hooks must not wait on the network.
+   * advanced. A remote store receives it only when its server advertises the
+   * `feedback.source` capability in `/me` (and so promises the same rule —
+   * docs/specs/2026-09-29-feedback-source-contract.md); any other remote is
+   * skipped. The ambiguity guard below does not dial a cold remote for it,
+   * because hooks must not wait on the network.
    */
   async feedback(
     id: string,
@@ -5700,10 +5701,14 @@ export class Plur {
     const sourceData = auto ? { source: 'auto' as const } : {}
     const refuseRemote = (where: string): never => {
       throw new Error(
-        `Automatic feedback is not sent to remote stores: ${id} is in "${where}". `
-        + `Rate it with plur_feedback to send an explicit signal.`,
+        `Automatic feedback is not sent to this remote store: ${id} is in "${where}", whose server does not `
+        + `advertise the "${FEEDBACK_SOURCE_CAPABILITY}" capability. Rate it with plur_feedback to send an explicit signal.`,
       )
     }
+    // Only a capable server may receive an automatic verdict (#1310).
+    const remoteAccepts = async (driver: RemoteStore): Promise<boolean> =>
+      !auto || await driver.hasCapability(FEEDBACK_SOURCE_CAPABILITY)
+    const remoteOpts = auto ? { source: 'auto' as const } : undefined
 
     if (scope !== undefined && (typeof scope !== 'string' || scope.trim() === '')) {
       throw new TypeError('plur.feedback: scope must be a non-empty string')
@@ -5719,18 +5724,18 @@ export class Plur {
       const entry = (this.config.stores ?? []).find(s => s.url && s.scope === scope)
       if (entry) {
         if (entry.readonly === true) throw new Error('Engram is in a readonly store')
-        if (auto) refuseRemote(entry.scope ?? entry.url!)
         const serverId = this._stripRemotePrefix(id, entry.scope)
         const driver = this._getRemoteDriver({ url: entry.url!, token: entry.token, scope: entry.scope })
+        if (!(await remoteAccepts(driver))) refuseRemote(entry.scope ?? entry.url!)
         const remoteEngram = await driver.getById(serverId)
         if (!remoteEngram) throw new Error(`Engram "${id}" not found in store "${scope}"`)
-        await driver.feedback(serverId, signal)
+        await driver.feedback(serverId, signal, remoteOpts)
         try {
           this._appendHistory({
             event: 'feedback_received',
             engram_id: id,
             timestamp: new Date().toISOString(),
-            data: { signal, routed_to: 'remote', scope },
+            data: { signal, routed_to: 'remote', scope, ...sourceData },
           })
         } catch (err) {
           logger.warning(
@@ -5738,7 +5743,7 @@ export class Plur {
             `${(err as Error).message}. Do not retry — the signal is already counted.`,
           )
         }
-        this._logInjectionOutcome(id, signal)
+        this._logInjectionOutcome(id, signal, options?.source)
         return
       }
       // No URL-backed store carries this scope. Falling through blindly was a
@@ -5905,10 +5910,12 @@ export class Plur {
     // Strip the prefix before querying the remote server. See: #86
     /** Stores this walk could not reach — so "not found" can say so (#907). */
     const unverifiedStores: string[] = []
-    // Automatic feedback stays local (#1310): skip the remote walk entirely.
-    for (const entry of (auto ? [] : (this.config.stores ?? []))) {
+    for (const entry of (this.config.stores ?? [])) {
       if (!entry.url) continue
       const serverId = this._stripRemotePrefix(id, entry.scope)
+      // Automatic feedback (#1310): a server that does not advertise
+      // `feedback.source` is skipped before any engram lookup is spent on it.
+      if (auto && !(await remoteAccepts(this._getRemoteDriver({ url: entry.url, token: entry.token, scope: entry.scope })))) continue
       if (entry.readonly === true) {
         const roDriver = this._getRemoteDriver({ url: entry.url, token: entry.token, scope: entry.scope })
         const roFound = await roDriver.getById(serverId)
@@ -5944,14 +5951,14 @@ export class Plur {
       if (!owns) continue
       const found = await driver.getById(serverId)
       if (found) {
-        await driver.feedback(serverId, signal)
+        await driver.feedback(serverId, signal, remoteOpts)
         // Same reasoning as the local path: the remote already counted it.
         try {
           this._appendHistory({
             event: 'feedback_received',
             engram_id: id,
             timestamp: new Date().toISOString(),
-            data: { signal, routed_to: 'remote' },
+            data: { signal, routed_to: 'remote', ...sourceData },
           })
         } catch (err) {
           logger.warning(
@@ -5959,7 +5966,7 @@ export class Plur {
             `written: ${(err as Error).message}. Do not retry — the signal is already counted.`,
           )
         }
-        this._logInjectionOutcome(id, signal)
+        this._logInjectionOutcome(id, signal, options?.source)
         return
       }
     }

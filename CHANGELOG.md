@@ -25,11 +25,21 @@ confident:
 **Automatic feedback changes ranking only.** It moves `retrieval_strength`
 and the feedback counters, and never advances `commitment`. It is recorded
 with `source: "auto"` on the `feedback_received` and `injection_outcome`
-history events, and it is never sent to a remote store: the server applies its
-own feedback rule, which this client cannot hold to "ranking only". Explicit
-`plur_feedback` works exactly as before. `Plur.feedback()` takes an optional
-fourth argument `{ source: 'auto' }`, and `applyFeedbackSignal()` takes
-`{ source }`.
+history events. Explicit `plur_feedback` works exactly as before.
+`Plur.feedback()` takes an optional fourth argument `{ source: 'auto' }`, and
+`applyFeedbackSignal()` takes `{ source }`.
+
+**Remote stores get automatic feedback only if they say they can handle it.**
+A server opts in by listing `feedback.source` in the `capabilities` array of
+its `GET /api/v1/me` response. The client then sends
+`{"signal": ..., "source": "auto"}` to `POST /api/v1/engrams/:id/feedback`, and
+the server must treat it as ranking-only. A server that does not list the
+capability receives no automatic feedback, only explicit feedback, whose
+request body is unchanged. The capability is read from the `/me` call that
+session start already makes, and is cached per server and token for the
+process: at most one extra `/me`, never one per rating. `RemoteStore.me()`
+now returns `capabilities` (`[]` for older servers). Contract:
+`docs/specs/2026-09-29-feedback-source-contract.md`.
 
 Each injected engram gets at most one automatic verdict per session.
 
