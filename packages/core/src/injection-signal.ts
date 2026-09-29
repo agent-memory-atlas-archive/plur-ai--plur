@@ -65,8 +65,18 @@ const DISTINCTIVE_MIN_LENGTH = 4
 /** How many distinctive words a correcting sentence must share with the statement. */
 const NEGATIVE_MIN_SHARED_WORDS = 2
 
-/** Correction phrases that open a sentence. */
-const LEADING_CORRECTION = /^(?:actually,|no,|correction:|wrong,|incorrect,)/
+/** Correction phrases that open a sentence and are a correction on their own. */
+const LEADING_CORRECTION = /^(?:correction:|wrong,|incorrect,)/
+/**
+ * Discourse markers that open corrections AND agreements alike: "Actually,
+ * let me also run the tests" and "No, the tests passed" agree with the memory
+ * (audit M3). They count only when the same sentence also contradicts
+ * something (see CONTRADICTION_CUE).
+ */
+const LEADING_MARKER = /^(?:actually,|no,)/
+/** Words that make a sentence opened by LEADING_MARKER an actual correction. */
+const CONTRADICTION_CUE =
+  /\b(?:not|never|no longer|n't|instead|rather than|anymore|wrong|incorrect|outdated|obsolete|deprecated|retired|removed|dropped|replaced)\b|n't\b/
 /**
  * Correction phrases anywhere in a sentence — constructions aimed at a prior
  * claim ("that is wrong", "is no longer true"), not a bare "is wrong", which
@@ -110,7 +120,9 @@ function sentences(text: string): string[] {
 }
 
 function isCorrection(sentence: string): boolean {
-  return LEADING_CORRECTION.test(sentence) || INLINE_CORRECTION.test(sentence)
+  return LEADING_CORRECTION.test(sentence)
+    || INLINE_CORRECTION.test(sentence)
+    || (LEADING_MARKER.test(sentence) && CONTRADICTION_CUE.test(sentence))
 }
 
 /** Rate one injected engram against the assistant's reply. */

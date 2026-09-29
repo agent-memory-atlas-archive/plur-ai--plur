@@ -131,6 +131,18 @@ describe('review fixes (#1318)', () => {
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
   })
 
+  it('an agreeing reply that merely opens with "Actually," or "No," is not a correction (audit M3)', () => {
+    const statement = 'Always run pnpm build before running the claw tests'
+    expect(detectInjectionSignal(statement, 'Actually, let me also run the claw tests right after the pnpm build.').signal).not.toBe('negative')
+    expect(detectInjectionSignal(statement, 'No, the claw tests passed after the pnpm build, all green.').signal).not.toBe('negative')
+  })
+
+  it('a leading "Actually," that does contradict the engram still counts', () => {
+    const statement = 'Always run pnpm build before running the claw tests'
+    expect(detectInjectionSignal(statement, 'Actually, the claw tests no longer need a pnpm build first.').signal).toBe('negative')
+    expect(detectInjectionSignal(statement, "No, the claw tests don't need the pnpm build anymore.").signal).toBe('negative')
+  })
+
   it('a correction aimed at a prior claim still counts', () => {
     const reply = 'That is wrong now: the migration script before deploying billing was dropped.'
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('negative')

@@ -12,7 +12,7 @@
  * HOME, PLUR_PATH and TMPDIR are temp dirs.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { spawn, spawnSync } from 'child_process'
@@ -21,6 +21,7 @@ import { StubServer } from '../../core/test/helpers/stub-server.js'
 import { RemoteStore } from '../../core/src/store/remote-store.js'
 import { namespaceEngramId } from '../../core/src/engrams.js'
 import { builtCliPath } from './helpers/built-cli.js'
+import { trustDirectory } from '@plur-ai/core'
 
 const CLI = builtCliPath(join(__dirname, '..'))
 const TOKEN = 'auto-rate-remote-token'
@@ -37,7 +38,7 @@ beforeAll(async () => {
 })
 afterAll(async () => { await server.stop() })
 
-describe('hook-auto-rate × remote store (#1318 review)', () => {
+describe('hook-auto-rate × remote store (#1318 review)', { timeout: 120_000 }, () => {
   let root: string
   let project: string
   let env: NodeJS.ProcessEnv
@@ -90,14 +91,38 @@ describe('hook-auto-rate × remote store (#1318 review)', () => {
     return existsSync(p) ? readFileSync(p, 'utf8').split('\n').filter(Boolean) : []
   }
 
-  function stop(sessionId: string, reply: string, extraEnv: Record<string, string> = {}): Promise<number> {
+  /**
+   * Wait until the auto-rate work for this test has finished: no queued turn
+   * and no worker running. The hook may hand its work to a background
+   * worker; assertions about the store must wait for it.
+   */
+  async function idle(timeoutMs = 45_000): Promise<void> {
+    const t0 = Date.now()
+    for (;;) {
+      const busy = existsSync(rateDir()) && readdirSync(rateDir()).some(f => /\.(queue|worker)/.test(f))
+      if (!busy) return
+      if (Date.now() - t0 > timeoutMs) throw new Error(`auto-rate still busy: ${readdirSync(rateDir()).join(', ')}`)
+      await new Promise(r => setTimeout(r, 100))
+    }
+  }
+
+  function spawnAsync(args: string[], input: unknown, extraEnv: Record<string, string> = {}, cwd = project): Promise<{ code: number; stdout: string; ms: number }> {
     return new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [CLI, 'hook-auto-rate', 'claude'], { env: { ...env, ...extraEnv }, cwd: project })
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('hook-auto-rate did not exit')) }, 30_000)
-      child.on('close', code => { clearTimeout(timer); resolve(code ?? 1) })
+      const t0 = Date.now()
+      const child = spawn(process.execPath, [CLI, ...args], { env: { ...env, ...extraEnv }, cwd })
+      let stdout = ''
+      child.stdout.on('data', d => { stdout += String(d) })
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`${args[0]} did not exit`)) }, 30_000)
+      child.on('close', code => { clearTimeout(timer); resolve({ code: code ?? 1, stdout, ms: Date.now() - t0 }) })
       child.on('error', err => { clearTimeout(timer); reject(err) })
-      child.stdin.end(JSON.stringify({ hook_event_name: 'Stop', session_id: sessionId, cwd: project, last_assistant_message: reply }))
+      child.stdin.end(JSON.stringify(input))
     })
+  }
+
+  async function stop(sessionId: string, reply: string, extraEnv: Record<string, string> = {}): Promise<number> {
+    const r = await spawnAsync(['hook-auto-rate', 'claude'], { hook_event_name: 'Stop', session_id: sessionId, cwd: project, last_assistant_message: reply }, extraEnv)
+    await idle()
+    return r.code
   }
 
   it('rates a remote engram from a fresh process when the server has feedback.source', async () => {
@@ -115,18 +140,89 @@ describe('hook-auto-rate × remote store (#1318 review)', () => {
     expect(server.getByIdCalls).toBe(0)
   })
 
-  it('records each rated id as it goes, so a watchdog cut keeps the verdicts already sent', async () => {
+  it('a slow store never holds up the hook, and each verdict is applied at most once (audit M1/F5)', async () => {
     server.setMe({ capabilities: ['feedback.source'] })
-    server.feedbackDelayMs = 15_000 // the remote rating hangs past the watchdog
+    server.feedbackDelayMs = 6_000 // the remote rating is slow
     const learn = spawnSync(process.execPath, [CLI, 'learn', LOCAL_STATEMENT, '--scope', 'global'], { env, cwd: project, encoding: 'utf8' })
     expect(learn.status, learn.stderr).toBe(0)
     const localId = (yaml.load(readFileSync(join(root, '.plur', 'engrams.yaml'), 'utf8')) as any).engrams
       .find((e: any) => e.statement === LOCAL_STATEMENT).id
     injected('r-3', [localId, remoteId])
     const reply = `Done. ${LOCAL_STATEMENT}. Also: ${REMOTE_STATEMENT}.`
-    expect(await stop('r-3', reply, { PLUR_AUTO_RATE_CEILING_MS: '3000' })).toBe(0)
-    // The local verdict was sent before the remote call hung; it must be on record.
-    expect(rated('r-3')).toContain(localId)
-    expect(rated('r-3')).not.toContain(remoteId)
+    const payload = { hook_event_name: 'Stop', session_id: 'r-3', cwd: project, last_assistant_message: reply }
+    const hook = await spawnAsync(['hook-auto-rate', 'claude'], payload)
+    expect(hook.code).toBe(0)
+    // The hook returned before the slow remote call finished.
+    expect(server.feedbackBodies).toEqual([])
+    expect(hook.ms).toBeLessThan(6_000)
+    await idle()
+    expect(server.feedbackBodies).toEqual([{ signal: 'positive', source: 'auto' }])
+    const localAfter = () => (yaml.load(readFileSync(join(root, '.plur', 'engrams.yaml'), 'utf8')) as any).engrams
+      .find((e: any) => e.id === localId)
+    expect(localAfter().feedback_signals.positive).toBe(1)
+    // The same reply again: nothing is applied twice.
+    server.feedbackDelayMs = 0
+    await spawnAsync(['hook-auto-rate', 'claude'], payload)
+    await idle()
+    expect(localAfter().feedback_signals.positive).toBe(1)
+    expect(server.feedbackBodies).toHaveLength(1)
+    expect(existsSync(join(root, '.plur', 'engrams.yaml.lock'))).toBe(false)
+  }, 90_000)
+
+  it('a worker killed while a verdict is in flight never applies it twice (write-ahead)', async () => {
+    server.setMe({ capabilities: ['feedback.source'] })
+    server.feedbackDelayMs = 12_000
+    injected('wa-1', [remoteId])
+    const payload = { hook_event_name: 'Stop', session_id: 'wa-1', cwd: project, last_assistant_message: `Per the team rule: ${REMOTE_STATEMENT}.` }
+    // The worker's guard fires while the (slow) remote feedback call is in flight.
+    await spawnAsync(['hook-auto-rate', 'claude'], payload, { PLUR_AUTO_RATE_WORKER_CEILING_MS: '6000' })
+    // Wait for the stub to finish the request the killed worker sent.
+    const t0 = Date.now()
+    while (server.feedbackBodies.length === 0 && Date.now() - t0 < 30_000) await new Promise(r => setTimeout(r, 200))
+    expect(server.feedbackBodies).toHaveLength(1)
+    // The next turn finds the killed worker's lock and batch and takes them over.
+    server.feedbackDelayMs = 0
+    await spawnAsync(['hook-auto-rate', 'claude'], payload)
+    await idle()
+    expect(server.feedbackBodies).toHaveLength(1)
   })
+
+  describe('auto-capture scope (audit adversarial M3)', () => {
+    const CAPTURE_REPLY = 'Done.\n\n---\n🧠 I learned:\n- My private notes about the contract dispute live in the home folder\n---\n'
+
+    it('an untrusted .plur.yaml cannot send captured reply text to a team store', async () => {
+      writeFileSync(join(project, '.plur.yaml'), `scope: ${SCOPE}\n`)
+      server.lastAppendBody = null
+      await stop('cap-1', CAPTURE_REPLY, { PLUR_AUTO_CAPTURE: '1' })
+      expect(server.lastAppendBody).toBeNull()
+      expect(server.engramCount).toBe(1) // only the seeded engram
+      const local = (yaml.load(readFileSync(join(root, '.plur', 'engrams.yaml'), 'utf8')) as any).engrams ?? []
+      const captured = local.find((x: any) => /contract dispute/.test(x.statement))
+      expect(captured).toBeTruthy()
+      expect(captured.scope).not.toBe(SCOPE)
+    }, 60_000)
+
+    it('a trusted folder mapped to the team scope may capture there', async () => {
+      writeFileSync(join(project, '.plur.yaml'), `scope: ${SCOPE}\n`)
+      trustDirectory(project, join(root, '.plur'))
+      server.lastAppendBody = null
+      await stop('cap-2', CAPTURE_REPLY, { PLUR_AUTO_CAPTURE: '1' })
+      expect(String(server.lastAppendBody?.statement ?? '')).toMatch(/contract dispute/)
+    }, 60_000)
+  })
+
+  it('end to end: a team engram injected by hook-inject (remote recall) is rated by the Stop hook (audit H1)', async () => {
+    server.setMe({ capabilities: ['feedback.source'] })
+    // Remote recall serves the seeded team engram; the project opts into the
+    // remote and is trusted, as `plur init-remote` + `plur trust` would do.
+    server.recallRows = [{ id: 'ENG-SRV-001', scope: SCOPE, status: 'active', statement: REMOTE_STATEMENT, score: 1 }]
+    writeFileSync(join(project, '.plur.yaml'), `scope: project:test/app\nremote_url: ${baseUrl}\nremote_token: ${TOKEN}\n`)
+    trustDirectory(project, join(root, '.plur'))
+    const inj = await spawnAsync(['hook-inject'], { hook_event_name: 'UserPromptSubmit', session_id: 'e2e-1', prompt: 'how do we tag a release candidate for the sprint' })
+    expect(inj.code).toBe(0)
+    expect(inj.stdout).toContain('sprint number')
+    expect(readFileSync(join(rateDir(), 'claude-e2e-1.injected'), 'utf8')).toContain(remoteId)
+    expect(await stop('e2e-1', `Per the team rule: ${REMOTE_STATEMENT}. Tagged.`)).toBe(0)
+    expect(server.feedbackBodies).toEqual([{ signal: 'positive', source: 'auto' }])
+  }, 90_000)
 })

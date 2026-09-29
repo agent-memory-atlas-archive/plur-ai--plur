@@ -23,9 +23,12 @@ confident:
 A quote or paraphrase is positive only when neither its sentence nor the next
 one corrects it. "Your note says 'use npm for installs' — that is no longer
 true" is rated negative, not positive. Correction phrases are ones aimed at a
-prior claim ("Actually, …", "that is wrong", "is no longer true"). A bare "is
-wrong" doesn't count, because ordinary prose ("check what is wrong with the
-deploy") uses it all the time.
+prior claim ("that is wrong", "is no longer true"). A bare "is wrong" doesn't
+count, because ordinary prose ("check what is wrong with the deploy") uses it
+all the time. A reply that merely opens with "Actually," or "No," is not a
+correction either: "No, the tests passed after the build" agrees with the
+memory. It counts only when the same sentence also contradicts something
+("not", "no longer", "instead", "removed", …).
 
 The heuristic lives in `@plur-ai/core` (`detectInjectionSignal`,
 `rateInjectedEngrams`), so it has one implementation.
@@ -58,13 +61,24 @@ without it is never asked for the engram. The new
 
 Each injected engram gets at most one automatic verdict per session, and is
 checked against at most three replies. After that it is settled with no
-verdict, and later turns take the fast path without opening the store. Each
-verdict is recorded as soon as it is sent. If the hook is cut off part-way, the
-verdicts already sent are not repeated on the next turn.
+verdict, and later turns take the fast path without opening the store.
 
-Measured on a 5,000-engram store with 10 injected engrams that the reply never
-mentions, on a heavily loaded machine: from the fourth turn on, the hook takes
-about 100–340 ms. Without the three-reply cap it took 900–1,600 ms on every turn.
+**The hook never does the store work itself.** It appends the turn to a
+per-session queue, starts a detached background worker
+(`plur hook-auto-rate --worker`), and exits. The worker loads, rates and writes
+outside the editor's timeout, one worker per session at a time. On a large
+store the store work takes seconds to tens of seconds; done inside the hook, it
+overran the editor's budget and was killed part-way, sometimes while holding
+the store lock. Each verdict is recorded as rated *before* it is applied, so a
+worker killed between the two loses that one signal and never applies it twice.
+The next worker takes over a dead worker's lock and finishes its queued turns.
+
+Measured under a heavy machine load (load average about 220):
+- 20,000-engram store: the hook returns in 0.3–0.8 s. An earlier audit
+  measured 12–30 s with the work done in the hook.
+- 5,000-engram store, 10 injected engrams the reply never mentions: from the
+  fourth turn on, the hook took about 100–340 ms. Without the three-reply cap
+  it took 900–1,600 ms on every turn.
 
 | Editor | End-of-turn event | Where the reply comes from |
 |---|---|---|
@@ -78,14 +92,19 @@ per-user temp directory (ids only, no engram text). When nothing was injected
 in the session, the hook exits without opening the store. Every path is
 fail-open, and the run is capped at 9s, below the 10s budget each editor gives
 it. The Claude Code `Stop` hook is synchronous: in a real `claude -p` session an
-async `Stop` hook was killed when the session exited and rated nothing.
+async `Stop` hook was killed when the session exited and rated nothing. The
+detached worker it starts does survive the session's exit (checked in a real
+`claude -p` session).
 
 Switches, both environment variables:
 
 - `PLUR_AUTO_RATE=0` (or `false`, `off`) turns automatic rating off. It is on by default.
 - `PLUR_AUTO_CAPTURE=1` (or `true`, `on`) turns on automatic capture of the reply's
   `🧠 I learned:` block, stored as `claim_class: inferred`. It is off by default and writes
-  nothing unless you opt in. `auto_learn: false` in `config.yaml` still wins.
+  nothing unless you opt in. `auto_learn: false` in `config.yaml` still wins. Captured text
+  goes to the local store. A `.plur.yaml` scope is honoured only when its folder is trusted
+  (`plur trust`), so a cloned repository cannot choose to publish the agent's reply text to
+  a team store. Captured text is never auto-routed into a shared scope.
 
 Run `plur init` again to install the new hook entries.
 
