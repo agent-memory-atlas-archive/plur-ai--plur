@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### SessionEnd finds the checkpoint for session ids with unusual characters
+
+**`plur hook-session-end` could miss the session checkpoint, so the session
+was not auto-closed.** The Stop hook writes the checkpoint under a key that
+**replaces** unsafe characters with `_`. The SessionEnd reader **stripped**
+them instead. For a session id such as `a.b:c/d`, the writer produced
+`a_b_c_d` and the reader looked for `abcd`. The reader now tries the `_` form
+first, then the stripped form older writers used. `plur_session_end` got the
+same fix earlier (#1301). Real Claude Code session ids are UUIDs, which both
+forms leave unchanged, so only unusual ids were affected.
+
 ### Queued team writes now leave the laptop when a session ends
 
 **An enterprise deployment reported engrams that stayed on laptops** (#1269).
