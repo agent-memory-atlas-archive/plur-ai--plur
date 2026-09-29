@@ -18,10 +18,21 @@ has no id. The prompt stored for rehydration after compaction is now updated
 on every prompt, not only the first.
 
 The marker is written only after the injected context has been written to
-stdout. If an injection fails, times out or is killed, the next prompt tries
-again, so one miss no longer leaves the whole session without memory. The
-concurrency lock is now also released when the injection throws. Before, it
-stayed in place, and a retry within the next minute exited silently.
+stdout. A first-message injection that does not finish is retried on the next
+prompt. That covers one that throws, one the hook's own 55-second watchdog
+stops, and one the editor kills at its hook timeout. At most **2** full
+attempts run per session. After that the hook stops retrying. It marks the
+session and prints a one-line notice that automatic memory was skipped and
+suggests `plur_session_start`. There is no keyword-only fallback, because
+whatever stopped the full injection (a store too slow for the timeout, or one
+that does not load) would stop it too. Rehydration after compaction is not
+counted and not capped.
+
+The concurrency lock is released when the injection throws, and the watchdog
+removes it before exiting. Before, the lock stayed in place, and every prompt
+in the next 55 seconds exited silently. A run the editor kills outright can
+still leave the lock. The next prompt after the lock goes stale (55 seconds)
+then retries, within the same 2-attempt cap.
 
 Checked in a real Claude Code session: before, the second prompt of a resumed
 session got a second full injection; now it gets none.
