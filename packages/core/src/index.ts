@@ -16,7 +16,7 @@ import { reactivate } from './decay.js'
 import { captureEpisode, queryTimeline } from './episodes.js'
 import { agenticSearch } from './agentic-search.js'
 import { embeddingSearch, embeddingSearchWithScores, type SimilarityResult } from './embeddings.js'
-import { applyFeedbackSignal } from './feedback.js'
+import { applyFeedbackSignal, type FeedbackSource } from './feedback.js'
 import { hybridSearch, hybridSearchWithMeta, applyReranker, rrfMergeEngrams as pgliteRrfMerge, type HybridSearchResult, type RerankOptions } from './hybrid-search.js'
 import { getReranker, resolveRerankerName, isRerankerOff, rerankerStatus, resetRerankerStatus, _resetRerankerCache, type RerankerAdapter, type RerankerRuntimeStatus, type RerankerName } from './rerankers/index.js'
 import { checkRerankerFit, type FitCheckResult } from './rerankers/fit-check.js'
@@ -358,8 +358,13 @@ export {
 export {
   applyFeedbackSignal, nextCommitment,
   POSITIVE_STRENGTH_DELTA, NEGATIVE_STRENGTH_DELTA,
-  type FeedbackSignal,
+  type FeedbackSignal, type FeedbackSource, type ApplyFeedbackOptions,
 } from './feedback.js'
+// Automatic rating of injected engrams from the reply text (#1310).
+export {
+  detectInjectionSignal, rateInjectedEngrams, AUTO_FEEDBACK_MIN_CONFIDENCE,
+  type InjectionSignal, type InjectionSignalResult, type RatedEngram,
+} from './injection-signal.js'
 // Client-side token inspection (#295/#587) — expiry + display-only payload
 // claims, no signature verification — and the endpoint-identity normalizer,
 // so CLI surfaces (login --status) compare hosts the same way the core does.
@@ -4412,6 +4417,22 @@ export class Plur {
     return engrams.find(e => e.id === id) ?? null
   }
 
+  /**
+   * Get several engrams by ID (#1310). The primary store is read by primary
+   * key; only ids it does not hold fall back to the full walk over stores and
+   * packs, once. Ids that exist nowhere are simply absent from the result.
+   */
+  async getByIds(ids: string[]): Promise<Engram[]> {
+    const wanted = [...new Set(ids.filter(Boolean))]
+    if (wanted.length === 0) return []
+    const primary = (await this._loadTargeted(wanted)).filter(e => wanted.includes(e.id))
+    const found = new Set(primary.map(e => e.id))
+    const missing = wanted.filter(id => !found.has(id))
+    if (missing.length === 0) return primary
+    const rest = (await this._loadAllEngrams()).filter(e => missing.includes(e.id))
+    return [...primary, ...rest]
+  }
+
   /** List all active engrams, optionally filtered by scope/domain. No search — returns all matches. */
   async list(options?: { scope?: string; scopes?: string[]; domain?: string; min_strength?: number; include_expired?: boolean }): Promise<Engram[]> {
     return await this._filterEngrams(options)
@@ -5659,9 +5680,30 @@ export class Plur {
    * scope string (e.g. "group:plur/plur-ai/engineering") to target that remote.
    * Without scope, an ID that exists in both the local store and a warmed remote cache
    * is an error — the caller must disambiguate rather than relying on resolution order.
+   *
+   * `options.source: 'auto'` (#1310) marks a verdict an editor hook inferred
+   * from the reply text. It adjusts ranking only — `commitment` is never
+   * advanced — and it stays local: it is never sent to a remote store (the
+   * server applies its own feedback rule, which this client cannot hold to
+   * "ranking only"), and the ambiguity guard below does not dial a cold
+   * remote for it, because hooks must not wait on the network.
    */
-  async feedback(id: string, signal: 'positive' | 'negative' | 'neutral', scope?: string): Promise<void> {
+  async feedback(
+    id: string,
+    signal: 'positive' | 'negative' | 'neutral',
+    scope?: string,
+    options?: { source?: FeedbackSource },
+  ): Promise<void> {
     this._assertWritable()
+    const auto = options?.source === 'auto'
+    const applyOpts = auto ? { source: 'auto' as const } : {}
+    const sourceData = auto ? { source: 'auto' as const } : {}
+    const refuseRemote = (where: string): never => {
+      throw new Error(
+        `Automatic feedback is not sent to remote stores: ${id} is in "${where}". `
+        + `Rate it with plur_feedback to send an explicit signal.`,
+      )
+    }
 
     if (scope !== undefined && (typeof scope !== 'string' || scope.trim() === '')) {
       throw new TypeError('plur.feedback: scope must be a non-empty string')
@@ -5677,6 +5719,7 @@ export class Plur {
       const entry = (this.config.stores ?? []).find(s => s.url && s.scope === scope)
       if (entry) {
         if (entry.readonly === true) throw new Error('Engram is in a readonly store')
+        if (auto) refuseRemote(entry.scope ?? entry.url!)
         const serverId = this._stripRemotePrefix(id, entry.scope)
         const driver = this._getRemoteDriver({ url: entry.url!, token: entry.token, scope: entry.scope })
         const remoteEngram = await driver.getById(serverId)
@@ -5740,6 +5783,11 @@ export class Plur {
           let existsRemotely: boolean
           if (remoteCached.length > 0) {
             existsRemotely = remoteCached.some(e => e.id === serverId)
+          } else if (auto) {
+            // A hook must not wait on the network for a ranking nudge. A cold
+            // cache reads as "no collision"; a mis-targeted auto signal moves
+            // strength by one step and never commitment, so it is recoverable.
+            existsRemotely = false
           } else if (Date.now() >= guardDeadline) {
             // Budget spent on earlier stores. Same branch an unreachable store
             // takes — "cannot tell" — so feedback proceeds with a warning
@@ -5775,7 +5823,7 @@ export class Plur {
         }
       }
 
-      applyFeedbackSignal(engram, signal)
+      applyFeedbackSignal(engram, signal, undefined, applyOpts)
 
       // Incremental write (#740): only the rated engram changed.
       await this._updateEngrams(engrams, [engram])
@@ -5788,7 +5836,7 @@ export class Plur {
           event: 'feedback_received',
           engram_id: id,
           timestamp: new Date().toISOString(),
-          data: { signal },
+          data: { signal, ...sourceData },
         })
       } catch (err) {
         logger.warning(
@@ -5800,7 +5848,7 @@ export class Plur {
     })
 
     if (found) {
-      this._logInjectionOutcome(id, signal)
+      this._logInjectionOutcome(id, signal, options?.source)
       return
     }
 
@@ -5827,10 +5875,10 @@ export class Plur {
       const storeEngrams = await this._storeAt(storeInfo.path).load()
       const engram = storeEngrams.find(e => e.id === storeInfo.originalId)
       if (engram) {
-        applyFeedbackSignal(engram, signal)
+        applyFeedbackSignal(engram, signal, undefined, applyOpts)
         await this._writeEngrams(storeInfo.path, storeEngrams)
         await this._syncIndex()
-        this._logInjectionOutcome(id, signal)
+        this._logInjectionOutcome(id, signal, options?.source)
         return true
       }
       return false
@@ -5857,7 +5905,8 @@ export class Plur {
     // Strip the prefix before querying the remote server. See: #86
     /** Stores this walk could not reach — so "not found" can say so (#907). */
     const unverifiedStores: string[] = []
-    for (const entry of (this.config.stores ?? [])) {
+    // Automatic feedback stays local (#1310): skip the remote walk entirely.
+    for (const entry of (auto ? [] : (this.config.stores ?? []))) {
       if (!entry.url) continue
       const serverId = this._stripRemotePrefix(id, entry.scope)
       if (entry.readonly === true) {
@@ -5916,8 +5965,8 @@ export class Plur {
     }
 
     // Search pack engrams by scanning pack directories
-    await this._feedbackPack(id, signal, unverifiedStores)
-    this._logInjectionOutcome(id, signal)
+    await this._feedbackPack(id, signal, unverifiedStores, applyOpts)
+    this._logInjectionOutcome(id, signal, options?.source)
   }
 
   /**
@@ -5928,7 +5977,11 @@ export class Plur {
    * Link resolution: in-process map first, then a bounded history scan for
    * injections logged by another process (hook-inject, CLI).
    */
-  private _logInjectionOutcome(engramId: string, signal: 'positive' | 'negative' | 'neutral'): void {
+  private _logInjectionOutcome(
+    engramId: string,
+    signal: 'positive' | 'negative' | 'neutral',
+    source?: FeedbackSource,
+  ): void {
     if (signal === 'neutral') return
     try {
       const injectionId = this._lastInjectionByEngram.get(engramId)
@@ -5938,7 +5991,7 @@ export class Plur {
         event: 'injection_outcome',
         engram_id: engramId,
         timestamp: new Date().toISOString(),
-        data: { injection_id: injectionId, signal },
+        data: { injection_id: injectionId, signal, ...(source === 'auto' ? { source } : {}) },
       })
     } catch { /* best-effort — outcome logging must never break feedback */ }
   }
@@ -7477,6 +7530,7 @@ export class Plur {
     id: string,
     signal: 'positive' | 'negative' | 'neutral',
     unreachedStores: string[] = [],
+    applyOpts: { source?: FeedbackSource } = {},
   ): Promise<void> {
     if (!fs.existsSync(this.paths.packs)) throw new Error(`Engram not found: ${id}`)
 
@@ -7502,7 +7556,7 @@ export class Plur {
         const engram = engrams.find(e => e.id === id)
         if (!engram) return false
 
-        applyFeedbackSignal(engram, signal)
+        applyFeedbackSignal(engram, signal, undefined, applyOpts)
 
         await packStore.save(engrams)
         return true
