@@ -189,3 +189,31 @@ describe('a match rejected where it sits is never positive (#1362)', () => {
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBe('positive')
   })
 })
+
+describe('one rejected occurrence does not override a follow-through one (#1362)', () => {
+  it('a statement first negated, then carried out, gets no verdict', () => {
+    const reply = `I did not ${STATEMENT.toLowerCase()} yet \u2014 doing it now: ${STATEMENT}.`
+    // Mixed occurrences get no verdict: neither negative nor positive.
+    expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
+  })
+
+  it('following the engram and then ruling out a variant of it is not negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Use pnpm. Never use pnpm with sudo, though.').signal).not.toBe('negative')
+    expect(detectInjectionSignal('Use pnpm', 'Use pnpm. Do not use pnpm dlx for this script.').signal).not.toBe('negative')
+  })
+
+  it('each run of trigrams is judged on its own', () => {
+    const reply =
+      "Don't run the migration script now. " +
+      'Later, run the migration script before deploying the billing services.'
+    expect(detectInjectionSignal(STATEMENT, reply).signal).not.toBe('negative')
+  })
+
+  it('"Why not use pnpm?" recommends it, so it is not negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Why not use pnpm?').signal).not.toBe('negative')
+  })
+
+  it('every occurrence rejected is still negative', () => {
+    expect(detectInjectionSignal('Use pnpm', 'Do not use pnpm. Never use pnpm here.').signal).toBe('negative')
+  })
+})

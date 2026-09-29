@@ -27,6 +27,9 @@
  * verdict right after it ('"use npm" is outdated') makes it negative too.
  * Only the words next to the match count, so a reply that follows the engram
  * and says "not" about something else in the same sentence stays positive.
+ * Each occurrence (each run of consecutive trigrams, under rule 2) is judged on
+ * its own. The reply is negative only when every occurrence is rejected, and
+ * gets no verdict when some are rejected and some are not.
  *
  * Statements under three words have no trigrams; comparing bare words would
  * rate "Prefer pnpm" positive for any short reply containing both words, so
@@ -173,50 +176,68 @@ export function detectInjectionSignal(statement: string, reply: string): Injecti
   const rejectedInPlace = (start: number, end: number): boolean => {
     let k = start - 1
     if (k >= 0 && sentOf[k] === sentOf[start] && NEGATION_FILLER.has(flat[k])) k--
-    if (k >= 0 && sentOf[k] === sentOf[start] && NEGATORS.has(flat[k])) return true
+    if (k >= 0 && sentOf[k] === sentOf[start] && NEGATORS.has(flat[k])) {
+      // "Why not use pnpm?" recommends it.
+      const whyNot = flat[k] === 'not' && k > 0 && sentOf[k - 1] === sentOf[k] && flat[k - 1] === 'why'
+      if (!whyNot) return true
+    }
     const after: string[] = []
     for (let k = end + 1; k < flat.length && after.length < 6 && sentOf[k] === sentOf[end]; k++) after.push(flat[k])
     return TRAILING_VERDICT.test(after.join(' '))
   }
 
+  /**
+   * One verdict from every occurrence of the match (#1362): negative only when
+   * each occurrence is rejected or corrected, positive only when none is. A
+   * reply that both rejects and follows the engram ("I did not X yet — doing
+   * it now: X") gets no verdict, so one rejected occurrence never overrides a
+   * follow-through one, and one clean occurrence never hides a rejection.
+   */
+  const verdict = (rejected: boolean[], positive: InjectionSignalResult): InjectionSignalResult => {
+    if (rejected.every(r => !r)) return positive
+    if (rejected.every(r => r)) return quotedThenCorrected
+    return { signal: null, confidence: 0 }
+  }
+  /** Is the span flat[start..end] rejected in place or corrected around it? */
+  const spanRejected = (start: number, end: number): boolean => {
+    const where = new Set<number>()
+    for (let k = start; k <= end; k++) where.add(sentOf[k])
+    return rejectedInPlace(start, end) || corrected(where)
+  }
+
   // 1. Verbatim, on token boundaries.
   const n = stmtWords.length
-  const exactAt = new Set<number>()
-  let exactRejected = false
+  const exactRejected: boolean[] = []
   for (let k = 0; k + n <= flat.length; k++) {
     let hit = true
     for (let j = 0; j < n; j++) if (flat[k + j] !== stmtWords[j]) { hit = false; break }
-    if (!hit) continue
-    for (let j = 0; j < n; j++) exactAt.add(sentOf[k + j])
-    if (rejectedInPlace(k, k + n - 1)) exactRejected = true
+    if (hit) exactRejected.push(spanRejected(k, k + n - 1))
   }
-  if (exactAt.size > 0) {
-    return exactRejected || corrected(exactAt)
-      ? quotedThenCorrected
-      : { signal: 'positive', confidence: EXACT_CONFIDENCE }
+  if (exactRejected.length > 0) {
+    return verdict(exactRejected, { signal: 'positive', confidence: EXACT_CONFIDENCE })
   }
 
   // 2. Trigram overlap — only for statements that have trigrams.
   if (n >= 3) {
     const stmtTris = trigrams(stmtWords)
-    const triSentences = new Map<string, number[]>()
-    let first = -1
-    let last = -1
+    const matched = new Set<string>()
+    // Runs of consecutive matching trigrams, each judged on its own: a
+    // negation before one run says nothing about another run elsewhere.
+    const runs: Array<[number, number]> = []
     for (let k = 0; k + 2 < flat.length; k++) {
       const t = `${flat[k]} ${flat[k + 1]} ${flat[k + 2]}`
       if (!stmtTris.has(t)) continue
-      const list = triSentences.get(t) ?? []
-      list.push(sentOf[k], sentOf[k + 2])
-      triSentences.set(t, list)
-      if (first < 0) first = k
-      last = k + 2
+      matched.add(t)
+      const run = runs[runs.length - 1]
+      if (run && run[1] === k + 1) run[1] = k + 2
+      else runs.push([k, k + 2])
     }
-    const overlap = triSentences.size / stmtTris.size
+    const overlap = matched.size / stmtTris.size
     if (overlap >= TRIGRAM_MIN_OVERLAP) {
-      const where = new Set([...triSentences.values()].flat())
-      return corrected(where) || rejectedInPlace(first, last)
-        ? quotedThenCorrected
-        : { signal: 'positive', confidence: 0.7 + 0.2 * overlap }
+      return verdict(
+        runs.map(([start, end]) => spanRejected(start, end)),
+        { signal: 'positive', confidence: 0.7 + 0.2 * overlap },
+      )
     }
   }
 
