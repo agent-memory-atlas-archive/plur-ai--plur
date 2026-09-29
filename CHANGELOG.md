@@ -93,7 +93,9 @@ twice** (#1267). Three separate faults:
   Codex keeps its registration in `config.toml`, which init does not edit by
   hand: when that registration is exactly the old `plur-mcp.cmd` shim, re-running
   `plur init --codex` replaces it through `codex mcp remove` + `codex mcp add`,
-  and `plur doctor` flags it (`codexCmdShimMcp`) until then.
+  and `plur doctor` flags it (`codexCmdShimMcp`) until then. A registration that
+  also carries an `env` (inline or as a subtable), another key, or a multi-line
+  `args` array is left alone, because the re-add would drop those settings.
 - The warning about committing `.cursor/hooks.json` with a machine-local path
   fires again when that path is quoted, and `plur init --no-opencode` now says
   it skipped opencode because of the flag.

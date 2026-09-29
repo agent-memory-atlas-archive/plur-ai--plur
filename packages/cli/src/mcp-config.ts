@@ -459,18 +459,33 @@ export function isOwnWin32CmdShimEntry(entry: McpServerEntry): boolean {
  * (with `\\` and `\"` escapes) and literal strings. Anything it cannot read
  * returns null, which callers treat as "not PLUR's entry", so an unusual
  * hand-written table is left alone rather than misread (#1267).
+ *
+ * That includes a table carrying anything besides `command` and `args`: an
+ * inline `env = {…}`, another key such as `startup_timeout_sec`, a
+ * `[mcp_servers.plur.env]` (or any other `mcp_servers.plur.*`) subtable, or
+ * an `args` array that does not close on its own line. Healing such an entry
+ * through `codex mcp remove` + `codex mcp add` would drop those settings — a
+ * lost `PLUR_PATH` silently moves the user's memory to the default store —
+ * so it is not treated as PLUR's (#1366).
  */
 export function readCodexPlurMcpEntry(toml: string): McpServerEntry | null {
   const lines = toml.split(/\r?\n/)
   const start = lines.findIndex((l) => /^\s*\[mcp_servers\.plur\]\s*(#.*)?$/.test(l))
   if (start === -1) return null
+  if (lines.some((l) => /^\s*\[\[?\s*mcp_servers\.plur\./.test(l))) return null
   const STRING = /"((?:[^"\\]|\\.)*)"|'([^']*)'/g
   let command: string | null = null
   let args: string[] = []
   for (const line of lines.slice(start + 1)) {
     if (/^\s*\[/.test(line)) break
+    if (/^\s*(#.*)?$/.test(line)) continue
     const kv = /^\s*(command|args)\s*=\s*(.*)$/.exec(line)
-    if (!kv) continue
+    if (!kv) return null
+    // Everything outside the strings must be the expected punctuation: one
+    // string for command, a closed `[...]` for args, then an optional comment.
+    const rest = kv[2].replace(STRING, '""')
+    const shape = kv[1] === 'command' ? /^""\s*(#.*)?$/ : /^\[\s*(""\s*,\s*)*(""\s*)?\]\s*(#.*)?$/
+    if (!shape.test(rest)) return null
     const values: string[] = []
     for (const m of kv[2].matchAll(STRING)) {
       values.push(m[2] !== undefined ? m[2] : m[1].replace(/\\(["\\])/g, '$1'))
