@@ -36,6 +36,13 @@ Now:
   folder above it and re-appends the rest, so `/var/…/missing` and
   `/private/var/…/missing` compare equal. How directory trust matches
   symlinked and not-yet-existing folders is settled separately, in #1348.
+- Path comparison also folds letter case on a case-insensitive filesystem
+  (macOS, Windows) (#1357). `canonicalize` returns the on-disk case, so
+  `~/Store/engrams.yaml` and `~/store/engrams.yaml` are one store. The CLI's
+  copy of `canonicalize` now matches core's. In the folder map, a checked
+  folder is compared in its on-disk case; an `off` entry still matches every
+  spelling it matched before, and a `trusted` entry recorded in the on-disk
+  case (as `plur trust` records it) now also covers other case spellings.
 
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
 

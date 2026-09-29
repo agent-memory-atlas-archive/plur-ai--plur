@@ -6,7 +6,7 @@ import yaml from 'js-yaml'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { atomicWrite } from './sync.js'
-import { canonicalize, findProjectConfigPath, readProjectConfigFromPath } from './project-config.js'
+import { canonicalize, canonicalSpellings, findProjectConfigPath, readProjectConfigFromPath } from './project-config.js'
 import { resolveProjectRemoteFromConfig } from './project-remote.js'
 import { isSharedScope } from './scope-util.js'
 import { isLocalOnlyScope } from './scope-target.js'
@@ -200,8 +200,10 @@ function entryForms(entryPath: string, home: string, lax: boolean): string[] {
     forms.add(literal + tail)
     if (lax) {
       const parent = dirname(literal)
-      if (parent !== literal) forms.add(join(canonicalize(parent), basename(literal)) + tail)
-      forms.add(canonicalize(literal) + tail)
+      // Both canonical spellings (#1357): the case-folded one and the
+      // case-preserving one, so folding case never drops an `off` match.
+      if (parent !== literal) for (const c of canonicalSpellings(parent)) forms.add(join(c, basename(literal)) + tail)
+      for (const c of canonicalSpellings(literal)) forms.add(c + tail)
     }
   }
   return [...forms]
@@ -373,7 +375,7 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
   const home = opts.home ?? homedir()
   const entries = loadFolderMap(opts.root).folders
   const strict = [canonicalize(dir)]
-  const lax = [...new Set([strict[0], resolve(dir)])]
+  const lax = [...new Set([strict[0], ...canonicalSpellings(dir), resolve(dir)])]
 
   if (entries.some(e => e.plur === 'off' && entryCovers(e, lax, home, true))) {
     return { mode: 'off', remoteAllowed: false, source: 'map' }

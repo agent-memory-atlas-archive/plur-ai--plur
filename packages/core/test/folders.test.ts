@@ -13,7 +13,7 @@ import { tmpdir } from 'os'
 import {
   resolveFolderPolicy, loadFolderMap, saveFolderMap, folderMapPath, setFolderEntry, removeFolderEntry,
   folderPatternMatches, folderPatternSpecificity, issueFolderNonce, consumeFolderNonce,
-  endFolderNonceSession, FolderMapError, FOLDER_NONCE_TTL_MS, type FolderEntry,
+  endFolderNonceSession, FolderMapError, isTrustedInMap, FOLDER_NONCE_TTL_MS, type FolderEntry,
 } from '../src/folders.js'
 import { isDirectoryTrusted, trustDirectory, untrustDirectory, listTrustedDirectories } from '../src/trust.js'
 import { logger } from '../src/logger.js'
@@ -156,6 +156,48 @@ describe('resolveFolderPolicy', () => {
     // `off` matches loosely: the safe direction.
     writeMap([{ path: join(linkHome, 'proj'), plur: 'off' }])
     expect(at(join(realHome, 'proj')).mode).toBe('off')
+  })
+
+  // #1357: canonicalize now folds letter case to the on-disk name. That must
+  // never make an `off` entry stop matching. Skipped on a case-sensitive
+  // filesystem, where differently-cased paths are different folders.
+  describe('letter case on a case-insensitive filesystem (#1357)', () => {
+    const caseInsensitive = () => {
+      mkdirSync(join(base, 'CaseProbe'), { recursive: true })
+      return existsSync(join(base, 'caseprobe'))
+    }
+
+    it('an `off` entry spelled in another case covers the folder', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      const d = mk('Work', 'Secret')
+      writeMap([{ path: join(home, 'work', 'secret'), plur: 'off' }])
+      expect(policy(d).mode).toBe('off')
+      expect(policy(join(home, 'WORK', 'SECRET')).mode).toBe('off')
+    })
+
+    it('an `off` glob that matched the case-preserving spelling still matches', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      // On disk: <real>/proj. Checked as <link>/PROJ. The old canonical form
+      // was <real>/PROJ (case kept); the folded form is <real>/proj. An `off`
+      // glob written against the old form must keep matching.
+      const real = join(base, 'real')
+      mkdirSync(join(real, 'proj'), { recursive: true })
+      const link = join(base, 'link')
+      symlinkSync(real, link)
+      writeMap([{ path: join(real, 'PRO*'), plur: 'off' }])
+      expect(policy(join(link, 'PROJ')).mode).toBe('off')
+    })
+
+    it('a `trusted` entry covers every case spelling of its folder, and a mis-cased entry fails closed', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      const d = mk('Team')
+      writeMap([{ path: join(home, 'team'), trusted: true }])
+      expect(isTrustedInMap(loadFolderMap(root).folders, join(home, 'team'), home)).toBe(false)
+      // Stored entries are compared as written (fail closed); the checked
+      // folder folds to its on-disk case, so the entry must be written that way.
+      writeMap([{ path: d, trusted: true }])
+      expect(isTrustedInMap(loadFolderMap(root).folders, join(home, 'TEAM'), home)).toBe(true)
+    })
   })
 })
 
