@@ -254,8 +254,8 @@ function installMcpBinary(): { shimPath: string; status: string } {
 
 // Enforcement hooks ensure plur_session_start is always called first.
 // Installed into global ~/.claude/settings.json unconditionally (issue #95) so
-// they fire from any subdirectory project. Each hook silent-passes when
-// isPlurConfigured() is false, so projects without plur are unaffected.
+// they fire from any subdirectory project. Each hook silent-passes unless the
+// folder map says on (#1347), so folders without plur are unaffected.
 function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
   return {
     SessionStart: [

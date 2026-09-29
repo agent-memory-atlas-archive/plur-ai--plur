@@ -3,7 +3,8 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { createPlur } from '../plur.js'
-import { isPlurConfigured } from '../lib/plur-configured.js'
+import { hookFolderOn, payloadDir } from '../lib/folder-gate.js'
+import { endFolderNonceSession } from '@plur-ai/core'
 
 /**
  * plur hook-session-end — Claude Code SessionEnd hook (shipped v1.0.85).
@@ -68,15 +69,19 @@ function readStdinRaw(): string {
 }
 
 export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
-  // Silent pass-through for projects without plur configured (#247) — lets the
-  // hook be installed globally without touching unrelated projects.
-  if (!isPlurConfigured()) return
-
   const raw = readStdinRaw()
   let payload: { session_id?: string; cwd?: string; reason?: string } = {}
   try {
     payload = JSON.parse(raw)
   } catch { /* fall back to env-derived keys */ }
+
+  // #1347: the ask flow's nonces for this session expire with it, whatever
+  // the folder's mode. Only removes this session's own nonce file.
+  if (payload.session_id) try { endFolderNonceSession(plurPath(flags), payload.session_id) } catch { /* best-effort */ }
+
+  // Nothing is captured unless the folder map says on (#1347; was #247's
+  // project gate).
+  if (!hookFolderOn(payloadDir(payload as Record<string, unknown>), flags)) return
 
   const sessionsDir = join(plurPath(flags), 'sessions')
   if (!existsSync(sessionsDir)) return

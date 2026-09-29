@@ -1,5 +1,5 @@
 import { type GlobalFlags } from '../plur.js'
-import { isPlurConfigured } from '../lib/plur-configured.js'
+import { hookFolderOn, payloadDir } from '../lib/folder-gate.js'
 import { readStdinJson, cursorConversationId, stopCountPath, incrementCounter } from '../lib/cursor-hook-io.js'
 
 /**
@@ -18,10 +18,10 @@ import { readStdinJson, cursorConversationId, stopCountPath, incrementCounter } 
 
 const NUDGE_EVERY_N_STOPS = 3
 
-export async function run(_args: string[], _flags: GlobalFlags): Promise<void> {
-  if (!isPlurConfigured()) return
-
+export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   const input = readStdinJson()
+  // Silent unless the folder map says on (#1347).
+  if (!hookFolderOn(payloadDir(input), flags)) return
   const conversationId = cursorConversationId(input)
   if (!conversationId) return
 

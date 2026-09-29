@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Every editor's hooks follow the folder map, and a folder with no decision asks once
+
+**Second half of #1347.** The Claude Code, Codex, Cursor and Antigravity hooks
+no longer gate on a project marker. They ask the folder map
+(`resolveFolderPolicy`, with the payload's `cwd` when the editor sends one)
+what you decided about the folder:
+
+- **off:** every hook is silent. No memories, no reminders, no guard, no
+  learning nudge, no observation or session capture.
+- **on:** memory works as before. A map `scope` (or a trusted `.plur.yaml`'s
+  hint) is the session scope, which is also what makes core dial the team
+  store that scope belongs to. A folder connected only through the map, with
+  no `.plur.yaml`, now gets that store's recall.
+- **ask** (no decision yet, including `$HOME`, or a `.plur.yaml` you have not
+  trusted): the first prompt of a session loads no memories. It carries one
+  instruction instead: ask you once whether to use PLUR in the folder, with a
+  suggested scope from the stores you have configured, and the exact commands
+  for **yes** (`plur folders set <folder> --scope <s> --nonce <n>`, or `--on`),
+  **not now** (nothing) and **never here** (`--off --nonce <n>`). For an
+  untrusted `.plur.yaml` it also offers `--trusted`, names the host the repo
+  wants to send memories to, and never shows its token. The nonce is issued for
+  that session and folder and works once. Later prompts in the session say
+  nothing; after a yes, the next prompt loads memory.
+
+**What you will notice:**
+- Folders with no `.plur.yaml` and no project MCP config, which got nothing
+  before, now ask once per session. Answer "never here" to silence one for good.
+- **A `.plur.yaml` you have not trusted stops applying its scope and domain**
+  (decision D1). You are asked once instead of seeing the old "Ignored remote
+  memory settings" line. To keep a repo working without the question, run
+  `plur trust <repo>`, or answer yes and trust it.
+- A trusted `.plur.yaml` and a project MCP config give byte-identical hook
+  output to before. Golden tests hold every editor to that.
+- Cursor gets the question through its rule file, as it gets memory. The file
+  is removed again once the folder is not `on`, if it still holds the question.
+- Antigravity without a workspace in the payload is unchanged: the install is
+  the opt-in there, as before.
+- The session-end hooks expire that session's unused nonces.
+
+Not changed yet: the opencode plugin and the MCP server's `plur_session_start`
+do not read the map.
+
 ### Claude Code: corrections in a prompt now prompt a `plur_learn`
 
 **The correction reminder never fired** (#1312). `plur hook-correction-detect`
@@ -121,6 +163,7 @@ turn that triggered it. A first message that needs no tools is answered
 without memory. In a one-shot `claude -p` run, that means no memory at all.
 
 An unknown `--event` no longer echoes the hook payload back to stdout.
+
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
 
 **First half of #1347: core and CLI only. No hook reads the map yet.** A new
