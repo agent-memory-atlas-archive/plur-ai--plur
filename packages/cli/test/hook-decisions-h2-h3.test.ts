@@ -25,6 +25,8 @@ import {
   claudeHookSpec,
   useClaudeExecForm,
   parseClaudeVersion,
+  nextRecordedEntries,
+  RECORDED_ENTRIES_MAX,
 } from '../src/lib/hook-command.js'
 import { isPlurHookCommand as mcpIsPlurHookCommand } from '../../mcp/src/hook-command.js'
 import { buildCursorHooks, mergeCursorHooks } from '../src/cursor-hooks.js'
@@ -139,6 +141,71 @@ describe('H2: any hook-* behind PLUR\'s launcher is PLUR\'s', () => {
  * then nothing but plain arguments. Chained or wrapped commands, and an
  * `echo <shim> hook-x`, are the user's.
  */
+/**
+ * F4 follow-up (idempotent init): plur-hook.meta.json keeps every CLI js
+ * entry PLUR itself has recorded, so an exec-form hook written by an earlier
+ * install location is still PLUR's and re-init replaces it. A foreign
+ * checkout that was never recorded is still not claimed.
+ */
+describe('F4: recorded CLI entries are a bounded history', () => {
+  const A = 'C:\\old\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js'
+  const B = 'C:\\new\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js'
+
+  function withMeta(meta: unknown, fn: () => void): void {
+    const saved = process.env.HOME
+    const home = mkdtempSync(join(tmpdir(), 'plur-f4-hist-'))
+    try {
+      process.env.HOME = home
+      mkdirSync(join(home, '.plur', 'bin'), { recursive: true })
+      writeFileSync(join(home, '.plur', 'bin', 'plur-hook.meta.json'), JSON.stringify(meta))
+      fn()
+    } finally {
+      if (saved === undefined) delete process.env.HOME
+      else process.env.HOME = saved
+      rmSync(home, { recursive: true, force: true })
+    }
+  }
+
+  it('migrates a single-entry meta file to a list of one, then appends the new entry', () => {
+    expect(nextRecordedEntries({ entrypoint: A }, B)).toEqual([A, B])
+    expect(nextRecordedEntries(null, B)).toEqual([B])
+    expect(nextRecordedEntries('garbage', B)).toEqual([B])
+  })
+
+  it('does not duplicate an entry already recorded (in any slash or case form)', () => {
+    expect(nextRecordedEntries({ entrypoint: B, entrypoints: [A, B] }, B)).toEqual([A, B])
+    expect(nextRecordedEntries({ entrypoints: [A, B] }, A.toUpperCase().replace(/\\/g, '/'))).toEqual([B, A.toUpperCase().replace(/\\/g, '/')])
+  })
+
+  it('is bounded: keeps the most recent entries, always including the current one', () => {
+    const many = Array.from({ length: 15 }, (_, i) => `C:\\p${i}\\@plur-ai\\cli\\dist\\index.js`)
+    const out = nextRecordedEntries({ entrypoints: many }, B)
+    expect(out.length).toBe(RECORDED_ENTRIES_MAX)
+    expect(out[out.length - 1]).toBe(B)
+    expect(out).toContain(many[14])
+    expect(out).not.toContain(many[0])
+  })
+
+  it('claims an exec-form hook whose entry was recorded earlier', () => {
+    withMeta({ entrypoint: B, entrypoints: [A, B] }, () => {
+      expect(isPlurHookSpec({ command: NODE_WIN, args: [A, 'hook-inject'] })).toBe(true)
+      expect(isPlurHookSpec({ command: NODE_WIN, args: [B, 'hook-inject'] })).toBe(true)
+    })
+  })
+
+  it('still claims the entry of a legacy single-entry meta file', () => {
+    withMeta({ entrypoint: A }, () => {
+      expect(isPlurHookSpec({ command: NODE_WIN, args: [A, 'hook-inject'] })).toBe(true)
+    })
+  })
+
+  it('never claims a foreign checkout that was never recorded', () => {
+    withMeta({ entrypoint: B, entrypoints: [A, B] }, () => {
+      expect(isPlurHookSpec({ command: NODE_WIN, args: ['C:\\src\\someone\\packages\\cli\\dist\\index.js', 'hook-inject'] })).toBe(false)
+    })
+  })
+})
+
 describe('F4: the PLUR-hook matcher is anchored', () => {
   const WIN_SHIM_F = 'C:\\Users\\me\\.plur\\bin\\plur-hook.cmd'
   const POSIX_SHIM_F = '/home/me/.plur/bin/plur-hook'

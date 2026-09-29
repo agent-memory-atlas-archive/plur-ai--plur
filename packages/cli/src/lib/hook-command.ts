@@ -167,19 +167,49 @@ export function isPlurHookSpec(spec: { command?: string; args?: unknown }): bool
   if (/(^|\/)cmd(\.exe)?$/.test(cmd)) return isPlurHookCommand(args.filter((a) => a.toLowerCase() !== '/c').join(' '))
   if (!/(^|\/)node(\.exe)?$/.test(cmd)) return false
   if (!/^hook-[a-z0-9][a-z0-9-]*$/.test(args[1] ?? '')) return false
-  // Decision F4: only the js entry `plur init` recorded in plur-hook.meta.json
-  // — not any path that merely ends in `.../cli/dist/index.js`.
-  const recorded = recordedCliEntry()
-  return recorded !== null && norm(recorded) === norm(args[0])
+  // Decision F4: only a js entry `plur init` itself recorded in
+  // plur-hook.meta.json — not any path that merely ends in
+  // `.../cli/dist/index.js`. Every entry PLUR has recorded counts, not only
+  // the current one, so hooks an earlier install location wrote are still
+  // PLUR's and re-init replaces them (idempotent init).
+  const target = normEntry(args[0])
+  return recordedCliEntries().some((e) => normEntry(e) === target)
 }
 
-/** The CLI entry `plur init` recorded next to the hook shim, if any. */
-function recordedCliEntry(): string | null {
+/** How many CLI js entries plur-hook.meta.json remembers (most recent kept). */
+export const RECORDED_ENTRIES_MAX = 10
+
+/** Windows paths compare without regard to slash style, quotes or case. */
+function normEntry(p: string): string {
+  return p.replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
+}
+
+/** The entries a parsed meta file records: `entrypoints`, else the legacy single `entrypoint`. */
+function entriesOf(meta: unknown): string[] {
+  if (!meta || typeof meta !== 'object') return []
+  const m = meta as { entrypoint?: unknown; entrypoints?: unknown }
+  if (Array.isArray(m.entrypoints)) return m.entrypoints.filter((e): e is string => typeof e === 'string' && e.length > 0)
+  return typeof m.entrypoint === 'string' && m.entrypoint.length > 0 ? [m.entrypoint] : []
+}
+
+/**
+ * The `entrypoints` list to write into plur-hook.meta.json when init records
+ * `current`: every entry recorded before (a legacy single-entry file becomes
+ * a list of one), with `current` moved or appended to the end, trimmed to
+ * the RECORDED_ENTRIES_MAX most recent. Only PLUR's own init writes this list,
+ * so a foreign checkout is never in it.
+ */
+export function nextRecordedEntries(previousMeta: unknown, current: string): string[] {
+  const kept = entriesOf(previousMeta).filter((e) => normEntry(e) !== normEntry(current))
+  return [...kept, current].slice(-RECORDED_ENTRIES_MAX)
+}
+
+/** Every CLI js entry `plur init` has recorded next to the hook shim. */
+export function recordedCliEntries(): string[] {
   try {
-    const meta = JSON.parse(readFileSync(join(homedir(), '.plur', 'bin', 'plur-hook.meta.json'), 'utf8')) as { entrypoint?: unknown }
-    return typeof meta.entrypoint === 'string' ? meta.entrypoint : null
+    return entriesOf(JSON.parse(readFileSync(join(homedir(), '.plur', 'bin', 'plur-hook.meta.json'), 'utf8')))
   } catch {
-    return null
+    return []
   }
 }
 
