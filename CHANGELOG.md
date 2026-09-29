@@ -61,6 +61,45 @@ needs updating before its producers switch. Four conformance vectors were added
 `no-engrams-v2` for an absent `SKILL.md` and an absent `engrams.yaml`), and every
 vector now declares its v2 value as well.
 
+### Two packs with the same manifest name no longer share an integrity baseline
+
+**The pack registry was keyed by manifest name, while installed packs live in
+directories named after their source** (found by the formal verification run in
+#1228). Two directories whose manifests shared a name shared one registry row,
+which caused two failures:
+
+- the second install overwrote the first's baseline, so `plur packs list`
+  reported the untouched first pack as `modified`;
+- uninstalling either pack removed the row by name, leaving the other one
+  `unverified`. Tamper detection was lost without any message.
+
+**Registry rows now record the install directory in a new `dir` field**, and
+install, uninstall and list all look rows up by it. Uninstalling one pack never
+removes another pack's row.
+
+**Older registry files still load unchanged.** A row without `dir` is matched by
+manifest name, as before, and reinstalling that pack upgrades the row in place —
+including when a newer pack with the same manifest name has been installed
+beside it since. On a case-insensitive filesystem the row follows the
+directory's real name, so `plur packs uninstall PACK-ONE` removes `pack-one`'s
+row along with the directory.
+
+**If you were hit by the original bug** — two installed packs with the same
+manifest name — your registry may hold one row that both packs could own.
+Nothing records which pack it belongs to, so `plur packs list` now reports both
+as `UNVERIFIED` (it used to report one of them as `modified` when it was not),
+`plur packs migrate-integrity` skips both as `skipped-ambiguous-legacy-row`, and
+uninstalling one never removes the row. The pack left behind after such an
+uninstall stays `UNVERIFIED`: the row is marked `ambiguous: true`, so it is not
+checked against a value that may be the removed pack's. **Reinstall each
+affected pack from a trusted source**; each then gets its own row.
+
+**Do not share a packs directory between this version and an older one.** An
+older PLUR matches rows by manifest name only: installing there replaces a
+same-name pack's row (dropping its `dir`), and uninstalling there removes every
+row with that name. If that has happened, run `plur packs list` with this
+version and reinstall any pack it reports as `UNVERIFIED`.
+
 ### An unscoped write can no longer land in a team store
 
 **If you wrote an engram without a scope, it could be auto-routed into a shared

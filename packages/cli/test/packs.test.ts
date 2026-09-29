@@ -346,4 +346,26 @@ describe('plur packs — text surface', () => {
     await packs(['list'], true)
     expect(JSON.parse(stdout()).packs[0].baseline).toBe('carried-from-v1')
   })
+
+  it('a legacy row two same-name packs could own is explained in migrate and list (audit of #1230, finding 4)', async () => {
+    // The registry the pre-`dir` defect left: two same-name packs, one row.
+    await packs(['install', writePack('shared', [engram('ENG-2026-0101-001')])])
+    const second = join(dir, 'pack-shared-2')
+    mkdirSync(second)
+    writeFileSync(join(second, 'SKILL.md'), '---\nname: shared\nversion: "1.0.0"\n---\n\n# second\n')
+    writeFileSync(join(second, 'engrams.yaml'), readFileSync(join(dir, 'pack-shared', 'engrams.yaml'), 'utf8'))
+    await packs(['install', second])
+    const regPath = join(dir, 'packs', 'registry.yaml')
+    const reg = readFileSync(regPath, 'utf8')
+    // Keep the first row only, without its `dir`.
+    const firstRow = reg.split(/\n(?=  - )/)[1]
+    writeFileSync(regPath, 'packs:\n' + firstRow.replace(/\n    dir: .*/, '') + '\n')
+    out.length = 0
+    await packs(['migrate-integrity'])
+    expect(stdout()).toMatch(/skipped-ambiguous-legacy-row/)
+    expect(stdout()).toMatch(/Reinstall each of them/i)
+    out.length = 0
+    await packs(['list'])
+    expect(stdout()).toMatch(/UNVERIFIED — its registry row could belong to another pack named "shared"/)
+  })
 })

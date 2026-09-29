@@ -66,6 +66,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
         // failed one — the two usually have the same cause.
         const integrityFlag = p.integrity_status === 'modified'
           ? ' ⚠️  MODIFIED — contents changed since install'
+          : p.registry_ambiguous
+            ? ` ⚠️  UNVERIFIED — its registry row could belong to another pack named "${p.name}"; reinstall this pack to give it its own`
           : p.integrity_status === 'unverified'
             ? ' ⚠️  UNVERIFIED — no registry entry, integrity cannot be checked'
             : ''
@@ -458,6 +460,11 @@ Use 'plur packs list' to see installed packs.`)
           + 'a v1 match cannot see bytes moved between SKILL.md and engrams.yaml, or an added manifest.yaml, '
           + 'so the new value inherits v1\'s trust and certifies nothing. `plur packs list` marks them. '
           + 'Reinstall them from a trusted source to get a verified baseline.')
+      }
+      if (report.packs.some(p => p.action === 'skipped-ambiguous-legacy-row')) {
+        outputText('Packs marked skipped-ambiguous-legacy-row share one registry row, written by an older PLUR, '
+          + 'with another installed pack of the same name, and nothing records which of them it belongs to. '
+          + 'Reinstall each of them from a trusted source: each then gets a row of its own, keyed by its directory.')
       }
       if (report.packs.some(p => p.action === 'skipped-modified')) {
         outputText('Packs marked skipped-modified keep their v1 value: they no longer match it, or they match it '
