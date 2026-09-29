@@ -182,7 +182,7 @@ describe('empty store lock takeover (#1354)', () => {
     observer.stdout!.on('data', d => { out += d })
     await waitForLine(observer, 'ready')
 
-    for (let i = 0; i < 1_500; i++) await withAsyncLock(filePath, async () => {})
+    for (let i = 0; i < 3_000; i++) await withAsyncLock(filePath, async () => {})
     writeFileSync(join(dir, 'stop'), '')
     await new Promise(r => observer.on('exit', r))
     const counts = JSON.parse(out.trim().split('\n').pop()!)
@@ -190,7 +190,7 @@ describe('empty store lock takeover (#1354)', () => {
     expect(counts.empty).toBe(0)
     // No private publish files left behind.
     expect(readdirSync(dir).filter(f => f !== 'engrams.yaml' && f !== 'stop')).toEqual([])
-  }, 120_000)
+  }, 180_000)
 
   it('concurrent acquirers in separate processes racing to take over abandoned empty locks never hold it together', async () => {
     // Each worker process loops: acquire (async or sync flavour), prove it is
