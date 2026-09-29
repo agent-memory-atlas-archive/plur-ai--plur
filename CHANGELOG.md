@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### A failed hook no longer prints an error document to the editor
+
+**When a `plur hook-*` command threw, the CLI printed `{"error": …}` on
+stdout and exited 1**. Editors read a hook's stdout as its result and show
+a non-zero exit as a hook error. So a hook-inject whose store would not load
+showed the user a hook error instead of failing open. The same happened to a
+run the watchdog had already stopped, if its injection then threw.
+
+Hook commands now write the error to stderr as `[plur] <command> failed: …`
+and exit 0. Every other command still prints its error document and exits 1.
+
 ### Claude Code: corrections in a prompt now prompt a `plur_learn`
 
 **The correction reminder never fired** (#1312). `plur hook-correction-detect`
