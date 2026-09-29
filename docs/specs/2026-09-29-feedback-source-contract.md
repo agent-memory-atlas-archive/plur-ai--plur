@@ -99,9 +99,19 @@ feed the following:
 - Each positive adds +0.05 to `retrieval_strength` and re-anchors
   `last_accessed`, which resets read-time decay and the extra decay for
   engrams with no recent positive feedback.
+- Engrams in installed packs skip both kinds of decay: injection scores them on
+  their raw `retrieval_strength`, and `confidenceDecay` does not apply to them
+  (`inject.ts`). An automatic positive on a pack engram therefore raises its
+  score and does not fade over time.
+- Automatic negatives act the same way in the other direction. Each one takes
+  0.10 off `retrieval_strength` (clamped at 0) and re-anchors `last_accessed`,
+  and the injection score drops by 10% per net negative signal, to at most half
+  (`inject.ts`). Negatives also lower `confidence_score` and can make an engram
+  count as failure-driven in meta-engram extraction.
 
 So the loop can reinforce itself: an engram is injected, the reply repeats it,
-the reply is rated positive, and the engram is injected more often.
+the reply is rated positive, and the engram is injected more often. A wrong
+negative verdict pushes the other way, and the engram is injected less often.
 `commitment` is not affected. Whether to count automatic signals separately or
 cap them across sessions is tracked in #1363 and not decided here. A server
 implementing section 3 should expect the same effect from its own ranking
