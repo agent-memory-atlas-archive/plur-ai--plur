@@ -21,10 +21,14 @@ usual ladder, but never to `locked`). You may end up with two engrams — your o
 and the team's — and that is intended. That includes an engram you moved to
 `global` yourself with `rescope`.
 
-**The ladder no longer broadens a team-bound engram to `global`.** An engram
-queued in the outbox for a url store, or in a scope a url store is registered
-for, keeps its team scope when it recurs. Before, it could be rewritten to
-`global` locally and then pushed to the team store as `scope: global`.
+**What is in a team store stays there.** The ladder no longer broadens a
+team-bound engram to `global`: one served by, queued for, or in the scope of any
+team store — a url store or a `shared: true` file-path store — keeps its team
+scope when it recurs (the recurrence is still counted and its commitment still
+escalates). Before, it could be rewritten to `global` in the team's own file, or
+rewritten locally and then pushed to the team store as `scope: global`. A
+personal or global copy can still exist alongside it. Non-shared file-path
+stores broaden as before.
 
 Shared↔shared recurrence, personal→personal recurrence, and a personal save
 recurring onto a shared engram behave as before.

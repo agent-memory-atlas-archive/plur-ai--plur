@@ -165,6 +165,38 @@ describe('shared-scope saves and cross-scope recurrence (#1268)', () => {
       expect(after.scope).toBe(TEAM)
     })
 
+    // Owner decision (2026-09-29, second round): what is in a team store stays
+    // there — shared FILE-PATH stores included, not only url stores.
+    it('an engram in a shared file-path store keeps its scope, on disk too', async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'plur-shared-path-'))
+      const storePath = join(storeDir, 'engrams.yaml')
+      try {
+        // Seed the engram IN the shared store file (a teammate's write).
+        await new Plur({ path: storeDir }).learn('review migrations in pairs', { scope: TEAM })
+        plur.addStore(storePath, TEAM, { shared: true, readonly: false })
+        await plur.learn('review migrations in pairs', { scope: 'project:a' })
+        const after = await plur.learn('review migrations in pairs', { scope: 'project:b' })
+        expect(after.recurrence_count).toBe(2)
+        expect(after.scope).toBe(TEAM)
+        const onDisk = (yaml.load(readFileSync(storePath, 'utf8')) as any).engrams
+          .find((e: any) => e.statement === 'review migrations in pairs')
+        expect(onDisk.scope).toBe(TEAM)
+        expect(onDisk.recurrence_count).toBe(2)
+      } finally { rmSync(storeDir, { recursive: true, force: true }) }
+    })
+
+    it('an engram in a NON-shared file-path store may still broaden (unchanged)', async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'plur-private-path-'))
+      const storePath = join(storeDir, 'engrams.yaml')
+      try {
+        await new Plur({ path: storeDir }).learn('keep a changelog', { scope: 'project:mine' })
+        plur.addStore(storePath, 'project:mine', { shared: false, readonly: false })
+        await plur.learn('keep a changelog', { scope: 'project:a' })
+        const after = await plur.learn('keep a changelog', { scope: 'project:b' })
+        expect(after.scope).toBe('global')
+      } finally { rmSync(storeDir, { recursive: true, force: true }) }
+    })
+
     it('without a team store the ladder still broadens (unchanged)', async () => {
       await plur.learn('write the test first', { scope: TEAM })
       await plur.learn('write the test first', { scope: 'project:a' })

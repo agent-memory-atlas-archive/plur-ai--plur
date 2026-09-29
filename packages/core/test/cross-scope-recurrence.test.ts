@@ -154,9 +154,11 @@ describe('cross-scope recurrence (#176)', () => {
         expect(after1.sources).toHaveLength(1)
         expect(after1.sources![0].scope).toBe('project:b')
 
-        // 2nd cross-scope hit — broadens to global, mutation should persist
-        // to the SECONDARY store (where the engram actually lives), and the
-        // stored engram's sources array must NOT be undefined after the round trip.
+        // 2nd cross-scope hit — mutation should persist to the SECONDARY store
+        // (where the engram actually lives), and the stored engram's sources
+        // array must NOT be undefined after the round trip. Owner decision
+        // (2026-09-29, #1268): what is in a team store stays there — this is a
+        // `shared: true` store, so the scope is NOT broadened to global.
         await plur.learn(legacyStmt, { scope: 'project:c' })
 
         // Read the secondary store file directly to verify durability.
@@ -164,7 +166,7 @@ describe('cross-scope recurrence (#176)', () => {
         const storedEngrams = loadEngrams(secondaryPath)
         const stored = storedEngrams.find(e => e.id === 'ENG-LEGACY-001')
         expect(stored).toBeDefined()
-        expect(stored!.scope).toBe('global')
+        expect(stored!.scope).toBe('project:legacy-a')
         expect((stored as any).recurrence_count).toBe(2)
         // Critical: sources is a real array with 2 entries, NOT undefined or empty.
         // (Iter-3 bug: field-copy approach overwrote stored.sources with hit.sources,
@@ -186,7 +188,8 @@ describe('cross-scope recurrence (#176)', () => {
         // is durable and the no-material-change branch correctly skips emission).
         expect(broadenEvents.length).toBe(1)
         expect(broadenEvents[0].data.persisted_to).toBe('secondary')
-        expect(broadenEvents[0].data.new_scope).toBe('global')
+        // Commitment escalated (the material change); scope held (#1268).
+        expect(broadenEvents[0].data.new_scope).toBe('project:legacy-a')
       } finally {
         rmSync(secondaryDir, { recursive: true, force: true })
       }
@@ -213,21 +216,23 @@ describe('cross-scope recurrence (#176)', () => {
         // Cross-scope re-learn at primary scope. Engram match is in the
         // secondary store; mutation must persist there.
         await plur.learn('cross-store rule', { scope: 'project:primary-b' })  // recurrence=1, no scope change yet
-        const after = await plur.learn('cross-store rule', { scope: 'project:primary-c' })  // recurrence=2, broadens
+        const after = await plur.learn('cross-store rule', { scope: 'project:primary-c' })  // recurrence=2
 
-        // In-memory state shows broadening
+        // Owner decision (2026-09-29, #1268): what is in a team store stays
+        // there. This store is `shared: true`, so the recurrence is recorded
+        // and persisted but the scope is never rewritten to global.
         expect(after.recurrence_count).toBe(2)
-        expect(after.scope).toBe('global')
+        expect(after.scope).toBe('project:secondary-a')
 
         // Reload from disk to verify durability — the mutation should
         // have been written to the SECONDARY store, not silently dropped
         // (this was the iter-1 defect Critic + Data flagged).
         const fresh = new Plur({ path: dir })
-        const reloaded = (await fresh.list({ scope: 'global' }))
+        const reloaded = (await fresh.list({ scope: 'project:secondary-a' }))
           .find(e => e.statement === 'cross-store rule')
         expect(reloaded).toBeDefined()
         expect(reloaded!.recurrence_count).toBe(2)
-        expect(reloaded!.scope).toBe('global')
+        expect(reloaded!.scope).toBe('project:secondary-a')
       } finally {
         rmSync(secondaryDir, { recursive: true, force: true })
       }

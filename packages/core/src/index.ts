@@ -2177,11 +2177,15 @@ export class Plur {
    * the outbox pushes `scope: global` into the team store.
    */
   private _isTeamStoreBound(e: Engram): boolean {
+    // Owner decision (2026-09-29): what is in a team store stays there. A team
+    // store is any url store or any `shared: true` file-path store; an engram
+    // it serves, or one queued for it, keeps its scope. The ladder may still
+    // credit it, and a personal/global copy can exist alongside.
     const a = e as any
     if (a.structured_data?._outbox) return true
-    if (this._isRemoteBackedScope(e.scope)) return true
-    if (typeof a._storeScope === 'string'
-        && (this.config.stores ?? []).some(s => !!s.url && s.scope === a._storeScope)) return true
+    const teamStores = (this.config.stores ?? []).filter(s => !!s.url || s.shared === true)
+    if (teamStores.some(s => isScopeWithin(e.scope, s.scope))) return true
+    if (typeof a._storeScope === 'string' && teamStores.some(s => s.scope === a._storeScope)) return true
     return false
   }
 
