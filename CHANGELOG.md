@@ -10,7 +10,9 @@
 auto-detected like Cursor, Codex and Antigravity: whenever `~/.config/opencode`
 exists, init writes the `plugin` entry and the `mcp.plur` entry with no flag.
 `--opencode` still forces it when the directory does not exist; `--no-opencode`
-skips it.
+skips it. The success line says so: `(auto-detected; global, applies to every
+opencode project; pass --no-opencode to skip)`, or `(global, applies to every
+opencode project)` when `--opencode` forced it.
 
 - **Windows:** `mcp.plur.command` is now built by the same builder as every
   other host since #1267 — `node.exe` plus `@plur-ai/mcp`'s js entry, or the

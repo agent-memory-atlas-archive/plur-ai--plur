@@ -1180,7 +1180,7 @@ function shouldSetupOpencode(args: string[]): boolean {
  * unpinned spec re-resolves on every publish and races the npx cache
  * rewrite.
  */
-function installOpencode(cliVersion: string): string {
+function installOpencode(cliVersion: string, autoDetected: boolean): string {
   const configPath = opencodeConfigPath()
   const result = writeOpencodeConfig(configPath, cliVersion)
 
@@ -1200,7 +1200,12 @@ function installOpencode(cliVersion: string): string {
   }
 
   const status = result.created ? 'created' : result.changed ? 'updated' : 'already up to date'
-  return `Opencode: config ${status} (${configPath})${opencodeMcpNote(result)}`
+  // The opencode config is global even on a project-scoped run, and the leg
+  // runs whenever opencode's config directory exists, so say both (#1338).
+  const scope = autoDetected
+    ? 'auto-detected; global, applies to every opencode project; pass --no-opencode to skip'
+    : 'global, applies to every opencode project'
+  return `Opencode: config ${status} (${configPath}) (${scope})${opencodeMcpNote(result)}`
 }
 
 function writeSettings(path: string, settings: Settings): void {
@@ -1518,7 +1523,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     : 'skipped (no .cursor/ dir found — pass --cursor to force, --no-cursor to silence this)'
 
   const opencodeStatus = shouldSetupOpencode(args)
-    ? containLeg('Opencode', () => installOpencode(CLI_VERSION))
+    ? containLeg('Opencode', () => installOpencode(CLI_VERSION, !args.includes('--opencode')))
     : args.includes('--no-opencode')
       ? 'Opencode: skipped (--no-opencode)'
       : `Opencode: skipped (no ${opencodeConfigDir()} found — pass --opencode to force, --no-opencode to silence this)`
