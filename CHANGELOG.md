@@ -27,11 +27,17 @@ Now:
   install's `engrams.yaml`. `canonicalize` used to fall back to the path as
   written when it could not be resolved. It now resolves the deepest existing
   folder above it and re-appends the rest, so `/var/…/missing` and
-  `/private/var/…/missing` compare equal. The directory-trust checks use the
-  same helper. A trust entry saved by an earlier version, for a folder that
-  did not exist yet under a symlinked parent, still grants trust (and
-  `plur untrust` still removes it). There is no migration step, and
-  `trust.yaml` is not rewritten.
+  `/private/var/…/missing` compare equal. New directory-trust grants are
+  recorded with the same helper.
+- **Action needed in one rare case:** if you ran `plur trust` on a folder
+  before it existed, and the folder sits under a symlinked parent, run
+  `plur trust` on it again. Earlier versions saved such a grant in the
+  symlinked spelling, and the trust check compares saved entries exactly as
+  written, so the old entry no longer matches. The check does not resolve
+  saved entries on purpose: doing so would also trust whatever a symlink
+  planted in place of a trusted folder, or one of its parents, points to.
+  `plur untrust` still removes the old entry when given the spelling it was
+  trusted under. `trust.yaml` is not rewritten.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 

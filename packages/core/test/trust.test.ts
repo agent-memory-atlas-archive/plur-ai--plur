@@ -168,14 +168,15 @@ describe('trust.ts (D2)', () => {
 })
 
 /**
- * Upgrade pin (#1319): before canonicalize resolved the existing ancestor of
- * a missing path, `plur trust` on a folder that did not exist yet stored it
- * plain-normalised — keeping a symlinked parent's spelling. Once the folder
- * exists, the new code canonicalises the target to the real spelling. The old
- * entry must still grant trust (and still be removable), with no rewrite of
- * trust.yaml and no migration step.
+ * #1319 trust and symlinks. Owner decision (2026-09-29): the trust check fails
+ * CLOSED. A stored entry is compared exactly as written against the checked
+ * folder's canonical form. It is never resolved at compare time, because
+ * resolving it would follow a symlink planted after trust was granted (#778).
+ * The cost: a trust that an older version granted for a folder that did not
+ * exist yet, under a symlinked parent, was stored in the parent's symlinked
+ * spelling and no longer matches once the folder exists. Re-run `plur trust`.
  */
-describe('trust.yaml entries written by the old canonicalize', () => {
+describe('trust.yaml entries and symlinks (#1319)', () => {
   let root: string
   let base: string
 
@@ -200,15 +201,17 @@ describe('trust.yaml entries written by the old canonicalize', () => {
     return { oldEntry, text }
   }
 
-  it('still trusts the folder, and folders under it, once it exists', () => {
+  it('an old-spelling entry does NOT grant trust once the folder exists (owner decision: re-run `plur trust`)', () => {
     const { text } = writeOldEntry()
     mkdirSync(join(base, 'real', 'later-project', 'sub'), { recursive: true })
-    expect(isDirectoryTrusted(join(base, 'link', 'later-project'), root)).toBe(true)
-    expect(isDirectoryTrusted(join(base, 'real', 'later-project'), root)).toBe(true)
-    expect(isDirectoryTrusted(join(base, 'real', 'later-project', 'sub'), root)).toBe(true)
-    expect(coveringTrustedAncestor(join(base, 'real', 'later-project', 'sub'), root)).not.toBeNull()
-    expect(isDirectoryTrusted(join(base, 'real'), root)).toBe(false)
+    expect(isDirectoryTrusted(join(base, 'link', 'later-project'), root)).toBe(false)
+    expect(isDirectoryTrusted(join(base, 'real', 'later-project'), root)).toBe(false)
+    expect(isDirectoryTrusted(join(base, 'real', 'later-project', 'sub'), root)).toBe(false)
+    expect(coveringTrustedAncestor(join(base, 'real', 'later-project', 'sub'), root)).toBeNull()
     expect(readFileSync(join(root, 'trust.yaml'), 'utf8')).toBe(text)
+    // Re-running `plur trust` restores it.
+    trustDirectory(join(base, 'link', 'later-project'), root)
+    expect(isDirectoryTrusted(join(base, 'real', 'later-project', 'sub'), root)).toBe(true)
   })
 
   it('a trusted folder later replaced by a symlink to another folder is NOT trusted (#778)', () => {
@@ -225,10 +228,22 @@ describe('trust.yaml entries written by the old canonicalize', () => {
     expect(readFileSync(join(root, 'trust.yaml'), 'utf8')).toBe(text)
   })
 
-  it('plur untrust removes the old entry', () => {
+  it('plur untrust removes an old-spelling entry by the spelling it was trusted under (owner decision)', () => {
     writeOldEntry()
     mkdirSync(join(base, 'real', 'later-project'))
-    expect(untrustDirectory(join(base, 'real', 'later-project'), root)).toBe(true)
-    expect(isDirectoryTrusted(join(base, 'real', 'later-project'), root)).toBe(false)
+    expect(untrustDirectory(join(base, 'link', 'later-project'), root)).toBe(true)
+    expect(listTrustedDirectories(root)).toEqual([])
+  })
+
+  it('a trusted folder whose PARENT is later replaced by a symlink is NOT trusted (#778)', () => {
+    mkdirSync(join(base, 'real', 'proj', 'sub'), { recursive: true })
+    mkdirSync(join(base, 'real', 'evil', 'sub'), { recursive: true })
+    trustDirectory(join(base, 'real', 'proj', 'sub'), root)
+    const text = readFileSync(join(root, 'trust.yaml'), 'utf8')
+    rmSync(join(base, 'real', 'proj'), { recursive: true })
+    symlinkSync(join(base, 'real', 'evil'), join(base, 'real', 'proj'), 'dir')
+    expect(isDirectoryTrusted(join(base, 'real', 'proj', 'sub'), root)).toBe(false)
+    expect(coveringTrustedAncestor(join(base, 'real', 'proj', 'sub'), root)).toBeNull()
+    expect(readFileSync(join(root, 'trust.yaml'), 'utf8')).toBe(text)
   })
 })
