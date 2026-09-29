@@ -180,6 +180,7 @@ describe('doctor --quiet (#730)', () => {
       cursorWired: false,
       codexDetected: false,
       codexWired: false,
+      codexCmdShimMcp: false,
       agyDetected: false,
       agyWired: false,
       pgliteGemmaReembedNeeded: false,
