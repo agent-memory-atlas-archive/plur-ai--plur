@@ -22,6 +22,8 @@ import {
   isPlurHookSpec,
   windowsHookCommand,
   claudeHookSpec,
+  useClaudeExecForm,
+  parseClaudeVersion,
 } from '../src/lib/hook-command.js'
 import { isPlurHookCommand as mcpIsPlurHookCommand } from '../../mcp/src/hook-command.js'
 import { buildCursorHooks, mergeCursorHooks } from '../src/cursor-hooks.js'
@@ -171,6 +173,34 @@ describe('H3: Windows hook commands never rely on shell quoting', () => {
   it('Claude Code on win32 without a CLI entry: exec form through cmd.exe, still no shell string', () => {
     expect(claudeHookSpec({ plat: 'win32', shellCmd: 'npx -y @plur-ai/cli@0.21.0', node: NODE_WIN, cliEntry: null }, 'hook-inject'))
       .toEqual({ command: 'cmd.exe', args: ['/c', 'npx', '-y', '@plur-ai/cli@0.21.0', 'hook-inject'] })
+  })
+
+  // Exec form (`args`) arrived in Claude Code 2.1.139 (anthropics/claude-code
+  // CHANGELOG.md, 2.1.139: "Added hook `args: string[]` field (exec form)").
+  it('Claude Code on win32 older than 2.1.139: the unquoted string form, not exec form', () => {
+    expect(claudeHookSpec({ plat: 'win32', shellCmd: 'unused', node: NODE_WIN, cliEntry: CLI_WIN, execForm: false, stringCmd: 'C:/Users/TESTUS~1/.plur/bin/plur-hook.cmd' }, 'hook-inject', '--rehydrate'))
+      .toEqual({ command: 'C:/Users/TESTUS~1/.plur/bin/plur-hook.cmd hook-inject --rehydrate' })
+  })
+
+  it.each([
+    // [claude --version, string form is a fallback, use exec form?]
+    ['2.1.139 (Claude Code)', false, true],
+    ['2.2.0 (Claude Code)', false, true],
+    ['10.0.1', true, true],
+    ['2.1.138 (Claude Code)', false, false],
+    ['2.0.99', true, false],
+    // Version unknown (claude not on PATH): the short-path string runs in
+    // every shell, so prefer it; exec form only when the string would be
+    // the fallback.
+    [null, false, false],
+    [null, true, true],
+  ])('claude %s, string fallback %s → exec form %s', (version, stringIsFallback, expected) => {
+    expect(useClaudeExecForm(version, stringIsFallback)).toBe(expected)
+  })
+
+  it('parses the version out of `claude --version` output', () => {
+    expect(parseClaudeVersion('2.1.214 (Claude Code)\n')).toBe('2.1.214')
+    expect(parseClaudeVersion('garbage')).toBeNull()
   })
 
   it('Claude Code on darwin/linux: the unchanged shell string', () => {

@@ -50,7 +50,10 @@ twice** (#1267). Three separate faults:
   wrong name in Antigravity. So on Windows no hook relies on shell quoting:
   - **Claude Code** hooks use the documented exec form — `command` + `args`,
     spawned with no shell (https://code.claude.com/docs/en/hooks): node plus
-    the CLI's js entry plus the subcommand.
+    the CLI's js entry plus the subcommand. Exec form arrived in Claude Code
+    2.1.139, so init reads `claude --version`: an older Claude Code gets the
+    unquoted short-path string below instead, and so does one whose version
+    cannot be read, unless that string would need the fallback.
   - **Codex, Cursor and Antigravity** hooks are one unquoted string with
     forward slashes. When the path contains a space, init uses its Windows
     8.3 short name (`C:/Users/TESTUS~1/...`). If the volume has no short
