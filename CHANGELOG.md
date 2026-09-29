@@ -51,6 +51,9 @@ Now:
   folder is compared in its on-disk case; an `off` entry still matches every
   spelling it matched before, and a `trusted` entry recorded in the on-disk
   case (as `plur trust` records it) now also covers other case spellings.
+  `plur folders set` and `plur folders rm` still find an entry recorded in
+  another case on such a filesystem: `set` rewrites it to the on-disk case
+  instead of adding a second entry, and `rm` removes it.
 
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
 

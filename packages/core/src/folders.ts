@@ -447,14 +447,38 @@ export function folderEntryKey(folder: string, home: string = homedir()): string
   return hasGlob(folder) ? folder : canonicalize(expandHome(folder, home))
 }
 
-function findEntryIndex(entries: FolderEntry[], folder: string, home: string): number {
-  if (hasGlob(folder)) return entries.findIndex(e => e.path === folder)
+function entryIsFolder(e: FolderEntry, folder: string, raw: string, target: string, home: string): boolean {
+  return e.path === folder ||
+    (!hasGlob(e.path) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false).includes(target)))
+}
+
+/**
+ * True when `target` (a canonical, existing path) sits on a case-insensitive
+ * filesystem: the same path with every letter's case swapped also exists.
+ * Only the checked folder is probed; no stored entry is resolved (#778).
+ */
+function caseInsensitiveAt(target: string): boolean {
+  const swapped = target.replace(/\p{L}/gu, c => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()))
+  return swapped !== target && existsSync(target) && existsSync(swapped)
+}
+
+/**
+ * The entry a CLI edit of `folder` refers to. After #1357 a checked folder is
+ * canonical in its ON-DISK case, so an entry recorded in another case (by hand,
+ * or before #1357 from a mis-cased typed path) no longer equals it. On a
+ * case-insensitive filesystem such an entry is still this folder's entry, so
+ * an edit or removal must find it rather than add a second entry beside it.
+ * Compared as written apart from letter case — never resolved on disk.
+ */
+function findEntryIndex(entries: FolderEntry[], folder: string, home: string): { idx: number; caseOnly: boolean } {
+  if (hasGlob(folder)) return { idx: entries.findIndex(e => e.path === folder), caseOnly: false }
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
-  return entries.findIndex(e =>
-    e.path === folder ||
-    (!hasGlob(e.path) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false).includes(target))),
-  )
+  const exact = entries.findIndex(e => entryIsFolder(e, folder, raw, target, home))
+  if (exact >= 0 || !caseInsensitiveAt(target)) return { idx: exact, caseOnly: false }
+  const t = target.toLowerCase()
+  const idx = entries.findIndex(e => !hasGlob(e.path) && entryForms(e.path, home, false).some(f => f.toLowerCase() === t))
+  return { idx, caseOnly: idx >= 0 }
 }
 
 function loadForWrite(root: string): FolderMap {
@@ -489,8 +513,10 @@ export function setFolderEntry(root: string, folder: string, change: FolderChang
   const map = loadForWrite(root)
   const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
   const key = folderEntryKey(folder, home)
-  const idx = findEntryIndex(map.folders, folder, home)
-  const entry: FolderEntry = idx >= 0 ? { ...map.folders[idx] } : { path: key }
+  const { idx, caseOnly } = findEntryIndex(map.folders, folder, home)
+  // A case-only match is rewritten to the on-disk spelling, so the strict
+  // (fail-closed) comparison matches it from now on (#1357).
+  const entry: FolderEntry = idx >= 0 ? { ...map.folders[idx], ...(caseOnly ? { path: key } : {}) } : { path: key }
   if (change.scope !== undefined) {
     entry.scope = change.scope
     if (change.mode === undefined) delete entry.plur
@@ -515,7 +541,7 @@ export function removeFolderEntry(
 ): boolean {
   const map = loadForWrite(root)
   const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
-  const idx = findEntryIndex(map.folders, folder, home)
+  const { idx } = findEntryIndex(map.folders, folder, home)
   if (idx < 0) return false
   map.folders.splice(idx, 1)
   saveFolderMap(root, map)

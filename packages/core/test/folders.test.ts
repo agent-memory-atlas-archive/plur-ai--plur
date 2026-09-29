@@ -188,6 +188,26 @@ describe('resolveFolderPolicy', () => {
       expect(policy(join(link, 'PROJ')).mode).toBe('off')
     })
 
+    it('set and rm find an entry recorded in another case, and set replaces it', ({ skip }) => {
+      if (!caseInsensitive()) skip()
+      const w = mk('W')
+      const onDisk = join(w, 'Proj')
+      mkdirSync(onDisk)
+      const misCased = join(w, 'proj')
+      // Recorded before #1357, from a mis-cased typed path.
+      writeMap([{ path: misCased, plur: 'off' }])
+      expect(policy(onDisk).mode).toBe('off')
+
+      expect(setFolderEntry(root, onDisk, { mode: 'on' }, { configuredScopes: [], home }))
+        .toEqual({ path: onDisk, plur: 'on' })
+      expect(loadFolderMap(root).folders).toEqual([{ path: onDisk, plur: 'on' }])
+      expect(policy(onDisk).mode).toBe('on')
+
+      writeMap([{ path: misCased, plur: 'off' }])
+      expect(removeFolderEntry(root, onDisk, home)).toBe(true)
+      expect(loadFolderMap(root).folders).toEqual([])
+    })
+
     it('a `trusted` entry covers every case spelling of its folder, and a mis-cased entry fails closed', ({ skip }) => {
       if (!caseInsensitive()) skip()
       const d = mk('Team')
