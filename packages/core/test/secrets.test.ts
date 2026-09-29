@@ -109,6 +109,11 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     ['AWS temporary access key id', 'ASIA' + 'Q'.repeat(12) + '2345', 'aws_access_key'],
     ['Stripe live secret key', 'sk' + '_live_' + body(24), 'stripe_live_key'],
     ['Stripe live restricted key', 'rk' + '_live_' + body(24), 'stripe_live_key'],
+    // Audit of #1340: Slack app-level and token-rotation formats.
+    ['Slack app-level token', 'xapp' + '-1-' + 'A012ABCD3EF' + '-' + '1234567890123' + '-' + '0a1b2c3d'.repeat(8), 'slack_token'],
+    ['Slack rotation refresh token', 'xoxe' + '-1-' + body(146), 'slack_token'],
+    ['Slack rotating user token', 'xoxe' + '.xoxp-1-' + body(164), 'slack_token'],
+    ['Slack rotating bot token', 'xoxe' + '.xoxb-1-' + body(164), 'slack_token'],
   ]
 
   for (const [label, token, pattern] of positives) {
@@ -157,6 +162,13 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     'read the xoxb' + '-2-step-guide-for-bot-installs page',
     'wiki/xoxp' + '-1-user-token-scopes-and-permissions',
     'see xoxa' + '-2-app-level-tokens-explained',
+    'app-level tokens start xapp' + '-1- and rotating ones xoxe' + '-1-',
+    'the xapp' + '-1-connections-write-scope-guide page',
+    // Audit of #1340: uppercase region-like prose is not an AWS key id.
+    'Deploy the Tokyo cluster to region ' + 'ASIA' + 'PACIFICNORTHEAST1' + ' first',
+    'the ' + 'ASIA' + 'PACIFICSOUTHEAST' + ' fleet is next',
+    'REGIONS: ' + 'ASIA' + 'PACIFICNORTHEAST2' + ', EUROPEWEST1',
+    'the ' + 'ASIA' + 'NMARKETSOVERVIEW' + ' report',
   ]
 
   for (const text of prose) {
@@ -191,6 +203,53 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
       }
     }
     expect(misses.length).toBeLessThanOrEqual(1)
+  })
+
+  describe('AWS access key id boundaries (audit of #1340)', () => {
+    const asia = (tail: string) => 'ASIA' + tail
+    it('flags an exact 20-character ASIA key id between delimiters', () => {
+      expect(detectSecrets('key=' + asia('QQQQQQQQQQQQ2345') + ';').map(h => h.pattern)).toContain('aws_access_key')
+    })
+    it('does not flag an ASIA run longer than a key id', () => {
+      expect(detectSecrets(asia('QQQQQQQQQQQQ23457')).map(h => h.pattern)).not.toContain('aws_access_key')
+    })
+    it('does not flag ASIA glued onto a longer word', () => {
+      expect(detectSecrets('X' + asia('QQQQQQQQQQQQ2345')).map(h => h.pattern)).not.toContain('aws_access_key')
+    })
+    it('keeps the AKIA pattern exactly as strict as main (no boundary required)', () => {
+      // Only strengthen: the long-term key pattern predates #1317 and still
+      // matches inside a longer run.
+      expect(detectSecrets('X' + 'AKIA' + 'QQQQQQQQQQQQ2345' + 'ZZ').map(h => h.pattern)).toContain('aws_access_key')
+    })
+  })
+
+  describe('tokens after a digit or inside a percent-encoded string (audit of #1340)', () => {
+    const gh = 'ghp' + '_' + body(36)
+    it('flags a GitHub token glued after a digit', () => {
+      expect(detectSecrets('1' + gh).map(h => h.pattern)).toContain('github_token')
+    })
+    it('flags a GitHub token after a percent-encoded =', () => {
+      expect(detectSecrets('https://x.example/cb?q=1&access_token%3D' + gh).map(h => h.pattern)).toContain('github_token')
+    })
+    it('flags a GitHub token whose underscore is percent-encoded', () => {
+      expect(detectSecrets('token=ghp%5F' + body(36)).map(h => h.pattern)).toContain('github_token')
+    })
+    it('flags a double-encoded token', () => {
+      expect(detectSecrets('next=%2Fcb%253Ftoken%253D' + gh).map(h => h.pattern)).toContain('github_token')
+    })
+    it('flags an ASIA key id after a percent-encoded =', () => {
+      expect(detectSecrets('X-Amz-Credential%3D' + 'ASIA' + 'QQQQQQQQQQQQ2345' + '%2F20260929').map(h => h.pattern)).toContain('aws_access_key')
+    })
+    it('stays clean on an ordinary percent-encoded URL', () => {
+      expect(detectSecrets('https://example.com/search?q=use%20a%20ghp_%20token&lang=en')).toEqual([])
+    })
+    it('the write/pack guard (detectSensitive) sees the decoded credential too', () => {
+      expect(detectSensitive('cb?access_token%3D' + gh).map(h => h.pattern)).toContain('github_token')
+    })
+    it('tolerates malformed percent sequences', () => {
+      expect(() => detectSecrets('100% sure, %zz and %E0%A4%A are fine')).not.toThrow()
+      expect(detectSecrets('100% sure, %zz and %E0%A4%A are fine')).toEqual([])
+    })
   })
 
   it('files the new token patterns under the secrets family', () => {

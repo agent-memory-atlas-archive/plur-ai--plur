@@ -18,12 +18,22 @@ Now flagged, each by the vendor's documented prefix, charset and length:
   (`gitlab_token`). GitLab bodies may legitimately contain `-` and `_`, so
   the body must also look random (mixed case or digits); a hyphenated slug
   after the prefix, as in a GitLab docs URL, stays clean.
-- Slack `xoxb-`, `xoxp-`, `xoxs-` (with their 8+ digit workspace id) and
-  `xoxa-`, `xoxr-` (`slack_token`); a prefix followed by a short
+- Slack `xoxb-`, `xoxp-`, `xoxs-` (with their 8+ digit workspace id),
+  `xoxa-`, `xoxr-`, app-level `xapp-` and the token-rotation formats `xoxe-`,
+  `xoxe.xoxp-`, `xoxe.xoxb-` (`slack_token`); a prefix followed by a short
   number and hyphenated words stays clean.
 - npm `npm_` (`npm_token`).
 - Stripe `sk_live_` and `rk_live_` (`stripe_live_key`).
 - AWS temporary access key ids, `ASIA…`, under the existing `aws_access_key`.
+  Because `ASIA` begins ordinary uppercase words, this branch needs exactly
+  20 characters with nothing alphanumeric on either side and at least one
+  digit, so region-like prose ("ASIAPACIFIC…") stays clean. The `AKIA` branch
+  is unchanged.
+
+Credentials are also matched against a percent-decoded copy of the text, so a
+token inside an encoded URL or query string (`access_token%3D` then the token,
+or an encoded `_` in the prefix) is found. A token glued after a digit is
+found too.
 
 The same patterns apply to the pack scanner, so a pack carrying one of these
 refuses to install (`docs/pack-scan-surface.md`). Text that only names a prefix,

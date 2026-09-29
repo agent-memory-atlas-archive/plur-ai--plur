@@ -29,15 +29,20 @@ with zero-width characters removed and confusable letters normalised. A
 zero-width joiner inside a key, or a Cyrillic letter that looks like a Latin
 one, does not get a credential past the scan.
 
+The credential patterns below are also matched against a percent-decoded copy
+(ASCII `%00`–`%7F`, up to three passes), so a token inside an encoded URL or
+query string, such as `access_token%3D` followed by the token, is still found.
+The infrastructure patterns are not matched against the decoded copy.
+
 ## Credentials — these refuse the install
 
 | Name | What matches |
 |---|---|
-| `aws_access_key` | `AKIA` (long-term) or `ASIA` (temporary) followed by 16 uppercase letters or digits |
+| `aws_access_key` | `AKIA` (long-term) followed by 16 uppercase letters or digits; or `ASIA` (temporary) followed by exactly 16 uppercase letters or digits, at least one a digit, with no letter or digit on either side |
 | `github_token` | `ghp_`, `gho_`, `ghu_`, `ghs_` or `ghr_`, then 36 or more letters or digits |
 | `github_pat` | `github_pat_`, 22 or more letters or digits, `_`, then 40 or more letters or digits |
 | `gitlab_token` | a documented GitLab prefix (`glpat-`, `gloas-`, `gldt-`, `glrt-`, `glrtr-`, `glcbt-`, `glptt-`, `glft-`, `glimt-`, `glagent-`, `glwt-`, `glsoat-`, `glffct-`), then 20 or more letters, digits, `_` or `-`, where the body has random-token structure: a lowercase letter or digit followed by an uppercase letter, an uppercase letter followed by an uppercase letter or digit, or four digits. A lowercase or Title-Case hyphenated slug after the prefix, as in a docs URL, does not match |
-| `slack_token` | `xoxb-`, `xoxp-` or `xoxs-`, a numeric id of 8 or more digits and `-`, then 10 or more token characters; or `xoxa-` / `xoxr-`, an optional digit and `-`, then an unbroken run of 16 or more letters and digits containing both |
+| `slack_token` | `xoxb-`, `xoxp-` or `xoxs-`, a numeric id of 8 or more digits and `-`, then 10 or more token characters; or `xoxa-` / `xoxr-`, an optional digit and `-`, then an unbroken run of 16 or more letters and digits containing both; or an app-level `xapp-<digit>-<app id>-<number>-<secret>`; or a rotation token `xoxe-`, `xoxe.xoxp-` or `xoxe.xoxb-`, a number and `-`, then 100 or more letters and digits |
 | `npm_token` | `npm_` followed by 36 or more letters or digits |
 | `stripe_live_key` | `sk_live_` or `rk_live_` followed by 24 or more letters or digits |
 | `aws_secret_key` | `aws_secret_access_key` or `secret_access_key`, then `=` or `:`, then 40 base64 characters |
@@ -50,7 +55,8 @@ one, does not get a credential past the scan.
 | `bearer_token` | `Bearer` followed by 20 or more token characters |
 
 The vendor-prefixed patterns (`github_token` to `stripe_live_key`) do not match
-when the prefix is glued onto a longer word, and each needs the vendor's
+when the prefix is glued onto the end of a longer word (a preceding digit or
+`=` does not count), and each needs the vendor's
 documented body length, so text that only names a prefix ("use a `ghp_` token")
 does not refuse an install.
 
