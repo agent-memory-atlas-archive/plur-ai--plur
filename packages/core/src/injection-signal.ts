@@ -171,11 +171,19 @@ export function detectInjectionSignal(statement: string, reply: string): Injecti
   sents.forEach((s, i) => { for (const t of tokens(s)) { flat.push(t); sentOf.push(i) } })
   if (stmtWords.length === 0 || flat.length === 0) return { signal: null, confidence: 0 }
 
+  // isCorrection by sentence index, computed at most once per sentence. Every
+  // occurrence asks about its own sentence and the next one; without the memo
+  // a long sentence full of occurrences was re-scanned once per occurrence,
+  // which is quadratic (a 1 MiB reply took over a minute).
+  const correctionMemo: Array<boolean | undefined> = new Array(sents.length)
+  const sentenceCorrects = (i: number): boolean =>
+    (correctionMemo[i] ??= isCorrection(sents[i]))
+
   /** Is the match in these sentences corrected there or in the next sentence? */
   const corrected = (idxs: Iterable<number>): boolean => {
     for (const i of idxs) {
-      if (isCorrection(sents[i])) return true
-      if (i + 1 < sents.length && isCorrection(sents[i + 1])) return true
+      if (sentenceCorrects(i)) return true
+      if (i + 1 < sents.length && sentenceCorrects(i + 1)) return true
     }
     return false
   }

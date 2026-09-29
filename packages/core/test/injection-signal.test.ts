@@ -234,3 +234,26 @@ describe('one rejected occurrence does not override a follow-through one (#1362)
     expect(detectInjectionSignal('Use pnpm', 'Do not use pnpm. Never use pnpm here.').signal).toBe('negative')
   })
 })
+
+describe('stays linear on long replies (#1362)', () => {
+  const MIB = 1024 * 1024
+  const time = (fn: () => unknown): number => { const t = performance.now(); fn(); return performance.now() - t }
+
+  it('a 1 MiB reply of repeated matches with no sentence break rates in under 1 s', () => {
+    const reply = 'use pnpm '.repeat(Math.ceil(MIB / 9))
+    let r: ReturnType<typeof detectInjectionSignal> | undefined
+    const ms = time(() => { r = detectInjectionSignal('Use pnpm', reply) })
+    expect(r!.signal).toBe('positive')
+    expect(ms).toBeLessThan(1000)
+  }, 30_000)
+
+  it('a 1 MiB reply of long sentences full of matches, the last one corrected, rates in under 1 s', () => {
+    const sentence = 'use pnpm '.repeat(Math.ceil(MIB / 9 / 16)) + 'done.\n'
+    const reply = sentence.repeat(15) + 'use pnpm. That is wrong now.'
+    let r: ReturnType<typeof detectInjectionSignal> | undefined
+    const ms = time(() => { r = detectInjectionSignal('Use pnpm', reply) })
+    // Fifteen clean sentences and one corrected occurrence: they disagree.
+    expect(r!.signal).toBeNull()
+    expect(ms).toBeLessThan(1000)
+  }, 30_000)
+})
