@@ -195,6 +195,11 @@ describe('a match rejected where it sits is never positive (#1362)', () => {
     expect(detectInjectionSignal('Use pnpm', reply.replace('’', "'")).signal).toBe('negative')
   })
 
+  it('an engram statement written with a curly apostrophe matches a straight one (#1365)', () => {
+    expect(detectInjectionSignal('Don\u2019t use npm', "Right: don't use npm here.").signal).toBe('positive')
+    expect(detectInjectionSignal('Don\u02bct use npm', 'Right: don\u2019t use npm here.').signal).toBe('positive')
+  })
+
   it('a reply that follows the engram with an unrelated "not" stays positive', () => {
     expect(detectInjectionSignal('Use pnpm', 'Use pnpm, not npm.').signal).toBe('positive')
     expect(detectInjectionSignal('Use pnpm', 'If not sure, use pnpm.').signal).toBe('positive')
