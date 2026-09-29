@@ -347,16 +347,38 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
       expect(hit?.match).toBe('eyJ...' + payload.slice(-4))
     })
 
-    it('matches exactly what the original regex matches (seeded random inputs)', () => {
-      const alphabet = ['e', 'y', 'J', 'A', '9', '.', '-', '_', ' ', '+', 'eyJ', 'eyJ', '.eyJ', 'AAAAAAAAAA']
+    // What detectSecrets shows for a jwt match: the prefix, then the last four
+    // characters (every match is at least 26 characters long).
+    const masked = (span: string) => 'eyJ...' + span.slice(-4)
+
+    it('needs ten characters after eyJ in the header and in the payload', () => {
+      const run = (n: number) => '0123456789ab'.slice(0, n)
+      const jwt = (h: number, p: number) => 'eyJ' + run(h) + '.' + 'eyJ' + run(p)
+      const found = (s: string) => detectSecrets('x ' + s + ' y').find(h => h.pattern === 'jwt')?.match
+      expect(found(jwt(10, 10))).toBe(masked(jwt(10, 10)))
+      expect(found(jwt(9, 10))).toBeUndefined()
+      expect(found(jwt(10, 9))).toBeUndefined()
+      expect(found(jwt(9, 9))).toBeUndefined()
+      // A 9-character header run before a 10-character one: only the second
+      // `eyJ` in the run can start the match.
+      expect(found('eyJ' + run(9) + jwt(10, 10))).toBe(masked(jwt(10, 10)))
+      for (const s of [jwt(10, 10), jwt(9, 10), jwt(10, 9), jwt(9, 9)])
+        expect(found(s) !== undefined, s).toBe(REFERENCE.test(s))
+    })
+
+    it('matches exactly what the original regex matches, span included (seeded random inputs)', () => {
+      // Short runs ('AAA', 'AAAA') make header and payload lengths land on
+      // the 9/10 boundary often.
+      const alphabet = ['e', 'y', 'J', 'A', '9', '.', '-', '_', ' ', '+', 'eyJ', 'eyJ', '.eyJ', 'AAA', 'AAAA', 'AAAAAAAAAA']
       let seed = 1397
       const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
       for (let i = 0; i < 20000; i++) {
         let s = ''
         const n = 1 + Math.floor(rnd() * 30)
         for (let j = 0; j < n; j++) s += alphabet[Math.floor(rnd() * alphabet.length)]
-        const expected = REFERENCE.test(s)
-        const actual = detectSecrets(s).some(h => h.pattern === 'jwt')
+        const ref = REFERENCE.exec(s)
+        const expected = ref ? masked(ref[0]) : undefined
+        const actual = detectSecrets(s).find(h => h.pattern === 'jwt')?.match
         if (actual !== expected) expect({ s, actual }).toEqual({ s, actual: expected })
       }
     })
