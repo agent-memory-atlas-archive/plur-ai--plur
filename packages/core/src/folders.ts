@@ -5,7 +5,7 @@ import { randomBytes } from 'crypto'
 import yaml from 'js-yaml'
 import { z } from 'zod'
 import { logger } from './logger.js'
-import { atomicWrite } from './sync.js'
+import { atomicWrite, withLock } from './sync.js'
 import { canonicalize, findProjectConfigPath, readProjectConfigFromPath } from './project-config.js'
 import { resolveProjectRemoteFromConfig } from './project-remote.js'
 import { isSharedScope } from './scope-util.js'
@@ -265,17 +265,46 @@ export function readLegacyTrustEntries(root: string): string[] {
   }
 }
 
+/**
+ * Serialise every read-modify-write of folders.yaml, trust.yaml and the nonce
+ * files (audit follow-up: 12 parallel `plur folders set` all reported success
+ * and 5 were saved). One lock file, `folders.yaml.lock`, covers all of them,
+ * so a dual-written grant or revocation is never interleaved with another.
+ * Reentrant within a process (these functions are synchronous and call each
+ * other); across processes it is core's O_EXCL `withLock`.
+ */
+let lockHeld = false
+/** Run `fn` holding the folder-map lock (reentrant). */
+export function withFolderMapLock<T>(root: string, fn: () => T): T {
+  return locked(root, fn)
+}
+
+function locked<T>(root: string, fn: () => T): T {
+  if (lockHeld) return fn()
+  if (!existsSync(root)) mkdirSync(root, { recursive: true })
+  return withLock(folderMapPath(root), () => {
+    lockHeld = true
+    try { return fn() } finally { lockHeld = false }
+  }, { maxRetries: 12, baseDelay: 25 })
+}
+
 function load(root: string): LoadResult {
   const existing = readMapFile(root)
   if (existing) return existing
-  // First read: import trust.yaml once, entries kept exactly as written. The
-  // import never writes trust.yaml; only `untrust` shrinks it (never adds),
-  // so a downgrade still works without resurrecting a revoked grant.
+  // First read: import trust.yaml once, entries kept exactly as written.
+  // trust.yaml itself is kept in step by the dual-write, not by the import.
   const legacy = readLegacyTrustEntries(root)
   const map: FolderMap = { version: 1, folders: legacy.map(path => ({ path, trusted: true })) }
   if (legacy.length > 0) {
     try {
-      saveFolderMap(root, map)
+      // Under the lock, and only if nobody created folders.yaml meanwhile:
+      // an import must never overwrite a concurrent writer's map.
+      return locked(root, () => {
+        const now = readMapFile(root)
+        if (now) return now
+        saveFolderMap(root, map)
+        return { map, malformed: false }
+      })
     } catch (err) {
       warnOnce(`import:${root}`, `[plur:folders] could not write ${folderMapPath(root)} while importing trust.yaml: ${(err as Error).message} — using the imported entries in memory`)
     }
@@ -464,11 +493,19 @@ function loadForWrite(root: string): FolderMap {
 }
 
 /**
+ * Create or update the entry for `folder` (under the folder-map lock). See
+ * setFolderEntryUnlocked for the rules.
+ */
+export function setFolderEntry(root: string, folder: string, change: FolderChange, opts: SetFolderOptions): FolderEntry {
+  return locked(root, () => setFolderEntryUnlocked(root, folder, change, opts))
+}
+
+/**
  * Create or update the entry for `folder`. `mode`/`scope` set the decision;
  * `--scope` alone means on (the `plur` field is dropped so it defaults to on).
  * Returns the entry as written.
  */
-export function setFolderEntry(root: string, folder: string, change: FolderChange, opts: SetFolderOptions): FolderEntry {
+function setFolderEntryUnlocked(root: string, folder: string, change: FolderChange, opts: SetFolderOptions): FolderEntry {
   const home = opts.home ?? homedir()
   if (change.mode === undefined && change.scope === undefined && change.trusted === undefined) {
     throw new FolderMapError('invalid', 'Nothing to set: pass --scope <s>, --on, --off, --ask, --trusted or --no-trusted.')
@@ -499,6 +536,10 @@ export function setFolderEntry(root: string, folder: string, change: FolderChang
   if (idx >= 0) map.folders[idx] = entry
   else map.folders.push(entry)
   saveFolderMap(root, map)
+  // Dual-write (see addLegacyTrustEntry): keep trust.yaml in step for
+  // adapters on the previous core.
+  if (change.trusted === true && !hasGlob(entry.path)) addLegacyTrustEntryUnlocked(root, entry.path)
+  if (change.trusted === false) removeLegacyTrustEntryUnlocked(root, folder, home)
   consume?.()
   return cleanEntry(entry)
 }
@@ -510,6 +551,12 @@ export function setFolderEntry(root: string, folder: string, change: FolderChang
  */
 export function removeFolderEntry(
   root: string, folder: string, home: string = homedir(), opts?: { nonce?: string; now?: number },
+): boolean {
+  return locked(root, () => removeFolderEntryUnlocked(root, folder, home, opts))
+}
+
+function removeFolderEntryUnlocked(
+  root: string, folder: string, home: string, opts?: { nonce?: string; now?: number },
 ): boolean {
   const map = loadForWrite(root)
   const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
@@ -526,6 +573,10 @@ export function removeFolderEntry(
  * decision is removed. Returns whether a grant was removed.
  */
 export function clearFolderTrust(root: string, folder: string, home: string = homedir()): boolean {
+  return locked(root, () => clearFolderTrustUnlocked(root, folder, home))
+}
+
+function clearFolderTrustUnlocked(root: string, folder: string, home: string): boolean {
   const map = loadForWrite(root)
   let changed = false
   const raw = resolve(expandHome(folder, home))
@@ -543,14 +594,32 @@ export function clearFolderTrust(root: string, folder: string, home: string = ho
 }
 
 /**
+ * DUAL-WRITE (audit follow-up, adversarial M1 / data-loss F7). While any
+ * published adapter still reads trust.yaml — the opencode plugin pins the
+ * pre-folder-map core — every grant is also recorded there, in that file's own
+ * format, and every revocation removes it there (removeLegacyTrustEntry).
+ * Because revocations land in both files, a downgrade or a re-import cannot
+ * resurrect a revoked grant. Globs are not written: the old reader matches
+ * literal folders only. Drop the dual-write once every adapter is on this core.
+ */
+function addLegacyTrustEntryUnlocked(root: string, path: string): void {
+  const entries = readLegacyTrustEntries(root)
+  if (entries.includes(path)) return
+  atomicWrite(legacyTrustPath(root), yaml.dump({ version: 1, trusted: [...entries, path].sort() }))
+}
+
+/**
  * Remove the grant for `folder` from the pre-#1347 `trust.yaml`, if it lists
  * one (the stored string, its plain spelling, or its canonical form). Without
  * this, a downgrade (an older CLI or MCP reading trust.yaml) or a re-import
  * after folders.yaml is deleted would bring a revoked grant back. Removal is
- * fail-safe; nothing is ever ADDED to trust.yaml. Returns whether an entry was
- * removed. Throws on a write error so a revocation never silently half-applies.
+ * fail-safe. Returns whether an entry was removed. Throws on a write error so a revocation never silently half-applies.
  */
 export function removeLegacyTrustEntry(root: string, folder: string, home: string = homedir()): boolean {
+  return locked(root, () => removeLegacyTrustEntryUnlocked(root, folder, home))
+}
+
+function removeLegacyTrustEntryUnlocked(root: string, folder: string, home: string): boolean {
   const file = legacyTrustPath(root)
   if (!existsSync(file)) return false
   const entries = readLegacyTrustEntries(root)
@@ -610,6 +679,10 @@ function writeNonceFile(file: string, data: NonceFile): void {
  * decision for exactly `folder`.
  */
 export function issueFolderNonce(root: string, sessionId: string, folder: string, now: number = Date.now()): string {
+  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, folder, now))
+}
+
+function issueFolderNonceUnlocked(root: string, sessionId: string, folder: string, now: number): string {
   mkdirSync(nonceDir(root), { recursive: true, mode: 0o700 })
   const file = nonceFile(root, sessionId)
   const data = readNonceFile(file) ?? { session: safeSessionKey(sessionId), nonces: [] }
@@ -628,7 +701,7 @@ export function endFolderNonceSession(root: string, sessionId: string): void {
  * Verify and consume `nonce` for `folder` in one step. See verifyFolderNonce.
  */
 export function consumeFolderNonce(root: string, nonce: string, folder: string, now: number = Date.now()): void {
-  verifyFolderNonce(root, nonce, folder, now)()
+  locked(root, () => verifyFolderNonce(root, nonce, folder, now)())
 }
 
 /**
