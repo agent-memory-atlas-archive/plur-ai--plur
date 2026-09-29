@@ -58,7 +58,7 @@ exits before that, so a store with no cache stayed without one, and every
 session's first prompt missed the deadline again. When the abandoned search
 is still running at exit, the hook now starts one background build of the
 cache: detached, at the lowest CPU priority, one per store at a time (the
-`.embeddings-warming` marker), stopped after 10 minutes
+`.embeddings-warming` marker), stopped after 60 minutes
 (`PLUR_WARM_CEILING_MS`). It takes no store write lock. The next session's
 hybrid search then meets its deadline.
 

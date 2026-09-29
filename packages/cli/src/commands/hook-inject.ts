@@ -447,7 +447,10 @@ export function settleWithin(p: Promise<unknown>, ms: number): Promise<boolean> 
  * write lock at all; the cache file is written atomically.
  */
 const WARM_MARKER = '.embeddings-warming'
-export const WARM_CEILING_MS = parseInt(process.env.PLUR_WARM_CEILING_MS ?? '', 10) || 10 * 60_000
+// 60 min: the cache is saved only once the whole store is embedded, and at the
+// lowest priority a 10,000-engram store did not finish inside 10 min on a busy
+// machine. A dead holder is detected at once, so this bounds only a stuck build.
+export const WARM_CEILING_MS = parseInt(process.env.PLUR_WARM_CEILING_MS ?? '', 10) || 60 * 60_000
 
 /** Take the single-flight marker, or false when a live build holds it. */
 export function claimWarmMarker(path: string, now = Date.now()): boolean {
