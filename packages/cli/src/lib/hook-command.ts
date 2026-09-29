@@ -197,8 +197,17 @@ const HOOK_SUBCOMMAND = '(?:hook-[a-z0-9][a-z0-9-]*)(?:\\s|$)'
  * start of the command, after a slash or after an opening quote — optionally
  * closed by a quote, then whitespace and a hook subcommand. The path before
  * it may contain spaces: versions before #1267 wrote it unquoted on Windows.
+ *
+ * Or its Windows 8.3 alias. On a spaced home with short names (the default on
+ * C:), decision H3 writes the short path, and the file name is shortened too:
+ * `C:/Users/RUNNER~1/.../PLUR~1/bin/PLUR-H~1.CMD hook-inject`. The alias
+ * (`plur-h~<n>.cmd`) is claimed only inside PLUR's own bin directory
+ * (`.plur/bin/` or its alias `plur~<n>/bin/`), so another file that happens
+ * to shorten to the same name elsewhere stays the user's.
  */
-const SHIM_FORM = new RegExp(`(?:^|[/"])plur-hook(?:\\.cmd)?"?\\s+${HOOK_SUBCOMMAND}`)
+const SHIM_FORM = new RegExp(
+  `(?:(?:^|[/"])plur-hook(?:\\.cmd)?|/(?:\\.plur|plur~\\d+)/bin/plur-h~\\d+\\.cmd)"?\\s+${HOOK_SUBCOMMAND}`,
+)
 
 /** The `npx @plur-ai/cli[@version] hook-*` fallback, in every form init wrote. */
 const NPX_FORM = new RegExp(`(?:^|\\s)@plur-ai/cli(?:@\\S+)?\\s+${HOOK_SUBCOMMAND}`)
