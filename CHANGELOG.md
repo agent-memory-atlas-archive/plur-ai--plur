@@ -52,6 +52,17 @@ at once. **Nothing is dropped, rescoped or rewritten automatically.** Only the
 retry bookkeeping changes: `attempt_count`, `last_attempt`, `last_error` and
 `last_status`.
 
+### SessionEnd finds the checkpoint for session ids with unusual characters
+
+**`plur hook-session-end` could miss the session checkpoint, so the session
+was not auto-closed.** The Stop hook writes the checkpoint under a key that
+**replaces** unsafe characters with `_`. The SessionEnd reader **stripped**
+them instead. For a session id such as `a.b:c/d`, the writer produced
+`a_b_c_d` and the reader looked for `abcd`. The reader now tries the `_` form
+first, then the stripped form older writers used. `plur_session_end` got the
+same fix earlier (#1301). Real Claude Code session ids are UUIDs, which both
+forms leave unchanged, so only unusual ids were affected.
+
 ### Queued team writes now leave the laptop when a session ends
 
 **An enterprise deployment reported engrams that stayed on laptops** (#1269).
@@ -78,6 +89,38 @@ are still queued.
 `flushOutbox()` takes an optional `{ timeoutMs }` and returns a new `deferred`
 count — entries it did not get to. A cut is not counted as an attempt or as a
 failure against the host.
+
+### The end-of-response learning nudge now reaches the model in Claude Code
+
+**The Stop hook's "did you learn something?" nudge was never shown to the
+model** (#1266). `plur hook-learn-check` printed a top-level
+`{"additionalContext": ...}`, which Claude Code records as plain hook output
+and drops. Checked in a real session: a codeword sent that way was never seen;
+the same codeword sent as `hookSpecificOutput` was.
+
+It also could not fire on schedule. The every-3rd-response counter was keyed
+on `CLAUDE_SESSION_ID`, which Claude Code does not pass to hooks, and fell
+back to the parent process id — a fresh shell on every Stop. So every Stop got
+its own counter and never reached 3.
+
+Now:
+
+- The nudge is sent as
+  `{"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": ...}}`,
+  the shape Claude Code delivers. Delivery works by giving the model **one extra
+  turn**. The prompt is written for that turn: call `plur_learn` if something
+  is worth keeping, otherwise reply "ok".
+- The hook never nudges on a Stop that carries `stop_hook_active: true` — the
+  turn its own nudge forced — and does not count it. Sending the nudge on every
+  Stop looped (about ten empty turns per prompt).
+- The counter and the session checkpoint are keyed on the payload
+  `session_id`, sanitised with the shared session-key helper, falling back to
+  `CLAUDE_SESSION_ID` and then the parent process id only when it is absent.
+- On every other Stop the hook prints nothing. It used to echo its input
+  payload back to stdout, which Claude Code parses as hook output — at best
+  ignored.
+
+Cost: one short extra turn every third response.
 
 ### An unscoped write can no longer land in a team store
 
