@@ -19,7 +19,9 @@ additive field). Entries queued before this are classified from their error
 text, and anything unclear counts as `retrying`.
 
 **The `needs_action` entries are reported**, with count, scope, a one-line
-reason and a next step, in:
+reason and a next step, in the places below. There is one row for each scope
+and reason: a scope holding both a 403 and a 422 gets two rows, each with its
+own advice.
 - the MCP `plur_session_start` result (`outbox_needs_action`, plus a line in `guide`);
 - `plur status` and `plur_status` (`outbox_needs_action`, `outbox_attention`);
 - `plur doctor`, as a failing `outbox` check. A write that only failed on the
@@ -33,7 +35,8 @@ The next step names real commands: get write access and run `plur outbox
 
 **Back-off:** automatic flushes (session start and end, stop hooks,
 `plur sync`) retry a `needs_action` entry at most once a day. They return the
-number held back as `held`. An explicit flush (`plur outbox --flush`,
+number held back as `held`. `plur sync` (`outbox.held` in `--json`) and the
+hook's stderr line report it, including when every entry was held back. An explicit flush (`plur outbox --flush`,
 `plur_outbox { flush: true }`, or `flushOutbox({ force: true })`) retries it
 at once. **Nothing is dropped, rescoped or rewritten automatically.** Only the
 retry bookkeeping changes: `attempt_count`, `last_attempt`, `last_error` and

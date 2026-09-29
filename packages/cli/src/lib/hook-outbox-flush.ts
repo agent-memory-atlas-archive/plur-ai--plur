@@ -113,6 +113,8 @@ export interface HookFlushOutcome {
   flushed?: number
   failed?: number
   deferred?: number
+  /** #1299: needs_action entries the flush did not dial (daily back-off). */
+  held?: number
   timed_out?: boolean
   error?: string
 }
@@ -156,13 +158,18 @@ export async function flushOutboxForHook(
         )
         return { ran: true, timed_out: true }
       }
-      if (result.flushed > 0 || result.failed > 0 || result.deferred > 0) {
+      // #1299: `held` counts too — when every entry is held back, nothing else
+      // moves, and staying silent is exactly the failure being fixed.
+      const held = result.held ?? 0
+      if (result.flushed > 0 || result.failed > 0 || result.deferred > 0 || held > 0) {
         process.stderr.write(
           `[plur] ${opts.hook}: outbox — ${result.flushed} delivered, ${result.failed} failed, `
-          + `${result.deferred} left for next time.\n`,
+          + `${result.deferred} left for next time`
+          + (held > 0 ? `, ${held} held back (needs action — run \`plur outbox\`)` : '')
+          + '.\n',
         )
       }
-      return { ran: true, flushed: result.flushed, failed: result.failed, deferred: result.deferred }
+      return { ran: true, flushed: result.flushed, failed: result.failed, deferred: result.deferred, held }
     } finally {
       if (timer) clearTimeout(timer)
     }

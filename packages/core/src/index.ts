@@ -416,7 +416,7 @@ export interface StatusResult {
   outbox_count?: number
   /** Queued writes a retry cannot deliver (401/403/404/422, refusal, no store) (#1299). */
   outbox_needs_action?: number
-  /** Present when `outbox_needs_action` > 0: one row per scope, with reason and next step. */
+  /** Present when `outbox_needs_action` > 0: one row per scope and reason, with its next step. */
   outbox_attention?: OutboxSummary['scopes']
   /** Present when the most recent background index pass failed (#272). */
   index_error?: IndexSyncError
