@@ -38,7 +38,37 @@ describe('hook-learn-check', () => {
     return { stdout: result.stdout ?? '', status: result.status ?? 1 }
   }
 
-  it('stays silent (raw passthrough) when plur is not configured', () => {
+  /**
+   * Drive the hook the way Claude Code does (#1266): the session id arrives in
+   * the stdin payload, CLAUDE_SESSION_ID is NOT set, and the hook is launched
+   * through a shell — so process.ppid is a fresh `sh` pid on every Stop.
+   */
+  function runStop(payload: Record<string, unknown>): { stdout: string; status: number } {
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home, TMPDIR: tmp }
+    delete env.CLAUDE_SESSION_ID
+    const result = runCli('/bin/sh', ['-c', `"${process.execPath}" "${CLI}" hook-learn-check`], {
+      input: JSON.stringify({ cwd: home, hook_event_name: 'Stop', ...payload }),
+      encoding: 'utf-8',
+      timeout: 10000,
+      env,
+      cwd: home,
+    })
+    return { stdout: result.stdout ?? '', status: result.status ?? 1 }
+  }
+
+  /** The Stop-event delivery shape Claude Code actually hands to the model. */
+  function nudgeText(stdout: string): string | undefined {
+    try {
+      const out = JSON.parse(stdout)
+      if (out?.hookSpecificOutput?.hookEventName !== 'Stop') return undefined
+      const ctx = out.hookSpecificOutput.additionalContext
+      return typeof ctx === 'string' ? ctx : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  it('prints nothing when plur is not configured', () => {
     const bareHome = mkdtempSync(join(tmpdir(), 'plur-learn-check-bare-'))
     const bareTmp = join(bareHome, 'tmp')
     mkdirSync(bareTmp, { recursive: true })
@@ -50,7 +80,9 @@ describe('hook-learn-check', () => {
         env: { ...process.env, HOME: bareHome, USERPROFILE: bareHome, TMPDIR: bareTmp, CLAUDE_SESSION_ID: 'unconfigured' },
         cwd: bareHome,
       })
-      expect(result.stdout.trim()).toBe(JSON.stringify({ cwd: bareHome }))
+      // #1266: a Stop hook's stdout is parsed as hook OUTPUT — echoing the
+      // input payload back was at best ignored. Say nothing.
+      expect(result.stdout).toBe('')
     } finally {
       rmSync(bareHome, { recursive: true, force: true })
     }
@@ -58,10 +90,64 @@ describe('hook-learn-check', () => {
 
   it('stays silent on the 1st and 2nd stop, nudges on the 3rd (LEARN_INTERVAL)', () => {
     const id = 'learn-interval-test'
-    expect(runHook(id).stdout).not.toContain('additionalContext')
-    expect(runHook(id).stdout).not.toContain('additionalContext')
+    expect(runHook(id).stdout).toBe('')
+    expect(runHook(id).stdout).toBe('')
     const third = runHook(id)
-    expect(JSON.parse(third.stdout).additionalContext).toContain('plur_learn')
+    expect(nudgeText(third.stdout)).toContain('plur_learn')
+  })
+
+  // #1266: Claude Code ignores a Stop hook's TOP-LEVEL additionalContext
+  // (recorded as plain hook stdout, never shown to the model). Only the
+  // hookSpecificOutput form is delivered — verified in a real session.
+  it('delivers the nudge as hookSpecificOutput for the Stop event, not top-level', () => {
+    const id = 'shape-test'
+    runHook(id)
+    runHook(id)
+    const out = JSON.parse(runHook(id).stdout)
+    expect(out).not.toHaveProperty('additionalContext')
+    expect(out.hookSpecificOutput.hookEventName).toBe('Stop')
+    expect(out.hookSpecificOutput.additionalContext).toContain('plur_learn')
+  })
+
+  // #1266: the delivered form forces ONE continuation turn. That turn ends in
+  // another Stop with stop_hook_active: true — nudging there would loop.
+  it('never nudges when stop_hook_active is true', () => {
+    const session_id = '5e0c1f7a-0000-4000-8000-000000000001'
+    runStop({ session_id })
+    runStop({ session_id })
+    // The 3rd Stop is a continuation Stop: must stay silent.
+    expect(runStop({ session_id, stop_hook_active: true }).stdout).toBe('')
+    // ...and it does not consume the interval — the next real Stop nudges.
+    expect(nudgeText(runStop({ session_id }).stdout)).toContain('plur_learn')
+    // The continuation that nudge forces must not nudge again.
+    expect(runStop({ session_id, stop_hook_active: true }).stdout).toBe('')
+  })
+
+  // #1266: Claude Code puts the session id in the payload and does not export
+  // CLAUDE_SESSION_ID to hooks. Keyed on ppid, each Stop (a fresh shell) got a
+  // fresh counter and the every-3rd nudge could never fire.
+  it('keys the counter on the payload session_id, across different ppids', () => {
+    const session_id = '5e0c1f7a-0000-4000-8000-000000000002'
+    expect(runStop({ session_id }).stdout).toBe('')
+    expect(runStop({ session_id }).stdout).toBe('')
+    expect(nudgeText(runStop({ session_id }).stdout)).toContain('plur_learn')
+    // A different session keeps its own count.
+    expect(runStop({ session_id: '5e0c1f7a-0000-4000-8000-000000000003' }).stdout).toBe('')
+  })
+
+  it('writes the checkpoint under the payload session_id', () => {
+    const session_id = '5e0c1f7a-0000-4000-8000-000000000004'
+    for (let i = 0; i < 10; i++) runStop({ session_id })
+    const checkpointPath = join(home, '.plur', 'sessions', `${session_id}.checkpoint.json`)
+    expect(existsSync(checkpointPath)).toBe(true)
+    expect(JSON.parse(readFileSync(checkpointPath, 'utf-8')).session_id).toBe(session_id)
+  })
+
+  it('sanitises a hostile payload session_id before using it as a path', () => {
+    const session_id = '../../escape'
+    for (let i = 0; i < 10; i++) runStop({ session_id })
+    expect(existsSync(join(home, '.plur', 'escape.checkpoint.json'))).toBe(false)
+    expect(existsSync(join(home, '.plur', 'sessions', '______escape.checkpoint.json'))).toBe(true)
   })
 
   it('writes a session checkpoint on the 10th stop (CHECKPOINT_INTERVAL)', () => {
@@ -95,11 +181,7 @@ describe('hook-learn-check', () => {
       results.push(stdout)
     }
     const nudged = results.map((r) => {
-      try {
-        return typeof JSON.parse(r).additionalContext === 'string'
-      } catch {
-        return false
-      }
+      return nudgeText(r) !== undefined
     })
     expect(nudged).toEqual([
       false, false, true, // 1,2,3

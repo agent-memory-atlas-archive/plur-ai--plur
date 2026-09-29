@@ -16,6 +16,7 @@ import { tmpdir } from 'os'
 import { spawn } from 'child_process'
 import { Plur } from '@plur-ai/core'
 import { StubServer } from '../../core/test/helpers/stub-server.js'
+import { isolateGitConfig } from '../../core/test/helpers/git-isolation.js'
 import { builtCliPath } from './helpers/built-cli.js'
 import { outboxMayHaveEntries } from '../src/lib/hook-outbox-flush.js'
 
@@ -66,6 +67,11 @@ async function waitFor(pred: () => Promise<boolean>, timeoutMs = 5000): Promise<
 }
 
 describe('outbox flush from hooks and plur sync (#1269)', () => {
+  // `plur sync` commits, and the spawned CLI inherits process.env: give its
+  // git an identity (and no developer config), or `git commit` fails on CI
+  // runners that have no account name to fall back on.
+  isolateGitConfig()
+
   let root: string
   let project: string
   let store: string
