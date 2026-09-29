@@ -211,6 +211,12 @@ interface OpencodeReport {
   /** `mcp.plur` is present — the explicit `plur_*` tool surface. */
   mcpPlurDeclared: boolean
   /**
+   * Paths PLUR's own win32 node-form `mcp.plur` entry names that no longer
+   * exist — the version-specific node binary after a Node upgrade (#1339).
+   * `plur init` rewrites such an entry. Empty when healthy.
+   */
+  mcpPlurMissingPaths: string[]
+  /**
    * Whether the declared plugin will actually resolve when opencode starts.
    * This is the load-bearing check — a `pluginDeclared: true` entry that
    * cannot resolve is worthless and, worse, invisible to the user.
@@ -898,6 +904,7 @@ async function buildOpencodeReport(skipNetworkCheck: boolean): Promise<OpencodeR
     ok: snapshot.ok,
     pluginDeclared: snapshot.pluginDeclared,
     mcpPlurDeclared: snapshot.mcpPlurDeclared,
+    mcpPlurMissingPaths: snapshot.mcpPlurMissingPaths,
     pluginResolvable,
     resolvedVia,
   }
@@ -1200,6 +1207,12 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
     const oc = report.opencode
     outputText(`${tick(oc.pluginDeclared)} opencode: plugin declared (${oc.configPath})`)
     outputText(`${tick(oc.mcpPlurDeclared)} opencode: mcp.plur declared`)
+    if (oc.mcpPlurMissingPaths.length > 0) {
+      outputText('  ✗ opencode\'s mcp.plur points at a path that no longer exists:')
+      for (const m of oc.mcpPlurMissingPaths) outputText(`     ${m}`)
+      outputText('    The node binary path is version-specific, so a Node upgrade or a version-manager')
+      outputText('    switch breaks it. Fix: re-run `plur init`, which rewrites the entry.')
+    }
     if (!oc.ok) {
       outputText('  Config exists but PLUR could not safely read it — invalid JSON (JSONC comments')
       outputText('  and trailing commas are not supported here) or a `plugin`/`mcp` field in an')

@@ -517,16 +517,32 @@ export function isOwnWin32NodeEntry(entry: McpServerEntry): boolean {
  */
 export function missingNodeEntryPaths(entry: McpServerEntry): string[] {
   if (!isOwnWin32NodeEntry(entry)) return []
-  return [entry.command, entry.args[0]].filter((p) => !existsSync(p))
+  // A bare `node` / `node.exe` is resolved through PATH at spawn time, so
+  // existsSync on it says nothing about whether it runs (#1302).
+  const paths = isPathResolvedCommand(entry.command) ? [entry.args[0]] : [entry.command, entry.args[0]]
+  return paths.filter((p) => !existsSync(p))
+}
+
+/**
+ * A command with no path separator (`node`, `node.exe`) is looked up through
+ * PATH when it is spawned. PLUR itself always writes an absolute node path
+ * (`process.execPath`), so an entry naming a bare `node` was written by the
+ * user: it keeps working across Node upgrades, and init must never pin it to
+ * a version-specific path or replace it with the npx fallback (#1302, #1339).
+ */
+export function isPathResolvedCommand(command: string): boolean {
+  return !/[\\/]/.test(command)
 }
 
 /**
  * Does PLUR's own node-form entry need rewriting? Yes when the node binary or
  * the js entry it names is gone, or when the js entry differs from the one
  * `plur init` resolved this run (plur-mcp.meta.json). A working entry is left
- * alone when nothing resolves now.
+ * alone when nothing resolves now. A PATH-resolved `node` is the user's own
+ * choice and is never rewritten (#1302).
  */
 function nodeEntryNeedsHealing(entry: McpServerEntry): boolean {
+  if (isPathResolvedCommand(entry.command)) return false
   if (missingNodeEntryPaths(entry).length > 0) return true
   const resolvedNow = findMcpJsEntry()
   return resolvedNow !== null && !sameWin32Path(resolvedNow, entry.args[0])

@@ -84,7 +84,12 @@ twice** (#1267). Three separate faults:
   the fallback. Re-running init heals an existing `plur-mcp.cmd` entry that init
   wrote, and a node-form entry whose `node.exe` or js entry no longer exists
   (after a Node upgrade or a version-manager switch); `plur doctor` reports
-  such an entry as broken. A hand-written entry is never changed.
+  such an entry as broken. A hand-written entry is never changed. An entry
+  whose command is a bare `node` or `node.exe` is resolved through PATH, so
+  doctor never reports it as missing, and init neither pins it to the
+  version-specific node path nor replaces it with the npx fallback; this holds
+  for opencode's `mcp.plur` too. `plur doctor` now also reports an opencode
+  `mcp.plur` whose node path no longer exists (`opencode.mcpPlurMissingPaths`).
   Codex keeps its registration in `config.toml`, which init does not edit by
   hand: when that registration is exactly the old `plur-mcp.cmd` shim, re-running
   `plur init --codex` replaces it through `codex mcp remove` + `codex mcp add`,
