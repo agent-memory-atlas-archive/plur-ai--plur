@@ -44,11 +44,12 @@ describe('detectInjectionSignal — positive rules', () => {
     expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
   })
 
-  it('a paraphrase sharing 5 of 8 trigrams (62%) is not positive (#1365)', () => {
-    // "run the migration script before deploying the" holds five of the
-    // statement's eight trigrams; the rest of the reply is about something else.
-    const reply = 'I will run the migration script before deploying the new mailer.'
-    expect(detectInjectionSignal(STATEMENT, reply).signal).toBeNull()
+  it('a paraphrase sharing 4 or 5 of 7 trigrams (57%, 71%) is not positive (#1365)', () => {
+    // The statement has nine words, so seven trigrams. "run the migration
+    // script before deploying" holds four of them, "... deploying the" five;
+    // the rest of each reply is about something else.
+    expect(detectInjectionSignal(STATEMENT, 'I will run the migration script before deploying today.').signal).toBeNull()
+    expect(detectInjectionSignal(STATEMENT, 'I will run the migration script before deploying the new mailer.').signal).toBeNull()
   })
 
   it('an empty statement or reply yields nothing', () => {
@@ -207,6 +208,10 @@ describe('one rejected occurrence does not override a follow-through one (#1362)
       "Don't run the migration script now. " +
       'Later, run the migration script before deploying the billing services.'
     expect(detectInjectionSignal(STATEMENT, reply).signal).not.toBe('negative')
+  })
+
+  it('a negator ending the previous sentence does not negate the match (#1365)', () => {
+    expect(detectInjectionSignal('Use pnpm', 'I will not. Use pnpm.').signal).toBe('positive')
   })
 
   it('"Why not use pnpm?" recommends it, so it is not negative', () => {
