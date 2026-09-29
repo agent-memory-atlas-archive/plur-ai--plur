@@ -31,9 +31,12 @@ on the next flush, **with the same key**. The client does not look for the
 write on the server before retrying.
 
 Two local writers never push the same queued write at once. Before pushing,
-the client takes a claim on the write: a file created atomically, with a
-60-second lease. A stale claim is taken over by renaming a new claim file over
-it, so the claim is never absent during a takeover.
+the client takes a claim on the write: a file created atomically. A claim made
+on this machine is held for as long as its process is alive, however long the
+push takes (a hard cap of 15 minutes guards against a recycled process id); a
+claim from another machine sharing the store directory is held for a 60-second
+lease. A stale claim is taken over by renaming a new claim file over it, so the
+claim is never absent during a takeover.
 
 ## What the server does with the key
 

@@ -118,11 +118,13 @@ delivered. Now:
   before it is posted, so a flush whose local write-back fails afterwards
   still retries with the same key;
 - each queued write is *claimed* before it is pushed: a small file created
-  atomically, with a 60-second lease. So a flush and `learn()`'s own
-  background push, or two flushes, never push the same write at once. Before,
-  this race gave two server copies in half of the audit's runs. A stale claim
-  is taken over by renaming a new claim over it, so there is never a moment
-  with no claim for a second writer to slip into;
+  atomically. So a flush and `learn()`'s own background push, or two flushes,
+  never push the same write at once. Before, this race gave two server copies
+  in half of the audit's runs. A claim is held while the process that made it
+  is alive, however long its push runs, so a POST held open by a slow server
+  cannot be re-pushed by a second flusher (a 15-minute cap covers a recycled
+  process id). A stale claim is taken over by renaming a new claim over it, so
+  there is never a moment with no claim for a second writer to slip into;
 - on a key-honouring server every write is stored once. A server that
   ignores the key may see at most one duplicate per write, and no write is
   ever dropped.

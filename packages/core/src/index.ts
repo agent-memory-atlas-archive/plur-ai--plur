@@ -676,8 +676,21 @@ const REMOTE_GUARD_BUDGET_MS = 45_000
 
 const OUTBOX_ID_MAP_MAX = 5000
 
-/** How long a push claim is honoured: longer than one bounded request (30s). */
+/**
+ * How long a push claim is honoured when its owner is on ANOTHER host, whose
+ * pid cannot be checked: longer than one bounded request (30s). An owner on
+ * this host holds its claim while its process is alive (see
+ * `_outboxClaimHeld`).
+ */
 const OUTBOX_CLAIM_LEASE_MS = 60_000
+
+/**
+ * Hard cap on a live same-host owner's claim: far above one push's worst case
+ * (a 30s request plus the 180s store-lock wait before the merge-back), so it
+ * never cuts a real push short, but finite so a recycled pid cannot hold an
+ * entry forever.
+ */
+const OUTBOX_CLAIM_MAX_AGE_MS = 15 * 60_000
 
 /** Is this process still running? (`kill 0` probes without signalling.) */
 function pidAlive(pid: number): boolean {
@@ -4609,19 +4622,15 @@ export class Plur {
       fs.mkdirSync(this.outboxClaimsDir(), { recursive: true })
       const stale = readRaw()
       if (stale !== undefined) {
-        let held: { key?: string; pid?: number; host?: string; until?: number } = {}
+        let held: { key?: string; pid?: number; host?: string; until?: number; at?: number } = {}
         try { held = JSON.parse(stale) } catch { /* unreadable: lapsed */ }
-        const now = Date.now()
-        const leaseLive = typeof held.until === 'number' && held.until > now
-          // A lease dated implausibly far ahead is clock skew, not a live writer.
-          && held.until - now <= 2 * OUTBOX_CLAIM_LEASE_MS
-        const ownerLive = held.host !== hostname() || (typeof held.pid === 'number' && pidAlive(held.pid))
-        if (leaseLive && ownerLive) return { status: 'busy' }
+        if (this._outboxClaimHeld(held, Date.now())) return { status: 'busy' }
       }
       const key = keyFor()
       const token = randomUUID()
+      const at = Date.now()
       const body = JSON.stringify({
-        key, token, pid: process.pid, host: hostname(), until: Date.now() + OUTBOX_CLAIM_LEASE_MS,
+        key, token, pid: process.pid, host: hostname(), at, until: at + OUTBOX_CLAIM_LEASE_MS,
       })
       if (stale === undefined) {
         fs.writeFileSync(path, body, { flag: 'wx' }) // EEXIST: someone else got it first
@@ -4645,6 +4654,37 @@ export class Plur {
       logger.warning(`[plur:outbox] could not record a push claim for ${id}: ${(err as Error).message}`)
       return { status: 'claimed', key: keyFor() }
     }
+  }
+
+  /**
+   * Is this claim still held by a live writer?
+   *
+   * - **Owner on this host:** held while its process is alive, however long
+   *   its push runs. The lease is NOT the bound here: a POST held open past
+   *   it by a slow but alive server would otherwise let a second flusher
+   *   take the claim over and re-push the same entry. A dead owner's claim is
+   *   stale at once. A hard age cap ({@link OUTBOX_CLAIM_MAX_AGE_MS}) still
+   *   applies, so a recycled pid cannot block an entry forever.
+   * - **Owner on another host** (a shared store directory): its pid cannot be
+   *   checked, so the lease decides.
+   *
+   * A timestamp dated implausibly far ahead is clock skew, not a live writer.
+   */
+  private _outboxClaimHeld(
+    held: { pid?: number; host?: string; until?: number; at?: number },
+    now: number,
+  ): boolean {
+    if (held.host === hostname()) {
+      if (typeof held.pid !== 'number' || !pidAlive(held.pid)) return false
+      const at = typeof held.at === 'number'
+        ? held.at
+        : typeof held.until === 'number' ? held.until - OUTBOX_CLAIM_LEASE_MS : undefined
+      if (at === undefined) return false
+      const age = now - at
+      return age >= -OUTBOX_CLAIM_LEASE_MS && age < OUTBOX_CLAIM_MAX_AGE_MS
+    }
+    return typeof held.until === 'number' && held.until > now
+      && held.until - now <= 2 * OUTBOX_CLAIM_LEASE_MS
   }
 
   /** Release a claim this process holds. Never throws. */

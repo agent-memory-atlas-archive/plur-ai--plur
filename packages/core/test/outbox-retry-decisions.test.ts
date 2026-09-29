@@ -14,9 +14,10 @@
  * Real-HTTP stub, temp store and HOME only.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'fs'
 import { join } from 'path'
 import { tmpdir, hostname } from 'os'
+import { spawnSync } from 'child_process'
 import yaml from 'js-yaml'
 import { Plur } from '../src/index.js'
 import { StubServer } from './helpers/stub-server.js'
@@ -75,8 +76,10 @@ describe('outbox decisions C3 and C4', () => {
     const id = 'ENG-2026-09-29-900'
     const claimPath = join(dir, 'cache', 'outbox-claims', `${id}.json`)
     mkdirSync(join(dir, 'cache', 'outbox-claims'), { recursive: true })
-    // A stale claim: lease long expired.
-    writeFileSync(claimPath, JSON.stringify({ key: 'k-stale', pid: process.pid, host: hostname(), until: Date.now() - 60_000 }))
+    // A stale claim: its owner process has exited (a live same-host owner
+    // keeps its claim however long its push runs).
+    const deadPid = spawnSync(process.execPath, ['-e', '']).pid
+    writeFileSync(claimPath, JSON.stringify({ key: 'k-stale', pid: deadPid, host: hostname(), until: Date.now() - 60_000 }))
 
     // A second claimer arrives while the first is mid-takeover.
     let nested: any
@@ -92,6 +95,51 @@ describe('outbox decisions C3 and C4', () => {
     expect(pathPresentMidTakeover, 'the takeover left the claim path empty').toBe(true)
     // …and never do both win.
     expect([outer.status, nested.status].filter(s => s === 'claimed')).toHaveLength(1)
+  })
+
+  it('C3: a POST held open past the claim lease is not re-pushed by a concurrent flush while its owner is alive', async () => {
+    const plur = new Plur({ path: dir })
+    await queue(plur, 'Held open past the lease')
+    const claimPath = join(dir, 'cache', 'outbox-claims')
+
+    // Flush A: its POST is held open by a slow (but alive) server.
+    server.appendDelayMs = 2_000
+    const a = plur.flushOutbox()
+    const until = Date.now() + 5_000
+    let file: string | undefined
+    while (!file && Date.now() < until) {
+      try { file = readdirSync(claimPath).find(f => f.endsWith('.json')) } catch { /* not yet */ }
+      if (!file) await new Promise(r => setTimeout(r, 10))
+    }
+    expect(file, 'flush A never claimed the entry').toBeDefined()
+    while (server.appendKeys.length === 0 && Date.now() < until) await new Promise(r => setTimeout(r, 10))
+    expect(server.appendKeys).toHaveLength(1)
+
+    // Time passes beyond the old 60s lease while A's POST is still open.
+    const claim = JSON.parse(readFileSync(join(claimPath, file!), 'utf8'))
+    claim.until = Date.now() - 1_000
+    writeFileSync(join(claimPath, file!), JSON.stringify(claim))
+
+    // Flush B, same live process: must leave the entry to A.
+    const b = await new Plur({ path: dir }).flushOutbox()
+    expect(b.flushed).toBe(0)
+    expect(server.appendKeys, 'a second flusher re-pushed the same entry').toHaveLength(1)
+
+    await a
+    expect(server.engramCount).toBe(1)
+    expect(await plur.outboxCount()).toBe(0)
+  })
+
+  it('C3: a live-owner claim still lapses after the hard age cap (pid reuse cannot block an entry forever)', async () => {
+    const plur = new Plur({ path: dir }) as any
+    const id = 'ENG-2026-09-29-901'
+    const claimsDir = join(dir, 'cache', 'outbox-claims')
+    mkdirSync(claimsDir, { recursive: true })
+    const old = Date.now() - 16 * 60_000
+    writeFileSync(join(claimsDir, `${id}.json`), JSON.stringify({
+      key: 'k', pid: process.pid, host: hostname(), at: old, until: old + 60_000,
+    }))
+    expect(plur._claimOutboxEntry(id, () => 'k2').status).toBe('claimed')
   })
 
   // ---- C4 -----------------------------------------------------------------
