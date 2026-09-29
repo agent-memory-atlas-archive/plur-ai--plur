@@ -66,19 +66,41 @@ describe('plur init --codex leaves a shim entry with extra settings alone (#1366
   })
   afterEach(() => { rmSync(home, { recursive: true, force: true }) })
 
-  it.each(SHAPES)('does not remove + re-add %s', (_label, toml) => {
-    mkdirSync(join(home, '.codex'), { recursive: true })
-    writeFileSync(join(home, '.codex', 'config.toml'), toml)
+  function run(args: string[]): string {
     try {
-      execFileSync(process.execPath, ['--import', WIN32_PRELOAD, CLI, 'init', '--global', '--no-desktop', '--no-cursor', '--no-antigravity', '--no-opencode', '--codex', '--no-prompt'], {
+      return execFileSync(process.execPath, ['--import', WIN32_PRELOAD, CLI, ...args], {
         encoding: 'utf-8', timeout: 30000, cwd: home,
         env: { ...isolatedHomeEnv(home), PATH: `${bin}:${process.env.PATH}` },
       })
-    } catch { /* the assertions below say what happened */ }
+    } catch (err: any) { return err.stdout?.toString() ?? '' }
+  }
+
+  it.each(SHAPES)('does not remove + re-add %s, and prints the lines to change by hand', (_label, toml) => {
+    mkdirSync(join(home, '.codex'), { recursive: true })
+    writeFileSync(join(home, '.codex', 'config.toml'), toml)
+    const out = run(['init', '--global', '--no-desktop', '--no-cursor', '--no-antigravity', '--no-opencode', '--codex', '--no-prompt'])
     const calls = existsSync(log) ? readFileSync(log, 'utf-8') : ''
     expect(calls).toContain('mcp list')
     expect(calls).not.toContain('mcp remove')
     expect(calls).not.toContain('mcp add')
     expect(readFileSync(join(home, '.codex', 'config.toml'), 'utf-8')).toBe(toml)
+    // Refs #1366 (re-review): the refusal names the fault and the manual fix.
+    expect(out).toContain('old plur-mcp.cmd entry, which fails to start (spawn EINVAL)')
+    expect(out).toMatch(/under \[mcp_servers\.plur\], replace the command and args lines with\s+command = /)
+    expect(out).toContain('keep every other setting (env included)')
+  })
+
+  it.each(SHAPES)('doctor still flags %s as the broken shim (codexCmdShimMcp, not wired)', (_label, toml) => {
+    mkdirSync(join(home, '.codex'), { recursive: true })
+    writeFileSync(join(home, '.codex', 'config.toml'), toml)
+    const report = JSON.parse(run(['doctor', '--no-handshake', '--json']))
+    expect(report.codexCmdShimMcp).toBe(true)
+    expect(report.codexWired).toBe(false)
+  })
+
+  it('doctor does not flag a custom command that merely has env', () => {
+    mkdirSync(join(home, '.codex'), { recursive: true })
+    writeFileSync(join(home, '.codex', 'config.toml'), `[mcp_servers.plur]\ncommand = 'C:\\custom\\run-plur.cmd'\n\n[mcp_servers.plur.env]\nPLUR_PATH = "D:/memory"\n`)
+    expect(JSON.parse(run(['doctor', '--no-handshake', '--json'])).codexCmdShimMcp).toBe(false)
   })
 })

@@ -470,9 +470,37 @@ export function healPlurMcpEntry(config: Record<string, unknown>, opts?: { env?:
  * the user's and is never touched.
  */
 export function isOwnWin32CmdShimEntry(entry: McpServerEntry): boolean {
+  return isOwnWin32CmdShimCommand(entry.command ?? '') && (entry.args ?? []).length === 0
+}
+
+/**
+ * Is this command PLUR's old Windows `plur-mcp.cmd` shim? The detection half
+ * of `isOwnWin32CmdShimEntry`, without the "nothing else in the entry" rule
+ * that only the automatic heal needs: whatever else the entry carries, that
+ * command cannot start (`spawn EINVAL`), so `plur doctor` flags it (#1366).
+ */
+export function isOwnWin32CmdShimCommand(command: string): boolean {
   if (platform() !== 'win32') return false
-  const cmd = (entry.command ?? '').replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
-  return cmd.endsWith('/.plur/bin/plur-mcp.cmd') && (entry.args ?? []).length === 0
+  return command.replace(/\\/g, '/').replace(/"/g, '').toLowerCase().endsWith('/.plur/bin/plur-mcp.cmd')
+}
+
+/**
+ * The `command` of the `[mcp_servers.plur]` table in Codex's config.toml, or
+ * null. Lenient where `readCodexPlurMcpEntry` is strict: other keys,
+ * subtables and multi-line arrays in the table are ignored. For detection
+ * only (doctor's `codexCmdShimMcp`, init's refusal message), never to decide
+ * that an entry is safe to remove and re-add (#1366).
+ */
+export function readCodexPlurMcpCommand(toml: string): string | null {
+  const lines = toml.split(/\r?\n/)
+  const start = lines.findIndex((l) => /^\s*\[mcp_servers\.plur\]\s*(#.*)?$/.test(l))
+  if (start === -1) return null
+  for (const line of lines.slice(start + 1)) {
+    if (/^\s*\[/.test(line)) break
+    const m = /^\s*command\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/.exec(line)
+    if (m) return m[2] !== undefined ? m[2] : m[1].replace(/\\(["\\])/g, '$1')
+  }
+  return null
 }
 
 /**

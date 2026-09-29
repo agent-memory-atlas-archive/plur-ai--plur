@@ -20,7 +20,7 @@ import { hasPlurCursorHooks, readCursorHooksConfig } from '../cursor-hooks.js'
 import { isPlurHookCommand, isPlurHookSpec } from '../lib/hook-command.js'
 import { hasPlurCodexHooks, readCodexHooksConfig } from '../codex-hooks.js'
 import { hasPlurAgyHooks, readAgyHooksConfig } from '../antigravity-hooks.js'
-import { codexHome, missingNodeEntryPaths, readCodexPlurMcpEntry, isOwnWin32CmdShimEntry } from '../mcp-config.js'
+import { codexHome, missingNodeEntryPaths, readCodexPlurMcpCommand, isOwnWin32CmdShimCommand } from '../mcp-config.js'
 import { opencodeConfigDir, opencodeConfigPath, readOpencodeConfig, PLUR_OPENCODE_PLUGIN } from '../opencode-config.js'
 import { computeContentHash, detectPlurStorage, loadEngrams, resolveBackendTier, loadConfig } from '@plur-ai/core'
 
@@ -1001,12 +1001,14 @@ function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<Doctor
   const codexHooksReport = configs.find((c) => c.label === 'Codex (~/.codex/hooks.json)')
   const codexTomlReport = configs.find((c) => c.label === 'Codex (~/.codex/config.toml)')
   // The `plur-mcp.cmd` entry an older init wrote on Windows is registered but
-  // cannot start (spawn EINVAL, #1267). Only PLUR's own entry is matched.
+  // cannot start (spawn EINVAL, #1267). Only PLUR's own shim command is
+  // matched, whatever else the entry carries (env, other keys, args): it
+  // fails either way, even when init will not heal it automatically (#1366).
   let codexCmdShimMcp = false
   if (codexTomlReport?.exists && codexTomlReport.hasPlurMcp) {
     try {
-      const entry = readCodexPlurMcpEntry(readFileSync(codexTomlReport.path, 'utf8'))
-      codexCmdShimMcp = entry !== null && isOwnWin32CmdShimEntry(entry)
+      const command = readCodexPlurMcpCommand(readFileSync(codexTomlReport.path, 'utf8'))
+      codexCmdShimMcp = command !== null && isOwnWin32CmdShimCommand(command)
     } catch { /* unreadable — nothing to flag */ }
   }
   const codexWired = Boolean(
@@ -1182,8 +1184,10 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
     outputText(`${tick(report.codexWired)} Codex: ~/.codex/hooks.json + config.toml wired to plur`)
     if (report.codexCmdShimMcp) {
       outputText('  config.toml registers the old ~/.plur/bin/plur-mcp.cmd shim, which current Node')
-      outputText('  cannot start (spawn EINVAL). Fix: run `plur init --codex` — it replaces the entry')
-      outputText('  through `codex mcp remove` + `codex mcp add`.')
+      outputText('  cannot start (spawn EINVAL). Fix: run `plur init --codex`. It replaces a plain entry')
+      outputText('  through `codex mcp remove` + `codex mcp add`; an entry that also carries other settings')
+      outputText('  (env, other keys, a multi-line args array) is left alone, and init prints the command')
+      outputText('  and args lines to change by hand so those settings are kept.')
     } else if (!report.codexWired) {
       outputText('  Codex is installed on this machine but PLUR is not wired into it — it')
       outputText('  would get MCP tools with no injection, enforcement, or learn nudges.')

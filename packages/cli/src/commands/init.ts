@@ -32,7 +32,9 @@ import {
   codexHooksConfigPath,
   codexConfigTomlPath,
   readCodexPlurMcpEntry,
+  readCodexPlurMcpCommand,
   isOwnWin32CmdShimEntry,
+  isOwnWin32CmdShimCommand,
   agyConfigDir,
   agyHooksConfigPath,
   agyMcpConfigPath,
@@ -962,6 +964,21 @@ function installCodexMcp(): string {
     // shim path and no args. Anything else is the user's.
     const existing = readCodexPlurMcpEntry(toml)
     if (!existing || !isOwnWin32CmdShimEntry(existing)) {
+      // The shim command with anything else in the entry (env, other keys, a
+      // multi-line args array): still broken, but `codex mcp add` would drop
+      // those settings — a lost PLUR_PATH moves the user's memory to the
+      // default store — so say what to change by hand instead (#1366).
+      const command = readCodexPlurMcpCommand(toml)
+      if (command !== null && isOwnWin32CmdShimCommand(command)) {
+        const lit = (v: string) => (v.includes("'") ? JSON.stringify(v) : `'${v}'`)
+        return 'already registered with the old plur-mcp.cmd entry, which fails to start (spawn EINVAL). ' +
+          'The entry also carries other settings (env, other keys or a multi-line args array) that ' +
+          '`codex mcp remove` + `codex mcp add` would drop, so init left it alone. Fix by hand: in ' +
+          `${codexConfigTomlPath()}, under [mcp_servers.plur], replace the command and args lines with\n` +
+          `    command = ${lit(entry.command)}\n` +
+          `    args = [${entry.args.map(lit).join(', ')}]\n` +
+          '  and keep every other setting (env included)'
+      }
       return 'already registered (run `codex mcp remove plur` first if you need to re-point it)'
     }
     try {
