@@ -53,6 +53,7 @@ import { resolveValidity, buildTemporal, normalizeIsoDate, type ResolvedValidity
 import { isCurrentlyValid } from './validity.js'
 import { decodeJwtExpiry, decodeJwtPayload } from './jwt.js'
 import { RemoteStore, normalizeEndpointUrl } from './store/remote-store.js'
+import { redactToken, containsToken } from './redact-token.js'
 import {
   remoteRecall, isRemoteRecallDisabled, resolveRemoteRecallTimeoutMs, scopeOrg,
   REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES,
@@ -365,6 +366,7 @@ export {
 // so CLI surfaces (login --status) compare hosts the same way the core does.
 export { decodeJwtExpiry, decodeJwtPayload, type JwtExpiry } from './jwt.js'
 export { normalizeEndpointUrl } from './store/remote-store.js'
+export { redactToken, redactTokenDeep, containsToken, tokenForms } from './redact-token.js'
 
 export * from './types.js'
 
@@ -9253,7 +9255,8 @@ Generate an improved version of the procedure that prevents this failure. Return
   }): Promise<{ status: 'added' | 'already_registered' | 'token_rotated' | 'overwritten'; scope: string; username?: string; authorised: string[] }> {
     const { url, token, scope } = opts
     const timeoutMs = opts.timeoutMs ?? 5000
-    const scrub = (msg: string) => (token ? msg.split(token).join('[redacted]') : msg)
+    // Every encoding of the token, not only the exact string (audit of #1272).
+    const scrub = (msg: string) => redactToken(msg, token)
     let parsed: URL | undefined
     try { parsed = new URL(url) } catch { /* handled below */ }
     if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
@@ -9281,12 +9284,21 @@ Generate an improved version of the procedure that prevents this failure. Return
       }
       throw new AddRemoteStoreError('unreachable', `could not verify the token against ${url}: ${msg}`)
     }
-    if (!me.scopes.includes(scope)) {
+    // The /me answer is the server's, not ours: re-apply the strict scope
+    // grammar and drop any scope that carries the token in any encoding, so a
+    // buggy or hostile server cannot get the token printed through the
+    // `authorised` list or the username (audit of #1272).
+    const authorised = me.scopes.filter(s =>
+      typeof s === 'string' && s.length <= 256 && /^[\w:./-]+$/.test(s) && !containsToken(s, token))
+    const withheld = me.scopes.length - authorised.length
+    const username = me.username && !containsToken(me.username, token) ? me.username : undefined
+    if (!authorised.includes(scope)) {
       throw new AddRemoteStoreError(
         'scope_not_authorised',
         `the token is not authorised for scope "${scope}" on ${url}. ` +
-        `Authorised: ${me.scopes.length ? me.scopes.join(', ') : '(none)'}`,
-        me.scopes,
+        `Authorised: ${authorised.length ? authorised.join(', ') : '(none)'}` +
+        (withheld ? ` (${withheld} withheld: malformed or carrying the token)` : ''),
+        authorised,
       )
     }
     // Scope held by a different store: refuse here, as a typed error, unless
@@ -9303,7 +9315,7 @@ Generate an improved version of the procedure that prevents this failure. Return
           'scope_conflict',
           `scope "${scope}" is already registered to a different store (${scrub(String(other.url ?? other.path))}). ` +
           `Nothing was changed; pass overwriteScope to replace that entry.`,
-          me.scopes,
+          authorised,
         )
       }
     }
@@ -9311,7 +9323,7 @@ Generate an improved version of the procedure that prevents this failure. Return
       url, token, shared: opts.shared, readonly: opts.readonly,
       ...(opts.overwriteScope === true ? { overwriteScope: true } : {}),
     })
-    return { status, scope, ...(me.username ? { username: me.username } : {}), authorised: me.scopes }
+    return { status, scope, ...(username ? { username } : {}), authorised }
   }
 
   /**
