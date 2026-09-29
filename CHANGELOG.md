@@ -59,7 +59,11 @@ twice** (#1267). Three separate faults:
     the CLI's js entry plus the subcommand. Exec form arrived in Claude Code
     2.1.139, so init reads `claude --version`: an older Claude Code gets the
     unquoted short-path string below instead, and so does one whose version
-    cannot be read, unless that string would need the fallback.
+    cannot be read, unless that string would need the fallback. The exec
+    form names the node binary that ran init (`process.execPath`), which is
+    version-specific: after a Node upgrade or a version-manager switch these
+    hooks point at a missing `node.exe` until you re-run `plur init`, which
+    rewrites them.
   - **Codex, Cursor and Antigravity** hooks are one unquoted string with
     forward slashes. When the path contains a space, init uses its Windows
     8.3 short name (`C:/Users/TESTUS~1/...`). If the volume has no short
@@ -69,6 +73,9 @@ twice** (#1267). Three separate faults:
   - A Windows CI job (`Windows init hooks`) runs `plur init` into a home with
     a space and executes every generated hook through `bash -c`,
     `pwsh -NoProfile -Command` and `cmd /C`, checking each one reached the CLI.
+    It then runs `plur init` again and fails if any editor's hook count
+    changed, or if `plur doctor` does not report PLUR's hooks in each editor's
+    hooks file.
 
   macOS/Linux output is unchanged: the path is quoted only when it contains
   whitespace, and a path without one is written byte-for-byte as before
@@ -77,7 +84,11 @@ twice** (#1267). Three separate faults:
   `.plur/bin/plur-hook` with forward slashes only, so every re-run on Windows
   appended another hook set. It now normalises slashes, quotes and case, and
   claims a hook when PLUR's own launcher — the shim, the `npx @plur-ai/cli`
-  fallback, or the Claude Code exec form — runs any `hook-*` subcommand. There
+  fallback, or the Claude Code exec form — runs any `hook-*` subcommand. The
+  shim also counts under its 8.3 short path, where Windows shortens the file
+  name too (`.../PLUR~1/bin/PLUR-H~1.CMD`); the short alias is claimed only
+  inside PLUR's own bin directory. Re-running init therefore leaves the hook
+  count of every editor unchanged, with or without short names. There
   is no subcommand list to keep up to date, so a new hook never duplicates on
   re-init. Re-run `plur init` once: it removes the duplicated, unquoted hooks
   older versions wrote and leaves exactly one set per event. Your own hooks are
@@ -101,11 +112,15 @@ twice** (#1267). Three separate faults:
   for opencode's `mcp.plur` too. `plur doctor` now also reports an opencode
   `mcp.plur` whose node path no longer exists (`opencode.mcpPlurMissingPaths`).
   Codex keeps its registration in `config.toml`, which init does not edit by
-  hand: when that registration is exactly the old `plur-mcp.cmd` shim, re-running
-  `plur init --codex` replaces it through `codex mcp remove` + `codex mcp add`,
-  and `plur doctor` flags it (`codexCmdShimMcp`) until then. A registration that
-  also carries an `env` (inline or as a subtable), another key, or a multi-line
-  `args` array is left alone, because the re-add would drop those settings.
+  hand. `plur doctor` flags any registration whose command is the old
+  `plur-mcp.cmd` shim (`codexCmdShimMcp`, and Codex is not reported as wired),
+  since it cannot start. When the registration is exactly that shim and
+  nothing else, re-running `plur init --codex` replaces it through
+  `codex mcp remove` + `codex mcp add`. A registration that also carries an
+  `env` (inline or as a subtable), another key, or a multi-line `args` array is
+  left alone, because the re-add would drop those settings: init says the
+  entry fails to start and prints the `command` and `args` lines to set by
+  hand under `[mcp_servers.plur]`, keeping everything else, env included.
 - The warning about committing `.cursor/hooks.json` with a machine-local path
   fires again when that path is quoted, and `plur init --no-opencode` now says
   it skipped opencode because of the flag.
