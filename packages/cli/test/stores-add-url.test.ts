@@ -187,6 +187,32 @@ describe('plur stores add --url (#1265)', () => {
     expect(existsSync(storeFile)).toBe(true)
   }, TEST_TIMEOUT_MS)
 
+  it('scope registered to a different store: exit 1 naming --overwrite-scope, config unchanged', async () => {
+    writeFileSync(join(plurDir, 'config.yaml'),
+      `embeddings:\n  enabled: false\nstores:\n  - path: "${join(root, 'team.yaml')}"\n    scope: "${SCOPE}"\n`)
+    const before = configText()
+    const r = await cli(['stores', 'add', '--url', baseUrl, '--token', TOKEN, '--scope', SCOPE])
+    expect(r.status).toBe(1)
+    expect(r.stdout + r.stderr).toContain('--overwrite-scope')
+    expect(r.stdout + r.stderr).not.toContain('overwriteScope: true')
+    expect(configText()).toBe(before)
+  }, TEST_TIMEOUT_MS)
+
+  it('--overwrite-scope reassigns the scope after verification', async () => {
+    writeFileSync(join(plurDir, 'config.yaml'),
+      `embeddings:\n  enabled: false\nstores:\n  - path: "${join(root, 'team.yaml')}"\n    scope: "${SCOPE}"\n`)
+    const r = await cli(['stores', 'add', '--url', baseUrl, '--token', TOKEN, '--scope', SCOPE, '--overwrite-scope', '--json'])
+    expect(r.status, r.stderr).toBe(0)
+    expect(JSON.parse(r.stdout)).toMatchObject({ success: true, status: 'overwritten', scope: SCOPE })
+    expect(configText()).toContain(baseUrl)
+    expect(configText()).not.toContain('team.yaml')
+    // A rejected token with the flag still writes nothing.
+    const after = configText()
+    const bad = await cli(['stores', 'add', '--url', 'http://127.0.0.1:1', '--token', 'wrong-token-SECRET-88', '--scope', SCOPE, '--overwrite-scope'])
+    expect(bad.status).toBe(1)
+    expect(configText()).toBe(after)
+  }, TEST_TIMEOUT_MS)
+
   it('discover empty state points at the new --url form', async () => {
     const out = await inProcess(['discover'])
     expect(out).toContain('plur stores add --url')

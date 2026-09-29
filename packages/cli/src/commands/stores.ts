@@ -3,7 +3,7 @@ import { AddRemoteStoreError } from '@plur-ai/core'
 import { shouldOutputJson, outputJson, outputText, outputInfo, exit } from '../output.js'
 
 const REMOTE_USAGE =
-  'Usage: plur stores add --url <url> --scope <scope> (--token <token> | --token-env <VAR> | --token -)'
+  'Usage: plur stores add --url <url> --scope <scope> (--token <token> | --token-env <VAR> | --token -) [--overwrite-scope]'
 
 /** Value following `name` in args, or undefined. A flag present with no value
  *  (or followed by another flag) yields '' so the caller can refuse it. */
@@ -52,12 +52,20 @@ async function addRemote(args: string[], plur: ReturnType<typeof createPlur>, fl
   const readonly = args.includes('--readonly')
   let result: Awaited<ReturnType<typeof plur.addRemoteStore>>
   try {
-    result = await plur.addRemoteStore({ url: url!, token, scope: scope!, ...(readonly ? { readonly } : {}) })
+    result = await plur.addRemoteStore({
+      url: url!, token, scope: scope!,
+      ...(readonly ? { readonly } : {}),
+      ...(args.includes('--overwrite-scope') ? { overwriteScope: true } : {}),
+    })
   } catch (err) {
     // AddRemoteStoreError messages are already token-free; anything else (an
     // addStore scope conflict, a write failure) is scrubbed here as well.
     const raw = err instanceof Error ? err.message : String(err)
-    const msg = raw.split(token).join('[redacted]')
+    let msg = raw.split(token).join('[redacted]')
+    // Core names its option; a CLI user needs the flag (review of #1272).
+    if (err instanceof AddRemoteStoreError && err.code === 'scope_conflict') {
+      msg = msg.replace('pass overwriteScope to replace that entry', 're-run with --overwrite-scope to replace that entry')
+    }
     const code = err instanceof AddRemoteStoreError ? err.code : 'error'
     if (shouldOutputJson(flags)) {
       outputJson({

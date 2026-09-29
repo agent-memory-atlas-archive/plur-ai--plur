@@ -127,4 +127,36 @@ describe('Plur.addRemoteStore (#1265)', () => {
     }
     expect(existsSync(join(dir, 'config.yaml'))).toBe(true)
   })
+
+  describe('scope already registered to a different store', () => {
+    const seedConflict = () => writeFileSync(join(dir, 'config.yaml'), yaml.dump({
+      index: false, stores: [{ path: join(dir, 'team.yaml'), scope: SCOPE, shared: false, readonly: false }],
+    }))
+
+    it('refuses without overwriteScope, naming the option, and writes nothing', async () => {
+      seedConflict()
+      const before = configText()
+      const err = await new Plur({ path: dir }).addRemoteStore({ url: baseUrl, token: TOKEN, scope: SCOPE }).catch(e => e)
+      expect(err).toMatchObject({ code: 'scope_conflict' })
+      expect(err.message).toContain('overwriteScope')
+      expect(err.message).not.toContain(TOKEN)
+      expect(configText()).toBe(before)
+    })
+
+    it('with overwriteScope, reassigns the scope after /me verifies', async () => {
+      seedConflict()
+      const r = await new Plur({ path: dir }).addRemoteStore({ url: baseUrl, token: TOKEN, scope: SCOPE, overwriteScope: true })
+      expect(r.status).toBe('overwritten')
+      const stores = (yaml.load(configText()) as { stores: Array<{ url?: string; path?: string; scope: string }> }).stores
+      expect(stores.filter(s => s.scope === SCOPE)).toEqual([expect.objectContaining({ url: baseUrl, token: TOKEN })])
+    })
+
+    it('with overwriteScope but a rejected token, the existing entry is untouched', async () => {
+      seedConflict()
+      const before = configText()
+      await expect(new Plur({ path: dir }).addRemoteStore({ url: baseUrl, token: 'nope-token', scope: SCOPE, overwriteScope: true }))
+        .rejects.toMatchObject({ code: 'auth_rejected' })
+      expect(configText()).toBe(before)
+    })
+  })
 })

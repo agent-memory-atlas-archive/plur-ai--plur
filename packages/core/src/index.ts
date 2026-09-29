@@ -917,7 +917,7 @@ export {
  *  callers; `message` never contains the token. */
 export class AddRemoteStoreError extends Error {
   constructor(
-    readonly code: 'invalid_url' | 'missing_token' | 'missing_scope' | 'auth_rejected' | 'unreachable' | 'scope_not_authorised',
+    readonly code: 'invalid_url' | 'missing_token' | 'missing_scope' | 'auth_rejected' | 'unreachable' | 'scope_not_authorised' | 'scope_conflict',
     message: string,
     readonly authorised: string[] = [],
   ) {
@@ -9246,6 +9246,10 @@ Generate an improved version of the procedure that prevents this failure. Return
   async addRemoteStore(opts: {
     url: string; token: string; scope: string
     shared?: boolean; readonly?: boolean; timeoutMs?: number
+    /** Replace an entry that already holds `scope` for a DIFFERENT store.
+     *  Never implied: without it such a conflict is refused (code
+     *  `scope_conflict`). Applied only after /me has verified the token. */
+    overwriteScope?: boolean
   }): Promise<{ status: 'added' | 'already_registered' | 'token_rotated' | 'overwritten'; scope: string; username?: string; authorised: string[] }> {
     const { url, token, scope } = opts
     const timeoutMs = opts.timeoutMs ?? 5000
@@ -9285,8 +9289,27 @@ Generate an improved version of the procedure that prevents this failure. Return
         me.scopes,
       )
     }
+    // Scope held by a different store: refuse here, as a typed error, unless
+    // the caller asked to replace it. Mirrors addStore's identity rule (a
+    // normalized url+scope match is the SAME entry, not a conflict).
+    if (opts.overwriteScope !== true) {
+      this.reloadConfigIfChanged()
+      const stores = loadConfig(this.paths.config).stores ?? []
+      const same = stores.some(s => s.url !== undefined && s.scope === scope &&
+        normalizeEndpointUrl(s.url) === normalizeEndpointUrl(url))
+      const other = same ? undefined : stores.find(s => s.scope === scope)
+      if (other) {
+        throw new AddRemoteStoreError(
+          'scope_conflict',
+          `scope "${scope}" is already registered to a different store (${scrub(String(other.url ?? other.path))}). ` +
+          `Nothing was changed; pass overwriteScope to replace that entry.`,
+          me.scopes,
+        )
+      }
+    }
     const { status } = this.addStore('', scope, {
       url, token, shared: opts.shared, readonly: opts.readonly,
+      ...(opts.overwriteScope === true ? { overwriteScope: true } : {}),
     })
     return { status, scope, ...(me.username ? { username: me.username } : {}), authorised: me.scopes }
   }
