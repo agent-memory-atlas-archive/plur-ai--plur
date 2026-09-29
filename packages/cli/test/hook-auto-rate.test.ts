@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import yaml from 'js-yaml'
+import { loadEngrams } from '@plur-ai/core'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
 
@@ -57,8 +57,7 @@ function cli(e: Env, args: string[], input: unknown, extraEnv: Record<string, st
 }
 
 function engrams(e: Env): Array<Record<string, any>> {
-  const doc = yaml.load(readFileSync(join(e.plurPath, 'engrams.yaml'), 'utf8')) as { engrams?: any[] }
-  return doc?.engrams ?? []
+  return loadEngrams(join(e.plurPath, 'engrams.yaml')) as Array<Record<string, any>>
 }
 
 function history(e: Env): Array<Record<string, any>> {

@@ -16,10 +16,9 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { spawn, spawnSync } from 'child_process'
-import yaml from 'js-yaml'
 import { StubServer } from '../../core/test/helpers/stub-server.js'
 import { RemoteStore } from '../../core/src/store/remote-store.js'
-import { namespaceEngramId } from '../../core/src/engrams.js'
+import { namespaceEngramId, loadEngrams } from '../../core/src/engrams.js'
 import { builtCliPath } from './helpers/built-cli.js'
 
 const CLI = builtCliPath(join(__dirname, '..'))
@@ -54,7 +53,8 @@ describe('hook-auto-rate × remote store (#1318 review)', () => {
     mkdirSync(join(root, '.plur'), { recursive: true })
     writeFileSync(join(project, '.plur.yaml'), '# test project\n')
     writeFileSync(join(root, '.plur', 'engrams.yaml'), 'engrams: []\n')
-    writeFileSync(join(root, '.plur', 'config.yaml'), yaml.dump({
+    // JSON is valid YAML, so config.yaml needs no YAML serializer here.
+    writeFileSync(join(root, '.plur', 'config.yaml'), JSON.stringify({
       embeddings: { enabled: false },
       stores: [{ url: baseUrl, token: TOKEN, scope: SCOPE, readonly: false }],
       index: false,
@@ -120,8 +120,8 @@ describe('hook-auto-rate × remote store (#1318 review)', () => {
     server.feedbackDelayMs = 15_000 // the remote rating hangs past the watchdog
     const learn = spawnSync(process.execPath, [CLI, 'learn', LOCAL_STATEMENT, '--scope', 'global'], { env, cwd: project, encoding: 'utf8' })
     expect(learn.status, learn.stderr).toBe(0)
-    const localId = (yaml.load(readFileSync(join(root, '.plur', 'engrams.yaml'), 'utf8')) as any).engrams
-      .find((e: any) => e.statement === LOCAL_STATEMENT).id
+    const localId = loadEngrams(join(root, '.plur', 'engrams.yaml'))
+      .find(e => e.statement === LOCAL_STATEMENT)!.id
     injected('r-3', [localId, remoteId])
     const reply = `Done. ${LOCAL_STATEMENT}. Also: ${REMOTE_STATEMENT}.`
     expect(await stop('r-3', reply, { PLUR_AUTO_RATE_CEILING_MS: '3000' })).toBe(0)
