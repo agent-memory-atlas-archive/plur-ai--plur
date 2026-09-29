@@ -204,6 +204,11 @@ describe('plur doctor sees Windows hooks (#1267)', { timeout: 60000 }, () => {
       args: ['C:\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js', 'hook-inject'],
     }],
   ])('reports hooksInstalled for a %s hook', (_label, spec) => {
+    // Decision F4: an exec-form hook is PLUR's only when its js entry is the
+    // one init recorded next to the shim.
+    mkdirSync(join(home, '.plur', 'bin'), { recursive: true })
+    writeFileSync(join(home, '.plur', 'bin', 'plur-hook.meta.json'),
+      JSON.stringify({ entrypoint: 'C:\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js' }))
     mkdirSync(join(home, '.claude'), { recursive: true })
     writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
       hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', ...spec }] }] },
