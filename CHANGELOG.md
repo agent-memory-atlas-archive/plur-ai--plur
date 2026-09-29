@@ -44,6 +44,12 @@ last four characters, such as `ghp_...WXYZ`; a value shorter than 16
 characters after the prefix, such as a password, is not shown at all (#1373).
 This is the text pack-scan issue details carry.
 
+The `jwt` pattern no longer takes quadratic time on repeated `eyJ` input
+(#1397). As a regex it took about six minutes on 1 MiB, the size packs and
+engrams are scanned up to, so a crafted pack or engram could stall pack
+install, preview or `learn`; every added scan view made it worse. It is now
+matched in linear time, with the same results and no cap on segment length.
+
 The same patterns apply to the pack scanner, so a pack carrying one of these
 refuses to install (`docs/pack-scan-surface.md`). Text that only names a prefix,
 such as "use a `ghp_` token", stays clean. No existing pattern changed except
@@ -2082,7 +2088,7 @@ PLUR's engram leak guard, scope isolation, pack/sync distribution, and remote-st
 
 `detectSensitive()` truncated its input to the first 64 KB before scanning, then silently passed the rest. The infra-topology detectors (`public_ipv4`, `public_ipv6`, `basic_auth_url`, `fqdn_port`, `ipv4_port`, `internal_host`) exist only in `detectSensitive`, so an engram whose first 64 KB was benign filler but which carried a public IP / basic-auth URL / internal host **after** byte 64 KB passed the write guard un-demoted and was written to a shared/remote store (and slipped past `filterPublishable`).
 
-- The scan window is raised from 64 KB to **1 MiB** — far above any realistic engram. The detector regexes are bounded/linear; a benign full-window pass is ~7ms/64KB but adversarial regex-dense input measured ~300–420 ms for a full 1 MiB pass (#386 review). Total scan work is capped at 1 MiB regardless of input size (bounded, linear — a per-write CPU cost on >64KB engrams, not a DoS).
+- The scan window is raised from 64 KB to **1 MiB** — far above any realistic engram. The detector regexes were described here as bounded/linear; that was wrong for `jwt`, which was quadratic on repeated `eyJ` (1 MiB took about six minutes) until #1397 replaced it with a linear matcher. A benign full-window pass is ~7ms/64KB but adversarial regex-dense input measured ~300–420 ms for a full 1 MiB pass (#386 review). Total scan work is capped at 1 MiB regardless of input size (bounded, linear — a per-write CPU cost on >64KB engrams, not a DoS).
 - Input larger than the ceiling is now **fail-closed**: `detectSensitive` appends a synthetic `scan_truncated` hit so `_guardSensitiveScope` demotes the write and `filterPublishable` excludes the engram — the unscanned tail can no longer be assumed clean. The `scan_truncated` signal is always offending regardless of a scope's `sensitivity` policy.
 - **Packs export inherits this** (via #389): `scanPrivacy` now routes through `detectSensitive` + `truncateToScanLimit`, so the raised window, the infra-family detectors, and the `scan_truncated` fail-closed all apply to `exportPack`/`installPack` too — the "...and packs" half of #386, delivered by the #389 packs-scan change rather than here.
 

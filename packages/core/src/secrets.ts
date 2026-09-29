@@ -3,7 +3,7 @@ export interface SecretMatch {
   match: string
 }
 
-const SECRET_PATTERNS: { name: string; regex: RegExp }[] = [
+const SECRET_PATTERNS: { name: string; regex?: RegExp; find?: (text: string) => string | null }[] = [
   // `AKIA` is a long-term access key id, `ASIA` a temporary (STS) one; both are
   // the four-letter prefix plus 16 uppercase letters or digits, 20 in all.
   //
@@ -94,10 +94,45 @@ const SECRET_PATTERNS: { name: string; regex: RegExp }[] = [
   { name: 'api_key_assignment', regex: /(?:api[_-]?key|api[_-]?secret|secret[_-]?key)\s*[=:]\s*\S{20,}/i },
   { name: 'password_assignment', regex: /password\s*[=:]\s*\S{8,}/i },
   { name: 'connection_string', regex: /(?:postgres|mysql|mongodb|redis):\/\/\S+/ },
-  { name: 'jwt', regex: /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}/ },
+  // Matched in code, not by regex (#1397): see findJwt.
+  { name: 'jwt', find: findJwt },
   { name: 'private_key', regex: /-----BEGIN\s+\S+\s+PRIVATE KEY-----/ },
   { name: 'bearer_token', regex: /Bearer\s+[A-Za-z0-9._~+/=-]{20,}/ },
 ]
+
+const isJwtSegmentChar = (c: number): boolean =>
+  (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 95
+
+/**
+ * The leftmost match of `eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}` in
+ * `text`, or null, found in linear time (#1397).
+ *
+ * As a regex, the pattern was quadratic: on repeated `eyJ` every start
+ * position ran its first segment to the end of the run before failing to find
+ * the dot, so 1 MiB took about six minutes, and every scan view paid it again.
+ * Bounding the runs would cap real tokens, whose payload segment can run to
+ * several kilobytes. Instead this anchors on each `.eyJ`, the one fixed
+ * point between header and payload: it walks back over the header run to the
+ * leftmost `eyJ` that leaves ten characters before the dot, and forward over
+ * the payload run. Runs end at a dot, so the runs walked for successive
+ * `.eyJ` are disjoint and the whole scan is linear. The test suite checks it
+ * against the original regex on seeded random inputs.
+ */
+function findJwt(text: string): string | null {
+  for (let dot = text.indexOf('.eyJ'); dot !== -1; dot = text.indexOf('.eyJ', dot + 1)) {
+    // Payload: `eyJ` then at least ten segment characters, as many as follow.
+    let end = dot + 4
+    while (end < text.length && isJwtSegmentChar(text.charCodeAt(end))) end++
+    if (end - (dot + 4) < 10) continue
+    // Header: the segment run ending at the dot.
+    let runStart = dot
+    while (runStart > 0 && isJwtSegmentChar(text.charCodeAt(runStart - 1))) runStart--
+    const start = text.indexOf('eyJ', runStart)
+    if (start === -1 || start + 13 > dot) continue
+    return text.slice(start, end)
+  }
+  return null
+}
 
 /**
  * The raw text and, when it differs, the folded copy a reader would see.
@@ -225,12 +260,12 @@ export function detectSecrets(text: string): SecretMatch[] {
   if (unescaped !== null) bases.push(unescaped)
   const views = bases.flatMap(scanViews)
   for (const view of views) {
-    for (const { name, regex } of SECRET_PATTERNS) {
+    for (const { name, regex, find } of SECRET_PATTERNS) {
       if (found.has(name)) continue
-      const m = view.match(regex)
-      if (m) {
+      const m = find ? find(view) : (view.match(regex as RegExp)?.[0] ?? null)
+      if (m !== null) {
         found.add(name)
-        matches.push({ pattern: name, match: maskFinding(name, m[0]) })
+        matches.push({ pattern: name, match: maskFinding(name, m) })
       }
     }
   }

@@ -330,6 +330,50 @@ describe('detectSecrets — vendor-prefixed tokens (#1317)', () => {
     })
   })
 
+  describe('jwt pattern runs in linear time (#1397)', () => {
+    // The original pattern, kept here as the reference for what must match.
+    const REFERENCE = /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}/
+    const b64url = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url')
+
+    it('flags a long, real-shaped synthetic JWT (8 KB payload with a large groups claim)', () => {
+      const header = b64url({ alg: 'RS256', typ: 'JWT', kid: 'k'.repeat(40), x5t: 'x'.repeat(40) })
+      const payload = b64url({
+        iss: 'https://login.example.com/tenant/v2.0', sub: 'user-0001', aud: 'api://example',
+        groups: Array.from({ length: 160 }, (_, i) => `00000000-0000-0000-0000-${String(i).padStart(12, '0')}`),
+      })
+      expect(payload.length).toBeGreaterThan(8000)
+      const jwt = header + '.' + payload + '.' + 'S'.repeat(342)
+      const hit = detectSecrets('Authorization: ' + jwt).find(h => h.pattern === 'jwt')
+      expect(hit?.match).toBe('eyJ...' + payload.slice(-4))
+    })
+
+    it('matches exactly what the original regex matches (seeded random inputs)', () => {
+      const alphabet = ['e', 'y', 'J', 'A', '9', '.', '-', '_', ' ', '+', 'eyJ', 'eyJ', '.eyJ', 'AAAAAAAAAA']
+      let seed = 1397
+      const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+      for (let i = 0; i < 20000; i++) {
+        let s = ''
+        const n = 1 + Math.floor(rnd() * 30)
+        for (let j = 0; j < n; j++) s += alphabet[Math.floor(rnd() * alphabet.length)]
+        const expected = REFERENCE.test(s)
+        const actual = detectSecrets(s).some(h => h.pattern === 'jwt')
+        if (actual !== expected) expect({ s, actual }).toEqual({ s, actual: expected })
+      }
+    })
+
+    it('scans 1 MiB of repeated eyJ in linear time with every view built', () => {
+      // `\\n` builds the escape-unfolded view, `é` the folded views, `%41`
+      // the percent-decoded view. `eyJA` is quadratic only once the escape
+      // before each repeat is unfolded.
+      for (const unit of ['eyJ', 'eyJA', '\\neyJA', 'eyJAAAAAAAAAAA.', '.eyJ', 'eyJ\\n']) {
+        const text = '\\né' + unit.repeat(Math.ceil((1 << 20) / unit.length)) + '%41'
+        const started = performance.now()
+        detectSecrets(text)
+        expect(performance.now() - started, unit).toBeLessThan(1_000)
+      }
+    })
+  })
+
   describe('findings do not echo the token body (#1373)', () => {
     // Each finding shows the non-secret prefix plus the last four characters,
     // so a reader can tell which credential it is without the finding (which
