@@ -62,9 +62,16 @@ function mapFolder(path: string, fields: string): void {
   writeFileSync(join(dir, '.plur', 'folders.yaml'), `version: 1\nfolders:\n  - path: ${path}\n${fields}`)
 }
 
-function nonceOf(text: string): string {
-  const m = /--nonce ([0-9a-f]{32})/.exec(text)
-  expect(m, `no nonce in: ${text}`).not.toBeNull()
+/**
+ * The nonce printed with the command for `flags` (#1477: every offered answer
+ * has its own nonce, valid only for that answer). Without `flags`, the first
+ * nonce in the text.
+ */
+function nonceOf(text: string, flags?: string): string {
+  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = flags ? new RegExp(`plur folders set \\S+ ${esc(flags)} --nonce ([0-9a-f]{32})`) : /--nonce ([0-9a-f]{32})/
+  const m = re.exec(text)
+  expect(m, `no nonce${flags ? ` for ${flags}` : ''} in: ${text}`).not.toBeNull()
   return m![1]
 }
 
@@ -84,8 +91,8 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
     const first = context(cli(['hook-inject'], payload(PROMPT)).stdout)
     expect(first).toContain('no decision for this folder yet')
     expect(first).toContain(repo)
-    expect(first).toContain(`plur folders set ${repo} --on --nonce ${nonceOf(first)}`)
-    expect(first).toContain(`plur folders set ${repo} --off --nonce ${nonceOf(first)}`)
+    expect(first).toContain(`plur folders set ${repo} --on --nonce ${nonceOf(first, '--on')}`)
+    expect(first).toContain(`plur folders set ${repo} --off --nonce ${nonceOf(first, '--off')}`)
     expect(first).not.toContain('ZEPHYRQUILL')
     expect(cli(['hook-inject'], payload(PROMPT)).stdout).toBe('')
     // A new session asks again ("not now" records nothing).
@@ -94,19 +101,20 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
 
   it('after a yes with the nonce, the next prompt of the same session injects', () => {
     const ask = context(cli(['hook-inject'], payload(PROMPT)).stdout)
-    const set = cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask)])
+    const set = cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask, '--on')])
     expect(set.status, set.stderr).toBe(0)
     const next = context(cli(['hook-inject'], payload(PROMPT)).stdout)
     expect(next).toContain('session started')
     expect(next).toContain('ZEPHYRQUILL')
-    // The nonce works once.
-    expect(cli(['folders', 'set', repo, '--off', '--nonce', nonceOf(ask)]).status).not.toBe(0)
+    // The nonce works once, and never for another answer.
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask, '--on')]).status).not.toBe(0)
+    expect(cli(['folders', 'set', repo, '--off', '--nonce', nonceOf(ask, '--on')]).status).not.toBe(0)
   })
 
   it('after a resume, the session is asked again with a fresh nonce that works once (option C)', () => {
     const sid = 'cc-resume'
     const ask = context(cli(['hook-inject'], payload(PROMPT, sid)).stdout)
-    const oldNonce = nonceOf(ask)
+    const oldNonce = nonceOf(ask, '--on')
     // SessionEnd kills the session's nonces, as before.
     expect(cli(['hook-session-end'], { session_id: sid, cwd: repo, reason: 'other' }).status).toBe(0)
     // `claude --resume` keeps the session id and fires SessionStart(resume).
@@ -115,12 +123,13 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
     expect(resumed.stdout).toBe('')
     const again = context(cli(['hook-inject'], payload(PROMPT, sid)).stdout)
     expect(again).toContain('no decision for this folder yet')
-    const newNonce = nonceOf(again)
+    const newNonce = nonceOf(again, '--on')
     expect(newNonce).not.toBe(oldNonce)
     // The ended session's nonce stays dead; the fresh one works exactly once.
     expect(cli(['folders', 'set', repo, '--on', '--nonce', oldNonce]).status).not.toBe(0)
     const yes = cli(['folders', 'set', repo, '--on', '--nonce', newNonce])
     expect(yes.status, yes.stderr).toBe(0)
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', newNonce]).status).not.toBe(0) // works once
     expect(cli(['folders', 'set', repo, '--off', '--nonce', newNonce]).status).not.toBe(0)
     expect(context(cli(['hook-inject'], payload(PROMPT, sid)).stdout)).toContain('ZEPHYRQUILL')
   })
@@ -136,7 +145,7 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
 
   it('never here: --off with the nonce silences every hook from then on', () => {
     const ask = context(cli(['hook-inject'], payload(PROMPT)).stdout)
-    expect(cli(['folders', 'set', repo, '--off', '--nonce', nonceOf(ask)]).status).toBe(0)
+    expect(cli(['folders', 'set', repo, '--off', '--nonce', nonceOf(ask, '--off')]).status).toBe(0)
     expect(cli(['hook-inject'], payload(PROMPT, 'cc-after-off')).stdout).toBe('')
   })
 
@@ -174,12 +183,12 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
     const ask = context(cli(['hook-inject'], payload(PROMPT, 'cc-untrusted')).stdout)
     expect(ask).toContain('.plur.yaml is not trusted')
     expect(ask).toContain('127.0.0.1:9')
-    expect(ask).toContain(`plur folders set ${repo} --trusted --nonce ${nonceOf(ask)}`)
+    expect(ask).toContain(`plur folders set ${repo} --trusted --nonce ${nonceOf(ask, '--trusted')}`)
     expect(ask).not.toContain('secret-fixture-token')
     expect(ask).not.toContain('ZEPHYRQUILL')
     expect(cli(['hook-inject'], payload(PROMPT, 'cc-untrusted')).stdout).toBe('')
     // Yes, trust it → the next prompt injects under the repo's scope.
-    expect(cli(['folders', 'set', repo, '--trusted', '--nonce', nonceOf(ask)]).status).toBe(0)
+    expect(cli(['folders', 'set', repo, '--trusted', '--nonce', nonceOf(ask, '--trusted')]).status).toBe(0)
     expect(context(cli(['hook-inject'], payload(PROMPT, 'cc-untrusted')).stdout)).toContain('Project scope: project:fixture')
   })
 
@@ -225,7 +234,7 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
     const without = ask.split('\n').find(l => l.startsWith('- Yes, without its settings'))
     expect(without, ask).toBeDefined()
     expect(without).not.toContain('group:acme/eng')
-    expect(without).toContain(`plur folders set ${repo} --on --nonce ${nonceOf(ask)}`)
+    expect(without).toContain(`plur folders set ${repo} --on --nonce ${nonceOf(ask, '--on')}`)
   })
 })
 
@@ -291,24 +300,25 @@ describe('Codex hooks read the folder map (#1347)', () => {
     expect(ask).not.toContain('ZEPHYRQUILL')
     expect(cli(['hook-codex-inject'], prompt('cx-ask')).stdout).toBe('')
     expect(cli(['hook-codex-guard'], { session_id: 'cx-ask', cwd: repo, tool_name: 'shell' }).stdout).toBe('')
-    expect(cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask)]).status).toBe(0)
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask, '--on')]).status).toBe(0)
     expect(context(cli(['hook-codex-inject'], prompt('cx-ask')).stdout)).toContain('ZEPHYRQUILL')
   })
 
   it('after a resume, the first prompt asks again with a fresh nonce that works once; a startup does not', () => {
     const sid = 'cx-resume'
     const ask = context(cli(['hook-codex-inject'], prompt(sid)).stdout)
-    const oldNonce = nonceOf(ask)
+    const oldNonce = nonceOf(ask, '--on')
     expect(cli(['hook-codex-session-start'], start(sid)).stdout).toBe('')
     expect(cli(['hook-codex-inject'], prompt(sid)).stdout).toBe('') // startup keeps the record
     expect(cli(['hook-codex-session-end'], { session_id: sid, cwd: repo, hook_event_name: 'SessionEnd' }).status).toBe(0)
     expect(cli(['hook-codex-session-start'], { ...start(sid), source: 'resume' }).stdout).toBe('')
     const again = context(cli(['hook-codex-inject'], prompt(sid)).stdout)
     expect(again).toContain('no decision for this folder yet')
-    const newNonce = nonceOf(again)
+    const newNonce = nonceOf(again, '--on')
     expect(newNonce).not.toBe(oldNonce)
     expect(cli(['folders', 'set', repo, '--on', '--nonce', oldNonce]).status).not.toBe(0)
     expect(cli(['folders', 'set', repo, '--on', '--nonce', newNonce]).status).toBe(0)
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', newNonce]).status).not.toBe(0) // works once
     expect(cli(['folders', 'set', repo, '--off', '--nonce', newNonce]).status).not.toBe(0)
   })
 
@@ -395,7 +405,7 @@ describe('Antigravity hooks read the folder map (#1347)', () => {
     expect(context(cli(['hook-agy-pre-invocation'], pre('ag-ask', 1)).stdout)).toBe(ask)
     expect(cli(['hook-agy-pre-invocation'], pre('ag-ask', 2, 1)).stdout).toBe('')
     expect(cli(['hook-agy-guard'], { conversationId: 'ag-ask', workspacePaths: [repo], toolCall: { name: 'run_command' } }).stdout).toBe('')
-    expect(cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask)]).status).toBe(0)
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask, '--on')]).status).toBe(0)
     expect(context(cli(['hook-agy-pre-invocation'], pre('ag-ask', 3, 2)).stdout)).toContain('ZEPHYRQUILL')
   })
 

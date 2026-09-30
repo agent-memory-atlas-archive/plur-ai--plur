@@ -5,6 +5,7 @@ import { type GlobalFlags } from '../plur.js'
 import { createPlur } from '../plur.js'
 import { hookFolderOn, payloadDir } from '../lib/folder-gate.js'
 import { endFolderNonceSession } from '@plur-ai/core'
+import { removeSessionTask } from '../lib/session-task.js'
 
 /**
  * plur hook-session-end — Claude Code SessionEnd hook (shipped v1.0.85).
@@ -46,7 +47,7 @@ function sessionKeys(payloadSessionId?: string): string[] {
 }
 
 function plurPath(flags: GlobalFlags): string {
-  return flags.path ?? process.env.PLUR_PATH ?? join(homedir(), '.plur')
+  return flags.path || process.env.PLUR_PATH || join(homedir(), '.plur') // `||`: empty means unset (H3)
 }
 
 function readStdinRaw(): string {
@@ -74,6 +75,10 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   try {
     payload = JSON.parse(raw)
   } catch { /* fall back to env-derived keys */ }
+
+  // The hook-inject rehydrate query is a copy of the user's latest prompt;
+  // it has no use once the session is over.
+  removeSessionTask(payload.session_id)
 
   // #1347: the ask flow's nonces for this session expire with it, whatever
   // the folder's mode. Only removes this session's own nonce file.
