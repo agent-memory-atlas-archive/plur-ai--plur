@@ -2,38 +2,15 @@
 
 ## Unreleased
 
-### Two processes flushing one store no longer both push the same engram
+### A push claim is released only by the writer that took it
 
-The outbox claim that stops a write being delivered twice was in-memory, so two
-processes sharing a store (say the MCP server and a CLI hook) could each flush
-the same queued write and the team store received it twice. A flush now takes
-an on-disk lease on each row before it pushes (`structured_data._outboxLease`:
-holder id and expiry, recorded under the store lock); another process skips a
-row with a live lease, the lease is released when the flush records its
-outcome, and an expired lease is taken over, so a crashed process holds its
-rows for at most ten minutes. The same applies to queued remote retirements.
-The field is additive: rows without it behave as before, and an older client
-ignores it. (Decision D2.)
-
-A flush reads the clock for its lease after it gets the store lock, not before
-waiting for it, so a long wait can no longer make another process's fresh
-lease look bogus. A push starts only while five minutes of the lease remain
-(was two): enough for the request, a wait for the store lock up to its own
-timeout, and the write that hands the row off, so a flush that queues behind a
-long lock holder at the end of its batch no longer lets another process
-deliver the same rows again. A flush with nothing it can send right now (every
-queued row's host in cooldown, or no store configured) leases nothing and
-leaves the store file untouched, as before the lease; and a flush that fails
-part-way releases the leases it took instead of holding them for ten minutes.
-
-Each lease also carries a `nonce`, and a push releases only the exact lease it
-wrote. Before, release matched the holder id, so when `learn()`'s immediate
-push failed it could remove the lease that a flush in the same process had just
-taken for its own retry. Another process then saw the row unleased and
-delivered it a second time. `learn()` now also keeps its in-process claim on
-the row until it has recorded the failure. A lease without a `nonce`, written
-by a client that predates the field, still blocks other processes until it
-expires.
+The outbox's per-entry push claims (#1277, decision C3) are the one guard
+against delivering a write twice. A release now removes a claim only when this
+Plur instance took it (its token). Before, any instance in the same process
+could remove another's claim if it held none of its own: two `Plur`s on one
+store share a pid. `listOutbox()` reports `leased_until` for an entry whose
+claim is live, read from the claim file alone: the entry is being pushed, not
+stuck. (#1228's earlier on-disk row leases never shipped and are gone.)
 
 ### PGLite recall reports its fusion score
 
@@ -93,6 +70,21 @@ now folds case like the shared-scope test (`GLOBAL`, `Project:x`), and a
 equals or contains it (segment-aware) — so naming a project scope that a url
 store covers reaches that store instead of being refused as "local".
 (Decisions E4, E5.)
+
+### A failed hook no longer prints an error document to the editor
+
+**When a `plur hook-*` command threw, the CLI printed `{"error": …}` on
+stdout and exited 1**. Editors read a hook's stdout as its result and show
+a non-zero exit as a hook error. So a hook-inject whose store would not load
+showed the user a hook error instead of failing open. The same happened to a
+run the watchdog had already stopped, if its injection then threw.
+
+Hook commands now write the error to stderr as `[plur] <command> failed: …`
+and exit 0. Every other command still prints its error document and exits 1.
+That exit first waits, bounded at 5s, for any store write of the same process
+still in flight, as the hooks' other forced exits do (#1349). Before, a hook
+that threw while its abandoned hybrid search was recording its injection left
+`engrams.yaml.lock` or its publish file behind for every later writer.
 
 ### `plur init` sets up opencode by default
 
@@ -277,6 +269,16 @@ lock, so every writer, including the next prompt's hook, waited out the 60s
 stale threshold. Checking for the lock file alone was not enough: the
 search's lock create can already be under way when the hook looks, and land
 after it.
+
+**A cold embedding cache now warms itself.** Core saves the embedding cache
+only when a hybrid search finishes. A first prompt that falls back to BM25
+exits before that, so a store with no cache stayed without one, and every
+session's first prompt missed the deadline again. When the abandoned search
+is still running at exit, the hook now starts one background build of the
+cache: detached, at the lowest CPU priority, one per store at a time (the
+`.embeddings-warming` marker), stopped after 60 minutes
+(`PLUR_WARM_CEILING_MS`). It takes no store write lock. The next session's
+hybrid search then meets its deadline.
 
 ### Codex and Antigravity hooks no longer leave a stale store lock
 
@@ -518,6 +520,161 @@ repo's request. Only the CLI writes the map.
     the folder you give it.
   - A `~` in the map expands to your home as written and to its canonical path.
 
+### A refused write to one scope no longer pauses writes to the whole server
+
+**A few refused writes to one scope could stop queued writes to every other
+scope on the same server** (#1308). Each failed outbox push counted toward the
+per-host circuit breaker, including refusals: 401, 403 ("Cannot write to scope
+..."), 404 and 422. Three of those opened the breaker, and the next flush then
+skipped healthy writes to other scopes on that server for five minutes. A
+refusal says the request was wrong, not that the server is down.
+
+Now a 401/403/404/422 answer to an outbox push neither counts toward the
+breaker nor resets it. Network errors, timeouts and 5xx still count, so a
+server that is really down still opens it.
+
+### Queued writes that can never succeed now say so
+
+**A queued team write the store keeps refusing was silent** (#1299). On one
+developer store, ten writes had been refused with `403 Cannot write to scope`
+on every attempt for twelve days, one of them 103 times. Session start,
+`plur status`, `plur doctor` and the hooks said nothing. Only `plur outbox`
+listed them, and only to someone who knew to look.
+
+**Each outbox entry is now classified by its last failure.** `retrying` covers
+the network, 5xx, 429 and timeouts, and those are retried as before.
+`needs_action` covers 401, 403, 404, 422, an explicit "cannot write to scope"
+refusal, and a scope with no writable store: retrying cannot fix any of these.
+A failed push now records its HTTP status on the entry (`last_status`, an
+additive field). Entries queued before this are classified from their error
+text, and anything unclear counts as `retrying`.
+
+**The `needs_action` entries are reported**, with count, scope, a one-line
+reason and a next step, in the places below. There is one row for each scope
+and reason: a scope holding both a 403 and a 422 gets two rows, each with its
+own advice.
+- the MCP `plur_session_start` result (`outbox_needs_action`, plus a line in `guide`);
+- `plur status` and `plur_status` (`outbox_needs_action`, `outbox_attention`);
+- `plur doctor`, as a failing `outbox` check. A write that only failed on the
+  network does not trip it;
+- `plur outbox` / `plur_outbox`: `state`, `reason`, `next_step` and
+  `next_retry_at` on each entry, plus `retrying` / `needs_action` counts.
+
+The next step names real commands: get write access and run `plur outbox
+--flush`, check `plur stores list`, or move the entry with `plur rescope <id>
+--to <scope>`.
+
+**Back-off:** automatic flushes (session start and end, stop hooks,
+`plur sync`) retry a `needs_action` entry at most once a day. They return the
+number held back as `held`. `plur sync` (`outbox.held` in `--json`) and the
+hook's stderr line report it, including when every entry was held back.
+An explicit flush (`plur outbox --flush`,
+`plur_outbox { flush: true }`, or `flushOutbox({ force: true })`) retries it
+at once. **Nothing is dropped, rescoped or rewritten automatically.** Only the
+retry bookkeeping changes: `attempt_count`, `last_attempt`, `last_error` and
+`last_status`.
+
+### SessionEnd finds the checkpoint for session ids with unusual characters
+
+**`plur hook-session-end` could miss the session checkpoint, so the session
+was not auto-closed.** The Stop hook writes the checkpoint under a key that
+**replaces** unsafe characters with `_`. The SessionEnd reader **stripped**
+them instead. For a session id such as `a.b:c/d`, the writer produced
+`a_b_c_d` and the reader looked for `abcd`. The reader now tries the `_` form
+first, then the stripped form older writers used. `plur_session_end` got the
+same fix earlier (#1301). Real Claude Code session ids are UUIDs, which both
+forms leave unchanged, so only unusual ids were affected.
+
+### Queued team writes now leave the laptop when a session ends
+
+**An enterprise deployment reported engrams that stayed on laptops** (#1269).
+A team-scoped write that cannot reach its store is queued locally (the
+outbox), and was retried only by the MCP tools `plur_session_start`,
+`plur_sync` and `plur_outbox`, or by `plur outbox --flush`. No editor hook
+retried it, and `plur sync` did not either — although `plur outbox` told you
+it did.
+
+**Session-end and stop hooks now flush the outbox**: Claude Code
+`SessionEnd`, Codex `SessionEnd`, and Cursor `stop`. Each flush has a budget
+that fits inside its hook's timeout (2.5s, 1.2s, 1.2s), and with nothing
+queued it is skipped after a single file read; Cursor's `stop`, which fires
+on every turn, retries at most once every five minutes. A throttle timestamp
+dated in the future, from clock skew, counts as expired instead of blocking
+the flush until the clock catches up. When the budget runs out the
+in-flight push is cut and the rest stays queued, unchanged; a failing remote
+leaves entries queued with the failure recorded, as before. The hook itself
+never fails over it. `PLUR_HOOK_OUTBOX_FLUSH=0` turns it off and
+`PLUR_HOOK_OUTBOX_FLUSH_MS` changes the budget.
+
+**`plur sync` now flushes too**, and reports what happened: `outbox` in
+`--json` output (`flushed`, `pending`, `warnings`), and a line for writes that
+are still queued.
+
+`flushOutbox()` takes an optional `{ timeoutMs }`. The clock starts after the
+local store is loaded, so a large store does not use up the network budget.
+The result has two new counts: `deferred` (entries it did not get to) and
+`skipped` (entries held back by an open circuit breaker). `plur sync` now
+reports skipped writes and the breaker's reason; before, it said nothing
+about them. A cut is not counted as a failure against the host.
+
+**A push that is cut, times out or throws is retried, with the same key.**
+The server may have stored it before the answer arrived, and the client cannot
+know. The owner decided this is not a "maybe delivered" state: the write stays
+queued, the attempt is recorded (`plur outbox` shows it), and the next flush
+posts it again. What makes that safe is the idempotency key.
+
+**Idempotency keys are unique per write, and on the row before the first
+POST.** An earlier version of this change derived the key from the engram id.
+On a direct team write that id is the placeholder `__pending__`, and on queued
+writes it is a per-day number that two machines share. A server following the
+contract would have kept only the first write and reported the rest as
+delivered. Now:
+
+- every write gets a random UUID when it is created. It is stored on the
+  queued write's outbox row before that write is first posted, and reused on
+  every retry. A row queued by an older client gets a key minted and stored
+  before it is posted, so a flush whose local write-back fails afterwards
+  still retries with the same key;
+- each queued write is *claimed* before it is pushed: a small file created
+  with O_EXCL. So a flush and `learn()`'s own background push, or two flushes,
+  never push the same write at once. Before, this race gave two server copies
+  in half of the audit's runs. A claim is held while the process that made it
+  is alive, however long its push runs, so a POST held open by a slow server
+  cannot be re-pushed by a second flusher (a 15-minute cap covers a recycled
+  process id). Taking over a stale claim is decided by O_EXCL too: one
+  takeover marker per stale claim, so exactly one writer wins. Measured with 6
+  processes racing for one stale claim: one winner in each of 60 rounds,
+  where the earlier read-compare-rename takeover let 2 or 3 win in 26 of 60.
+  A marker left by a writer that died cannot block the write;
+- a claim is checked against the queued row, not against the flush's
+  snapshot of it. A flush that reaches a write after another writer delivered
+  it and released the claim re-reads the row, finds it gone, and skips it.
+  Before, two racing flushes, three racing flushes, and a flush racing
+  `learn()`'s background push each sent the same write twice, measured in
+  separate processes against a server that ignores the key. Now each sends
+  one POST per write;
+- on a key-honouring server every write is stored once, and no write is ever
+  dropped. A server that ignores the key gets one extra row for each attempt
+  it stored but the client never heard back from, so there is no fixed bound
+  per write: 3 flushes cut after the server stored the write, then 1 flush that
+  completed, left 4 rows (#1463).
+
+`docs/remote-store-contract.md` states this exactly: unique per logical write,
+persisted before the first POST, stable across retries, deduplicated by a
+key-honouring server within a 7-day window.
+
+**A recall refused with 422 no longer trips the host breaker.** Like 401, 403
+and 404 before it, and like the write leg (#1308), a 422 answer to a recall
+neither counts toward the per-host breaker nor resets it. Three refused
+recalls used to open a 5-minute cooldown that also parked queued writes to
+every scope on the host.
+
+**An empty `PLUR_PATH` no longer hides queued writes from the hook flush.**
+The hooks' "is anything queued?" check treated `PLUR_PATH=""` as a path and
+looked for `./engrams.yaml` in the current directory, so it skipped a store
+under `~/.plur` that had queued writes. An empty value now counts as unset,
+as it does everywhere else (#1395).
+
 ### Claude Code: one full injection per session, and the reminder fires
 
 **Every prompt in a Claude Code session re-ran the full "session started"
@@ -593,10 +750,10 @@ checkpoint in `<PLUR root>/sessions`. An empty `PLUR_PATH` now means "unset"
 wherever the hooks resolve the PLUR root, so it never resolves against the
 working directory.
 
-`UserPromptSubmit` stays `async: true`. Async context does arrive, but at the
-next safe point (after a tool result, or before the next prompt), not on the
-turn that triggered it. A first message that needs no tools is answered
-without memory. In a one-shot `claude -p` run, that means no memory at all.
+This fix alone kept both registrations `async: true`, so the context arrived
+only at the next safe point, not on the turn that triggered it. Both are now
+synchronous: see "Claude Code: memory is in place for the first reply" above
+(#1313).
 
 An unknown `--event` no longer echoes the hook payload back to stdout.
 
