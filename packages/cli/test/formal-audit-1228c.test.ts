@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, realpathSync } from 'fs'
 import { join } from 'path'
 import { tmpdir, homedir } from 'os'
-import { listTrustedDirectories } from '@plur-ai/core'
+import { listTrustedDirectories, issueFolderNonce } from '@plur-ai/core'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
 import { trustCommand } from '../src/plur.js'
@@ -74,7 +74,11 @@ describe('CLI hooks, custom store (1228-c #1, end to end)', () => {
     const m = /run: plur ((?:--path \S+ )?trust \S+?)(?=\\n|"|\s|$)/.exec(out)
     expect(m, out).not.toBeNull()
     expect(m![1]).toBe(`--path ${store} trust ${repo}`)
-    const t = runCli('node', [CLI, ...m![1].split(' ')], { encoding: 'utf-8', timeout: 60_000, env: env(false), cwd: dir })
+    // Outside a terminal `plur trust` needs a nonce bound to this folder and
+    // answer (#1378, owner decision). The printed command is for a person at a
+    // terminal, so the test adds the nonce that a terminal would make unneeded.
+    const nonce = issueFolderNonce(store, 'session-1228c', repo, { trusted: true })
+    const t = runCli('node', [CLI, ...m![1].split(' '), '--nonce', nonce], { encoding: 'utf-8', timeout: 60_000, env: env(false), cwd: dir })
     expect(t.status, t.stderr).toBe(0)
     expect(listTrustedDirectories(store)).toContain(repo)
     // The next session start is a fresh hook run: a fresh TMPDIR, no marker.
@@ -101,7 +105,9 @@ describe('`--` for every command with positional arguments (1228-c #3)', () => {
       env: { ...process.env, HOME: dir, USERPROFILE: dir, PLUR_PATH: store } })
 
   it('`plur trust -- <dir>` trusts <dir>, not a directory named `--`', { timeout: 60_000 }, () => {
-    const r = plur('trust', '--', join(dir, 'repo'))
+    // A nonce goes before `--`; everything after it is positional (#1378).
+    const nonce = issueFolderNonce(store, 'session-dd', join(dir, 'repo'), { trusted: true })
+    const r = plur('trust', '--nonce', nonce, '--', join(dir, 'repo'))
     expect(r.status, r.stderr).toBe(0)
     const trusted = listTrustedDirectories(store)
     expect(trusted).toContain(join(dir, 'repo'))
