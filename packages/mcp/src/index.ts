@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url'
 import { homedir, platform } from 'os'
 
 import { VERSION } from './version.js'
-import { isPlurHookCommand } from './hook-command.js'
+import { isPlurHookSpec } from './hook-command.js'
 
 const HELP = `plur-mcp v${VERSION} — persistent memory for AI agents
 
@@ -171,7 +171,7 @@ export interface Settings {
 
 export interface HookEntry {
   matcher?: string
-  hooks: Array<{ type: string; command: string; timeout?: number; async?: boolean }>
+  hooks: Array<{ type: string; command: string; args?: string[]; timeout?: number; async?: boolean }>
 }
 
 const CLAUDE_MD_SECTION = `## PLUR Memory
@@ -288,13 +288,17 @@ function writeMcpConfig(configPath: string): string {
   return `added to ${configPath}`
 }
 
-/** Does this entry hold at least one hook PLUR wrote? See isPlurHookCommand. */
 /**
- * Claude Code also has `type: "prompt"` and `type: "agent"` hooks, which
- * carry no `command`. They are never PLUR's and must not make init throw.
+ * Is this one hook PLUR's? The same spec-level check `plur init` uses
+ * (isPlurHookSpec): a shell string is matched by isPlurHookCommand, and on
+ * Windows the exec form `plur init` writes (node + the recorded CLI js entry
+ * + hook-*, or cmd.exe /c + npx) counts too, so `plur-mcp init` after
+ * `plur init` does not add a second set. Claude Code also has
+ * `type: "prompt"` and `type: "agent"` hooks, which carry no `command`. They
+ * are never PLUR's and must not make init throw.
  */
-function isPlurCommandHook(h: { command?: unknown }): boolean {
-  return typeof h.command === 'string' && isPlurHookCommand(h.command)
+function isPlurCommandHook(h: { command?: unknown; args?: unknown }): boolean {
+  return typeof h.command === 'string' && isPlurHookSpec({ command: h.command, args: h.args })
 }
 
 function isPlurHook(entry: HookEntry): boolean {
@@ -304,9 +308,15 @@ function isPlurHook(entry: HookEntry): boolean {
 /** Same normalisation as isPlurHookCommand: backslashes to `/`, any case. */
 const REHYDRATE = /(?:^|\s)hook-inject\s+--rehydrate(?:\s|$)/
 
-function isPlurRehydrateHook(h: { command?: unknown }): boolean {
+/** The whole launch line: the command, then the exec-form `args` if any. */
+function launchLine(h: { command?: unknown; args?: unknown }): string {
+  const args = Array.isArray(h.args) ? h.args.filter((a): a is string => typeof a === 'string') : []
+  return [h.command as string, ...args].join(' ')
+}
+
+function isPlurRehydrateHook(h: { command?: unknown; args?: unknown }): boolean {
   return isPlurCommandHook(h) &&
-    REHYDRATE.test((h.command as string).replace(/\\/g, '/').toLowerCase())
+    REHYDRATE.test(launchLine(h).replace(/\\/g, '/').toLowerCase())
 }
 
 function isPlurRehydrate(entry: HookEntry): boolean {
@@ -332,10 +342,12 @@ function stripPlurHooks(entries: HookEntry[]): HookEntry[] {
 }
 
 /**
- * Merge PLUR hooks into Claude Code settings (#1279). Pure, no I/O.
- * A hook is PLUR's only when isPlurHookCommand says so: PLUR's binary, in
- * the shim or npx form and with any slash direction or quoting, followed by
- * a subcommand init writes.
+ * Merge PLUR hooks into Claude Code settings (#1279). No I/O apart from
+ * reading plur-hook.meta.json for the exec-form check.
+ * A hook is PLUR's only when isPlurHookSpec says so: the whole command is
+ * PLUR's launcher (the shim, with any slash direction or quoting, or the npx
+ * fallback, or on Windows the exec form `plur init` writes) followed by a
+ * `hook-*` subcommand and plain arguments (decisions H2, F4).
  * - No PLUR hook present: append the full set ('installed').
  * - PLUR hooks present: remove PLUR's hooks from PostCompact, which cannot
  *   carry context (#1274), one hook at a time, dropping an entry only when

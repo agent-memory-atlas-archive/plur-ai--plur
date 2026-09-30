@@ -4,7 +4,7 @@ import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
 import { ensureSessionDir, ticketCounter } from '../lib/codex-hook-io.js'
-import { hookSessionKey } from '../lib/session-key.js' // decision H1
+import { hookSessionKey } from '../lib/session-key.js'
 import { hookSessionDir } from '../lib/session-task.js'
 
 /**
@@ -56,6 +56,9 @@ const CHECKPOINT_INTERVAL = parseInt(process.env.PLUR_CHECKPOINT_INTERVAL || '10
  * orphaned counter delays one nudge at most.
  */
 function sessionKey(payloadSessionId?: unknown): string {
+  // Owner decision H1 ("payload", 2026-09-29): the one shared helper, so the
+  // counter/checkpoint writer and every reader agree. The stop counter is not
+  // migrated from legacy keys: an orphaned counter delays one nudge at most.
   return hookSessionKey(payloadSessionId)
 }
 

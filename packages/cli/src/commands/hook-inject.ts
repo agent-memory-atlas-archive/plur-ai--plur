@@ -123,11 +123,20 @@ const NO_CONTEXT_EVENTS = new Set(['PostCompact'])
 // no compact_summary, so rehydration queries with it. Rewritten on every
 // prompt, length-capped, 0600 in a verified 0700 dir, removed at SessionEnd.
 
-// #1278 / decision H1: this session's marker, reminder clock and inject lock
-// are keyed by `hookSessionKey` (lib/session-key.ts) — the payload
-// `session_id`, then CLAUDE_SESSION_ID, then ppid. Claude Code runs every hook
-// in a fresh `/bin/sh -c` and does not export CLAUDE_SESSION_ID, so a ppid key
-// changed on every prompt; ppid is kept only as the last fallback.
+/**
+ * #1278: the key for this session's marker, reminder clock and inject lock.
+ * The payload `session_id` first, then CLAUDE_SESSION_ID, then ppid — the same
+ * precedence as the Stop counter (#1266), sanitised with the shared helper.
+ * Claude Code runs every hook in a fresh `/bin/sh -c` and does not export
+ * CLAUDE_SESSION_ID, so a ppid key changed on every prompt: the "already
+ * started" check never matched, every prompt re-ran the full injection, and
+ * the 10-minute reminder never fired. ppid is kept only as the last fallback
+ * for callers that send no session id at all.
+ */
+function sessionKey(input: Record<string, unknown>): string {
+  // Owner decision H1 ("payload", 2026-09-29): the one shared helper.
+  return hookSessionKey(input.session_id)
+}
 
 /**
  * #1312: the `hook-correction-detect` reminder for this prompt, or null.
@@ -170,7 +179,7 @@ const REMINDER_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 // ignored .plur.yaml because the reader lived in this CLI-only file).
 import { claimHookDegradationLines, type Plur } from '@plur-ai/core'
 import { resolveProjectRemote, projectRemoteRefusalNotice, type ProjectRemote } from '../lib/project-remote.js'
-import { hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js' // decision H1
+import { hookSessionKey } from '../lib/session-key.js' // decision H1
 
 /**
  * #776: the former `tryRemoteInject` remote-first POST /api/v1/inject path
@@ -237,24 +246,55 @@ function sessionStatePath(key: string, ext: string): string | null {
   return dir ? join(dir, `${key}.${ext}`) : null
 }
 
-/**
- * The marker for `key`, or — for a READER, when it does not exist — the
- * marker under a key an older writer used (decision H1 upgrade path: the
- * `sid-` key above, the uncapped or env-first forms), so a session started
- * before the upgrade is not injected twice. Writers always use `key`.
- */
-function readableMarkerPath(input: Record<string, unknown>, key: string): string | null {
-  const current = sessionMarkerPath(key)
-  if (!current || existsSync(current)) return current
-  for (const legacy of legacyHookSessionKeys(input.session_id)) {
-    const p = sessionMarkerPath(legacy)
-    if (p && existsSync(p)) return p
-  }
-  return current
-}
-
 function sessionMarkerPath(key: string): string | null {
   return sessionStatePath(key, 'marker')
+}
+
+/**
+ * The keys an older hook-inject wrote this session's MARKER under — not the
+ * checkpoint/counter forms, which `legacyHookSessionKeys` also returns for
+ * their own readers (#1396 review).
+ *
+ * With a payload session_id, only forms derived from that id: #1228's `sid-`
+ * key and the uncapped `safeSessionKey(payload)` main wrote before the 64-char
+ * cap. Never the env/ppid forms: under payload-first keying a ppid marker can
+ * never belong to this session (the ppid changes on every prompt), and stale
+ * `<pid>.marker` files from releases before #1278 would otherwise make a new
+ * session look already started and skip its injection.
+ *
+ * Without a payload session_id, main's own marker key: the uncapped
+ * `safeSessionKey(env || ppid)`. Main never read the stripped checkpoint form
+ * for markers, so neither does this.
+ */
+function legacyMarkerKeys(key: string, input: Record<string, unknown>): string[] {
+  const id = input.session_id
+  const payload = typeof id === 'string' && id ? id : ''
+  const forms = payload
+    ? [`sid-${safeSessionKey(payload)}`, safeSessionKey(payload)]
+    : [safeSessionKey(process.env.CLAUDE_SESSION_ID || String(process.ppid || 'unknown'))]
+  return [...new Set(forms.filter(k => k !== key))]
+}
+
+/**
+ * The marker to READ for this session: the current key's, or — when it does
+ * not exist — one an older writer left under a legacy key (H1 upgrade path:
+ * #1228's `sid-` prefix or the uncapped form; see legacyMarkerKeys), so a session that
+ * started before the upgrade is not injected twice. Writers use `key` only.
+ *
+ * #1395: null when the state dir is refused — read nothing, persist nothing.
+ * The dir is resolved once and every legacy candidate is joined onto that
+ * same verified dir, never onto an unverified one.
+ */
+function readableMarkerPath(key: string, input: Record<string, unknown>): string | null {
+  const dir = sessionDir()
+  if (!dir) return null
+  const current = join(dir, `${key}.marker`)
+  if (existsSync(current)) return current
+  for (const legacy of legacyMarkerKeys(key, input)) {
+    const p = join(dir, `${legacy}.marker`)
+    if (existsSync(p)) return p
+  }
+  return current
 }
 
 function lastReminderPath(key: string): string | null {
@@ -669,10 +709,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Every path needs the payload now (#1278): the session key comes from its
   // `session_id`. Reading stdin is a single synchronous read.
   const input = readStdinSync()
-  // Owner decision H1 ("payload"): the one shared helper keys hook state; the
-  // marker reader also accepts a legacy-keyed marker (readableMarkerPath).
-  const key = hookSessionKey(input.session_id)
-  const marker = readableMarkerPath(input, key)
+  const key = sessionKey(input)
+  const marker = readableMarkerPath(key, input)
 
   // Contextual injection for specific events (plan_mode, skill, agent, subagent)
   if (event) {
