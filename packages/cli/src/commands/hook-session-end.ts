@@ -7,6 +7,7 @@ import { isPlurConfigured } from '../lib/plur-configured.js'
 import { safeSessionKey } from '../lib/session-key.js'
 import { flushOutboxForHook, HOOK_OUTBOX_BUDGET_MS } from '../lib/hook-outbox-flush.js'
 import { hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js' // decision H1
+import { removeSessionTask } from '../lib/session-task.js'
 
 /**
  * plur hook-session-end — Claude Code SessionEnd hook (shipped v1.0.85).
@@ -64,7 +65,7 @@ function sessionKeys(payloadSessionId?: string): string[] {
 }
 
 function plurPath(flags: GlobalFlags): string {
-  return flags.path ?? process.env.PLUR_PATH ?? join(homedir(), '.plur')
+  return flags.path || process.env.PLUR_PATH || join(homedir(), '.plur') // `||`: empty means unset (H3)
 }
 
 function readStdinRaw(): string {
@@ -103,6 +104,10 @@ async function closeSession(flags: GlobalFlags): Promise<void> {
   try {
     payload = JSON.parse(raw)
   } catch { /* fall back to env-derived keys */ }
+
+  // The hook-inject rehydrate query is a copy of the user's latest prompt;
+  // it has no use once the session is over.
+  removeSessionTask(payload.session_id)
 
   const sessionsDir = join(plurPath(flags), 'sessions')
   if (!existsSync(sessionsDir)) return

@@ -2,6 +2,297 @@
 
 ## Unreleased
 
+### A failed hook no longer prints an error document to the editor
+
+**When a `plur hook-*` command threw, the CLI printed `{"error": …}` on
+stdout and exited 1**. Editors read a hook's stdout as its result and show
+a non-zero exit as a hook error. So a hook-inject whose store would not load
+showed the user a hook error instead of failing open. The same happened to a
+run the watchdog had already stopped, if its injection then threw.
+
+Hook commands now write the error to stderr as `[plur] <command> failed: …`
+and exit 0. Every other command still prints its error document and exits 1.
+That exit first waits, bounded at 5s, for any store write of the same process
+still in flight, as the hooks' other forced exits do (#1349). Before, a hook
+that threw while its abandoned hybrid search was recording its injection left
+`engrams.yaml.lock` or its publish file behind for every later writer.
+
+### `plur init` sets up opencode by default
+
+**An enterprise deployment reported editors that were never set up** (#1311).
+`plur init` wired opencode only with `--opencode`, on the grounds that
+`@plur-ai/opencode` was not yet on npm. It is published now, so opencode is
+auto-detected like Cursor, Codex and Antigravity: whenever `~/.config/opencode`
+exists, init writes the `plugin` entry and the `mcp.plur` entry with no flag.
+`--opencode` still forces it when the directory does not exist; `--no-opencode`
+skips it. The success line says so: `(auto-detected; global, applies to every
+opencode project; pass --no-opencode to skip)`, or `(global, applies to every
+opencode project)` when `--opencode` forced it.
+
+- **Windows:** `mcp.plur.command` is now built by the same builder as every
+  other host since #1267 — `node.exe` plus `@plur-ai/mcp`'s js entry, or the
+  pinned `cmd.exe /c npx` form when the entry cannot be resolved. It is never
+  a bare `npx`. darwin/linux keep the pinned `npx -y @plur-ai/mcp@<version>`.
+  Upgrading needs no manual step: re-running init on Windows replaces the
+  `command` of the bare-`npx` entry older versions wrote (exactly
+  `npx -y @plur-ai/mcp@<version>`), keeping its other fields. Any other
+  `mcp.plur` entry is left alone. The node.exe entry itself is repaired the
+  same way #1267 repairs the Claude Code one: when the node binary or
+  `@plur-ai/mcp` js entry it names no longer exists (after a Node upgrade or a
+  version-manager switch), or the js entry differs from the one resolved now,
+  init rewrites its `command` and keeps its other fields. A different node
+  binary that still exists is left alone, so switching between Node installs
+  does not rewrite the entry on every run. Init prints what it wrote: the
+  node.exe launcher, or the `cmd.exe /c npx` fallback.
+- **Where:** the config directory is resolved the way opencode resolves it:
+  `OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else
+  `~/.config/opencode`. A leftover `~/.config/opencode` no longer receives a
+  config opencode never reads.
+- Re-running init is idempotent, and an existing `opencode.json` keeps its
+  other keys. An existing `mcp.plur` is still left as it is, and an
+  `opencode.jsonc` with comments is still reported and left byte-for-byte
+  untouched. An existing `@plur-ai/opencode` plugin entry is recognised by
+  package name, so a pinned (`@plur-ai/opencode@0.1.1`), tagged
+  (`@plur-ai/opencode@latest`) or tuple (`["@plur-ai/opencode", {…}]`) entry is
+  left as it is; init no longer appends a second, bare entry that opencode
+  would load in its place.
+
+### `plur init` works on Windows, including home directories with a space
+
+**An enterprise deployment reported editors on Windows not set up, or set up
+twice** (#1267). Three separate faults:
+
+- **Hook commands were the bare shim path.** Editors run hooks through a
+  shell, so `C:\Users\Test User\.plur\bin\plur-hook.cmd hook-inject` split at
+  the space and every hook failed. Quoting the path does not fix it: the
+  editors use different shells (Git Bash or PowerShell for Claude Code,
+  PowerShell for Codex and reportedly Cursor, `cmd /C` with escaped quotes
+  for Antigravity), and a quoted path is an expression in PowerShell and a
+  wrong name in Antigravity. So on Windows no hook relies on shell quoting:
+  - **Claude Code** hooks use the documented exec form — `command` + `args`,
+    spawned with no shell (https://code.claude.com/docs/en/hooks): node plus
+    the CLI's js entry plus the subcommand. Exec form arrived in Claude Code
+    2.1.139, so init reads `claude --version`: an older Claude Code gets the
+    unquoted short-path string below instead, and so does one whose version
+    cannot be read, unless that string would need the fallback. The exec
+    form names the node binary that ran init (`process.execPath`), which is
+    version-specific: after a Node upgrade or a version-manager switch these
+    hooks point at a missing `node.exe` until you re-run `plur init`, which
+    rewrites them.
+  - **Codex, Cursor and Antigravity** hooks are one unquoted string with
+    forward slashes. When the path contains a space, init uses its Windows
+    8.3 short name (`C:/Users/TESTUS~1/...`). If the volume has no short
+    names, Codex and Cursor get PowerShell's `& "<path>"` and Antigravity the
+    plain path, and `plur doctor` names each affected editor
+    (`windowsHookFallback`), because those hooks may not run.
+  - A Windows CI job (`Windows init hooks`) runs `plur init` into a home with
+    a space and executes every generated hook through `bash -c`,
+    `pwsh -NoProfile -Command` and `cmd /C`, checking each one reached the CLI.
+    It then runs `plur init` again and fails if any editor's hook count
+    changed, or if `plur doctor` does not report PLUR's hooks in each editor's
+    hooks file.
+
+  macOS/Linux output is unchanged: the path is quoted only when it contains
+  whitespace, and a path without one is written byte-for-byte as before
+  (pinned by a snapshot test).
+- **Re-running init did not recognise its own hooks.** The matcher looked for
+  `.plur/bin/plur-hook` with forward slashes only, so every re-run on Windows
+  appended another hook set. It now normalises slashes, quotes and case, and
+  claims a hook when PLUR's own launcher — the shim, the `npx @plur-ai/cli`
+  fallback, or the Claude Code exec form — runs any `hook-*` subcommand. The
+  match covers the whole command: PLUR's launcher, the subcommand, then
+  plain arguments only. A command that chains, pipes, redirects or
+  substitutes (`&&`, `;`, `|`, `>`, backticks, `$(`), or that wraps the shim
+  (`echo`, `nice`, `env`), is yours and is left alone. An exec-form hook counts
+  only when its js entry is one that init itself recorded in
+  `~/.plur/bin/plur-hook.meta.json`. That file now keeps the last 10 entries
+  PLUR has recorded (a single-entry file from an older version becomes a list
+  of one), so after the CLI moves — an npm prefix change, an upgrade into a
+  new directory — re-running init still replaces the old hooks instead of
+  adding a second set, while a checkout PLUR never recorded is never claimed.
+  The
+  shim also counts under its 8.3 short path, where Windows shortens the file
+  name too (`.../PLUR~1/bin/PLUR-H~1.CMD`); the short alias is claimed only
+  inside PLUR's own bin directory. Re-running init therefore leaves the hook
+  count of every editor unchanged, with or without short names. There
+  is no subcommand list to keep up to date, so a new hook never duplicates on
+  re-init. Re-run `plur init` once: it removes the duplicated, unquoted hooks
+  older versions wrote and leaves exactly one set per event. Your own hooks are
+  untouched, including one named `hook-*` that another program runs and one
+  that shares an entry with a PLUR hook. `plur doctor`, the Cursor and Codex
+  legs and `plur-mcp init` use the same matcher (`plur-mcp init` no longer adds
+  a second set next to the shim hooks `plur init` wrote).
+- **The MCP entry launched a `.cmd`.** Current Node refuses to spawn a `.cmd`
+  directly (`spawn EINVAL`). On Windows the entry is now
+  `{ command: <node.exe>, args: [<@plur-ai/mcp js entry>] }`, for Claude Code,
+  Claude Desktop, Cursor, Codex and Antigravity alike. When the js entry cannot
+  be resolved (a CLI-only install), the pinned `cmd.exe /c npx` form remains
+  the fallback. Re-running init heals an existing `plur-mcp.cmd` entry that init
+  wrote, and a node-form entry whose `node.exe` or js entry no longer exists
+  (after a Node upgrade or a version-manager switch); `plur doctor` reports
+  such an entry as broken. Init's status line names which of these it healed
+  and what it wrote, instead of "upgraded stale npx entry". A hand-written entry is never changed. An entry
+  whose command is a bare `node` or `node.exe` is resolved through PATH, so
+  doctor never reports it as missing, and init neither pins it to the
+  version-specific node path nor replaces it with the npx fallback; this holds
+  for opencode's `mcp.plur` too. `plur doctor` now also reports an opencode
+  `mcp.plur` whose node path no longer exists (`opencode.mcpPlurMissingPaths`).
+  Codex keeps its registration in `config.toml`, which init does not edit by
+  hand. `plur doctor` flags any registration whose command is the old
+  `plur-mcp.cmd` shim (`codexCmdShimMcp`, and Codex is not reported as wired),
+  since it cannot start. When the registration is exactly that shim and
+  nothing else, re-running `plur init --codex` replaces it through
+  `codex mcp remove` + `codex mcp add`. A registration that also carries an
+  `env` (inline or as a subtable), another key, or a multi-line `args` array is
+  left alone, because the re-add would drop those settings: init says the
+  entry fails to start and prints the `command` and `args` lines to set by
+  hand under `[mcp_servers.plur]`, keeping everything else, env included.
+- The warning about committing `.cursor/hooks.json` with a machine-local path
+  fires again when that path is quoted, and `plur init --no-opencode` now says
+  it skipped opencode because of the flag.
+
+### Claude Code: corrections in a prompt now prompt a `plur_learn`
+
+**The correction reminder never fired** (#1312). `plur hook-correction-detect`
+spots correction-shaped prompts ("no, …", "from now on", "I prefer" …) and
+reminds the agent to save the rule with `plur_learn`. No installer registered
+it, so corrections were acknowledged in prose and lost.
+
+`plur hook-inject` now runs the same detection on every `UserPromptSubmit`
+and appends the reminder to its own output: after the memory on the first
+prompt, alongside the 10-minute reminder when both are due, or on its own on
+a later prompt. A prompt that does not match, including the known false
+positives ("no problem", "actually that works", "wait a sec"), adds nothing.
+There is no extra process per prompt and no `plur init` step beyond the one
+for #1313. The standalone command still works for anyone who registered it by
+hand; if you did, remove that entry, or the reminder appears twice.
+
+Checked in a real Claude Code session: a second prompt starting "No, from
+now on" carried the reminder, and the model quoted it back.
+
+### Claude Code: memory is in place for the first reply
+
+**The first reply of a Claude Code session had no memory unless it called a
+tool, and a one-shot `claude -p` never had any** (#1313). `plur init`
+registered the `UserPromptSubmit` injection as `async: true`, and Claude Code
+delivers async context only at the next safe point. The rehydrate after
+compaction (`SessionStart`, matcher `compact`) had the same problem.
+
+Both are now registered synchronously with a 20s timeout. **Re-run
+`plur init`** to move an existing registration; it replaces the old entries.
+The hook bounds its own work below the timeout: hybrid search gets 8s
+(`PLUR_HOOK_HYBRID_DEADLINE_MS`), then BM25 serves the turn, and the hook
+exits by itself after 15s (`PLUR_HOOK_CEILING_MS`, was 55s). The inject lock
+goes stale on the same clock, so a lock left by a killed run blocks for 15s,
+not 55s.
+
+Later prompts do not re-run the injection, so they add little. Measured on a
+10,000-engram store (10.6 MB of YAML), each run a fresh process: the first
+prompt took 2.3 to 2.5s, the rehydrate 2.3 to 2.7s, and a later prompt 68 to
+101ms, against 34ms for a bare `node -e 0`. With no embedding cache, the
+hybrid deadline is missed and BM25 answers in 9.1 to 9.3s.
+
+When the hook exits past a hybrid search that missed its deadline, it first
+waits, for up to 5s, for that search to finish, and then for any store lock
+of its own still on disk. Without the wait, 10 of 12 runs on the same store
+left an empty `engrams.yaml.lock` behind. Core cannot tell who owns an empty
+lock, so every writer, including the next prompt's hook, waited out the 60s
+stale threshold. Checking for the lock file alone was not enough: the
+search's lock create can already be under way when the hook looks, and land
+after it.
+
+### Codex and Antigravity hooks no longer leave a stale store lock
+
+**The Codex `SessionStart` / `UserPromptSubmit` hooks and the Antigravity
+pre-invocation hook could exit in the middle of a store write and leave
+`engrams.yaml.lock` behind** (#1343), the same leak #1313 fixed for Claude
+Code. They force-exit as soon as the turn is served, while a hybrid search
+that missed its deadline is still recording its injection. With lock
+acquisition slowed in a test, all three left an empty lock on every run;
+the Claude Code hook did the same when its 15s watchdog fired mid-write.
+
+Every force-exit now goes through one bounded wait (`lib/store-lock-exit.ts`,
+moved out of `hook-inject`) until the process has no store lock work in
+flight. The lock file alone could not show that: when one in-process writer
+hands the lock to the next, the next one's create is already issued but is
+not on disk yet. Core now exports `pendingStoreLockOps()`, a count of lock
+operations that are queued, acquiring, held or releasing. The exit waits
+until that count is zero and no lock file of its own is left, and it checks
+both in the same step that calls `process.exit()`. The shared
+Codex/Antigravity exit waits up to 5s, and the Claude Code watchdog up to 3s,
+so it still exits before Claude Code's 20s timeout. The run the watchdog stopped
+prints nothing and does not mark the session during that wait. After an
+abandoned hybrid search, the Claude Code hook first waits for that search to
+finish and then runs this check, both inside the watchdog budget. Hooks that never open the
+store (Codex guard, post-tool and session-end; Antigravity guard) share the
+exit, so they are covered if they ever start writing. Cursor hooks do not
+force-exit and were not affected.
+
+### The primary store is no longer registered a second time as a project store
+
+**On some installs every engram was injected twice, under two ids** (#1319).
+Store auto-discovery walks up from the working directory looking for
+`.plur/engrams.yaml`, and skipped the primary store by comparing path strings.
+When the primary path and the walk spelled the same directory differently —
+a symlinked home, or `/var` versus `/private/var` — the check missed, and the
+primary `engrams.yaml` was written into `config.yaml` as `project:<home>`. It
+was then loaded once as the primary and once as a secondary with namespaced
+ids, costing injection budget and splitting feedback between the two copies.
+
+Now:
+
+- Discovery and `addStore` compare canonical paths. `addStore` refuses the
+  primary file under any spelling. If `config.yaml` already lists the primary
+  file as a store, the error says that entry is ignored and can be removed.
+  A second spelling of an already-registered local store returns
+  `already_registered` with the scope of an entry that is actually loaded,
+  preferring the scope you asked for.
+- A `config.yaml` that already holds such an entry needs no edit. At load, a
+  local store entry is ignored, with one warning, when its file is the
+  primary file, or when both its file and its scope repeat an earlier entry.
+  The entry stays in `config.yaml`, and writebacks start from the file on
+  disk, so nothing is removed.
+- `plur doctor` lists the store entries that are ignored at load (also in
+  `--json`, as `ignoredDuplicateStores`), and the new `plur stores prune`
+  removes the ones that name the primary store file, which stops the
+  warning (#1356). It removes only those entries, leaves every other byte of
+  `config.yaml` as it was (comments included), and writes atomically. If the
+  `stores:` list is not in plain block style it changes nothing and says so.
+  An entry that repeats another store's file and scope is still left for you
+  to remove by hand.
+- One file registered under two different scopes keeps loading under both,
+  as before, because each scope admits different engrams. A warning says the
+  two entries share a file, and that engrams scoped `global` in it appear
+  under both scopes.
+- Path comparison also holds for files that do not exist yet, such as a fresh
+  install's `engrams.yaml`. `canonicalize` used to fall back to the path as
+  written when it could not be resolved. It now resolves the deepest existing
+  folder above it and re-appends the rest, so `/var/…/missing` and
+  `/private/var/…/missing` compare equal. How directory trust matches
+  symlinked and not-yet-existing folders is settled separately, in #1348.
+- Path comparison also folds letter case on a case-insensitive filesystem
+  (macOS, Windows) (#1357). `canonicalize` returns the on-disk case, so
+  `~/Store/engrams.yaml` and `~/store/engrams.yaml` are one store. The CLI's
+  copy of `canonicalize` now matches core's. In the folder map, a checked
+  folder is compared in its on-disk case; an `off` entry still matches every
+  spelling it matched before, and a `trusted` entry recorded in the on-disk
+  case (as `plur trust` records it) now also covers other case spellings.
+  `plur folders set`, `plur folders rm` and `plur untrust` find every entry
+  recorded for a folder, including one that spells it differently: as
+  typed, through a symlink, as `~/dup` beside its absolute path (both kept
+  by the `trust.yaml` import), or in another letter case when the
+  filesystem shows that spelling is the same folder (a sibling `pROJ` or
+  `Ⓟ` on a case-sensitive disk is never taken for `Proj` or `ⓟ`). `rm`
+  removes all of them, and `untrust` clears all their grants. `set` merges
+  them into one entry and keeps what was in effect: a trust grant and a
+  scope come only from entries that applied to the folder, and the scope
+  kept is the one the resolver was using. An entry that matched only by
+  its spelling never applied its grant or scope (only an `off` applies
+  that loosely), so it can only make the mode more restrictive: its `off`
+  or `ask` counts, its `on` does not. The most restrictive mode is kept
+  unless you set one. `--scope` without a mode
+  means `on`, also when it replaces a merged `off`.
+
 ### The secret guard now recognises GitHub, GitLab, Slack, npm, Stripe and AWS temporary keys
 
 **A memory holding a GitHub token was stored, and could sync to a team
@@ -66,14 +357,26 @@ repo's request. Only the CLI writes the map.
 - **`resolveFolderPolicy(dir)`** (core, and `Plur.resolveFolderPolicy`) returns
   `{ mode, scope?, remoteAllowed, source }`, resolved in this order:
   1. Any matching `off` entry wins.
-  2. A `.plur.yaml` means on. A map `scope` beats its scope hint, and its remote
-     is allowed only under a `trusted` entry.
+  2. A **trusted** `.plur.yaml`, or one that requests nothing, means on, exactly
+     as before. A map `scope` beats its scope hint, and its remote is allowed
+     only under a `trusted` entry. An **untrusted** `.plur.yaml` that requests a
+     scope, domain or remote has those requests ignored. A map decision for the
+     folder applies if there is one; otherwise the answer is `ask`, with
+     `reason: 'untrusted-plur-yaml'` and what the repo `requested`.
   3. A project MCP config means on.
   4. Otherwise the most specific matching entry decides.
   5. Otherwise the answer is `ask`, and that includes `$HOME`.
 
   Paths may be globs (`*`, `**`, `?`) and may start with `~`. A plain folder
   also covers everything below it.
+
+  **This changes behaviour for anyone whose `.plur.yaml` is not trusted**
+  (owner decision D1, "ignore-ask"). A cloned repo can no longer choose where
+  your saves go. Once the hooks use this resolver (the next PR), such a repo
+  stops applying its scope hint and asks you once instead. Answering yes records
+  `trusted: true` (plus a scope if you choose one), and the repo then works as
+  it does today. Until that PR lands, the hooks behave exactly as before. To
+  keep a repo working without being asked, run `plur trust <repo>` now.
 - **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
   `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
   `--no-trusted`.
@@ -91,10 +394,33 @@ repo's request. Only the CLI writes the map.
   - Neither command writes to a folders.yaml it cannot read; it is never
     overwritten.
 - **Upgrade needs no steps.** The first read of a missing `folders.yaml` imports
-  the `trust.yaml` entries as `trusted: true` entries. Nothing is ever added to
-  `trust.yaml`. `plur untrust` removes the grant from both files, so neither a
-  downgrade (an older version reading `trust.yaml`) nor a fresh import brings a
-  revoked grant back.
+  the `trust.yaml` entries as `trusted: true` entries.
+- **Trust is written to both files, for now.** The published opencode plugin
+  still reads only `trust.yaml`. So until every adapter is on this core, each
+  grant and each revocation updates both `folders.yaml` and `trust.yaml`. This
+  covers `plur trust`, `plur untrust`, `plur folders set --trusted` and
+  `--no-trusted`.
+  - A revocation lands in both files, so neither an older reader, a downgrade
+    nor a fresh import brings it back. This applies to `plur untrust`, to
+    `--no-trusted`, and to `plur folders rm` of a trusted entry (owner decision
+    F2). A `trust.yaml` line counts as the same folder under the map's own
+    matching, so a `~/…` spelling, or a differently-cased spelling on a
+    case-insensitive disk, is removed too. When a revocation matches several
+    entries for the folder, the line of every entry that held a grant is
+    removed. On a case-sensitive disk, the line of a sibling folder whose name
+    differs only in letter case is kept. A revocation never adds anything to
+    `trust.yaml`.
+  - The one-time code is used up as soon as `folders.yaml` is saved, before
+    `trust.yaml` is written (owner decision F3). If the `trust.yaml` write
+    fails, the command reports the error, and the code cannot be used again;
+    the next attempt needs a fresh ask.
+  - Glob grants are recorded only in the map, because the old reader cannot
+    express them.
+  - A grant that an older core adds to `trust.yaml` after the import is not
+    seen by this core until you run `plur trust` again.
+- **Writes are serialised.** Every change to `folders.yaml`, `trust.yaml` and
+  the nonce files is made under one lock. Before this, 12 parallel
+  `plur folders set` runs all reported success but only 5 entries were saved.
 - **`plur trust`, `plur untrust` and `plur init-remote`** now set and clear
   `trusted` in the map. Their output and exit codes are unchanged, with one
   exception: `plur trust` and `plur untrust` exit 1 on a folders.yaml they
@@ -269,6 +595,244 @@ The hooks' "is anything queued?" check treated `PLUR_PATH=""` as a path and
 looked for `./engrams.yaml` in the current directory, so it skipped a store
 under `~/.plur` that had queued writes. An empty value now counts as unset,
 as it does everywhere else (#1395).
+
+### Claude Code: one full injection per session, and the reminder fires
+
+**Every prompt in a Claude Code session re-ran the full "session started"
+injection, and the 10-minute memory reminder never fired** (#1278). The
+session marker in `plur hook-inject` was keyed on the parent process id.
+Claude Code runs every hook in a fresh shell, so the id changed on every
+prompt, and the "already started" check never matched. This is the same root
+cause as the Stop counter (#1266).
+
+The marker, the reminder clock and the concurrency lock are now keyed on the
+payload `session_id`, sanitised with the shared session-key helper. They fall
+back to `CLAUDE_SESSION_ID`, then the parent process id, only when the payload
+has no id. The prompt stored for rehydration after compaction is now updated
+on every prompt, not only the first.
+
+The marker is written only after the injected context has been written to
+stdout. A first-message injection that does not finish is retried on the next
+prompt. That covers one that throws, one the hook's own 55-second watchdog
+stops, and one the editor kills at its hook timeout. At most **2** full
+attempts run per session. After that the hook stops retrying. It marks the
+session and prints a one-line notice that automatic memory was skipped and
+suggests `plur_session_start`. There is no keyword-only fallback, because
+whatever stopped the full injection (a store too slow for the timeout, or one
+that does not load) would stop it too. Rehydration after compaction is not
+counted and not capped.
+
+The concurrency lock is released when the injection throws, and the watchdog
+removes it before exiting. Before, the lock stayed in place, and every prompt
+in the next 55 seconds exited silently. A run the editor kills outright can
+still leave the lock. The next prompt after the lock goes stale (55 seconds)
+then retries, within the same 2-attempt cap.
+
+Checked in a real Claude Code session: before, the second prompt of a resumed
+session got a second full injection; now it gets none.
+
+`plur_session_end` also looks for the session checkpoint under the key the
+Stop hook writes. That hook replaces unsafe characters with `_`, while this
+reader stripped them, so a session id with such characters left its checkpoint
+behind, and the next session reported it as orphaned.
+
+### Claude Code now actually receives injected memory
+
+**In Claude Code, automatic memory never reached the model** (#1274). An
+enterprise deployment reported that most folders had no automatic memory.
+`plur hook-inject` printed `{"additionalContext": ...}` at the top level.
+Claude Code records that as plain hook output and does not show it to the
+model. The same bug hit the Stop nudge (#1266).
+
+Every Claude Code event that `hook-inject` serves now prints
+`{"hookSpecificOutput":{"hookEventName":<event>,"additionalContext":...}}`,
+named after the event that fired: `UserPromptSubmit` (the first-message
+injection and the 10-minute reminder), `PreToolUse` (plan mode, skills,
+agents) and `SubagentStart`. The name comes from the payload's
+`hook_event_name`, or from how the hook was invoked when the payload has none.
+
+**Re-injection after compaction moved from `PostCompact` to `SessionStart`
+(matcher `compact`).** `PostCompact` cannot carry context at all. Claude Code
+rejects `hookEventName: "PostCompact"` with a visible validation error and
+ignores the top-level field. **Re-run `plur init`** to move the hook. Until you
+do, the old `PostCompact` entry prints nothing. The `SessionStart` payload has
+no compaction summary, so the rehydrate query now comes from the session's
+last prompt, stored per Claude Code `session_id`. That copy is private: the
+session directory is created 0700 and must be a real directory this user owns.
+A planted symlink, or a directory another user created, is refused, and state
+moves to `hook-sessions/` under the PLUR root instead, but only if that directory
+passes the same check. If both are refused, the hook keeps no state at all and
+still injects. A refused directory is never written to. The file is written 0600
+through an exclusive, no-follow temp file and a rename, so a symlink at its path
+is replaced, never followed. It keeps only the first 1000 characters, and the
+SessionEnd hook deletes it. On Linux `$TMPDIR` is usually the shared `/tmp`.
+The Stop hook's counter follows the same rule, and so does its session
+checkpoint in `<PLUR root>/sessions`. An empty `PLUR_PATH` now means "unset"
+wherever the hooks resolve the PLUR root, so it never resolves against the
+working directory.
+
+`UserPromptSubmit` stays `async: true`. Async context does arrive, but at the
+next safe point (after a tool result, or before the next prompt), not on the
+turn that triggered it. A first message that needs no tools is answered
+without memory. In a one-shot `claude -p` run, that means no memory at all.
+
+An unknown `--event` no longer echoes the hook payload back to stdout.
+
+**`plur-mcp init` now registers the same rehydrate hook** (#1279). It still
+put rehydrate on `PostCompact`. It now uses `SessionStart` with matcher
+`compact`, synchronous with `timeout: 20`, the same as `plur init` (#1313);
+its `UserPromptSubmit` injection moves to the same 20s budget. A test fails
+if the two diverge. Re-running `plur-mcp init` used to stop at "already
+installed". It now removes PLUR's `PostCompact` hooks and, in the same file,
+puts the `SessionStart(compact)` one in place of the old rehydrate. A file
+with PLUR hooks but no rehydrate gets none added. That covers the global
+settings file, where `plur init` puts only its enforcement hooks, so
+rehydrate does not run twice. Hooks with no `command` (`type: "prompt"` or
+`"agent"`) no longer make init throw. It removes PLUR's hooks one at a time and only
+those: a hook counts as PLUR's when it runs the PLUR binary (the
+`~/.plur/bin/plur-hook` shim or `npx @plur-ai/cli`) with a subcommand init
+writes. Your own hooks, including your own `PostCompact` hooks and one that
+shares an entry with a PLUR hook, are left in place. Installs that use the
+local shim, including the backslash and quoted Windows paths, now count as
+installed too, so re-running no longer adds a second set (#1303, on Windows
+as well).
+
+### A killed writer no longer stalls the store for a minute
+
+**A process killed while taking the store lock left an empty
+`engrams.yaml.lock` that blocked every other writer for the full 60s stale
+threshold** (#1354). The lock was created first and its owner token written
+second; a process killed in between (SIGKILL, a hook killed at its harness
+budget) left a file with no pid in it, so the liveness check that recovers
+from a dead holder at once had nothing to check. Hooks, the MCP server and the
+CLI all waited it out.
+
+Now:
+
+- Core publishes the lock complete. The token is written to a private file and
+  hard-linked into place, which fails on an existing lock exactly as the
+  exclusive create did. A kill at any point leaves either no lock or a lock
+  naming a dead pid, which is taken over at once. Measured: an observer
+  process polling the lock during 3,000 acquisitions saw an empty lock 4,115
+  times before this change and never after it.
+- An empty lock older than 10s is treated as abandoned and taken over. Empty
+  locks can still come from older clients sharing the store and from
+  filesystems without hard links. The 10s comes from measurement: over 20,000
+  create-then-write cycles the gap was at most 0.73s, p99 10–117ms depending
+  on event-loop load.
+- Takeovers are serialized by a ladder of guard slots
+  (`engrams.yaml.lock.guard-<key>-<n>`, keyed by the token of the lock being
+  taken over). A slot left by a crashed stealer is stepped over, never
+  removed, so a crash inside a takeover cannot let two stealers in at once. A
+  single guard file had that flaw: after two crashes, two stealers could both
+  hold it. Under its slot, a stealer re-inspects the lock and claims it only if
+  it is the same file and still abandoned. This closes an older race that applies to every takeover,
+  including the immediate one for a dead holder. Two waiters that judged the
+  same abandoned lock could both act on it. The second one moved the first
+  one's fresh, live lock aside, and while it was putting that lock back, a
+  third process could acquire it. A test that pauses a takeover at that point
+  shows two holders without the guard and none with it. The claim also checks
+  that the file it moved is the one it inspected, not just that the contents
+  match, and it puts a live owner's lock back by hard link, so the lock is
+  never briefly empty.
+- A lock carrying a token is unchanged. A live owner is never stolen from,
+  however old the lock. A token that cannot be checked, such as one from
+  another host, still gets the full 60s.
+
+This applies to the YAML store, and to PGLite, which keeps YAML as its source
+of truth and takes the same lock. A Postgres primary store serializes writers
+with a Postgres advisory lock and does not use this lock file.
+
+### A team save is no longer swallowed by a personal note with the same text (#1268)
+
+**A shared-scope write whose text matched a personal engram was never
+written.** Cross-scope recurrence (#176) matched any active engram with the same
+content hash in a different scope, and on a match it updates that engram
+*instead* of writing a new one. So a `group:` or `project:` learn identical to
+something in `global`, `local`, `user:` or `agent:` bumped the personal note's
+recurrence count and nothing reached the team scope. Found while triaging an
+enterprise deployment's report of team saves that never reached the team store.
+
+**A shared-scope save now always writes its team copy.** It is never absorbed
+into another engram — not a personal or `global` one (including one the
+recurrence ladder graduated, or one you moved to `global` yourself with
+`rescope`), and not another team's engram either: a save to `group:a/ops` whose
+text matches an engram in `group:a/eng` now reaches the ops store instead of
+vanishing into the eng engram. The matching engram is still credited: the team
+save is recorded on it as a recurrence (counted, with a source marked
+`validated_by` the team scope, and commitment escalated by the usual ladder).
+You may end up with several engrams with the same text — your own and each
+team's — and that is intended. `plur import` follows the same rule: a record for
+a shared scope whose text exists elsewhere is imported into its own scope, and
+`--dry-run` now predicts that instead of reporting it as a duplicate.
+
+**What is in a team store stays there.** When the ladder would broaden a
+team-bound engram to `global` — one served by, queued for, or in the scope of
+any team store, a url store or a `shared: true` file-path store — it now leaves
+that engram exactly as it is and creates, once, a `global` copy in your local
+store instead. The copy points back at the team engram (`derived_from`), its
+first source records `promoted_from` the team scope, its commitment escalates
+as the ladder would, and it is never queued for or pushed to a team store.
+Later recurrences credit the same copy. A team engram still queued for its
+store also records the recurrence on itself (count and source; its scope and
+queue entry are kept). The copy keeps the
+team engram's validity window, knowledge anchors and dual coding; it does not
+take its pin (a pin spends your own injection budget) or its relations (they
+name team-store ids). When a `global` engram with the same text already exists,
+the ladder credits that one rather than creating a second. Before, the team
+engram could be rewritten to `global` in the team's own file, or rewritten
+locally and then pushed to the team store as `scope: global`. Non-shared
+file-path stores still broaden in place.
+
+Personal→personal recurrence, and a personal save recurring onto a shared
+engram, behave as before.
+
+**How far the ladder may escalate is now a setting.** `recurrence.max_commitment`
+in `config.yaml` caps the commitment the cross-scope ladder can reach — team
+validation and the promoted `global` copy included:
+
+```yaml
+recurrence:
+  max_commitment: locked   # default: the ladder may lock a rule
+  # max_commitment: decided  # stop one step below; only an explicit act locks
+```
+
+A config without the key behaves as `locked`, which is what the ladder has
+always done. An unresolved tension still blocks the step into `locked` either
+way — on the engram itself, on the promoted `global` copy, and on an existing
+`global` engram the ladder credits instead. The ladder only moves the four rungs
+`exploring → leaning → decided → locked`; a `draft` engram (pending approval)
+or any other value is never advanced.
+
+### A team save that stays on this machine now says so (#1264)
+
+**A write to a shared scope with no store registered for it never left the
+machine, and nothing said so.** An enterprise deployment reported engrams that
+were created and never reached the team. A `learn` to `group:`/`project:`/`org:`…
+with no writable url store for exactly that scope falls through to the local
+store — deliberately, since nothing is auto-routed into a shared store — but
+`plur_learn` answered `decision: "ADD"` and `plur learn` printed nothing else.
+
+Every learn result now carries `delivery`: `remote` (a store accepted it),
+`outbox` (saved here and queued for a store — the push is deferred or failed and
+will be retried) or `local` (on this machine only). A shared scope that lands
+`local` also carries a warning naming the scope and how to register a store for
+it. `plur_learn` returns both (`delivery`, `delivery_warning`); `plur learn
+--json` does too, and plain `plur learn` prints the warning even with `--quiet`.
+Core exposes the same answer as `plur.deliveryOf(engram, requestedScope?)`.
+
+When a save to a shared scope comes back as an engram in a *different* scope —
+recorded as a recurrence on another team's engram, or on a `global` one — the
+result is `local` and the warning names the scope you asked for and says nothing
+was written there. Before, the warning named the other team's scope (the one
+you did not write to), or there was no warning at all.
+
+A save that matched an existing row is classified by the store that actually
+holds that row. With a url store and a local path store registered for the same
+scope, a match on the path store's row is reported `local`, not `remote` —
+nothing was sent anywhere.
+
+Nothing about where engrams are written changes. The field is additive.
 
 ### `plur stores add` can register a remote store, and checks the token first (#1265)
 
