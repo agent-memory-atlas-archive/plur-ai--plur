@@ -63,6 +63,16 @@ what you decided about the folder:
   older install. Codex's existing SessionStart hook handles `resume` itself.
   Cursor and Antigravity send no resume signal and delete no nonces at session
   end, so a resumed conversation there keeps its unexpired question.
+- **Some folders cannot be answered from the question.** A folder rule reads
+  `*` and `?` as a pattern, so a "yes" for a folder named `x*` would also
+  cover its sibling `xyz` (#1493). A path with `*`, `?` or `[`, or with a
+  control or line-break character, gets a short notice instead: the path is
+  shown JSON-escaped as quoted data, and no command or nonce is offered. The
+  folder stays undecided and is asked about once per session. Set it by hand.
+- Asking changes nothing. The question no longer registers the folder's own
+  `.plur/engrams.yaml` as a project store in config.yaml (the hooks build
+  their scope ranker with store discovery off), so that store never reaches
+  another folder's session and is never offered as a scope.
 
 Not changed yet: the opencode plugin and the MCP server's `plur_session_start`
 do not read the map.

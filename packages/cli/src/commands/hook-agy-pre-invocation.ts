@@ -1,5 +1,5 @@
 import { createPlur, type GlobalFlags } from '../plur.js'
-import { hookFolderPolicy, sessionSettings, folderAskOnce } from '../lib/folder-gate.js'
+import { hookFolderPolicy, sessionSettings, folderAskOnce, createAskPlur } from '../lib/folder-gate.js'
 import type { FolderPolicy } from '@plur-ai/core'
 import {
   readStdinJson,
@@ -123,9 +123,8 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
     if (workspace && policy?.mode === 'ask') {
       // The question, once per conversation; an empty message after that. It
       // is cached as this turn's message so mid-turn invocations replay it.
-      let askPlur = null
-      try { askPlur = createPlur(flags, { readonly: true }) } catch { /* the question works without the ranker */ }
-      const ask = folderAskOnce({ dir: workspace, policy, sessionId: conversationId, flags, plur: askPlur, prompt: user?.text ?? '' }) ?? ''
+      // No store discovery: asking must not register this folder's .plur store.
+      const ask = folderAskOnce({ dir: workspace, policy, sessionId: conversationId, flags, plur: createAskPlur(flags), prompt: user?.text ?? '' }) ?? ''
       writeAgyTurnCache({ conversationId, step: user?.stepIndex ?? 0, textHash: userHash, message: ask })
       if (ask) emitInjectSteps(ask)
       return
