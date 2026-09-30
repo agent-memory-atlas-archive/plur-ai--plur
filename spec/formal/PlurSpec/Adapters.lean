@@ -9,6 +9,23 @@ exhibits a counterexample for the original code. Core library only.
 Checked against commit 55d47099 (2026-09-27): hook-inject.ts changed only `acquireInjectLock`'s
 stale-takeover path (modelled and proved in R2CLI §InjectLock). None of this file's sections
 (`.plur.yaml` trust in §9 included) touches the lock, so every theorem still holds.
+
+Checked against the merge of main into #1228 (2026-09-30: #1276, #1300, #1353,
+#1395, #1396, #1270):
+- hook-inject.ts: session key, marker timing, state dir and lock are R2CLI
+  §1–§3. The `trustedProjectScope` gate of §9 is still applied at session
+  start and on the reminder path.
+- tools.ts: plur_session_end's checkpoint key list also tries the `_`-replacing
+  form (R2CLI §2). §1 and §2 do not read keys.
+- init.ts, doctor.ts, cursor-hooks.ts: #1270 (decisions H2, H3, F4) replaced
+  the classifier. It is re-read in §3 and §4, and doctor was re-modelled in
+  §3's S4(2).
+- mcp-config.ts: #1270 added the Windows node.exe/cmd-shim healing. The env
+  merge of §4(b) is unchanged.
+
+Checked against #1349 (2026-09-30): still holds. hook-inject.ts's change is its
+exit path: the watchdog marks the run stopping and waits, bounded, for the
+store to go idle. The §9 trust gate is untouched.
 -/
 
 namespace PlurSpec.Adapters
@@ -416,7 +433,20 @@ abstracted to the features the classifier reads.
 Checked against round 2 (2026-09-27): still holds because `mergeHooks`,
 `stripPlurHooks` and `isPlurHookSpec` are not in the round-2 diff of init.ts; round 2
 only widened the PostToolUse session-mark MATCHER to `mcp__.*__plur_session_start`,
-which is a field of an installed spec, not the classifier. -/
+which is a field of an installed spec, not the classifier.
+
+Checked against the main merge (2026-09-30): #1270 (decisions H2, H3, F4)
+replaced init.ts's local `isPlurHookSpec` with the shared matcher in
+lib/hook-command.ts. `plurBinary` now reads as "PLUR's own launcher runs it":
+the plur-hook shim or the npx fallback as an anchored shell-string prefix
+(backslashes and case normalised, length-capped), `cmd.exe /c` plus those,
+or the exec form `node <cli js entry>` for an entry `plur init` recorded.
+`hookSub` is still "runs a `hook-*` subcommand", and `hasCommand` is still
+"the command is a string". `stripPlurHooks` keeps the same per-spec shape, so
+`strip`, `merge_idempotent` and `merge_preserves_user` still describe it. The
+session-mark matcher upgrade (an old `mcp__plur__…` entry is replaced, not
+duplicated) is an instance of `merge_idempotent`. It is replayed by
+test/init-session-mark-upgrade.test.ts. -/
 
 structure Spec where
   hasCommand : Bool   -- `command` is a string (false for `type: "prompt"`)
@@ -565,17 +595,19 @@ and the binary check after `\ → /`.
 
 Checked against round 2 (2026-09-27): still holds because `hasAnyPlurHook` is
 unchanged; round 2 only made the HEALTHY line name the harnesses that carry hooks
-(`hookHarnesses`/`readyLine`, R2CLI §5 `fixed_claim_sound`). -/
+(`hookHarnesses`/`readyLine`, R2CLI §5 `fixed_claim_sound`).
+
+Re-modelled for the main merge (2026-09-30): since #1270, `hasAnyPlurHook` calls
+the same `isPlurHookSpec` as init (decisions H2, H3), so doctor's test is now
+exactly init's classifier. That includes the `hook-*` subcommand. -/
 
 def doctorDetectsOrig (h : Spec) : Bool := h.hasCommand && h.plurBinary && !h.winPath
-def doctorDetects (h : Spec) : Bool := h.hasCommand && h.plurBinary
+def doctorDetects (h : Spec) : Bool := plurSpec h
 
 /-- Whatever init installs (or would strip as PLUR's), doctor sees. -/
-theorem doctor_sees_installed (h : Spec) (hp : plurSpec h = true) : doctorDetects h = true := by
-  simp only [plurSpec, Bool.and_eq_true] at hp
-  simp [doctorDetects, hp.1.1, hp.1.2]
+theorem doctor_sees_installed (h : Spec) (hp : plurSpec h = true) : doctorDetects h = true := hp
 theorem doctor_ignores_user (h : Spec) (hu : h.plurBinary = false) : doctorDetects h = false := by
-  simp [doctorDetects, hu]
+  simp [doctorDetects, plurSpec, hu]
 theorem orig_doctor_misses_windows :
     plurSpec plurShimWin = true ∧ doctorDetectsOrig plurShimWin = false := by decide
 
@@ -586,7 +618,14 @@ theorem orig_doctor_misses_windows :
 (b) the healed MCP entry's env: `{...existing, ...caller}` versus replace.
 
 Checked against round 2 (2026-09-27): still holds because cursor-hooks.ts and
-mcp-config.ts have no round-2 change. -/
+mcp-config.ts have no round-2 change.
+
+Checked against the main merge (2026-09-30): still holds. cursor-hooks.ts's
+only change is its classifier, which is now the shared `isPlurHookCommand`
+(read as `plurSpec`, §3). The top-level merge that keeps `version` and unknown
+keys is unchanged. In mcp-config.ts, #1270 added Windows entry healing, and
+`healPlurMcpEntry` still merges env as `{...existing.env, ...recommended.env}`
+(`envHeal`). -/
 
 structure CursorCfg where
   version : Nat

@@ -11,6 +11,29 @@ abstract (oracles / parameters): every theorem holds for all of them. Each
 section states the property of the FIXED code, proves it, exhibits a
 counterexample theorem for the ORIGINAL code, and a reachability theorem so the
 property is not vacuous.
+
+Checked against the merge of main into #1228 (2026-09-30: #1276, #1300, #1353,
+#1395, #1396, #1270), section by section:
+- §1 holds. The Claude Code hook state dir is `hookSessionDir()`
+  (lib/session-task.ts): the shared dir if `ensureSessionDir` vets it, else
+  the private fallback under the store if that one is vetted, else null
+  (persist nothing). The Stop counter uses the same rule (H3). Every reader
+  and writer still goes through the vetting modelled here.
+- §2 was updated for decision H1: the checkpoint writer's key is payload-first
+  (`writerKey`). `closer_finds_writer` is re-proved for the new key.
+- §3 holds, with notes in the section: the marker key and the lock, which
+  run() now takes and releases through `takeInjectLock`/`releaseInjectLock`.
+- §4 to §7 hold. The counters still use `ticketCounter`. doctor's
+  `hookHarnesses`/`readyLine` are unchanged, and #1270 changed only its hook
+  classifier (Adapters §3).
+
+Checked against #1349 (2026-09-30): still holds. The Codex hooks
+(codex-hook-io.ts `runCodexHook`) and hook-inject now exit only once no store
+lock operation of theirs is in flight (bounded, lib/store-lock-exit.ts). The
+hook-inject watchdog marks the run stopping, so a stopped run prints nothing
+and writes no marker. It still releases the inject lock through
+`releaseInjectLock`. Session-dir vetting, keys, the lock and the counters are
+unchanged.
 -/
 
 namespace PlurSpec.R2CLI
@@ -180,24 +203,42 @@ the original writer disagreed with the closer whenever `--path` was given. -/
 theorem orig_writer_ignores_path :
     rootOrigWriter (some "/b") (some "/a") "~" ≠ rootFixed (some "/b") (some "/a") "~" := by decide
 
-/-- Keys (DOWNGRADED sub-claim): the writer keys `CLAUDE_SESSION_ID || ppid`; the
-closer tries `[payload, CLAUDE_SESSION_ID, ppid]`. Same env, same ppid ⇒ the
+/-- Keys (DOWNGRADED sub-claim; sanitisation abstract). Decision H1 (#1396, as
+merged): the writer (hook-learn-check) keys `hookSessionKey` = payload
+`session_id`, then `CLAUDE_SESSION_ID`, then ppid. It used to key
+`CLAUDE_SESSION_ID || ppid`. The closers (hook-session-end, plur_session_end)
+try `[payload, CLAUDE_SESSION_ID, ppid]`, each in the writer's `_`-replacing
+form and in the older stripped form. For the same payload, env and ppid, the
 closer's list contains the writer's key. -/
-def writerKey (env : Option String) (ppid : String) : String := env.getD ppid
+def writerKey (payload env : Option String) (ppid : String) : String := (payload <|> env).getD ppid
 def closerKeys (payload env : Option String) (ppid : String) : List String :=
   [payload, env, some ppid].filterMap id
 
 theorem closer_finds_writer (payload env : Option String) (ppid : String) :
-    writerKey env ppid ∈ closerKeys payload env ppid := by
+    writerKey payload env ppid ∈ closerKeys payload env ppid := by
   cases payload <;> cases env <;> simp [writerKey, closerKeys]
+
+/-- The pre-H1 writer key (env first) is still found too: older checkpoints
+are not orphaned by the upgrade. -/
+theorem closer_finds_pre_h1_writer (payload env : Option String) (ppid : String) :
+    env.getD ppid ∈ closerKeys payload env ppid := by
+  cases payload <;> cases env <;> simp [closerKeys]
 
 end Checkpoint
 
 /-! ## 3. Session identity and the inject lock (cli#7) -/
 namespace Inject
 
-/-- Marker key. `sid`/`pid` are disjoint by construction (the `sid-` prefix; a
-ppid is all digits). `safe` is `safeSessionKey`, an arbitrary function. -/
+/-- Marker key. `safe` is `safeSessionKey`, an arbitrary function. `sid` is the
+key derived from the payload `session_id`, and `pid` is the fallback key.
+
+Since decision H1 (#1396, as merged) the code writes `hookSessionKey`, which is
+`safe s` with no prefix: the `sid-` prefix is gone. #1228's `injectSessionKey`
+is kept only as a legacy READER form. The two constructors therefore stand for
+the key's source, not for disjoint strings. In code a payload id made only of
+digits could equal a ppid key. Claude Code session ids are UUIDs, and with a
+payload id the marker reader never tries ppid forms (`legacyMarkerKeys`). The
+theorems below compare keys of one source, so they are unaffected. -/
 inductive Key where
   | sid (s : String)
   | pid (p : Nat)
@@ -229,7 +270,16 @@ theorem fixed_same_session_no_reinject (safe : String → String) (s : String) (
   simp [injects, keyFixed]
 
 /-! Lock. Each acquirer is a process; the ORIGINAL acquire is two steps (stat,
-then write) and can interleave; the FIXED acquire is one atomic O_EXCL create. -/
+then write) and can interleave; the FIXED acquire is one atomic O_EXCL create.
+
+Merge with main (2026-09-30): main's #1276/#1353 structure is kept. That is the
+watchdog release, the two-attempt cap in `<key>.attempts` and the release in a
+`finally`. run() now takes the lock with `takeInjectLock` (the `excl` step
+below) and releases it with `releaseInjectLock`, both on the `finally` path and
+in the watchdog, so `releasedFixed` and §InjectLock describe run() itself.
+Main's stat-then-write was `origTwo`. Replayed by
+test/hook-inject-lock-concurrent.test.ts: six runs lined up at the lock. On a
+stat-then-write mutant every run injects. With O_EXCL exactly one does. -/
 
 /-- Original two-step protocol for two processes; schedule `[a-stat, b-stat,
 a-write, b-write]`. Returns who proceeds. -/

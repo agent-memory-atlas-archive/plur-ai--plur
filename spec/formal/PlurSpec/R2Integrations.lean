@@ -5,6 +5,11 @@ MCP annotations and plur_admin dispatch, the hermes bridge, the migrate codemod,
 claw setup/context-engine, opencode turn buffer, ui host normalisation, plus the
 round-1 follow-ups. Each section models the code branch for branch, proves the
 fixed behaviour and keeps the original-code counterexample. Core library only.
+
+Checked against the merge of main into #1228 (2026-09-30): the model still holds.
+Its only tools.ts change is plur_session_end's checkpoint key list, which now
+also tries the `_`-replacing `safeSessionKey` form (#1278; R2CLI §2). No tool's
+annotations, effects or plur_admin dispatch changed.
 -/
 
 namespace PlurSpec.R2Integrations

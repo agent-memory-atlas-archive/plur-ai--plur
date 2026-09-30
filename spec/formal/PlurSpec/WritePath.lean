@@ -6,6 +6,9 @@ covers. Each section names the code it mirrors. Payloads (statements, ids,
 content scanners, config) are abstracted: theorems quantify over them.
 
 Findings and replays: spec/formal/findings/writepath.md.
+
+Checked against #1349 (merged into #1228 on 2026-09-30): still holds. index.ts's
+only change is a re-export of `pendingStoreLockOps`, and no write-path branch changed.
 -/
 
 namespace PlurSpec.WritePath
