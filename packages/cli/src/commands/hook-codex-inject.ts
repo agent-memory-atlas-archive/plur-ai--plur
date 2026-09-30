@@ -2,6 +2,7 @@ import { createPlur, type GlobalFlags } from '../plur.js'
 import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce } from '../lib/folder-gate.js'
 import { readStdinJson, runCodexHook, codexSessionId, markSessionStarted, emitContext, injectWithFallback } from '../lib/codex-hook-io.js'
 import { resolveProjectRemote, projectRemoteRefusalNotice } from '../lib/project-remote.js'
+import { recordInjected } from '../lib/auto-rate.js'
 
 /**
  * plur hook-codex-inject — Codex `UserPromptSubmit` hook.
@@ -65,6 +66,7 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
       }
 
       const { result, mode } = await injectWithFallback(plur, prompt, injectOpts)
+      recordInjected('codex', sessionId, result.injected_ids) // #1310 auto-rate
 
       const body = [result.directives, result.constraints, result.consider].filter(Boolean).join('\n')
       // A refusal is emitted even with nothing recalled: silence is exactly the

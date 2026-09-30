@@ -8,6 +8,7 @@ import type { FolderPolicy } from '@plur-ai/core'
 import { safeSessionKey } from '../lib/session-key.js'
 import { injectWithFallback, hybridEnabled, type Injectable, type InjectOutcome } from '../lib/codex-hook-io.js'
 import { correctionReminder } from './hook-correction-detect.js'
+import { recordInjected } from '../lib/auto-rate.js'
 
 // Remote budget for the recall leg inside injectHybrid (#776). The hook is
 // on the hot path of every prompt; slow networks make this a perceptible
@@ -521,6 +522,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     let eventSessionId: string | undefined
     try { eventSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
     const result = await plur.inject(task, { budget: 3000, source: 'hook', session_id: eventSessionId })
+    recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
     if (result.count > 0) {
       const parts: string[] = []
       if (result.directives) parts.push(result.directives)
@@ -776,6 +778,7 @@ async function injectSession(
   // the process (and so the prompt) open until the watchdog.
   abandonedHybrid = mode === 'bm25' && hybridEnabled() ? hybrid : null
   storeLockPath = join(plur.storageRoot, 'engrams.yaml.lock')
+  recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
   if (result.count > 0) {
     const parts: string[] = []
     if (result.directives) parts.push(result.directives)
