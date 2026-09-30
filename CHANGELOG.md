@@ -62,6 +62,25 @@ repo's request. Only the CLI writes the map.
     the folder you give it.
   - A `~` in the map expands to your home as written and to its canonical path.
 
+### Claude Code: corrections in a prompt now prompt a `plur_learn`
+
+**The correction reminder never fired** (#1312). `plur hook-correction-detect`
+spots correction-shaped prompts ("no, …", "from now on", "I prefer" …) and
+reminds the agent to save the rule with `plur_learn`. No installer registered
+it, so corrections were acknowledged in prose and lost.
+
+`plur hook-inject` now runs the same detection on every `UserPromptSubmit`
+and appends the reminder to its own output: after the memory on the first
+prompt, alongside the 10-minute reminder when both are due, or on its own on
+a later prompt. A prompt that does not match, including the known false
+positives ("no problem", "actually that works", "wait a sec"), adds nothing.
+There is no extra process per prompt and no `plur init` step beyond the one
+for #1313. The standalone command still works for anyone who registered it by
+hand; if you did, remove that entry, or the reminder appears twice.
+
+Checked in a real Claude Code session: a second prompt starting "No, from
+now on" carried the reminder, and the model quoted it back.
+
 ### Claude Code: memory is in place for the first reply
 
 **The first reply of a Claude Code session had no memory unless it called a
@@ -189,6 +208,25 @@ turn that triggered it. A first message that needs no tools is answered
 without memory. In a one-shot `claude -p` run, that means no memory at all.
 
 An unknown `--event` no longer echoes the hook payload back to stdout.
+
+**`plur-mcp init` now registers the same rehydrate hook** (#1279). It still
+put rehydrate on `PostCompact`. It now uses `SessionStart` with matcher
+`compact`, synchronous with `timeout: 20`, the same as `plur init` (#1313);
+its `UserPromptSubmit` injection moves to the same 20s budget. A test fails
+if the two diverge. Re-running `plur-mcp init` used to stop at "already
+installed". It now removes PLUR's `PostCompact` hooks and, in the same file,
+puts the `SessionStart(compact)` one in place of the old rehydrate. A file
+with PLUR hooks but no rehydrate gets none added. That covers the global
+settings file, where `plur init` puts only its enforcement hooks, so
+rehydrate does not run twice. Hooks with no `command` (`type: "prompt"` or
+`"agent"`) no longer make init throw. It removes PLUR's hooks one at a time and only
+those: a hook counts as PLUR's when it runs the PLUR binary (the
+`~/.plur/bin/plur-hook` shim or `npx @plur-ai/cli`) with a subcommand init
+writes. Your own hooks, including your own `PostCompact` hooks and one that
+shares an entry with a PLUR hook, are left in place. Installs that use the
+local shim, including the backslash and quoted Windows paths, now count as
+installed too, so re-running no longer adds a second set (#1303, on Windows
+as well).
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
