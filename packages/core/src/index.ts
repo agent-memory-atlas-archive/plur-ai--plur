@@ -84,6 +84,7 @@ import {
   type FolderPolicy,
   type FolderEntry,
   type FolderChange,
+  type FolderAnswer,
 } from './folders.js'
 import type { Engram } from './schemas/engram.js'
 import { ATTRIBUTION_UNIDENTIFIED, MeasuredUnderSchema, type MeasuredUnder } from './schemas/engram.js'
@@ -157,6 +158,7 @@ export {
   type FolderPolicy,
   type FolderPolicySource,
   type FolderChange,
+  type FolderAnswer,
   type FolderMapErrorCode,
 } from './folders.js'
 export { generateGuardrails } from './guardrails.js'
@@ -9433,14 +9435,20 @@ Generate an improved version of the procedure that prevents this failure. Return
     return _isDirectoryTrusted(dir, this.paths.root)
   }
 
-  /** Grant trust to `dir` (`plur trust`). Returns the canonicalized path recorded. */
-  trustDirectory(dir: string): string {
-    return _trustDirectory(dir, this.paths.root)
+  /**
+   * Grant trust to `dir` (`plur trust`). Returns the canonicalized path
+   * recorded. A `nonce` must be one issued for `dir` and `{ trusted: true }` (#1378).
+   */
+  trustDirectory(dir: string, options?: { nonce?: string }): string {
+    return _trustDirectory(dir, this.paths.root, options)
   }
 
-  /** Revoke trust from `dir` (`plur untrust`). Returns whether an entry was removed. */
-  untrustDirectory(dir: string): boolean {
-    return _untrustDirectory(dir, this.paths.root)
+  /**
+   * Revoke trust from `dir` (`plur untrust`). Returns whether an entry was
+   * removed. A `nonce` must be one issued for `dir` and `{ trusted: false }` (#1378).
+   */
+  untrustDirectory(dir: string, options?: { nonce?: string }): boolean {
+    return _untrustDirectory(dir, this.paths.root, options)
   }
 
   /** List every directory this user has explicitly trusted. */
@@ -9488,9 +9496,13 @@ Generate an improved version of the procedure that prevents this failure. Return
     return _removeFolderEntry(this.paths.root, folder, undefined, options)
   }
 
-  /** Issue a single-use nonce naming `folder` for the ask flow of `sessionId`. */
-  issueFolderNonce(sessionId: string, folder: string): string {
-    return _issueFolderNonce(this.paths.root, sessionId, folder)
+  /**
+   * Issue a single-use nonce for the ask flow of `sessionId` that authorises
+   * exactly `answer` on exactly `folder` (#1378). The ask flow issues one per
+   * answer it offers; see folders.ts issueFolderNonce.
+   */
+  issueFolderNonce(sessionId: string, folder: string, answer: FolderAnswer): string {
+    return _issueFolderNonce(this.paths.root, sessionId, folder, answer)
   }
 
   /** Expire every folder nonce of `sessionId` (call at session end). */

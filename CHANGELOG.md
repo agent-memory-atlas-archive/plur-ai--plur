@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### A folder nonce now authorises one answer, and `plur trust` / `plur untrust` need one outside a terminal
+
+**A nonce issued for the folder question authorised any answer, `--trusted`
+included, and `plur trust <dir>` needed no nonce at all from a script**
+(#1378). Now:
+
+- Each nonce is bound to the folder and to the exact answer it was issued
+  for: the mode (on, off or ask), the scope if any, and whether it grants
+  trusted. `plur folders set` refuses a nonce whose answer differs from the
+  flags given (`nonce-answer`, exit 1) and leaves folders.yaml unchanged; the
+  nonce stays valid for its own answer. `plur folders rm` needs a nonce issued
+  for removing the entry. `--scope X` and `--scope X --on` are the same answer.
+- **Scripted use changes:** `plur trust <dir>` and `plur untrust <dir>` now
+  have the same gate as `plur folders set`. From an interactive terminal
+  nothing changes. Without one (stdin or stdout is not a terminal: a script,
+  CI, an agent's tool call) they exit 1 with `nonce-required` unless given
+  `--nonce <n>` issued for that folder and `{ trusted: true }` (trust) or
+  `{ trusted: false }` (untrust). Output and exit codes are otherwise
+  unchanged. `plur trust --list` needs no nonce. A script that granted trust
+  can call core's `trustDirectory(dir, root)` directly.
+- Core: `issueFolderNonce(root, sessionId, folder, answer)` now takes the
+  answer (`FolderAnswer`), and `verifyFolderNonce` / `consumeFolderNonce` take
+  the answer they check. The ask flow issues one nonce per answer it offers.
+  A nonce written before this change, with no answer, authorises nothing.
+
+What the gate does not stop: the terminal check is `isTTY` on stdin and
+stdout, so a process that runs the CLI under a pseudo-terminal (Python's
+`pty` module, `script`, `expect`) passes it as a person would. Anything that
+can write files as this user can edit folders.yaml directly. `plur
+init-remote` still records trust for the directory whose `.plur.yaml` it has
+just written, after a live connectivity check. And a nonce shows that a
+command matches an answer the question offered; it does not show that a
+person chose that answer.
+
 ### The secret guard now recognises GitHub, GitLab, Slack, npm, Stripe and AWS temporary keys
 
 **A memory holding a GitHub token was stored, and could sync to a team

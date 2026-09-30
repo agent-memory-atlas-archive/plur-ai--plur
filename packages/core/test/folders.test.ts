@@ -321,25 +321,25 @@ describe('writes: nonce and shared-scope guards', () => {
   it('an ask-flow nonce works once, for its folder only', () => {
     const d = mk('asked')
     const other = mk('other')
-    const n = issueFolderNonce(root, 'sess-1', d)
+    const n = issueFolderNonce(root, 'sess-1', d, { mode: 'on' })
     expect(() => setFolderEntry(root, other, { mode: 'on' }, { configuredScopes: [], nonce: n, home }))
       .toThrow(expect.objectContaining({ code: 'nonce-folder' }))
     // A folder mismatch does not burn it.
     expect(setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], nonce: n, home }).plur).toBe('on')
-    expect(() => setFolderEntry(root, d, { mode: 'off' }, { configuredScopes: [], nonce: n, home }))
+    expect(() => setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], nonce: n, home }))
       .toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
     expect(loadFolderMap(root).folders).toEqual([{ path: realpathSync(d), plur: 'on' }])
   })
 
   it('a missing or stale nonce is refused and nothing is written', () => {
     const d = mk('stale')
-    expect(() => consumeFolderNonce(root, 'deadbeef', d)).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
+    expect(() => consumeFolderNonce(root, 'deadbeef', d, { mode: 'on' })).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
 
-    const n1 = issueFolderNonce(root, 'sess-2', d, 1000)
+    const n1 = issueFolderNonce(root, 'sess-2', d, { mode: 'on' }, 1000)
     expect(() => setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], nonce: n1, home, now: 1000 + FOLDER_NONCE_TTL_MS + 1 }))
       .toThrow(expect.objectContaining({ code: 'nonce-expired' }))
 
-    const n2 = issueFolderNonce(root, 'sess-2', d)
+    const n2 = issueFolderNonce(root, 'sess-2', d, { mode: 'on' })
     endFolderNonceSession(root, 'sess-2')
     expect(() => setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], nonce: n2, home }))
       .toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
@@ -350,7 +350,7 @@ describe('writes: nonce and shared-scope guards', () => {
     'a failed save does not consume the nonce',
     () => {
       const d = mk('unwritable')
-      const n = issueFolderNonce(root, 'sess-save', d)
+      const n = issueFolderNonce(root, 'sess-save', d, { mode: 'on' })
       chmodSync(root, 0o555)
       try {
         expect(() => setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], nonce: n, home })).toThrow()
@@ -358,7 +358,7 @@ describe('writes: nonce and shared-scope guards', () => {
         chmodSync(root, 0o755)
       }
       expect(setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], nonce: n, home }).plur).toBe('on')
-      expect(() => setFolderEntry(root, d, { mode: 'off' }, { configuredScopes: [], nonce: n, home }))
+      expect(() => setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], nonce: n, home }))
         .toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
     },
   )
@@ -367,7 +367,7 @@ describe('writes: nonce and shared-scope guards', () => {
     const d = mk('rm-nonce')
     setFolderEntry(root, d, { mode: 'off' }, { configuredScopes: [], home })
     const other = mk('rm-other')
-    const n = issueFolderNonce(root, 'sess-rm', d)
+    const n = issueFolderNonce(root, 'sess-rm', d, { remove: true })
     expect(() => removeFolderEntry(root, other, home, { nonce: n })).toThrow(expect.objectContaining({ code: 'nonce-folder' }))
     expect(removeFolderEntry(root, d, home, { nonce: n })).toBe(true)
     expect(() => removeFolderEntry(root, d, home, { nonce: n })).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
@@ -375,7 +375,7 @@ describe('writes: nonce and shared-scope guards', () => {
 
   it('a hostile session id cannot escape the nonce dir', () => {
     const d = mk('x')
-    issueFolderNonce(root, '../../escape', d)
+    issueFolderNonce(root, '../../escape', d, { mode: 'off' })
     expect(existsSync(join(root, 'folder-nonces', '______escape.yaml'))).toBe(true)
   })
 
@@ -540,7 +540,7 @@ describe('dual-write to trust.yaml for adapters on the previous core', () => {
   it('F3: a failed trust.yaml write after a saved map still consumes the nonce', () => {
     const d = mk('f3')
     mkdirSync(join(root, 'trust.yaml'))   // a directory: the trust.yaml write fails
-    const n = issueFolderNonce(root, 'sess-f3', d)
+    const n = issueFolderNonce(root, 'sess-f3', d, { mode: 'on', trusted: true })
     expect(() => setFolderEntry(root, d, { mode: 'on', trusted: true }, { configuredScopes: [], nonce: n, home })).toThrow()
     expect(loadFolderMap(root).folders).toEqual([{ path: realpathSync(d), plur: 'on', trusted: true }])
     rmSync(join(root, 'trust.yaml'), { recursive: true })
@@ -551,5 +551,69 @@ describe('dual-write to trust.yaml for adapters on the previous core', () => {
   it('a glob grant is not written to trust.yaml (the old reader cannot express it)', () => {
     setFolderEntry(root, '~/work/**', { trusted: true }, { configuredScopes: [], home })
     expect(existsSync(join(root, 'trust.yaml'))).toBe(false)
+  })
+})
+
+// #1378: a nonce authorises exactly the answer it was issued for (the mode,
+// the scope if any, and whether it grants trusted), not just the folder.
+describe('nonce binding to the answer (#1378)', () => {
+  const opts = (nonce: string) => ({ configuredScopes: ['group:example/eng', 'group:example/ops'], nonce, home })
+
+  it('a nonce for "yes, without its settings" (--on) cannot grant --trusted, and folders.yaml is untouched', () => {
+    const d = mk('bind-trusted')
+    writeMap([{ path: realpathSync(d), plur: 'ask' }])
+    const before = readFileSync(folderMapPath(root))
+    const n = issueFolderNonce(root, 'sess-b1', d, { mode: 'on' })
+    for (const change of [{ trusted: true }, { mode: 'on' as const, trusted: true }, { mode: 'off' as const }, { scope: 'group:example/eng' }]) {
+      expect(() => setFolderEntry(root, d, change, opts(n))).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    }
+    expect(readFileSync(folderMapPath(root)).equals(before)).toBe(true)
+    // A refused answer does not burn it: the offered answer still works, once.
+    expect(setFolderEntry(root, d, { mode: 'on' }, opts(n)).plur).toBe('on')
+    expect(() => setFolderEntry(root, d, { mode: 'on' }, opts(n))).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
+  })
+
+  it('a scope nonce authorises that scope only; --scope X and --scope X --on are the same answer', () => {
+    const d = mk('bind-scope')
+    const n = issueFolderNonce(root, 'sess-b2', d, { scope: 'group:example/eng' })
+    expect(() => setFolderEntry(root, d, { scope: 'group:example/ops' }, opts(n))).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    expect(() => setFolderEntry(root, d, { mode: 'on' }, opts(n))).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    expect(() => setFolderEntry(root, d, { scope: 'group:example/eng', trusted: true }, opts(n))).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    expect(setFolderEntry(root, d, { mode: 'on', scope: 'group:example/eng' }, opts(n)).scope).toBe('group:example/eng')
+  })
+
+  it('a trusted nonce grants trusted; an off nonce cannot remove the entry, a remove nonce cannot set', () => {
+    const d = mk('bind-rm')
+    const t = issueFolderNonce(root, 'sess-b3', d, { trusted: true })
+    expect(setFolderEntry(root, d, { trusted: true }, opts(t)).trusted).toBe(true)
+    const off = issueFolderNonce(root, 'sess-b3', d, { mode: 'off' })
+    expect(() => removeFolderEntry(root, d, home, { nonce: off })).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    const rm = issueFolderNonce(root, 'sess-b3', d, { remove: true })
+    expect(() => setFolderEntry(root, d, { mode: 'off' }, opts(rm))).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    expect(removeFolderEntry(root, d, home, { nonce: rm })).toBe(true)
+  })
+
+  it('trustDirectory / untrustDirectory accept only a nonce bound to that grant or revocation', () => {
+    const d = mk('bind-trust')
+    const on = issueFolderNonce(root, 'sess-b4', d, { mode: 'on' })
+    expect(() => trustDirectory(d, root, { nonce: on })).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    expect(existsSync(folderMapPath(root))).toBe(false)
+    const grant = issueFolderNonce(root, 'sess-b4', d, { trusted: true })
+    expect(trustDirectory(d, root, { nonce: grant })).toBe(realpathSync(d))
+    expect(() => untrustDirectory(d, root, { nonce: grant })).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
+    const other = issueFolderNonce(root, 'sess-b4', d, { trusted: true })
+    expect(() => untrustDirectory(d, root, { nonce: other })).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    expect(isDirectoryTrusted(d, root)).toBe(true)
+    const revoke = issueFolderNonce(root, 'sess-b4', d, { trusted: false })
+    expect(untrustDirectory(d, root, { nonce: revoke })).toBe(true)
+    expect(isDirectoryTrusted(d, root)).toBe(false)
+  })
+
+  it('a nonce record with no bound answer authorises nothing', () => {
+    const d = mk('bind-legacy')
+    mkdirSync(join(root, 'folder-nonces'), { recursive: true })
+    writeFileSync(join(root, 'folder-nonces', 'old.yaml'),
+      yaml.dump({ session: 'old', nonces: [{ nonce: 'abc123', folder: realpathSync(d), issued_at: Date.now() }] }))
+    expect(() => setFolderEntry(root, d, { mode: 'on' }, opts('abc123'))).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
   })
 })
