@@ -248,6 +248,9 @@ describe.skipIf(!posix)('on Windows, a folder named with shell metacharacters is
     ['cmd %VAR%', 'x%PATH%', false],
     ['cmd !VAR!', 'x!PATH!', false],
     ['double quote', 'x"q', false],
+    ['left curly double quote', 'x\u201c; ni CANARY; #', false],
+    ['right curly double quote', 'x\u201d; ni CANARY; #', false],
+    ['low curly double quote', 'x\u201e; ni CANARY; #', false],
   ])('%s: %s', (label, name, canary) => {
     const folder = join(repo, name)
     mkdirSync(folder, { recursive: true })
@@ -263,6 +266,12 @@ describe.skipIf(!posix)('on Windows, a folder named with shell metacharacters is
         runLinesInBash(text, run)
         expect(existsSync(join(run, 'CANARY')), editor).toBe(false)
       }
+    }
+    if (canary) {
+      // The notice names the folder with $ and backtick escaped, never raw.
+      const pathLine = out.claude.text.split('\n').find(l => l.startsWith('Folder path, quoted'))!
+      expect(pathLine).toMatch(name.includes('$') ? /\\u0024/ : /\\u0060/)
+      expect(pathLine).not.toMatch(/[$`]/)
     }
     expect(noncesIssued()).toBe(0)
     expect(existsSync(join(plurRoot, 'folders.yaml'))).toBe(false)
@@ -329,4 +338,142 @@ describe.skipIf(!posix)('a folder path with a bidi or zero-width character is sh
     }
     expect(noncesIssued()).toBe(0)
   })
+})
+
+/**
+ * Every line of the question, not only its commands, may be pasted into a
+ * shell. A folder printed raw in the header ran `x&touch CANARY` (#1418
+ * review). Each name runs through bash, on POSIX and under the win32 stub,
+ * for an undecided folder and for one with an untrusted .plur.yaml.
+ */
+const SHELL_NAMES = [
+  'x&touch CANARY', 'x;touch CANARY', 'x|touch CANARY', 'x>CANARY', 'x^&touch CANARY',
+  'x$(touch CANARY)', 'x`touch CANARY`', "x'$(touch CANARY)'", "x';touch CANARY;'",
+]
+
+describe.skipIf(!posix)('no printed line runs a command named in the folder, in bash (#1418 review)', () => {
+  let repo: string
+  beforeEach(() => {
+    setup(realpathSync(mkdtempSync(join(tmpdir(), 'plur-ask-lines-'))))
+    repo = join(dir, 'repo')
+    mkdirSync(join(repo, '.git'), { recursive: true })
+  })
+  afterEach(() => { nodePre = []; rmSync(dir, { recursive: true, force: true }) })
+
+  it.each(SHELL_NAMES)('%s', (name) => {
+    let n = 0
+    for (const platform of ['posix', 'win32'] as const) {
+      nodePre = platform === 'win32' ? ['--import', WIN32_PRELOAD] : []
+      for (const untrusted of [false, true]) {
+        const folder = join(repo, `${n}`, name)
+        mkdirSync(folder, { recursive: true })
+        if (untrusted) writeFileSync(join(folder, '.plur.yaml'), 'scope: group:acme/eng\n')
+        const out = askAll(folder, `lines-${n}`)
+        for (const [editor, { text, rule }] of Object.entries(out)) {
+          const where = `${platform} ${untrusted ? 'untrusted' : 'undecided'} ${editor}`
+          expect(text, where).toMatch(/\[PLUR Memory — /)
+          for (const t of [text, rule ?? '']) {
+            const run = join(dir, `run-${n}-${editor}-${t === text ? 'out' : 'rule'}`)
+            mkdirSync(run)
+            runLinesInBash(t, run)
+            expect(existsSync(join(run, 'CANARY')), where).toBe(false)
+          }
+        }
+        n++
+      }
+    }
+  }, 120_000)
+})
+
+/** A PowerShell binary: PLUR_TEST_PWSH, else `pwsh` on PATH, else null. */
+function findPwsh(): string | null {
+  for (const bin of [process.env.PLUR_TEST_PWSH, 'pwsh']) {
+    if (!bin) continue
+    const r = spawnSync(bin, ['-NoProfile', '-NonInteractive', '-Command', '1'], { encoding: 'utf8', timeout: 60000 })
+    if (r.status === 0) return bin
+  }
+  return null
+}
+const PWSH = posix ? findPwsh() : null
+
+/**
+ * Runs each unit's script as its own PowerShell script in the unit's `run`
+ * directory, with `plur` stubbed to append its third argument (the folder)
+ * to `<run>/ARGS`. One pwsh process for all units: its start-up is slow.
+ */
+function runInPwsh(units: Array<{ script: string; run: string }>): void {
+  const unitsFile = join(dir, `units-${Date.now()}.json`)
+  writeFileSync(unitsFile, JSON.stringify(units))
+  const script = [
+    `$units = Get-Content -Raw -LiteralPath '${unitsFile}' | ConvertFrom-Json`,
+    'foreach ($u in $units) {',
+    '  $ps = [powershell]::Create()',
+    '  [void]$ps.AddScript("Set-Location -LiteralPath \'$($u.run)\'; function plur { [IO.File]::AppendAllText(\'$($u.run)/ARGS\', [string]`$args[2] + [char]10) }").Invoke()',
+    '  $ps.Commands.Clear()',
+    '  try { [void]$ps.AddScript([string]$u.script).Invoke() } catch {}',
+    '  $ps.Dispose()',
+    '}',
+  ].join('\n')
+  const r = spawnSync(PWSH!, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 120000 })
+  expect(r.status, r.stderr).toBe(0)
+}
+
+function pwshArgs(run: string): string[] {
+  const args = join(run, 'ARGS')
+  return existsSync(args) ? readFileSync(args, 'utf8').split('\n').filter(Boolean) : []
+}
+
+const COMMAND = /plur folders set .*? --nonce [0-9a-f]{32}/g
+
+describe.skipIf(!posix || !PWSH)('no printed line or command runs a command named in the folder, in PowerShell (#1418 review)', () => {
+  let repo: string
+  beforeEach(() => {
+    setup(realpathSync(mkdtempSync(join(tmpdir(), 'plur-ask-pwsh-'))))
+    repo = join(dir, 'repo')
+    mkdirSync(join(repo, '.git'), { recursive: true })
+    nodePre = ['--import', WIN32_PRELOAD]
+  })
+  afterEach(() => { nodePre = []; rmSync(dir, { recursive: true, force: true }) })
+
+  it.each([
+    ['x\u201c; ni CANARY; #', false],
+    ['x\u201d; ni CANARY; #', false],
+    ['x\u201e; ni CANARY; #', false],
+    ['x\u2018; ni CANARY; #', true],
+    ['x\u2019; ni CANARY; #', true],
+    ["x'; ni CANARY; #", true],
+    ['x&ni CANARY', true],
+    ['x;ni CANARY', true],
+  ])('%s (offered: %s)', (name, offered) => {
+    let n = 0
+    for (const untrusted of [false, true]) {
+      const folder = join(repo, `${n}`, name)
+      mkdirSync(folder, { recursive: true })
+      if (untrusted) writeFileSync(join(folder, '.plur.yaml'), 'scope: group:acme/eng\n')
+      const out = askAll(folder, `pwsh-${n}`)
+      const units: Array<{ script: string; run: string }> = []
+      const checks: Array<{ where: string; run: string; commands: number | null }> = []
+      for (const [editor, { text, rule }] of Object.entries(out)) {
+        const where = `${untrusted ? 'untrusted' : 'undecided'} ${editor}`
+        const commands = text.match(COMMAND) ?? []
+        if (offered) expect(commands.length, where).toBeGreaterThan(0)
+        else expect(commands, where).toEqual([])
+        for (const [kind, t] of [['out', text], ['rule', rule ?? '']] as const) {
+          const run = join(dir, `run-${n}-${editor}-${kind}`)
+          mkdirSync(run)
+          for (const line of [...t.split('\n'), ...(t.match(COMMAND) ?? [])]) units.push({ script: line, run })
+          checks.push({ where: `${where} ${kind}`, run, commands: kind === 'out' ? commands.length : null })
+        }
+      }
+      runInPwsh(units)
+      for (const { where, run, commands } of checks) {
+        expect(existsSync(join(run, 'CANARY')), where).toBe(false)
+        const got = pwshArgs(run)
+        // Each offered command hands plur the folder unchanged.
+        for (const g of got) expect(g, where).toBe(folder)
+        if (commands !== null) expect(got.length, where).toBeGreaterThanOrEqual(commands)
+      }
+      n++
+    }
+  }, 120_000)
 })

@@ -68,11 +68,19 @@ what you decided about the folder:
   cover its sibling `xyz` (#1493). A path with `*`, `?` or `[`, a control or
   line-break character, or a bidi or zero-width character (U+200B–U+200F,
   U+202A–U+202E, U+2066–U+2069, U+FEFF) gets a short notice instead, and so
-  does a path with `$`, a backtick, `%`, `!` or `"` on Windows, where the
-  offered command double-quotes the folder and bash, PowerShell or cmd would
-  still expand them. The path is shown JSON-escaped as quoted data (`$` and
-  backticks escaped too), and no command or nonce is offered. The
+  does a path with `$`, a backtick, `%`, `!`, `"` or a curly double quote
+  (U+201C, U+201D, U+201E) on Windows, where the offered command
+  double-quotes the folder and bash, PowerShell or cmd would still expand
+  them (PowerShell ends a double-quoted string at a curly double quote). The
+  path is shown JSON-escaped as quoted data (`$`, backticks, `'` and curly
+  quotes escaped too), and no command or nonce is offered. The
   folder stays undecided and is asked about once per session. Set it by hand.
+- Outside the commands, the question prints the folder only in that
+  JSON-escaped form, and no line of it holds an apostrophe, so no printed
+  line runs a command named in the folder (`x&touch CANARY`, `x$(...)`) when
+  pasted into bash or PowerShell. The untrusted header now reads "the repo
+  .plur.yaml is not trusted", and the trust answer "Yes, and trust the
+  .plur.yaml in this repo".
 - Asking changes nothing. The question no longer registers the folder's own
   `.plur/engrams.yaml` as a project store in config.yaml (the hooks build
   their scope ranker with store discovery off), so that store never reaches
