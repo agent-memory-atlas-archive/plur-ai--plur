@@ -955,6 +955,13 @@ export {
   type ProvenanceSummary,
 } from './provenance.js'
 
+/**
+ * Where a learn result went (#1264). `remote`: a url store accepted it.
+ * `outbox`: it is saved here and queued for a url store (the push is deferred,
+ * or failed and will be retried). `local`: it exists on this machine only.
+ */
+export type LearnDelivery = 'remote' | 'outbox' | 'local'
+
 /** Refusal from {@link Plur.addRemoteStore} (#1265). `code` is stable for
  *  callers; `message` never contains the token. */
 export class AddRemoteStoreError extends Error {
@@ -969,6 +976,13 @@ export class AddRemoteStoreError extends Error {
 }
 
 export class Plur {
+  /**
+   * Engrams a url store confirmed on the write path (#1264). The server's reply
+   * is the only evidence a write left the machine, and it leaves no mark on the
+   * engram itself, so it is remembered here — per returned object, never
+   * persisted.
+   */
+  private _remoteDelivered = new WeakSet<object>()
   private paths: PlurPaths
   private config: PlurConfig
   private indexedStorage: IndexedStorage | null = null
@@ -1441,6 +1455,12 @@ export class Plur {
         cloned.id = cloned.id.replace(/^(ENG|ABS|META)-/, `$1-${prefix}-`)
         cloned._originalId = originalId
         cloned._storeScope = store.scope
+        // Which store served the row, not just its scope: several stores may
+        // share one scope (a url store and a path store both load), and
+        // delivery reporting must classify by the one that held the row. A
+        // boolean, not the url: every field of a loaded row is content-scanned
+        // on the explicit-update path, and a url is not content.
+        if (store.url) cloned._fromRemoteStore = true
         all.push(cloned)
       }
     }
@@ -3796,7 +3816,75 @@ export class Plur {
         `written: ${(err as Error).message}. The engram is safe; the local audit trail is incomplete.`,
       )
     }
+    this._remoteDelivered.add(serverEngram)
     return serverEngram
+  }
+
+  /**
+   * Where a learn result went, and a warning when that is not where a reader
+   * would assume (#1264).
+   *
+   * A write to a shared scope (`group:`, `project:`, `org:` …) with no writable
+   * url store registered for exactly that scope falls through to the local
+   * primary store. That is deliberate — nothing is auto-routed into a shared
+   * store — but it used to be silent, so a team save could sit on one machine
+   * indefinitely while the caller was told only `ADD`. This reports it.
+   *
+   * Pure: reads the returned engram and the store config, never the network,
+   * and changes nothing about where anything was written. Pass the object
+   * `learn()` / `learnRouted()` returned; a copy loses the `remote` evidence.
+   *
+   * `requestedScope` (audit F8): the scope the caller asked for. When the save
+   * came back as an engram in a DIFFERENT scope — recorded as a recurrence on
+   * another team's engram, or on a `global` one — nothing was written to the
+   * requested shared scope, so the result is `local` for that scope and the
+   * warning names the requested scope, not the one it landed in. A sensitive-
+   * content demotion is excluded: it already carries its own warning.
+   */
+  deliveryOf(engram: Engram, requestedScope?: string): { delivery: LearnDelivery; warning?: string } {
+    const e = engram as any
+    const stores = this.config.stores ?? []
+    if (requestedScope && requestedScope !== engram.scope && isSharedScope(requestedScope)
+        && !e.structured_data?._demoted) {
+      return {
+        delivery: 'local',
+        warning: `You saved to shared scope "${requestedScope}", but this matched an existing engram in ` +
+          `"${engram.scope}" and was recorded on it as a recurrence. Nothing was written to ` +
+          `"${requestedScope}" or sent to its store, so that team will not see it.`,
+      }
+    }
+    let delivery: LearnDelivery
+    if (this._remoteDelivered.has(engram)) delivery = 'remote'
+    else if (e.structured_data?._outbox) delivery = 'outbox'
+    else if (typeof e._storeScope === 'string') {
+      // A dedup/recurrence hit on a row read from a secondary store: it lives
+      // wherever the store that SERVED it lives. Classified by the loader's
+      // `_fromRemoteStore` marker, never by the scope's first store entry — a
+      // url store and a path store can share one scope (formal replay, cluster 1).
+      delivery = e._fromRemoteStore === true ? 'remote' : 'local'
+    } else delivery = 'local'
+    if (delivery !== 'local' || !isSharedScope(engram.scope)) return { delivery }
+
+    const scope = engram.scope
+    const urlStores = stores.filter(s => !!s.url && s.scope === scope)
+    let why: string
+    // `visibility` defaults to 'private' on every engram, so it cannot tell an
+    // explicitly private write apart here; the store config can.
+    if (urlStores.length > 0 && urlStores.every(s => s.readonly === true)) {
+      why = 'the store registered for it is read-only, so this engram was saved on this machine only'
+    } else if (urlStores.length > 0) {
+      why = 'this engram was not sent to the store registered for it (an explicitly private write, or a match ' +
+        'with a copy already saved on this machine)'
+    } else {
+      why = 'no remote store is registered for exactly that scope, so this engram was saved on this machine only'
+    }
+    return {
+      delivery,
+      warning: `Scope "${scope}" is shared, but ${why}. No one else will see it. ` +
+        `To share this scope, register a writable store for "${scope}" ` +
+        `(plur_stores_add with url, token and scope "${scope}", or a url store in ~/.plur/config.yaml). ` +
+        `Engrams already saved here are not moved automatically.`,
+    }
   }
 
   /**
