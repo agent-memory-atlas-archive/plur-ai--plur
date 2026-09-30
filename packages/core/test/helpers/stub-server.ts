@@ -76,6 +76,34 @@ export class StubServer {
   /** When set, POST /engrams short-circuits to this error response BEFORE reading
    *  the body — to simulate a server that rejects the write (#912 sanitise test). */
   appendErrorResponse: { status: number; body: string } | null = null
+  /** Per-scope refusal for POST /engrams, keyed by the body's `scope` — to
+   *  simulate a server that refuses one scope while accepting another on the
+   *  same host (#1308). Checked after the body is read. */
+  appendErrorByScope: Record<string, { status: number; body: string }> = {}
+  /** Delay before answering POST /engrams, ms — a slow-but-alive remote, for
+   *  bounded-flush tests (#1269). The write is still applied when it answers. */
+  appendDelayMs = 0
+  /** Number of POST /api/v1/engrams requests received, answered or refused
+   *  (#1299: proves a backed-off outbox entry did not dial the server). */
+  appendCalls = 0
+  /** With `appendDelayMs`: store the engram only when the delayed answer is
+   *  sent, so a client that gives up first leaves nothing on the server. */
+  appendDropWhileDelayed = false
+  /** Statement of every POST /engrams body received, in arrival order. The
+   *  server ignores the key unless `honourIdempotency` is set, so this counts
+   *  every push that reached it — duplicates included. */
+  appendStatements: string[] = []
+  /** Pending holds, consumed one per POST /engrams in arrival order: the
+   *  engram is stored on receipt, but the answer waits for `release()`. */
+  private appendHolds: Array<{ arrived: (statement: string) => void; released: Promise<void> }> = []
+  /** `Idempotency-Key` header of the most recent POST /engrams. */
+  lastAppendIdempotencyKey: string | null = null
+  /** Every `Idempotency-Key` received on an accepted POST /engrams, in order. */
+  appendKeys: Array<string | null> = []
+  /** Model a server that follows docs/remote-store-contract.md on POST: a key
+   *  already accepted from the same token replays the original response. */
+  honourIdempotency = false
+  private idempotencyReplies = new Map<string, { id: string; scope: string; status: string; data: Record<string, unknown> }>()
   /** When set, PATCH /engrams/:id still applies the update server-side but
    *  echoes this value as the {engram: ...} body — to simulate a server whose
    *  echoed row fails RemoteRowSchema validation (#327). */
@@ -136,6 +164,9 @@ export class StubServer {
   async stop(): Promise<void> {
     return new Promise((resolve) => {
       if (!this.server) return resolve()
+      // Drop connections a delayed response is still holding, or close() waits
+      // for them (#1269 bounded-flush tests leave one open on purpose).
+      this.server.closeAllConnections?.()
       this.server.close(() => {
         this.server = null
         this.engrams.clear()
@@ -166,12 +197,42 @@ export class StubServer {
     })
   }
 
+  /**
+   * Hold the answer to the next POST /engrams that arrives (after any holds
+   * already queued). `arrived` resolves with its statement once the engram is
+   * stored; the client gets its answer only after `release()`. For ordering
+   * separate writer processes deterministically.
+   */
+  holdNextAppend(): { arrived: Promise<string>; release: () => void } {
+    let arrived!: (statement: string) => void
+    let release!: () => void
+    const arrivedP = new Promise<string>(r => { arrived = r })
+    const released = new Promise<void>(r => { release = r })
+    this.appendHolds.push({ arrived, released })
+    return { arrived: arrivedP, release }
+  }
+
+  /** How many POST /engrams bodies with this statement arrived. */
+  appendCountFor(statement: string): number {
+    return this.appendStatements.filter(s => s === statement).length
+  }
+
   /** Reset all data without restarting. */
   reset(): void {
     this.engrams.clear()
     this.idCounter = 0
     this.badAppendId = null
     this.appendErrorResponse = null
+    this.appendErrorByScope = {}
+    this.appendDelayMs = 0
+    this.appendCalls = 0
+    this.appendDropWhileDelayed = false
+    this.appendStatements = []
+    this.appendHolds = []
+    this.lastAppendIdempotencyKey = null
+    this.appendKeys = []
+    this.honourIdempotency = false
+    this.idempotencyReplies.clear()
     this.badPatchEcho = null
     this.recallRows = []
     this.recallStatus = null
@@ -259,15 +320,35 @@ export class StubServer {
 
     // POST /api/v1/engrams — create
     if (method === 'POST' && path === '/api/v1/engrams') {
+      this.appendCalls++
       if (this.appendErrorResponse !== null) {
         const { status, body } = this.appendErrorResponse
         res.writeHead(status, { 'Content-Type': 'text/plain' })
         res.end(body)
         return
       }
+      const idemKey = req.headers['idempotency-key']
+      this.lastAppendIdempotencyKey = typeof idemKey === 'string' ? idemKey : null
       this.readBody(req, (body) => {
         this.lastAppendBody = body
+        const key = typeof idemKey === 'string' ? idemKey : null
+        this.appendKeys.push(key)
+        const replayKey = key ? `${req.headers.authorization}\0${key}` : null
+        if (this.honourIdempotency && replayKey && this.idempotencyReplies.has(replayKey)) {
+          this.json(res, 201, this.idempotencyReplies.get(replayKey))
+          return
+        }
         const { statement, scope, domain, type, source } = body
+        if (typeof statement === 'string') this.appendStatements.push(statement)
+        const hold = this.appendHolds.shift()
+        const refusal = typeof scope === 'string' ? this.appendErrorByScope[scope] : undefined
+        if (refusal) {
+          res.writeHead(refusal.status, { 'Content-Type': 'text/plain' })
+          res.end(refusal.body)
+          return
+        }
+        // Recorded with the row, as docs/remote-store-contract.md recommends.
+        const idempotency_key = body.idempotency_key
         const id = `ENG-SRV-${String(++this.idCounter).padStart(3, '0')}`
         const now = new Date().toISOString()
         const engram: StoredEngram = {
@@ -278,15 +359,33 @@ export class StubServer {
           status: 'active',
           // `source` carries rescope provenance over the wire (#676) — keep it
           // so tests can assert the pushed shape.
-          data: { statement, domain, type, ...(source !== undefined ? { source } : {}) },
+          data: {
+            statement, domain, type,
+            ...(source !== undefined ? { source } : {}),
+            ...(idempotency_key !== undefined ? { idempotency_key } : {}),
+          },
           created_at: now,
           updated_at: now,
         }
-        this.engrams.set(id, engram)
+        const store = () => {
+          this.engrams.set(id, engram)
+          if (replayKey) this.idempotencyReplies.set(replayKey, { id, scope: engram.scope, status: engram.status, data: engram.data })
+        }
+        if (!(this.appendDelayMs > 0 && this.appendDropWhileDelayed)) store()
         // Normally the server returns the real assigned id; badAppendId lets a
         // test make it return a malformed one (#404).
         const returnedId = this.badAppendId !== null ? this.badAppendId : id
-        this.json(res, 201, { id: returnedId, scope: engram.scope, status: engram.status, data: engram.data })
+        const respond = () => {
+          if (!res.writableEnded && !res.destroyed) {
+            if (this.appendDelayMs > 0 && this.appendDropWhileDelayed) store()
+            this.json(res, 201, { id: returnedId, scope: engram.scope, status: engram.status, data: engram.data })
+          }
+        }
+        if (hold) {
+          hold.arrived(typeof statement === 'string' ? statement : '')
+          void hold.released.then(respond)
+        } else if (this.appendDelayMs > 0) setTimeout(respond, this.appendDelayMs).unref()
+        else respond()
       })
       return
     }
