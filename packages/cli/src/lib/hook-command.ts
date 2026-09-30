@@ -151,6 +151,25 @@ export function claudeHookSpec(ctx: ClaudeHookContext, sub: string, ...extra: st
   return { command: 'cmd.exe', args: ['/c', ...ctx.shellCmd.split(/\s+/), sub, ...extra] }
 }
 
+/** How many CLI js entries plur-hook.meta.json remembers (most recent kept). */
+export const RECORDED_ENTRIES_MAX = 10
+
+/**
+ * The `entrypoints` list to write into plur-hook.meta.json when init records
+ * `current`: every entry recorded before (a legacy single-entry file becomes
+ * a list of one), with `current` moved or appended to the end, trimmed to
+ * the RECORDED_ENTRIES_MAX most recent. Only PLUR's own init writes this list,
+ * so a foreign checkout is never in it.
+ */
+export function nextRecordedEntries(previousMeta: unknown, current: string): string[] {
+  const kept = entriesOf(previousMeta).filter((e) => normEntry(e) !== normEntry(current))
+  return [...kept, current].slice(-RECORDED_ENTRIES_MAX)
+}
+
+// BEGIN shared hook matcher — packages/mcp/src/hook-command.ts keeps a
+// byte-identical copy of this region (the mcp package cannot import the
+// CLI); test/hook-decisions-h2-h3.test.ts fails when they drift.
+
 /**
  * Is this Claude Code hook spec one PLUR wrote? A spec with `args` is the
  * exec form (decision H3): node plus the CLI js entry recorded in
@@ -176,9 +195,6 @@ export function isPlurHookSpec(spec: { command?: string; args?: unknown }): bool
   return recordedCliEntries().some((e) => normEntry(e) === target)
 }
 
-/** How many CLI js entries plur-hook.meta.json remembers (most recent kept). */
-export const RECORDED_ENTRIES_MAX = 10
-
 /** Windows paths compare without regard to slash style, quotes or case. */
 function normEntry(p: string): string {
   return p.replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
@@ -192,18 +208,6 @@ function entriesOf(meta: unknown): string[] {
   return typeof m.entrypoint === 'string' && m.entrypoint.length > 0 ? [m.entrypoint] : []
 }
 
-/**
- * The `entrypoints` list to write into plur-hook.meta.json when init records
- * `current`: every entry recorded before (a legacy single-entry file becomes
- * a list of one), with `current` moved or appended to the end, trimmed to
- * the RECORDED_ENTRIES_MAX most recent. Only PLUR's own init writes this list,
- * so a foreign checkout is never in it.
- */
-export function nextRecordedEntries(previousMeta: unknown, current: string): string[] {
-  const kept = entriesOf(previousMeta).filter((e) => normEntry(e) !== normEntry(current))
-  return [...kept, current].slice(-RECORDED_ENTRIES_MAX)
-}
-
 /** Every CLI js entry `plur init` has recorded next to the hook shim. */
 export function recordedCliEntries(): string[] {
   try {
@@ -212,10 +216,6 @@ export function recordedCliEntries(): string[] {
     return []
   }
 }
-
-// BEGIN shared hook matcher — packages/mcp/src/hook-command.ts keeps a
-// byte-identical copy of this region (the mcp package cannot import the
-// CLI); test/hook-decisions-h2-h3.test.ts fails when they drift.
 
 /**
  * The matcher is anchored (decision F4): the WHOLE command must be PLUR's

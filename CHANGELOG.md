@@ -349,6 +349,141 @@ repo's request. Only the CLI writes the map.
     the folder you give it.
   - A `~` in the map expands to your home as written and to its canonical path.
 
+### Claude Code: one full injection per session, and the reminder fires
+
+**Every prompt in a Claude Code session re-ran the full "session started"
+injection, and the 10-minute memory reminder never fired** (#1278). The
+session marker in `plur hook-inject` was keyed on the parent process id.
+Claude Code runs every hook in a fresh shell, so the id changed on every
+prompt, and the "already started" check never matched. This is the same root
+cause as the Stop counter (#1266).
+
+The marker, the reminder clock and the concurrency lock are now keyed on the
+payload `session_id`, sanitised with the shared session-key helper. They fall
+back to `CLAUDE_SESSION_ID`, then the parent process id, only when the payload
+has no id. The prompt stored for rehydration after compaction is now updated
+on every prompt, not only the first.
+
+The marker is written only after the injected context has been written to
+stdout. If an injection fails, times out or is killed, the next prompt tries
+again, so one miss no longer leaves the whole session without memory. The
+concurrency lock is now also released when the injection throws. Before, it
+stayed in place, and a retry within the next minute exited silently.
+
+Checked in a real Claude Code session: before, the second prompt of a resumed
+session got a second full injection; now it gets none.
+
+`plur_session_end` also looks for the session checkpoint under the key the
+Stop hook writes. That hook replaces unsafe characters with `_`, while this
+reader stripped them, so a session id with such characters left its checkpoint
+behind, and the next session reported it as orphaned.
+
+### Claude Code now actually receives injected memory
+
+**In Claude Code, automatic memory never reached the model** (#1274). An
+enterprise deployment reported that most folders had no automatic memory.
+`plur hook-inject` printed `{"additionalContext": ...}` at the top level.
+Claude Code records that as plain hook output and does not show it to the
+model. The same bug hit the Stop nudge (#1266).
+
+Every Claude Code event that `hook-inject` serves now prints
+`{"hookSpecificOutput":{"hookEventName":<event>,"additionalContext":...}}`,
+named after the event that fired: `UserPromptSubmit` (the first-message
+injection and the 10-minute reminder), `PreToolUse` (plan mode, skills,
+agents) and `SubagentStart`. The name comes from the payload's
+`hook_event_name`, or from how the hook was invoked when the payload has none.
+
+**Re-injection after compaction moved from `PostCompact` to `SessionStart`
+(matcher `compact`).** `PostCompact` cannot carry context at all. Claude Code
+rejects `hookEventName: "PostCompact"` with a visible validation error and
+ignores the top-level field. **Re-run `plur init`** to move the hook. Until you
+do, the old `PostCompact` entry prints nothing. The `SessionStart` payload has
+no compaction summary, so the rehydrate query now comes from the session's
+last prompt, stored per Claude Code `session_id`. That copy is private: the
+session directory is created 0700 and must be a real directory this user owns.
+A planted symlink, or a directory another user created, is refused, and state
+moves to `hook-sessions/` under the PLUR root instead, but only if that directory
+passes the same check. If both are refused, the hook keeps no state at all and
+still injects. A refused directory is never written to. The file is written 0600
+through an exclusive, no-follow temp file and a rename, so a symlink at its path
+is replaced, never followed. It keeps only the first 1000 characters, and the
+SessionEnd hook deletes it. On Linux `$TMPDIR` is usually the shared `/tmp`.
+The Stop hook's counter follows the same rule, and so does its session
+checkpoint in `<PLUR root>/sessions`. An empty `PLUR_PATH` now means "unset"
+wherever the hooks resolve the PLUR root, so it never resolves against the
+working directory.
+
+`UserPromptSubmit` stays `async: true`. Async context does arrive, but at the
+next safe point (after a tool result, or before the next prompt), not on the
+turn that triggered it. A first message that needs no tools is answered
+without memory. In a one-shot `claude -p` run, that means no memory at all.
+
+An unknown `--event` no longer echoes the hook payload back to stdout.
+
+**`plur-mcp init` now registers the same rehydrate hook** (#1279). It still
+put rehydrate on `PostCompact`. It now uses `SessionStart` with matcher
+`compact`, `async: true`, `timeout: 90`, the same as `plur init`; a test fails
+if the two diverge. Re-running `plur-mcp init` used to stop at "already
+installed". It now removes PLUR's `PostCompact` hooks and, in the same file,
+puts the `SessionStart(compact)` one in place of the old rehydrate. A file
+with PLUR hooks but no rehydrate gets none added. That covers the global
+settings file, where `plur init` puts only its enforcement hooks, so
+rehydrate does not run twice. Hooks with no `command` (`type: "prompt"` or
+`"agent"`) no longer make init throw. It removes PLUR's hooks one at a time and only
+those: a hook counts as PLUR's when it runs the PLUR binary (the
+`~/.plur/bin/plur-hook` shim or `npx @plur-ai/cli`) with a subcommand init
+writes. Your own hooks, including your own `PostCompact` hooks and one that
+shares an entry with a PLUR hook, are left in place. Installs that use the
+local shim, including the backslash and quoted Windows paths, now count as
+installed too, so re-running no longer adds a second set (#1303, on Windows
+as well).
+
+### A killed writer no longer stalls the store for a minute
+
+**A process killed while taking the store lock left an empty
+`engrams.yaml.lock` that blocked every other writer for the full 60s stale
+threshold** (#1354). The lock was created first and its owner token written
+second; a process killed in between (SIGKILL, a hook killed at its harness
+budget) left a file with no pid in it, so the liveness check that recovers
+from a dead holder at once had nothing to check. Hooks, the MCP server and the
+CLI all waited it out.
+
+Now:
+
+- Core publishes the lock complete. The token is written to a private file and
+  hard-linked into place, which fails on an existing lock exactly as the
+  exclusive create did. A kill at any point leaves either no lock or a lock
+  naming a dead pid, which is taken over at once. Measured: an observer
+  process polling the lock during 3,000 acquisitions saw an empty lock 4,115
+  times before this change and never after it.
+- An empty lock older than 10s is treated as abandoned and taken over. Empty
+  locks can still come from older clients sharing the store and from
+  filesystems without hard links. The 10s comes from measurement: over 20,000
+  create-then-write cycles the gap was at most 0.73s, p99 10–117ms depending
+  on event-loop load.
+- Takeovers are serialized by a ladder of guard slots
+  (`engrams.yaml.lock.guard-<key>-<n>`, keyed by the token of the lock being
+  taken over). A slot left by a crashed stealer is stepped over, never
+  removed, so a crash inside a takeover cannot let two stealers in at once. A
+  single guard file had that flaw: after two crashes, two stealers could both
+  hold it. Under its slot, a stealer re-inspects the lock and claims it only if
+  it is the same file and still abandoned. This closes an older race that applies to every takeover,
+  including the immediate one for a dead holder. Two waiters that judged the
+  same abandoned lock could both act on it. The second one moved the first
+  one's fresh, live lock aside, and while it was putting that lock back, a
+  third process could acquire it. A test that pauses a takeover at that point
+  shows two holders without the guard and none with it. The claim also checks
+  that the file it moved is the one it inspected, not just that the contents
+  match, and it puts a live owner's lock back by hard link, so the lock is
+  never briefly empty.
+- A lock carrying a token is unchanged. A live owner is never stolen from,
+  however old the lock. A token that cannot be checked, such as one from
+  another host, still gets the full 60s.
+
+This applies to the YAML store, and to PGLite, which keeps YAML as its source
+of truth and takes the same lock. A Postgres primary store serializes writers
+with a Postgres advisory lock and does not use this lock file.
+
 ### A team save is no longer swallowed by a personal note with the same text (#1268)
 
 **A shared-scope write whose text matched a personal engram was never

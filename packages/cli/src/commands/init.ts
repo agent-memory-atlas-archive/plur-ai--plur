@@ -128,7 +128,17 @@ interface HookEntry {
  * string, darwin/linux) or `{ command, args }` (exec form, Windows).
  * See `claudeHookSpec`.
  */
-type HookLaunch = (sub: string, ...extra: string[]) => { command: string; args?: string[] }
+export type HookLaunch = (sub: string, ...extra: string[]) => { command: string; args?: string[] }
+
+/**
+ * A plain command prefix (`npx @plur-ai/cli`, a shim path) is the shell
+ * string form, `<prefix> <sub> [args]`. @plur-ai/mcp's tests pin its mirrored
+ * hook set to these builders by passing such a prefix.
+ */
+function asHookLaunch(launch: HookLaunch | string): HookLaunch {
+  if (typeof launch !== 'string') return launch
+  return (sub, ...extra) => ({ command: [launch, sub, ...extra].join(' ') })
+}
 
 // ── Hook shim installation ──────────────────────────────────────────────────
 // Instead of using `npx @plur-ai/cli hook-*` (slow, races on version bumps),
@@ -290,7 +300,8 @@ function installMcpBinary(): { shimPath: string; status: string } {
 // Installed into global ~/.claude/settings.json unconditionally (issue #95) so
 // they fire from any subdirectory project. Each hook silent-passes when
 // isPlurConfigured() is false, so projects without plur are unaffected.
-function buildEnforcementHooks(mk: HookLaunch): Record<string, HookEntry[]> {
+export function buildEnforcementHooks(launch: HookLaunch | string): Record<string, HookEntry[]> {
+  const mk = asHookLaunch(launch)
   return {
     SessionStart: [
       {
@@ -337,7 +348,8 @@ function buildEnforcementHooks(mk: HookLaunch): Record<string, HookEntry[]> {
 // Injection hooks pull relevant engrams into the conversation context. Installed
 // at the path chosen by --global/--project (default project) because per-project
 // domain/scope tuning may matter for what gets injected.
-function buildInjectionHooks(mk: HookLaunch): Record<string, HookEntry[]> {
+export function buildInjectionHooks(launch: HookLaunch | string): Record<string, HookEntry[]> {
+  const mk = asHookLaunch(launch)
   return {
     // First message: inject engrams based on the prompt.
     // Subsequent messages: periodic reminder to call plur_learn (~1ms skip).
@@ -358,9 +370,12 @@ function buildInjectionHooks(mk: HookLaunch): Record<string, HookEntry[]> {
     ],
 
     // Re-inject after context compaction so engrams survive long conversations.
-    PostCompact: [
+    // SessionStart with matcher "compact" fires right after compaction and can
+    // carry context; PostCompact cannot (#1274). Re-running init strips the
+    // old PostCompact entry with the rest of the plur hooks.
+    SessionStart: [
       {
-        matcher: 'auto|manual',
+        matcher: 'compact',
         hooks: [
           { type: 'command', ...mk('hook-inject', '--rehydrate'), timeout: 90, async: true },
         ],
@@ -1601,7 +1616,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo('', flags)
   outputInfo(`Injection hooks (9): ${injectionHooksStatus}`, flags)
   outputInfo('  UserPromptSubmit  — inject engrams + auto-start session', flags)
-  outputInfo('  PostCompact       — re-inject engrams after context compaction', flags)
+  outputInfo('  SessionStart      — re-inject engrams after context compaction', flags)
   outputInfo('  PreToolUse        — contextual injection (plan mode, skills, agents)', flags)
   outputInfo('  PreToolUse        — observation capture for pattern learning', flags)
   outputInfo('  PostToolUse       — observation results capture', flags)

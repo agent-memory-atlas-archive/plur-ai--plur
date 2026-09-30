@@ -150,7 +150,8 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     const commands = allCommands(settings)
     expect(commands.some((c) => c.includes(winHome))).toBe(false)
     expect(settings.hooks?.UserPromptSubmit?.filter((e) => e.hooks[0].args?.[1] === 'hook-inject')).toHaveLength(1)
-    expect(settings.hooks?.SessionStart).toHaveLength(1)
+    // hook-session-remind once, plus (since #1274) the compact rehydrate.
+    expect(settings.hooks?.SessionStart?.map((e) => e.hooks[0].args?.slice(1).join(' '))).toEqual(['hook-session-remind', 'hook-inject --rehydrate'])
     expect(settings.hooks?.Stop).toHaveLength(1)
     // The user's own hook survives.
     expect(commands).toContain('C:\\tools\\my-own-hook.exe')

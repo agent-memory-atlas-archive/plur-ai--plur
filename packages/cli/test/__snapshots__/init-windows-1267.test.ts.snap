@@ -11,6 +11,17 @@ exports[`plur init on darwin/linux output is unchanged (#1267) > hook commands m
           "timeout": 3
         }
       ]
+    },
+    {
+      "matcher": "compact",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "<HOME>/.plur/bin/plur-hook hook-inject --rehydrate",
+          "timeout": 90,
+          "async": true
+        }
+      ]
     }
   ],
   "SessionEnd": [
@@ -104,19 +115,6 @@ exports[`plur init on darwin/linux output is unchanged (#1267) > hook commands m
         {
           "type": "command",
           "command": "<HOME>/.plur/bin/plur-hook hook-inject",
-          "timeout": 90,
-          "async": true
-        }
-      ]
-    }
-  ],
-  "PostCompact": [
-    {
-      "matcher": "auto|manual",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "<HOME>/.plur/bin/plur-hook hook-inject --rehydrate",
           "timeout": 90,
           "async": true
         }

@@ -1,14 +1,86 @@
 /**
  * The hook matcher `plur-mcp init` uses to see whether PLUR's Claude Code
  * hooks are already installed, so it never adds a second set next to the
- * ones `plur init` wrote. A copy of @plur-ai/cli's matcher: this package
- * cannot import the CLI.
+ * ones `plur init` wrote, and to remove only PLUR's own hooks when it heals
+ * a stale PostCompact entry (#1279, #1303). A copy of @plur-ai/cli's
+ * matcher: this package cannot import the CLI. The region below is kept
+ * byte-identical with the cli's; test/hook-command.test.ts also runs the
+ * same cases against both copies.
+ *
+ * Pure apart from reading `~/.plur/bin/plur-hook.meta.json` (the exec-form
+ * check), so tests can import it without loading the `plur-mcp` bin entry.
  */
 import { homedir } from 'os'
+import { readFileSync } from 'fs'
+import { join } from 'path'
+
+/**
+ * The subcommands `plur init` and `plur-mcp init` have written into a Claude
+ * Code settings.json (every version since the first, including the
+ * `npx @plur-ai/cli` era). No longer an allow-list: since decision H2 the
+ * matcher claims ANY `hook-*` behind PLUR's launcher, so a new hook needs no
+ * list update. Kept as the reference list the tests iterate.
+ */
+export const PLUR_SETTINGS_SUBCOMMANDS = [
+  'hook-inject',
+  'hook-observe',
+  'hook-learn-check',
+  'hook-session-remind',
+  'hook-session-guard',
+  'hook-session-mark',
+  'hook-session-end',
+] as const
 
 // BEGIN shared hook matcher — packages/mcp/src/hook-command.ts keeps a
 // byte-identical copy of this region (the mcp package cannot import the
 // CLI); test/hook-decisions-h2-h3.test.ts fails when they drift.
+
+/**
+ * Is this Claude Code hook spec one PLUR wrote? A spec with `args` is the
+ * exec form (decision H3): node plus the CLI js entry recorded in
+ * `~/.plur/bin/plur-hook.meta.json` (decision F4) followed by a `hook-*`
+ * subcommand, or `cmd.exe /c` plus the npx fallback. A spec without
+ * `args` is a shell string, matched by `isPlurHookCommand`.
+ */
+export function isPlurHookSpec(spec: { command?: string; args?: unknown }): boolean {
+  const command = typeof spec.command === 'string' ? spec.command : ''
+  const args = Array.isArray(spec.args) ? spec.args.filter((a): a is string => typeof a === 'string') : []
+  if (args.length === 0) return isPlurHookCommand(command)
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
+  const cmd = norm(command)
+  if (/(^|\/)cmd(\.exe)?$/.test(cmd)) return isPlurHookCommand(args.filter((a) => a.toLowerCase() !== '/c').join(' '))
+  if (!/(^|\/)node(\.exe)?$/.test(cmd)) return false
+  if (!/^hook-[a-z0-9][a-z0-9-]*$/.test(args[1] ?? '')) return false
+  // Decision F4: only a js entry `plur init` itself recorded in
+  // plur-hook.meta.json — not any path that merely ends in
+  // `.../cli/dist/index.js`. Every entry PLUR has recorded counts, not only
+  // the current one, so hooks an earlier install location wrote are still
+  // PLUR's and re-init replaces them (idempotent init).
+  const target = normEntry(args[0])
+  return recordedCliEntries().some((e) => normEntry(e) === target)
+}
+
+/** Windows paths compare without regard to slash style, quotes or case. */
+function normEntry(p: string): string {
+  return p.replace(/\\/g, '/').replace(/"/g, '').toLowerCase()
+}
+
+/** The entries a parsed meta file records: `entrypoints`, else the legacy single `entrypoint`. */
+function entriesOf(meta: unknown): string[] {
+  if (!meta || typeof meta !== 'object') return []
+  const m = meta as { entrypoint?: unknown; entrypoints?: unknown }
+  if (Array.isArray(m.entrypoints)) return m.entrypoints.filter((e): e is string => typeof e === 'string' && e.length > 0)
+  return typeof m.entrypoint === 'string' && m.entrypoint.length > 0 ? [m.entrypoint] : []
+}
+
+/** Every CLI js entry `plur init` has recorded next to the hook shim. */
+export function recordedCliEntries(): string[] {
+  try {
+    return entriesOf(JSON.parse(readFileSync(join(homedir(), '.plur', 'bin', 'plur-hook.meta.json'), 'utf8')))
+  } catch {
+    return []
+  }
+}
 
 /**
  * The matcher is anchored (decision F4): the WHOLE command must be PLUR's
