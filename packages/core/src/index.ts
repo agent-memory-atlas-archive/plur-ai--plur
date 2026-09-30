@@ -53,6 +53,7 @@ import { resolveValidity, buildTemporal, normalizeIsoDate, type ResolvedValidity
 import { isCurrentlyValid } from './validity.js'
 import { decodeJwtExpiry, decodeJwtPayload } from './jwt.js'
 import { RemoteStore, normalizeEndpointUrl } from './store/remote-store.js'
+import { redactToken, containsToken } from './redact-token.js'
 import {
   remoteRecall, isRemoteRecallDisabled, resolveRemoteRecallTimeoutMs, scopeOrg,
   REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES,
@@ -405,6 +406,7 @@ export {
 // so CLI surfaces (login --status) compare hosts the same way the core does.
 export { decodeJwtExpiry, decodeJwtPayload, type JwtExpiry } from './jwt.js'
 export { normalizeEndpointUrl } from './store/remote-store.js'
+export { redactToken, redactTokenDeep, containsToken, tokenForms } from './redact-token.js'
 
 export * from './types.js'
 
@@ -959,6 +961,19 @@ export {
  * or failed and will be retried). `local`: it exists on this machine only.
  */
 export type LearnDelivery = 'remote' | 'outbox' | 'local'
+
+/** Refusal from {@link Plur.addRemoteStore} (#1265). `code` is stable for
+ *  callers; `message` never contains the token. */
+export class AddRemoteStoreError extends Error {
+  constructor(
+    readonly code: 'invalid_url' | 'missing_token' | 'missing_scope' | 'auth_rejected' | 'unreachable' | 'scope_not_authorised' | 'scope_conflict',
+    message: string,
+    readonly authorised: string[] = [],
+  ) {
+    super(message)
+    this.name = 'AddRemoteStoreError'
+  }
+}
 
 export class Plur {
   /**
@@ -9335,6 +9350,108 @@ Generate an improved version of the procedure that prevents this failure. Return
       : [...(config.stores ?? []), newEntry]
     this.persistStores(stores)
     return { status: scopeConflict ? 'overwritten' : 'added', scope }
+  }
+
+  /**
+   * Register a remote (url) store only after the server has vouched for it
+   * (#1265). {@link addStore} is synchronous and never checks the token, so an
+   * installer script using it could write a dead token, or a scope the token
+   * cannot reach, and learn so only at the first failed recall.
+   *
+   * Order: validate the URL, ask `GET /api/v1/me` with the offered token (raced
+   * against `timeoutMs`), require `scope` to be among the scopes `/me`
+   * authorises, THEN delegate to `addStore`. Any refusal throws an
+   * {@link AddRemoteStoreError} and config.yaml is not touched.
+   *
+   * Idempotency and rotation come from `addStore`'s url+scope identity: an
+   * identical re-run returns `already_registered` and writes nothing; the same
+   * url+scope with a different token that `/me` accepts returns
+   * `token_rotated` (the old token is replaced in place). A different token
+   * that `/me` rejects never reaches `addStore`, so the old entry survives.
+   *
+   * The token never appears in the thrown message: the `/me` error text
+   * includes the server's response body, which is not ours to trust, so every
+   * occurrence of the token is scrubbed before it is rethrown.
+   */
+  async addRemoteStore(opts: {
+    url: string; token: string; scope: string
+    shared?: boolean; readonly?: boolean; timeoutMs?: number
+    /** Replace an entry that already holds `scope` for a DIFFERENT store.
+     *  Never implied: without it such a conflict is refused (code
+     *  `scope_conflict`). Applied only after /me has verified the token. */
+    overwriteScope?: boolean
+  }): Promise<{ status: 'added' | 'already_registered' | 'token_rotated' | 'overwritten'; scope: string; username?: string; authorised: string[] }> {
+    const { url, token, scope } = opts
+    const timeoutMs = opts.timeoutMs ?? 5000
+    // Every encoding of the token, not only the exact string (audit of #1272).
+    const scrub = (msg: string) => redactToken(msg, token)
+    let parsed: URL | undefined
+    try { parsed = new URL(url) } catch { /* handled below */ }
+    if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+      throw new AddRemoteStoreError('invalid_url', `invalid URL "${scrub(String(url))}" — must be a valid http(s) URL`)
+    }
+    if (!token) throw new AddRemoteStoreError('missing_token', 'a token is required to register a remote store')
+    if (!scope) throw new AddRemoteStoreError('missing_scope', 'a scope is required to register a remote store')
+
+    // A throwaway driver, not _getRemoteDriver: an unverified token must not
+    // be cached as this url's driver.
+    const driver = new RemoteStore(url, token, scope)
+    let me: Awaited<ReturnType<RemoteStore['me']>>
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    try {
+      me = await Promise.race([
+        driver.me().finally(() => { if (timeoutHandle) clearTimeout(timeoutHandle) }),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error(`/me timeout (${timeoutMs}ms)`)), timeoutMs)
+        }),
+      ])
+    } catch (err) {
+      const msg = scrub(err instanceof Error ? err.message : String(err))
+      if (/\b40[13]\b/.test(msg)) {
+        throw new AddRemoteStoreError('auth_rejected', `the server at ${url} rejected the token (${msg})`)
+      }
+      throw new AddRemoteStoreError('unreachable', `could not verify the token against ${url}: ${msg}`)
+    }
+    // The /me answer is the server's, not ours: re-apply the strict scope
+    // grammar and drop any scope that carries the token in any encoding, so a
+    // buggy or hostile server cannot get the token printed through the
+    // `authorised` list or the username (audit of #1272).
+    const authorised = me.scopes.filter(s =>
+      typeof s === 'string' && s.length <= 256 && /^[\w:./-]+$/.test(s) && !containsToken(s, token))
+    const withheld = me.scopes.length - authorised.length
+    const username = me.username && !containsToken(me.username, token) ? me.username : undefined
+    if (!authorised.includes(scope)) {
+      throw new AddRemoteStoreError(
+        'scope_not_authorised',
+        `the token is not authorised for scope "${scope}" on ${url}. ` +
+        `Authorised: ${authorised.length ? authorised.join(', ') : '(none)'}` +
+        (withheld ? ` (${withheld} withheld: malformed or carrying the token)` : ''),
+        authorised,
+      )
+    }
+    // Scope held by a different store: refuse here, as a typed error, unless
+    // the caller asked to replace it. Mirrors addStore's identity rule (a
+    // normalized url+scope match is the SAME entry, not a conflict).
+    if (opts.overwriteScope !== true) {
+      this.reloadConfigIfChanged()
+      const stores = loadConfig(this.paths.config).stores ?? []
+      const same = stores.some(s => s.url !== undefined && s.scope === scope &&
+        normalizeEndpointUrl(s.url) === normalizeEndpointUrl(url))
+      const other = same ? undefined : stores.find(s => s.scope === scope)
+      if (other) {
+        throw new AddRemoteStoreError(
+          'scope_conflict',
+          `scope "${scope}" is already registered to a different store (${scrub(String(other.url ?? other.path))}). ` +
+          `Nothing was changed; pass overwriteScope to replace that entry.`,
+          authorised,
+        )
+      }
+    }
+    const { status } = this.addStore('', scope, {
+      url, token, shared: opts.shared, readonly: opts.readonly,
+      ...(opts.overwriteScope === true ? { overwriteScope: true } : {}),
+    })
+    return { status, scope, ...(username ? { username } : {}), authorised }
   }
 
   /**
