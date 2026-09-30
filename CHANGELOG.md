@@ -215,6 +215,83 @@ repo's request. Only the CLI writes the map.
     the folder you give it.
   - A `~` in the map expands to your home as written and to its canonical path.
 
+### Claude Code: one full injection per session, and the reminder fires
+
+**Every prompt in a Claude Code session re-ran the full "session started"
+injection, and the 10-minute memory reminder never fired** (#1278). The
+session marker in `plur hook-inject` was keyed on the parent process id.
+Claude Code runs every hook in a fresh shell, so the id changed on every
+prompt, and the "already started" check never matched. This is the same root
+cause as the Stop counter (#1266).
+
+The marker, the reminder clock and the concurrency lock are now keyed on the
+payload `session_id`, sanitised with the shared session-key helper. They fall
+back to `CLAUDE_SESSION_ID`, then the parent process id, only when the payload
+has no id. The prompt stored for rehydration after compaction is now updated
+on every prompt, not only the first.
+
+The marker is written only after the injected context has been written to
+stdout. If an injection fails, times out or is killed, the next prompt tries
+again, so one miss no longer leaves the whole session without memory. The
+concurrency lock is now also released when the injection throws. Before, it
+stayed in place, and a retry within the next minute exited silently.
+
+Checked in a real Claude Code session: before, the second prompt of a resumed
+session got a second full injection; now it gets none.
+
+`plur_session_end` also looks for the session checkpoint under the key the
+Stop hook writes. That hook replaces unsafe characters with `_`, while this
+reader stripped them, so a session id with such characters left its checkpoint
+behind, and the next session reported it as orphaned.
+
+### Claude Code now actually receives injected memory
+
+**In Claude Code, automatic memory never reached the model** (#1274). An
+enterprise deployment reported that most folders had no automatic memory.
+`plur hook-inject` printed `{"additionalContext": ...}` at the top level.
+Claude Code records that as plain hook output and does not show it to the
+model. The same bug hit the Stop nudge (#1266).
+
+Every Claude Code event that `hook-inject` serves now prints
+`{"hookSpecificOutput":{"hookEventName":<event>,"additionalContext":...}}`,
+named after the event that fired: `UserPromptSubmit` (the first-message
+injection and the 10-minute reminder), `PreToolUse` (plan mode, skills,
+agents) and `SubagentStart`. The name comes from the payload's
+`hook_event_name`, or from how the hook was invoked when the payload has none.
+
+**Re-injection after compaction moved from `PostCompact` to `SessionStart`
+(matcher `compact`).** `PostCompact` cannot carry context at all. Claude Code
+rejects `hookEventName: "PostCompact"` with a visible validation error and
+ignores the top-level field. **Re-run `plur init`** to move the hook. Until you
+do, the old `PostCompact` entry prints nothing. The `SessionStart` payload has
+no compaction summary, so the rehydrate query now comes from the session's
+last prompt, stored per Claude Code `session_id`.
+
+`UserPromptSubmit` stays `async: true`. Async context does arrive, but at the
+next safe point (after a tool result, or before the next prompt), not on the
+turn that triggered it. A first message that needs no tools is answered
+without memory. In a one-shot `claude -p` run, that means no memory at all.
+
+An unknown `--event` no longer echoes the hook payload back to stdout.
+
+**`plur-mcp init` now registers the same rehydrate hook** (#1279). It still
+put rehydrate on `PostCompact`. It now uses `SessionStart` with matcher
+`compact`, `async: true`, `timeout: 90`, the same as `plur init`; a test fails
+if the two diverge. Re-running `plur-mcp init` used to stop at "already
+installed". It now removes PLUR's `PostCompact` hooks and, in the same file,
+puts the `SessionStart(compact)` one in place of the old rehydrate. A file
+with PLUR hooks but no rehydrate gets none added. That covers the global
+settings file, where `plur init` puts only its enforcement hooks, so
+rehydrate does not run twice. Hooks with no `command` (`type: "prompt"` or
+`"agent"`) no longer make init throw. It removes PLUR's hooks one at a time and only
+those: a hook counts as PLUR's when it runs the PLUR binary (the
+`~/.plur/bin/plur-hook` shim or `npx @plur-ai/cli`) with a subcommand init
+writes. Your own hooks, including your own `PostCompact` hooks and one that
+shares an entry with a PLUR hook, are left in place. Installs that use the
+local shim, including the backslash and quoted Windows paths, now count as
+installed too, so re-running no longer adds a second set (#1303, on Windows
+as well).
+
 ### A killed writer no longer stalls the store for a minute
 
 **A process killed while taking the store lock left an empty
