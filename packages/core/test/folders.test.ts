@@ -936,6 +936,22 @@ describe('nonce binding to the answer (#1378)', () => {
     expect(() => setFolderEntry(root, d, { mode: 'on' }, opts(n))).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
   })
 
+  // #1477 review: the nonce is checked against the key the write records, so
+  // a quoted `~/x` is the home's x for both (not `<cwd>/~/x` for the check).
+  it('a nonce is checked against the folder the write records: ~ expands to the home', () => {
+    const d = mk('victim')
+    const other = mk('other')
+    const forOther = issueFolderNonce(root, 'sess-h', other, { trusted: true })
+    expect(() => setFolderEntry(root, '~/victim', { trusted: true }, opts(forOther))).toThrow(expect.objectContaining({ code: 'nonce-folder' }))
+    const rmOther = issueFolderNonce(root, 'sess-h', other, { remove: true })
+    expect(() => removeFolderEntry(root, '~/victim', home, { nonce: rmOther })).toThrow(expect.objectContaining({ code: 'nonce-folder' }))
+    expect(existsSync(folderMapPath(root))).toBe(false)
+    const forD = issueFolderNonce(root, 'sess-h', d, { mode: 'on' })
+    expect(setFolderEntry(root, '~/victim', { mode: 'on' }, opts(forD))).toEqual({ path: realpathSync(d), plur: 'on' })
+    const rmD = issueFolderNonce(root, 'sess-h', d, { remove: true })
+    expect(removeFolderEntry(root, '~/victim', home, { nonce: rmD })).toBe(true)
+  })
+
   it('a scope nonce authorises that scope only; --scope X and --scope X --on are the same answer', () => {
     const d = mk('bind-scope')
     const n = issueFolderNonce(root, 'sess-b2', d, { scope: 'group:example/eng' })
@@ -956,19 +972,16 @@ describe('nonce binding to the answer (#1378)', () => {
     expect(removeFolderEntry(root, d, home, { nonce: rm })).toBe(true)
   })
 
-  it('trustDirectory / untrustDirectory accept only a nonce bound to that grant or revocation', () => {
+  it('trustDirectory accepts only a nonce bound to the grant; untrustDirectory needs none (#1477 review)', () => {
     const d = mk('bind-trust')
     const on = issueFolderNonce(root, 'sess-b4', d, { mode: 'on' })
     expect(() => trustDirectory(d, root, { nonce: on })).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
     expect(existsSync(folderMapPath(root))).toBe(false)
     const grant = issueFolderNonce(root, 'sess-b4', d, { trusted: true })
     expect(trustDirectory(d, root, { nonce: grant })).toBe(realpathSync(d))
-    expect(() => untrustDirectory(d, root, { nonce: grant })).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
-    const other = issueFolderNonce(root, 'sess-b4', d, { trusted: true })
-    expect(() => untrustDirectory(d, root, { nonce: other })).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+    expect(() => trustDirectory(d, root, { nonce: grant })).toThrow(expect.objectContaining({ code: 'nonce-unknown' }))
     expect(isDirectoryTrusted(d, root)).toBe(true)
-    const revoke = issueFolderNonce(root, 'sess-b4', d, { trusted: false })
-    expect(untrustDirectory(d, root, { nonce: revoke })).toBe(true)
+    expect(untrustDirectory(d, root)).toBe(true)
     expect(isDirectoryTrusted(d, root)).toBe(false)
   })
 

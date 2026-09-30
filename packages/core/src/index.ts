@@ -10550,10 +10550,10 @@ Generate an improved version of the procedure that prevents this failure. Return
 
   /**
    * Revoke trust from `dir` (`plur untrust`). Returns whether an entry was
-   * removed. A `nonce` must be one issued for `dir` and `{ trusted: false }` (#1378).
+   * removed. Needs no nonce: a revocation only removes trust (#1477 review).
    */
-  untrustDirectory(dir: string, options?: { nonce?: string }): boolean {
-    return _untrustDirectory(dir, this.paths.root, options)
+  untrustDirectory(dir: string): boolean {
+    return _untrustDirectory(dir, this.paths.root)
   }
 
   /** List every directory this user has explicitly trusted. */

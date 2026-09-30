@@ -1,6 +1,6 @@
 import { homedir } from 'os'
 import { canonicalize } from './project-config.js'
-import { loadFolderMap, isTrustedInMap, setFolderEntry, clearFolderTrust, removeLegacyTrustEntry, withFolderMapLock, verifyFolderNonce } from './folders.js'
+import { loadFolderMap, isTrustedInMap, setFolderEntry, clearFolderTrust, removeLegacyTrustEntry, withFolderMapLock } from './folders.js'
 
 /**
  * Directory trust — a one-time, explicit, per-directory grant, the same
@@ -64,17 +64,14 @@ export function trustDirectory(dir: string, root: string, opts?: { nonce?: strin
  * The grant is removed from folders.yaml AND from trust.yaml (the dual-write
  * for adapters on the previous core), so neither an older reader, a downgrade
  * nor a re-import can bring it back.
+ *
+ * Takes no nonce (#1477 review): a revocation only removes trust, so, like a
+ * grant before #1378, it works from a script. Only a grant is gated.
  */
-export function untrustDirectory(dir: string, root: string, opts?: { nonce?: string; now?: number }): boolean {
+export function untrustDirectory(dir: string, root: string): boolean {
   return withFolderMapLock(root, () => {
-    // A `nonce` (#1378) must be one issued for `dir` and the answer
-    // `{ trusted: false }`. It is checked before anything is written and
-    // consumed only when a grant was actually removed.
-    const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, dir, { trusted: false }, opts.now) : null
     const fromMap = clearFolderTrust(root, dir)
-    if (fromMap) consume?.()
     const fromLegacy = removeLegacyTrustEntry(root, dir)
-    if (fromLegacy && !fromMap) consume?.()
     return fromMap || fromLegacy
   })
 }

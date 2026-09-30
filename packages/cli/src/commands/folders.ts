@@ -9,13 +9,14 @@ const USAGE =
   'Without --nonce, set and rm work only from an interactive terminal.'
 
 /**
- * Whether a `folders set`/`rm`, `trust` or `untrust` must carry a `--nonce`.
+ * Whether a `folders set`/`rm` or `trust` must carry a `--nonce`.
  *
  * Only a person at a terminal may write the map without one. When stdin or
  * stdout is not a TTY, the caller is a script or an agent (the ask flow runs
  * the command from a tool call), and without this an agent could skip the
  * nonce check simply by omitting `--nonce`, and write any folder, `--trusted`
- * included. Since #1378 `plur trust` and `plur untrust` go through here too.
+ * included. Since #1378 `plur trust` (a grant) goes through here too;
+ * `plur untrust` does not, because a revocation only removes trust.
  *
  * What this does NOT stop (#1378): a process that runs the CLI under a
  * pseudo-terminal (python's pty module, script(1), expect) passes this check
