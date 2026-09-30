@@ -88,6 +88,11 @@ const ALWAYS_ASYNC = new Set([
   // never have been sync; new in this release, so there is no pre-0.16 call
   // site to rewrite.
   'addRemoteStore',
+  // Born async (#1413) — the /me round trip addRemoteStore and `plur remote`
+  // share, split out so a store can be checked without writing it. Network
+  // I/O, so it could never have been sync; new in this release, so there is
+  // no pre-0.16 call site to rewrite.
+  'verifyRemoteStore',
 ])
 
 /** Public methods of `Plur`, mapped to whether they are declared `async`. */
