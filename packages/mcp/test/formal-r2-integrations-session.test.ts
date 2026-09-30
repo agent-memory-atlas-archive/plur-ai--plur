@@ -122,7 +122,7 @@ describe('R2 follow-up: plur_outbox pending after a flush is counted from listOu
     const entry = { id: 'ENG-1', target_scope: 'group:acme/eng', queued_at: '2026-09-26T00:00:00Z', attempt_count: 1, age_days: 0, kind: 'retire' }
     vi.spyOn(plur, 'listOutbox').mockResolvedValue([entry] as any)
     vi.spyOn(plur, 'outboxCount').mockResolvedValue(0)
-    vi.spyOn(plur, 'flushOutbox').mockResolvedValue({ flushed: 0, failed: 1, expired_warnings: [] })
+    vi.spyOn(plur, 'flushOutbox').mockResolvedValue({ flushed: 0, failed: 1, deferred: 0, held: 0, skipped: 0, expired_warnings: [] })
     const tool = getToolDefinitions('full').find(t => t.name === 'plur_outbox')!
     const shown = await tool.handler({}, plur) as any
     expect(shown.entries).toEqual([entry])
