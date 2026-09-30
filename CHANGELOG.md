@@ -257,6 +257,67 @@ This applies to the YAML store, and to PGLite, which keeps YAML as its source
 of truth and takes the same lock. A Postgres primary store serializes writers
 with a Postgres advisory lock and does not use this lock file.
 
+### A team save is no longer swallowed by a personal note with the same text (#1268)
+
+**A shared-scope write whose text matched a personal engram was never
+written.** Cross-scope recurrence (#176) matched any active engram with the same
+content hash in a different scope, and on a match it updates that engram
+*instead* of writing a new one. So a `group:` or `project:` learn identical to
+something in `global`, `local`, `user:` or `agent:` bumped the personal note's
+recurrence count and nothing reached the team scope. Found while triaging an
+enterprise deployment's report of team saves that never reached the team store.
+
+**A shared-scope save now always writes its team copy.** It is never absorbed
+into another engram — not a personal or `global` one (including one the
+recurrence ladder graduated, or one you moved to `global` yourself with
+`rescope`), and not another team's engram either: a save to `group:a/ops` whose
+text matches an engram in `group:a/eng` now reaches the ops store instead of
+vanishing into the eng engram. The matching engram is still credited: the team
+save is recorded on it as a recurrence (counted, with a source marked
+`validated_by` the team scope, and commitment escalated by the usual ladder).
+You may end up with several engrams with the same text — your own and each
+team's — and that is intended. `plur import` follows the same rule: a record for
+a shared scope whose text exists elsewhere is imported into its own scope, and
+`--dry-run` now predicts that instead of reporting it as a duplicate.
+
+**What is in a team store stays there.** When the ladder would broaden a
+team-bound engram to `global` — one served by, queued for, or in the scope of
+any team store, a url store or a `shared: true` file-path store — it now leaves
+that engram exactly as it is and creates, once, a `global` copy in your local
+store instead. The copy points back at the team engram (`derived_from`), its
+first source records `promoted_from` the team scope, its commitment escalates
+as the ladder would, and it is never queued for or pushed to a team store.
+Later recurrences credit the same copy. A team engram still queued for its
+store also records the recurrence on itself (count and source; its scope and
+queue entry are kept). The copy keeps the
+team engram's validity window, knowledge anchors and dual coding; it does not
+take its pin (a pin spends your own injection budget) or its relations (they
+name team-store ids). When a `global` engram with the same text already exists,
+the ladder credits that one rather than creating a second. Before, the team
+engram could be rewritten to `global` in the team's own file, or rewritten
+locally and then pushed to the team store as `scope: global`. Non-shared
+file-path stores still broaden in place.
+
+Personal→personal recurrence, and a personal save recurring onto a shared
+engram, behave as before.
+
+**How far the ladder may escalate is now a setting.** `recurrence.max_commitment`
+in `config.yaml` caps the commitment the cross-scope ladder can reach — team
+validation and the promoted `global` copy included:
+
+```yaml
+recurrence:
+  max_commitment: locked   # default: the ladder may lock a rule
+  # max_commitment: decided  # stop one step below; only an explicit act locks
+```
+
+A config without the key behaves as `locked`, which is what the ladder has
+always done. An unresolved tension still blocks the step into `locked` either
+way — on the engram itself, on the promoted `global` copy, and on an existing
+`global` engram the ladder credits instead. The ladder only moves the four rungs
+`exploring → leaning → decided → locked`; a `draft` engram (pending approval)
+or any other value is never advanced.
+
 ### A team save that stays on this machine now says so (#1264)
 
 **A write to a shared scope with no store registered for it never left the
