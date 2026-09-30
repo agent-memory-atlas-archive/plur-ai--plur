@@ -17,6 +17,7 @@ Claude Code's `hook-inject` was async with a 90s timeout until #1313.
 | Antigravity | pre-invocation | 20s |
 | Cursor | `sessionStart` | 10s |
 | Claude Code | `UserPromptSubmit`, `SessionStart` (matcher `compact`) | 20s; the hook exits itself at 15s (`PLUR_HOOK_CEILING_MS`) |
+| All four | end-of-turn auto-rate (`hook-auto-rate`, #1310) | 10s (sync), self-capped at 9s from process start, plus up to 0.8s waiting for an in-flight store write |
 
 Codex's own default is 600s. PLUR's are deliberately tight so a wedged hook
 cannot hang a turn.
@@ -32,6 +33,19 @@ Claude Code hook then starts one background build of the cache
 (`hook-inject --warm-embeddings`, lowest CPU priority, marker
 `.embeddings-warming` in the store, stopped after `PLUR_WARM_CEILING_MS`), so
 the next session's first prompt takes the hybrid path.
+
+The auto-rate hook never opens the store. It costs a Node start, a few small
+file reads, and when something is pending, one queue append and the start of a
+detached worker. The worker does the store work outside the editor's budget:
+it reads the pending ids and writes one feedback signal per verdict. It dials
+a remote store only to rate one of that store's engrams. That costs at most one
+bounded `/me` call per process, to check for the `feedback.source` capability,
+plus the feedback call if the server has it.
+
+- `PLUR_AUTO_RATE=0` turns auto-rate off.
+- `PLUR_AUTO_RATE_CEILING_MS` moves the hook's self-cap.
+- `PLUR_AUTO_RATE_WORKER_CEILING_MS` (default 15 min) moves the worker's
+  guard against an immortal process.
 
 ## What actually consumes the budget
 

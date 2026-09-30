@@ -2,6 +2,129 @@
 
 ## Unreleased
 
+### Editors now rate the memory they inject, from the reply
+
+**No editor hook ever produced a feedback outcome** (#1310). plur-hermes rated
+injected engrams after each reply; Claude Code, Codex, Cursor and Antigravity
+did not, so ranking there learned only from explicit `plur_feedback` calls.
+
+Now each editor's end-of-turn hook rates the engrams injected in that session
+against the assistant's reply, and sends a verdict only when it is at least 0.6
+confident:
+
+- the engram's statement appears in the reply: positive;
+- most of its word trigrams appear in the reply: positive. This rule applies
+  only to statements of three words or more; shorter ones must appear verbatim;
+- one sentence of the reply both corrects something and contains at least two
+  of the engram's distinctive words: negative. The Python version looked at a
+  window of 100 to 200 characters around any correction word, which marked
+  unrelated engrams negative.
+
+A quote or paraphrase is positive only when neither its sentence nor the next
+one corrects it. "Your note says 'use npm for installs' — that is no longer
+true" is rated negative, not positive. A match is also negative when the word
+right before it negates it ("Do not use pnpm, use npm." against the engram "Use
+pnpm"; also "no longer", "instead of", "rather than", "ignore") or the words
+right after it reject it ('"use npm" is outdated', "does not apply", "was
+dropped"). A "not" elsewhere in the sentence ("Use pnpm, not npm.", "Rather
+than npm, use pnpm.") leaves it positive, and
+"Why not use pnpm?" is not a negation. Each occurrence of the statement, and
+each run of matching trigrams, is judged on its own: the reply is negative only
+when every occurrence is rejected, and gets no verdict when it both rejects and
+follows the engram. Curly apostrophes count as straight ones.
+Correction phrases are ones aimed at a prior claim ("that is wrong", "is no
+longer true"). A bare "is wrong" doesn't count, because ordinary prose ("check
+what is wrong with the deploy") uses it all the time. A reply that merely opens
+with "Actually," or "No," is not a correction either: "No, the tests passed
+after the build" agrees with the memory. It counts only when the same sentence
+also contradicts something ("not", "no longer", "instead", "removed", …).
+
+The heuristic lives in `@plur-ai/core` (`detectInjectionSignal`,
+`rateInjectedEngrams`), so it has one implementation.
+
+**Automatic feedback changes ranking only.** It moves `retrieval_strength`
+and the feedback counters, and never advances `commitment`. It is recorded
+with `source: "auto"` on the `feedback_received` and `injection_outcome`
+history events. Explicit `plur_feedback` works exactly as before.
+`Plur.feedback()` takes an optional fourth argument `{ source: 'auto' }`, and
+`applyFeedbackSignal()` takes `{ source }`.
+
+**Remote stores get automatic feedback only if they say they can handle it.**
+A server opts in by listing `feedback.source` in the `capabilities` array of
+its `GET /api/v1/me` response. The client then sends
+`{"signal": ..., "source": "auto"}` to `POST /api/v1/engrams/:id/feedback`, and
+the server must treat it as ranking-only. A server that does not list the
+capability receives no automatic feedback, only explicit feedback, whose
+request body is unchanged. The capability is read from the `/me` call that
+session start already makes, and is cached per server and token for the
+process: at most one extra `/me`, never one per rating. `RemoteStore.me()`
+now returns `capabilities` (`[]` for older servers). Contract:
+`docs/specs/2026-09-29-feedback-source-contract.md`.
+
+A hook runs in a fresh process, where the remote cache is empty. So the hook
+fetches an injected remote engram by id, with one bounded request per id and at
+most 20 per store. It asks only servers that list the capability; a server
+without it is never asked for the engram. The new
+`Plur.getByIds(ids, { remoteCapability })` does this. Without the option,
+`getByIds` never touches the network.
+
+Each injected engram gets at most one automatic verdict per session, and is
+checked against at most three replies. After that it is settled with no
+verdict, and later turns take the fast path without opening the store.
+
+**The hook never does the store work itself.** It appends the turn to a
+per-session queue, starts a detached background worker
+(`plur hook-auto-rate --worker`), and exits. The worker loads, rates and writes
+outside the editor's timeout, one worker per session at a time. On a large
+store the store work takes seconds to tens of seconds; done inside the hook, it
+overran the editor's budget and was killed part-way, sometimes while holding
+the store lock. Each verdict is recorded as rated *before* it is applied, so a
+worker killed between the two loses that one signal and never applies it twice.
+If that record can't be written (full disk, quota, an unwritable file), the
+verdict is skipped. Nothing else would stop the next turn from applying it
+again. The next worker takes over a dead worker's lock and finishes its queued
+turns. The takeover is atomic: it claims the lock by renaming it, the way the
+core store lock does. A second worker that also judged the lock dead can
+therefore never delete the lock the first one now holds. For Codex, the Stop
+hook reads the session id from the same fields the inject hook records it
+under (`session_id`, then `conversation_id`).
+
+Measured under a heavy machine load (load average about 220):
+- 20,000-engram store: the hook returns in 0.3–0.8 s. An earlier audit
+  measured 12–30 s with the work done in the hook.
+- 5,000-engram store, 10 injected engrams the reply never mentions: from the
+  fourth turn on, the hook took about 100–340 ms. Without the three-reply cap
+  it took 900–1,600 ms on every turn.
+
+| Editor | End-of-turn event | Where the reply comes from |
+|---|---|---|
+| Claude Code | `Stop` (its own entry, next to the learning nudge) | `last_assistant_message` |
+| Codex | `Stop` (new) | `last_assistant_message` |
+| Cursor | `afterAgentResponse` (new; `stop` carries no reply) | `text` |
+| Antigravity | `Stop` (new; prints nothing, so it never blocks the stop) | model responses in the transcript since the last user message |
+
+The inject hooks record the ids they delivered, per editor session, in a
+per-user temp directory (ids only, no engram text). When nothing was injected
+in the session, the hook exits without opening the store. Every path is
+fail-open, and the run is capped at 9s, below the 10s budget each editor gives
+it. The Claude Code `Stop` hook is synchronous: in a real `claude -p` session an
+async `Stop` hook was killed when the session exited and rated nothing. The
+detached worker it starts does survive the session's exit (checked in a real
+`claude -p` session).
+
+Switches, both environment variables:
+
+- `PLUR_AUTO_RATE=0` (or `false`, `off`) turns automatic rating off. It is on by default.
+- `PLUR_AUTO_CAPTURE=1` (or `true`, `on`) turns on automatic capture of the reply's
+  `🧠 I learned:` block, stored as `claim_class: inferred`. It is off by default and writes
+  nothing unless you opt in. `auto_learn: false` in `config.yaml` still wins. Captured text
+  goes to the local store unless you chose a scope: a folder-map entry's scope
+  (`plur folders`), or a `.plur.yaml` scope in a trusted folder (`plur trust`). A cloned
+  repository cannot choose to publish the agent's reply text to a team store. Captured text
+  is never auto-routed into a shared scope, and a folder the map turns off captures nothing.
+
+Run `plur init` again to install the new hook entries.
+
 ### A folder nonce now authorises one answer, and `plur trust` needs one outside a terminal
 
 **A nonce issued for the folder question authorised any answer, `--trusted`
