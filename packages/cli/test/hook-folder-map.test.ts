@@ -103,6 +103,37 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
     expect(cli(['folders', 'set', repo, '--off', '--nonce', nonceOf(ask)]).status).not.toBe(0)
   })
 
+  it('after a resume, the session is asked again with a fresh nonce that works once (option C)', () => {
+    const sid = 'cc-resume'
+    const ask = context(cli(['hook-inject'], payload(PROMPT, sid)).stdout)
+    const oldNonce = nonceOf(ask)
+    // SessionEnd kills the session's nonces, as before.
+    expect(cli(['hook-session-end'], { session_id: sid, cwd: repo, reason: 'other' }).status).toBe(0)
+    // `claude --resume` keeps the session id and fires SessionStart(resume).
+    const resumed = cli(['hook-session-resume'], { session_id: sid, cwd: repo, hook_event_name: 'SessionStart', source: 'resume' })
+    expect(resumed.status, resumed.stderr).toBe(0)
+    expect(resumed.stdout).toBe('')
+    const again = context(cli(['hook-inject'], payload(PROMPT, sid)).stdout)
+    expect(again).toContain('no decision for this folder yet')
+    const newNonce = nonceOf(again)
+    expect(newNonce).not.toBe(oldNonce)
+    // The ended session's nonce stays dead; the fresh one works exactly once.
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', oldNonce]).status).not.toBe(0)
+    const yes = cli(['folders', 'set', repo, '--on', '--nonce', newNonce])
+    expect(yes.status, yes.stderr).toBe(0)
+    expect(cli(['folders', 'set', repo, '--off', '--nonce', newNonce]).status).not.toBe(0)
+    expect(context(cli(['hook-inject'], payload(PROMPT, sid)).stdout)).toContain('ZEPHYRQUILL')
+  })
+
+  it('a startup SessionStart does not clear the ask-once record of an ongoing session', () => {
+    const sid = 'cc-startup'
+    expect(context(cli(['hook-inject'], payload(PROMPT, sid)).stdout)).toContain('no decision for this folder yet')
+    for (const source of ['startup', 'clear', 'compact']) {
+      expect(cli(['hook-session-resume'], { session_id: sid, cwd: repo, hook_event_name: 'SessionStart', source }).status).toBe(0)
+      expect(cli(['hook-inject'], payload(PROMPT, sid)).stdout).toBe('')
+    }
+  })
+
   it('never here: --off with the nonce silences every hook from then on', () => {
     const ask = context(cli(['hook-inject'], payload(PROMPT)).stdout)
     expect(cli(['folders', 'set', repo, '--off', '--nonce', nonceOf(ask)]).status).toBe(0)
@@ -217,6 +248,23 @@ describe('Codex hooks read the folder map (#1347)', () => {
     expect(cli(['hook-codex-guard'], { session_id: 'cx-ask', cwd: repo, tool_name: 'shell' }).stdout).toBe('')
     expect(cli(['folders', 'set', repo, '--on', '--nonce', nonceOf(ask)]).status).toBe(0)
     expect(context(cli(['hook-codex-inject'], prompt('cx-ask')).stdout)).toContain('ZEPHYRQUILL')
+  })
+
+  it('after a resume, the first prompt asks again with a fresh nonce that works once; a startup does not', () => {
+    const sid = 'cx-resume'
+    const ask = context(cli(['hook-codex-inject'], prompt(sid)).stdout)
+    const oldNonce = nonceOf(ask)
+    expect(cli(['hook-codex-session-start'], start(sid)).stdout).toBe('')
+    expect(cli(['hook-codex-inject'], prompt(sid)).stdout).toBe('') // startup keeps the record
+    expect(cli(['hook-codex-session-end'], { session_id: sid, cwd: repo, hook_event_name: 'SessionEnd' }).status).toBe(0)
+    expect(cli(['hook-codex-session-start'], { ...start(sid), source: 'resume' }).stdout).toBe('')
+    const again = context(cli(['hook-codex-inject'], prompt(sid)).stdout)
+    expect(again).toContain('no decision for this folder yet')
+    const newNonce = nonceOf(again)
+    expect(newNonce).not.toBe(oldNonce)
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', oldNonce]).status).not.toBe(0)
+    expect(cli(['folders', 'set', repo, '--on', '--nonce', newNonce]).status).toBe(0)
+    expect(cli(['folders', 'set', repo, '--off', '--nonce', newNonce]).status).not.toBe(0)
   })
 
   it('off: every Codex hook is silent', () => {

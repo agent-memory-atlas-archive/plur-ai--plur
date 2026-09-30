@@ -1,5 +1,5 @@
 import { createPlur, type GlobalFlags } from '../plur.js'
-import { hookFolderPolicy, payloadDir, sessionSettings } from '../lib/folder-gate.js'
+import { hookFolderPolicy, payloadDir, sessionSettings, clearFolderAsk, isResumeStart } from '../lib/folder-gate.js'
 import { readStdinJson, runCodexHook, codexSessionId, markSessionStarted, emitContext, injectWithFallback } from '../lib/codex-hook-io.js'
 import { resolveProjectRemote, projectRemoteRefusalNotice } from '../lib/project-remote.js'
 import { recordInjected } from '../lib/auto-rate.js'
@@ -29,6 +29,10 @@ import { recordInjected } from '../lib/auto-rate.js'
 export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   await runCodexHook('codex session-start', async () => {
     const input = readStdinJson()
+    // #1347 option C: a resumed session keeps its id, but SessionEnd deleted
+    // its nonces. Forget that it was asked, so its first prompt asks again
+    // with a fresh nonce. Only on resume: startup, clear and compact keep it.
+    if (isResumeStart(input)) clearFolderAsk(String(input.session_id ?? input.conversation_id ?? '')) // the key hook-codex-inject asks under
     // #1347: only an `on` folder gets a session batch. An `ask` folder is
     // asked by hook-codex-inject on the first prompt; `off` is silent.
     const dir = payloadDir(input)

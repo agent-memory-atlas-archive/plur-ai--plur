@@ -264,6 +264,16 @@ export function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> 
           { type: 'command', command: `${cmd} hook-session-remind`, timeout: 3 },
         ],
       },
+      // `claude --resume` keeps the session id, and SessionEnd below deleted
+      // its folder-question nonces: forget that the session was asked, so the
+      // resumed session asks again with a fresh nonce (#1347, option C). In
+      // the same file as SessionEnd, so the pair is always installed together.
+      {
+        matcher: 'resume',
+        hooks: [
+          { type: 'command', command: `${cmd} hook-session-resume`, timeout: 3 },
+        ],
+      },
     ],
 
     // Auto-close the memory lifecycle when the session ends (Claude Code
@@ -1500,7 +1510,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo(`  command: ${entry.command} ${entry.args.join(' ')}`, flags)
   outputInfo('', flags)
   outputInfo(`Enforcement hooks (4, always global): ${enforcementHooksStatus}`, flags)
-  outputInfo('  SessionStart      — enforce plur_session_start before any work', flags)
+  outputInfo('  SessionStart      — enforce plur_session_start before any work; on resume, re-ask the folder question', flags)
   outputInfo('  SessionEnd        — auto-close memory lifecycle (captures closing episode)', flags)
   outputInfo('  PreToolUse        — session guard (blocks tools until session started)', flags)
   outputInfo('  PostToolUse       — session sentinel (marks session as started)', flags)

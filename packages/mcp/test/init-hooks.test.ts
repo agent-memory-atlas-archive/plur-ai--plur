@@ -17,7 +17,7 @@ describe('plur-mcp init hook definitions (#1279)', () => {
   it('registers rehydrate on SessionStart with matcher compact, not PostCompact', () => {
     const hooks = buildPlurHooks(CMD)
     expect(hooks.PostCompact).toBeUndefined()
-    expect(hooks.SessionStart).toEqual([
+    expect(compactOnly(hooks.SessionStart)).toEqual([
       {
         matcher: 'compact',
         hooks: [{ type: 'command', command: `${CMD} hook-inject --rehydrate`, timeout: 20 }],
@@ -29,7 +29,53 @@ describe('plur-mcp init hook definitions (#1279)', () => {
     const mcp = buildPlurHooks(CMD)
     const cli = buildInjectionHooks(CMD)
     expect(cli.PostCompact).toBeUndefined()
-    expect(mcp.SessionStart).toEqual(cli.SessionStart)
+    expect(compactOnly(mcp.SessionStart)).toEqual(cli.SessionStart)
+  })
+
+  it('registers the SessionStart(resume) hook next to SessionEnd, identical to `plur init` (#1347 option C)', () => {
+    const mcp = buildPlurHooks(CMD)
+    const cli = buildEnforcementHooks(CMD)
+    const resume = (entries: Array<{ matcher?: string }>) => entries.filter(e => e.matcher === 'resume')
+    expect(resume(mcp.SessionStart)).toEqual([
+      { matcher: 'resume', hooks: [{ type: 'command', command: `${CMD} hook-session-resume`, timeout: 3 }] },
+    ])
+    expect(resume(mcp.SessionStart)).toEqual(resume(cli.SessionStart))
+    expect(mcp.SessionEnd).toBeDefined()
+  })
+})
+
+/** The SessionStart entries other than the resume one (#1347 option C). */
+function compactOnly<T extends { matcher?: string }>(entries: T[]): T[] {
+  return entries.filter(e => e.matcher !== 'resume')
+}
+
+describe('applyPlurHooks adds the resume hook to an install that has SessionEnd (#1347 option C)', () => {
+  const hooks = buildPlurHooks(CMD)
+  const withoutResume = () => ({
+    hooks: {
+      UserPromptSubmit: hooks.UserPromptSubmit,
+      SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: 'echo hi' }] }, ...compactOnly(hooks.SessionStart)],
+      SessionEnd: hooks.SessionEnd,
+    },
+  })
+
+  it('an older install with SessionEnd but no resume hook gets it, once', () => {
+    const first = applyPlurHooks(withoutResume(), hooks)
+    expect(first.status).toBe('healed')
+    const resume = first.settings.hooks!.SessionStart.filter(e => e.matcher === 'resume')
+    expect(resume).toHaveLength(1)
+    expect(resume[0].hooks[0].command).toBe(`${CMD} hook-session-resume`)
+    // the user's own SessionStart hook is kept, in place
+    expect(first.settings.hooks!.SessionStart[0]).toEqual({ matcher: 'startup', hooks: [{ type: 'command', command: 'echo hi' }] })
+    const second = applyPlurHooks(JSON.parse(JSON.stringify(first.settings)), hooks)
+    expect(second.status).toBe('already')
+  })
+
+  it('a file with PLUR hooks but no SessionEnd gets no resume hook', () => {
+    const old = { hooks: { UserPromptSubmit: hooks.UserPromptSubmit } }
+    const { settings, status } = applyPlurHooks(old, hooks)
+    expect(status).toBe('already')
+    expect(settings.hooks!.SessionStart).toBeUndefined()
   })
 })
 
@@ -65,7 +111,7 @@ describe('applyPlurHooks (#1279)', () => {
       expect(status).toBe('healed')
       // user hooks untouched, in place
       expect(settings.hooks!.PostCompact).toEqual([userCompact])
-      expect(settings.hooks!.SessionStart).toEqual([userSessionStart, ...hooks.SessionStart])
+      expect(settings.hooks!.SessionStart).toEqual([userSessionStart, ...compactOnly(hooks.SessionStart)])
       expect(settings.hooks!.Stop).toEqual([userStop, ...hooks.Stop])
       expect(settings.hooks!.UserPromptSubmit).toEqual(hooks.UserPromptSubmit)
     })
@@ -82,7 +128,7 @@ describe('applyPlurHooks (#1279)', () => {
     }
     const { settings } = applyPlurHooks(old, plurHooks)
     expect(settings.hooks!.PostCompact).toBeUndefined()
-    expect(settings.hooks!.SessionStart).toEqual(plurHooks.SessionStart)
+    expect(settings.hooks!.SessionStart).toEqual(compactOnly(plurHooks.SessionStart))
   })
 
   it('an up-to-date install is left alone', () => {
@@ -118,7 +164,7 @@ describe('applyPlurHooks only ever removes PLUR hooks (#1300 review, #1303)', ()
     const { settings, status } = applyPlurHooks(old, plurHooks)
     expect(status).toBe('healed')
     expect(settings.hooks!.PostCompact).toEqual([{ matcher: 'auto|manual', hooks: [userHook] }])
-    expect(settings.hooks!.SessionStart).toEqual(plurHooks.SessionStart)
+    expect(settings.hooks!.SessionStart).toEqual(compactOnly(plurHooks.SessionStart))
   })
 
   it("a user's own `npx @plur-ai/cli doctor` PostCompact hook is kept", () => {
@@ -164,7 +210,7 @@ describe('applyPlurHooks only ever removes PLUR hooks (#1300 review, #1303)', ()
       const { settings, status } = applyPlurHooks(old, hooks)
       expect(status).toBe('healed')
       expect(settings.hooks!.PostCompact).toBeUndefined()
-      expect(settings.hooks!.SessionStart).toEqual(hooks.SessionStart)
+      expect(settings.hooks!.SessionStart).toEqual(compactOnly(hooks.SessionStart))
     })
   }
 
@@ -228,7 +274,7 @@ describe('applyPlurHooks heal scope (#1300 review, second round)', () => {
     expect(r.status).toBe('healed')
     expect(r.settings.hooks!.PostCompact).toBeUndefined()
     // the existing (differently cased) rehydrate is recognised: no second one
-    expect(r.settings.hooks!.SessionStart).toHaveLength(1)
+    expect(compactOnly(r.settings.hooks!.SessionStart)).toHaveLength(1)
   })
 
   it('hooks without a command (type prompt / agent) do not make init throw', () => {
@@ -246,7 +292,7 @@ describe('applyPlurHooks heal scope (#1300 review, second round)', () => {
     const r = applyPlurHooks(old, hooks)
     expect(r.status).toBe('healed')
     expect(r.settings.hooks!.PostCompact).toEqual([agent])
-    expect(r.settings.hooks!.SessionStart).toEqual([prompt, ...hooks.SessionStart])
+    expect(r.settings.hooks!.SessionStart).toEqual([prompt, ...compactOnly(hooks.SessionStart)])
   })
 })
 

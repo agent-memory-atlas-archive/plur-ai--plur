@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync, readSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, readSync, rmSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import { homedir, tmpdir } from 'os'
 import {
@@ -100,6 +100,25 @@ function claimAsk(sessionId: string): boolean {
   } catch (err) {
     return (err as NodeJS.ErrnoException)?.code !== 'EEXIST'
   }
+}
+
+/**
+ * Forget that this session was asked, so its next prompt asks again with a
+ * fresh nonce. Called only when the editor resumes a session (Claude Code and
+ * Codex send SessionStart with `source: "resume"`): SessionEnd already deleted
+ * that session's nonces, so the question shown before the resume can no
+ * longer be answered, and without this the resumed session is never asked
+ * again (#1347, option C). Nonces are untouched here: they stay single-use,
+ * bound to one folder, and still die at SessionEnd.
+ */
+export function clearFolderAsk(sessionId: string): void {
+  if (!sessionId) return
+  try { rmSync(askedPath(sessionId), { force: true }) } catch { /* best-effort */ }
+}
+
+/** True when a SessionStart payload says the session was resumed. */
+export function isResumeStart(input: Record<string, unknown> | null | undefined): boolean {
+  return input?.source === 'resume'
 }
 
 /**

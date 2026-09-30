@@ -129,6 +129,12 @@ export function buildPlurHooks(cli: string): Record<string, HookEntry[]> {
     SessionStart: [{
       matcher: 'compact',
       hooks: [{ type: 'command', command: `${cli} hook-inject --rehydrate`, timeout: 20 }],
+    }, {
+      // `claude --resume` keeps the session id, and SessionEnd below deleted
+      // its folder-question nonces: the resumed session is asked again with a
+      // fresh nonce (#1347, option C). Identical to `plur init`'s entry.
+      matcher: 'resume',
+      hooks: [{ type: 'command', command: `${cli} hook-session-resume`, timeout: 3 }],
     }],
     // Auto-close the memory lifecycle at session end (Claude Code SessionEnd,
     // shipped v1.0.85) — captures a closing episode and cleans up the session
@@ -313,6 +319,15 @@ function isPlurRehydrate(entry: HookEntry): boolean {
   return (entry.hooks ?? []).some(isPlurRehydrateHook)
 }
 
+/** A PLUR hook running `subcommand` (same normalisation as isPlurHookCommand). */
+function hasPlurSubcommand(entries: HookEntry[] | undefined, subcommand: string): boolean {
+  const re = new RegExp(`(?:^|\\s)${subcommand}(?:\\s|$)`)
+  return (entries ?? []).some(e => (e.hooks ?? []).some(h =>
+    isPlurCommandHook(h) && re.test((h.command as string).replace(/\\/g, '/').toLowerCase())))
+}
+
+const isResumeEntry = (e: HookEntry): boolean => e.matcher === 'resume'
+
 /**
  * Remove PLUR's hooks from a list of entries, one hook at a time. An entry
  * is dropped only when nothing is left in it; an entry without a PLUR hook
@@ -376,8 +391,19 @@ export function applyPlurHooks(
   // hooks and puts rehydrate in the project file; adding one to the global
   // file would run rehydrate twice per compaction there.
   if (movedRehydrate && !(hooks.SessionStart ?? []).some(isPlurRehydrate)) {
-    hooks.SessionStart = [...(hooks.SessionStart ?? []), ...(hooksMap.SessionStart ?? [])]
+    hooks.SessionStart = [...(hooks.SessionStart ?? []), ...(hooksMap.SessionStart ?? []).filter(e => !isResumeEntry(e))]
     changed = true
+  }
+  // SessionEnd deletes a session's folder-question nonces, so a file that
+  // runs PLUR's SessionEnd also needs PLUR's SessionStart(resume), or a
+  // resumed session is never asked again (#1347, option C). Added to an
+  // install from before it existed; a file without SessionEnd gets none.
+  if (hasPlurSubcommand(hooks.SessionEnd, 'hook-session-end') && !hasPlurSubcommand(hooks.SessionStart, 'hook-session-resume')) {
+    const resume = (hooksMap.SessionStart ?? []).filter(isResumeEntry)
+    if (resume.length > 0) {
+      hooks.SessionStart = [...(hooks.SessionStart ?? []), ...resume]
+      changed = true
+    }
   }
   return changed
     ? { settings: { ...settings, hooks }, status: 'healed' }
@@ -404,7 +430,7 @@ function installHooks(): string {
   mkdirSync(dir, { recursive: true })
   writeFileSync(settingsPath, JSON.stringify(next, null, 2) + '\n')
   return status === 'healed'
-    ? `moved rehydrate hook to SessionStart(compact) in ${settingsPath}`
+    ? `updated PLUR hooks (SessionStart compact/resume) in ${settingsPath}`
     : `installed in ${settingsPath}`
 }
 

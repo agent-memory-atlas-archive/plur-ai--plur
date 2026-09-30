@@ -24,6 +24,7 @@ export const PLUR_SETTINGS_SUBCOMMANDS = [
   'hook-session-guard',
   'hook-session-mark',
   'hook-session-end',
+  'hook-session-resume',
 ] as const
 
 const SUBCOMMAND = `(?:${PLUR_SETTINGS_SUBCOMMANDS.join('|')})(?:\\s|$)`

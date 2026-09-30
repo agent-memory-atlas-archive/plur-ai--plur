@@ -40,6 +40,18 @@ what you decided about the folder:
 - Antigravity without a workspace in the payload is unchanged: the install is
   the opt-in there, as before.
 - The session-end hooks expire that session's unused nonces.
+- **A resumed session is asked again.** `claude --resume` and Codex's resume
+  keep the session id, and SessionEnd had already deleted its nonces, so the
+  question was never repeated and a "yes" to the old one failed with
+  nonce-unknown. On SessionStart with `source: "resume"` the session's
+  asked-once record is cleared, and its first prompt asks again with a fresh
+  nonce. A startup, clear or compact SessionStart does not re-ask. Nonces stay
+  single-use and bound to one folder, and still die at SessionEnd. `plur init`
+  and `plur-mcp init` register a `SessionStart` hook with matcher `resume`
+  (`hook-session-resume`) next to SessionEnd; re-running either adds it to an
+  older install. Codex's existing SessionStart hook handles `resume` itself.
+  Cursor and Antigravity send no resume signal and delete no nonces at session
+  end, so a resumed conversation there keeps its unexpired question.
 
 Not changed yet: the opencode plugin and the MCP server's `plur_session_start`
 do not read the map.
