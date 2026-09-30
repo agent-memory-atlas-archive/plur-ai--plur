@@ -115,15 +115,20 @@ const CLI = existsSync(_shimCandidate) ? _shimCandidate : 'npx @plur-ai/cli'
 export function buildPlurHooks(cli: string): Record<string, HookEntry[]> {
   return {
     // --- Session lifecycle ---
+    // Sync with a 20s budget, like `plur init` (#1313): async context reaches
+    // Claude Code only at the next safe point, so a first reply without tool
+    // calls had no memory. hook-inject exits by itself after 15s, so the
+    // timeout sits above that. Keep in step with CLAUDE_INJECT_TIMEOUT_S in
+    // @plur-ai/cli's lib/claude-inject-budget.ts.
     UserPromptSubmit: [{
-      hooks: [{ type: 'command', command: `${cli} hook-inject`, timeout: 15 }],
+      hooks: [{ type: 'command', command: `${cli} hook-inject`, timeout: 20 }],
     }],
     // Re-inject after compaction. SessionStart with matcher "compact" fires
     // right after compaction and can carry context; PostCompact cannot
     // (#1274, #1279). Re-running init moves an old PostCompact entry here.
     SessionStart: [{
       matcher: 'compact',
-      hooks: [{ type: 'command', command: `${cli} hook-inject --rehydrate`, timeout: 90, async: true }],
+      hooks: [{ type: 'command', command: `${cli} hook-inject --rehydrate`, timeout: 20 }],
     }],
     // Auto-close the memory lifecycle at session end (Claude Code SessionEnd,
     // shipped v1.0.85) — captures a closing episode and cleans up the session

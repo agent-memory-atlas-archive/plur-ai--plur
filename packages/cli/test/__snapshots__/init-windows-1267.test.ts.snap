@@ -18,8 +18,7 @@ exports[`plur init on darwin/linux output is unchanged (#1267) > hook commands m
         {
           "type": "command",
           "command": "<HOME>/.plur/bin/plur-hook hook-inject --rehydrate",
-          "timeout": 90,
-          "async": true
+          "timeout": 20
         }
       ]
     }
@@ -115,8 +114,7 @@ exports[`plur init on darwin/linux output is unchanged (#1267) > hook commands m
         {
           "type": "command",
           "command": "<HOME>/.plur/bin/plur-hook hook-inject",
-          "timeout": 90,
-          "async": true
+          "timeout": 20
         }
       ]
     }
