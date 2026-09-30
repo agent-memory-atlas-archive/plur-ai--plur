@@ -1444,6 +1444,9 @@ function getAllToolDefinitions(): ToolDefinition[] {
 
         try {
           const engram = await plur.learnRouted(statement, context)
+          // #1264: where the engram went. Read off the returned object before
+          // anything copies it — a copy loses the remote-confirmed evidence.
+          const delivered = plur.deliveryOf(engram, context?.scope)
           const isOutbox = !!(engram as any).structured_data?._outbox
           const demoted = (engram as any).structured_data?._demoted as { from: string; to: string; patterns: string } | undefined
           const routed = (engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
@@ -1506,6 +1509,11 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // it as 'ADD' told the caller a new memory exists when none was
             // written. Same vocabulary as plur_learn_batch (formal Adapters #1).
             ...learnDecision(engram),
+            // #1264: always present. The warning sits BEFORE the others so a
+            // more specific `warning` below (outbox, demotion, refusal) still
+            // wins that key; `delivery_warning` keeps this one either way.
+            delivery: delivered.delivery,
+            ...(delivered.warning ? { delivery_warning: delivered.warning, warning: delivered.warning } : {}),
             ...(dedup?.near_duplicates?.length ? { dedup } : {}),
             ...(redraft ? { redraft } : {}),
             ...(() => { const c = composeHints(statement, context?.rationale, context?.source); return c ? { composition: c } : {} })(),
@@ -1529,6 +1537,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
 // learnRouted now saves to outbox on remote failure, so this
           // path should rarely be reached. Keep as defense-in-depth.
           const engram = await plur.learn(statement, context)
+          const delivered = plur.deliveryOf(engram, context?.scope)
           const isOutbox = !!(engram as any).structured_data?._outbox
           const routedFallback = (engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
           mcpCanary.signal('learn_activity')
@@ -1541,6 +1550,8 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // Outbox engrams stay local-form (same rule as line 1149).
             id: isOutbox ? engram.id : plur.readIdFor(engram), statement: engram.statement,
             scope: engram.scope, type: engram.type, ...learnDecision(engram),
+            delivery: delivered.delivery,
+            ...(delivered.warning ? { delivery_warning: delivered.warning } : {}),
             ...temporalEcho(engram),
             ...scopeHint(engram.scope, !!routedFallback),
             ...domainHint(!!routedFallback),

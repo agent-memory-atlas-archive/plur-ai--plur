@@ -94,6 +94,59 @@ equals or contains it (segment-aware) — so naming a project scope that a url
 store covers reaches that store instead of being refused as "local".
 (Decisions E4, E5.)
 
+### The secret guard now recognises GitHub, GitLab, Slack, npm, Stripe and AWS temporary keys
+
+**A memory holding a GitHub token was stored, and could sync to a team
+store** (#1317). `detectSecrets` had no pattern for vendor-prefixed tokens, so a
+classic `ghp_…` token and a fine-grained `github_pat_…` token both scanned
+clean.
+
+Now flagged, each by the vendor's documented prefix, charset and length:
+
+- GitHub `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` (`github_token`) and
+  `github_pat_` (`github_pat`).
+- GitLab `glpat-`, `gloas-`, `gldt-`, `glrt-`, `glrtr-`, `glcbt-`, `glptt-`,
+  `glft-`, `glimt-`, `glagent-`, `glwt-`, `glsoat-`, `glffct-`
+  (`gitlab_token`). GitLab bodies may legitimately contain `-` and `_`, so
+  the body must also look random (mixed case or digits); a hyphenated slug
+  after the prefix, as in a GitLab docs URL, stays clean.
+- Slack `xoxb-`, `xoxp-`, `xoxs-` (with their 8+ digit workspace id),
+  `xoxa-`, `xoxr-`, app-level `xapp-` and the token-rotation formats `xoxe-`,
+  `xoxe.xoxp-`, `xoxe.xoxb-` (`slack_token`); a prefix followed by a short
+  number and hyphenated words stays clean.
+- npm `npm_` (`npm_token`).
+- Stripe `sk_live_` and `rk_live_` (`stripe_live_key`).
+- AWS temporary access key ids, `ASIA…`, under the existing `aws_access_key`.
+  Because `ASIA` begins ordinary uppercase words, this branch needs exactly
+  20 characters with nothing alphanumeric on either side and at least one
+  digit, so region-like prose ("ASIAPACIFIC…") stays clean. The `AKIA` branch
+  is unchanged.
+
+Credentials are also matched against a percent-decoded copy of the text, so a
+token inside an encoded URL or query string (`access_token%3D` then the token,
+or an encoded `_` in the prefix) is found, and against a copy with JSON
+backslash escapes unfolded, so a token after a literal `\n`, `\t` or `\r` in
+JSON-escaped text or a pasted log is found (#1372). A token glued after a
+digit is found too.
+
+A credential finding no longer echoes the first 20 characters of the match,
+which for a GitHub or npm token was the prefix plus 16 of its 36 secret
+characters. It now shows the prefix (or the keyword of an assignment) and the
+last four characters, such as `ghp_...WXYZ`; a value shorter than 16
+characters after the prefix, such as a password, is not shown at all (#1373).
+This is the text pack-scan issue details carry.
+
+The `jwt` pattern no longer takes quadratic time on repeated `eyJ` input
+(#1397). As a regex it took about six minutes on 1 MiB, the size packs and
+engrams are scanned up to, so a crafted pack or engram could stall pack
+install, preview or `learn`; every added scan view made it worse. It is now
+matched in linear time, with the same results and no cap on segment length.
+
+The same patterns apply to the pack scanner, so a pack carrying one of these
+refuses to install (`docs/pack-scan-surface.md`). Text that only names a prefix,
+such as "use a `ghp_` token", stays clean. No existing pattern changed except
+`aws_access_key`, which now also accepts `ASIA`.
+
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
 
 **First half of #1347: core and CLI only. No hook reads the map yet.** A new
@@ -105,14 +158,26 @@ repo's request. Only the CLI writes the map.
 - **`resolveFolderPolicy(dir)`** (core, and `Plur.resolveFolderPolicy`) returns
   `{ mode, scope?, remoteAllowed, source }`, resolved in this order:
   1. Any matching `off` entry wins.
-  2. A `.plur.yaml` means on. A map `scope` beats its scope hint, and its remote
-     is allowed only under a `trusted` entry.
+  2. A **trusted** `.plur.yaml`, or one that requests nothing, means on, exactly
+     as before. A map `scope` beats its scope hint, and its remote is allowed
+     only under a `trusted` entry. An **untrusted** `.plur.yaml` that requests a
+     scope, domain or remote has those requests ignored. A map decision for the
+     folder applies if there is one; otherwise the answer is `ask`, with
+     `reason: 'untrusted-plur-yaml'` and what the repo `requested`.
   3. A project MCP config means on.
   4. Otherwise the most specific matching entry decides.
   5. Otherwise the answer is `ask`, and that includes `$HOME`.
 
   Paths may be globs (`*`, `**`, `?`) and may start with `~`. A plain folder
   also covers everything below it.
+
+  **This changes behaviour for anyone whose `.plur.yaml` is not trusted**
+  (owner decision D1, "ignore-ask"). A cloned repo can no longer choose where
+  your saves go. Once the hooks use this resolver (the next PR), such a repo
+  stops applying its scope hint and asks you once instead. Answering yes records
+  `trusted: true` (plus a scope if you choose one), and the repo then works as
+  it does today. Until that PR lands, the hooks behave exactly as before. To
+  keep a repo working without being asked, run `plur trust <repo>` now.
 - **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
   `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
   `--no-trusted`.
@@ -130,10 +195,30 @@ repo's request. Only the CLI writes the map.
   - Neither command writes to a folders.yaml it cannot read; it is never
     overwritten.
 - **Upgrade needs no steps.** The first read of a missing `folders.yaml` imports
-  the `trust.yaml` entries as `trusted: true` entries. Nothing is ever added to
-  `trust.yaml`. `plur untrust` removes the grant from both files, so neither a
-  downgrade (an older version reading `trust.yaml`) nor a fresh import brings a
-  revoked grant back.
+  the `trust.yaml` entries as `trusted: true` entries.
+- **Trust is written to both files, for now.** The published opencode plugin
+  still reads only `trust.yaml`. So until every adapter is on this core, each
+  grant and each revocation updates both `folders.yaml` and `trust.yaml`. This
+  covers `plur trust`, `plur untrust`, `plur folders set --trusted` and
+  `--no-trusted`.
+  - A revocation lands in both files, so neither an older reader, a downgrade
+    nor a fresh import brings it back. This applies to `plur untrust`, to
+    `--no-trusted`, and to `plur folders rm` of a trusted entry (owner decision
+    F2). A `trust.yaml` line counts as the same folder under the map's own
+    matching, so a `~/…` spelling, or a differently-cased spelling on a
+    case-insensitive disk, is removed too. A revocation never adds anything to
+    `trust.yaml`.
+  - The one-time code is used up as soon as `folders.yaml` is saved, before
+    `trust.yaml` is written (owner decision F3). If the `trust.yaml` write
+    fails, the command reports the error, and the code cannot be used again;
+    the next attempt needs a fresh ask.
+  - Glob grants are recorded only in the map, because the old reader cannot
+    express them.
+  - A grant that an older core adds to `trust.yaml` after the import is not
+    seen by this core until you run `plur trust` again.
+- **Writes are serialised.** Every change to `folders.yaml`, `trust.yaml` and
+  the nonce files is made under one lock. Before this, 12 parallel
+  `plur folders set` runs all reported success but only 5 entries were saved.
 - **`plur trust`, `plur untrust` and `plur init-remote`** now set and clear
   `trusted` in the map. Their output and exit codes are unchanged, with one
   exception: `plur trust` and `plur untrust` exit 1 on a folders.yaml they
@@ -153,6 +238,75 @@ repo's request. Only the CLI writes the map.
   - `plur untrust` also removes an entry stored under the plain spelling of
     the folder you give it.
   - A `~` in the map expands to your home as written and to its canonical path.
+
+### A team save that stays on this machine now says so (#1264)
+
+**A write to a shared scope with no store registered for it never left the
+machine, and nothing said so.** An enterprise deployment reported engrams that
+were created and never reached the team. A `learn` to `group:`/`project:`/`org:`…
+with no writable url store for exactly that scope falls through to the local
+store — deliberately, since nothing is auto-routed into a shared store — but
+`plur_learn` answered `decision: "ADD"` and `plur learn` printed nothing else.
+
+Every learn result now carries `delivery`: `remote` (a store accepted it),
+`outbox` (saved here and queued for a store — the push is deferred or failed and
+will be retried) or `local` (on this machine only). A shared scope that lands
+`local` also carries a warning naming the scope and how to register a store for
+it. `plur_learn` returns both (`delivery`, `delivery_warning`); `plur learn
+--json` does too, and plain `plur learn` prints the warning even with `--quiet`.
+Core exposes the same answer as `plur.deliveryOf(engram, requestedScope?)`.
+
+When a save to a shared scope comes back as an engram in a *different* scope —
+recorded as a recurrence on another team's engram, or on a `global` one — the
+result is `local` and the warning names the scope you asked for and says nothing
+was written there. Before, the warning named the other team's scope (the one
+you did not write to), or there was no warning at all.
+
+A save that matched an existing row is classified by the store that actually
+holds that row. With a url store and a local path store registered for the same
+scope, a match on the path store's row is reported `local`, not `remote` —
+nothing was sent anywhere.
+
+Nothing about where engrams are written changes. The field is additive.
+
+### `plur stores add` can register a remote store, and checks the token first (#1265)
+
+**An installer script can now connect a machine to a team store without MCP**
+(#1265). An enterprise deployment reported that its installer had no way to do
+this: `plur stores add` took only `<path> <scope>`, the one command that could
+add a url store was the MCP tool `plur_stores_add`, and the advice printed by
+`plur stores discover` and `plur login` pointed at a command that could not do
+it.
+
+```
+plur stores add --url https://plur.example.test --scope group:example/eng --token-env PLUR_TOKEN
+```
+
+The token can also come from `--token <t>` or from stdin with `--token -`, so it
+need not sit in shell history.
+
+**Nothing is written until the server agrees.** The command asks the server's
+`/me` first. A rejected token, an unreachable server, or a scope the token is
+not authorised for exits 1 and leaves `config.yaml` as it was; the scope refusal
+lists the scopes the token can reach. Running the same command twice exits 0
+and says "already registered" without touching the file. The same url and scope
+with a *different* token replaces the stored token, but only after the new one
+verifies — a token the server rejects never overwrites a working one.
+
+**A scope that already belongs to another store is never taken silently.** The
+command refuses, changes nothing, and says to re-run with `--overwrite-scope`.
+With that flag the scope is reassigned to the url store, and only after the
+token has passed `/me`.
+
+The token is never printed: not in text output, not in `--json`, and not in an
+error, including an error that echoes the server's reply. That covers the token
+raw, percent-encoded, JSON-escaped and base64-encoded, and a scope or username
+in the server's `/me` answer that carries the token (such scopes are left out
+of the listed authorised scopes, and the message says how many were withheld).
+A fragment of the token, or its base64 buried inside a larger blob, has no
+fixed form and is not caught. `plur stores add
+<path> <scope>` is unchanged. The core method is `Plur.addRemoteStore()`, which
+throws `AddRemoteStoreError` with a stable `code`.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
@@ -2337,7 +2491,7 @@ PLUR's engram leak guard, scope isolation, pack/sync distribution, and remote-st
 
 `detectSensitive()` truncated its input to the first 64 KB before scanning, then silently passed the rest. The infra-topology detectors (`public_ipv4`, `public_ipv6`, `basic_auth_url`, `fqdn_port`, `ipv4_port`, `internal_host`) exist only in `detectSensitive`, so an engram whose first 64 KB was benign filler but which carried a public IP / basic-auth URL / internal host **after** byte 64 KB passed the write guard un-demoted and was written to a shared/remote store (and slipped past `filterPublishable`).
 
-- The scan window is raised from 64 KB to **1 MiB** — far above any realistic engram. The detector regexes are bounded/linear; a benign full-window pass is ~7ms/64KB but adversarial regex-dense input measured ~300–420 ms for a full 1 MiB pass (#386 review). Total scan work is capped at 1 MiB regardless of input size (bounded, linear — a per-write CPU cost on >64KB engrams, not a DoS).
+- The scan window is raised from 64 KB to **1 MiB** — far above any realistic engram. The detector regexes were described here as bounded/linear; that was wrong for `jwt`, which was quadratic on repeated `eyJ` (1 MiB took about six minutes) until #1397 replaced it with a linear matcher. A benign full-window pass is ~7ms/64KB but adversarial regex-dense input measured ~300–420 ms for a full 1 MiB pass (#386 review). Total scan work is capped at 1 MiB regardless of input size (bounded, linear — a per-write CPU cost on >64KB engrams, not a DoS).
 - Input larger than the ceiling is now **fail-closed**: `detectSensitive` appends a synthetic `scan_truncated` hit so `_guardSensitiveScope` demotes the write and `filterPublishable` excludes the engram — the unscanned tail can no longer be assumed clean. The `scan_truncated` signal is always offending regardless of a scope's `sensitivity` policy.
 - **Packs export inherits this** (via #389): `scanPrivacy` now routes through `detectSensitive` + `truncateToScanLimit`, so the raised window, the infra-family detectors, and the `scan_truncated` fail-closed all apply to `exportPack`/`installPack` too — the "...and packs" half of #386, delivered by the #389 packs-scan change rather than here.
 
