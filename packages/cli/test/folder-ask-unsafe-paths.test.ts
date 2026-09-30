@@ -477,3 +477,101 @@ describe.skipIf(!posix || !PWSH)('no printed line or command runs a command name
     }
   }, 120_000)
 })
+
+/**
+ * What an untrusted .plur.yaml requests reaches a line of the question. The
+ * parsed host of a non-special-scheme URL keeps quotes, `;`, `$(` and
+ * backticks, so `foo://a";ni('CANARY');"b/` printed a pasteable command
+ * (#1418 review). Every value is grammar-checked and printed escaped.
+ */
+describe.skipIf(!posix)('hostile values in an untrusted .plur.yaml never reach a line as code (#1418 review)', () => {
+  let repo: string
+  beforeEach(() => {
+    setup(realpathSync(mkdtempSync(join(tmpdir(), 'plur-ask-yaml-'))))
+    repo = join(dir, 'repo')
+    mkdirSync(join(repo, '.git'), { recursive: true })
+  })
+  afterEach(() => { nodePre = []; rmSync(dir, { recursive: true, force: true }) })
+
+  it.each([
+    // No spaces: a URL host with a space does not parse, so these are the
+    // forms that reached the question (${IFS} is a space to bash).
+    ['remote_url', 'foo://a";touch${IFS}CANARY;"b/', 'an invalid remote URL'],
+    ['remote_url', `foo://a";ni('CANARY');"b/`, 'an invalid remote URL'],
+    ['remote_url', 'foo://a$(touch${IFS}CANARY)b/', 'an invalid remote URL'],
+    ['remote_url', 'foo://a`touch${IFS}CANARY`b/', 'an invalid remote URL'],
+    ['remote_url', "foo://a';touch${IFS}CANARY;'b/", 'an invalid remote URL'],
+    ['remote_url', 'foo://a&touch${IFS}CANARY&b/', 'an invalid remote URL'],
+    ['domain', 'a";touch CANARY;"', 'an invalid domain'],
+    ['domain', `a";ni('CANARY');"`, 'an invalid domain'],
+    ['domain', 'a$(touch CANARY)', 'an invalid domain'],
+    ['scope', 'group:a";touch CANARY;"', 'an invalid scope'],
+    ['scope', 'group:a$(touch CANARY)', 'an invalid scope'],
+  ])('%s: %s', (key, value, shown) => {
+    let n = 0
+    const units: Array<{ script: string; run: string }> = []
+    const runs: string[] = []
+    for (const platform of ['posix', 'win32'] as const) {
+      nodePre = platform === 'win32' ? ['--import', WIN32_PRELOAD] : []
+      const folder = join(repo, `${n}`)
+      mkdirSync(folder, { recursive: true })
+      writeFileSync(join(folder, '.plur.yaml'), `${key}: ${value}\n`) // raw: the parser does not unescape JSON quoting
+      const out = askAll(folder, `yaml-${n}`)
+      for (const [editor, { text, rule }] of Object.entries(out)) {
+        const where = `${platform} ${editor}`
+        expect(text, where).toContain('.plur.yaml is not trusted')
+        expect(text, where).toContain(shown)
+        expect(text, where).not.toContain('CANARY')
+        for (const [kind, t] of [['out', text], ['rule', rule ?? '']] as const) {
+          const bashRun = join(dir, `bash-${n}-${editor}-${kind}`)
+          mkdirSync(bashRun)
+          runLinesInBash(t, bashRun)
+          expect(existsSync(join(bashRun, 'CANARY')), `${where} ${kind}`).toBe(false)
+          const psRun = join(dir, `pwsh-${n}-${editor}-${kind}`)
+          mkdirSync(psRun)
+          runs.push(psRun)
+          for (const line of [...t.split('\n'), ...(t.match(COMMAND) ?? [])]) units.push({ script: line, run: psRun })
+        }
+      }
+      n++
+    }
+    if (PWSH) {
+      runInPwsh(units)
+      for (const run of runs) expect(existsSync(join(run, 'CANARY')), run).toBe(false)
+    }
+  }, 120_000)
+
+  it.each([
+    ['https://mem.example.com:8443/api', 'sending memories to host "mem.example.com:8443"'],
+    ['https://10.0.0.5/', 'sending memories to host "10.0.0.5"'],
+    ['https://[::1]:8443/', 'sending memories to host "[::1]:8443"'],
+  ])('a plain remote host is still shown: %s', (url, shown) => {
+    const folder = join(repo, 'plain')
+    mkdirSync(folder, { recursive: true })
+    writeFileSync(join(folder, '.plur.yaml'), `remote_url: ${JSON.stringify(url)}\ndomain: eng/platform\nscope: group:acme/eng\n`)
+    const text = context(cli(['hook-inject'], { session_id: 'cc-plain-host', cwd: folder, hook_event_name: 'UserPromptSubmit', prompt: PROMPT }, folder).stdout)
+    expect(text).toContain(shown)
+    expect(text).toContain('domain "eng/platform"')
+    expect(text).toContain('scope "group:acme/eng"')
+  })
+})
+
+describe.skipIf(!posix)('on Windows, a folder path ending in a backslash is offered no command (#1418 review)', () => {
+  beforeEach(() => {
+    setup(realpathSync(mkdtempSync(join(tmpdir(), 'plur-ask-bs-'))))
+    mkdirSync(join(dir, 'repo', '.git'), { recursive: true })
+    nodePre = ['--import', WIN32_PRELOAD]
+  })
+  afterEach(() => { nodePre = []; rmSync(dir, { recursive: true, force: true }) })
+
+  it('a name ending in a backslash gets the notice', () => {
+    const folder = join(dir, 'repo', 'x\\')
+    mkdirSync(folder, { recursive: true })
+    const out = askAll(folder, 'bs')
+    for (const [editor, { text }] of Object.entries(out)) {
+      expect(text, editor).toContain('ends in a backslash')
+      expect(text, editor).not.toMatch(/plur folders set|--nonce/)
+    }
+    expect(noncesIssued()).toBe(0)
+  })
+})

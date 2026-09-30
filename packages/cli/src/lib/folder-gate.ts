@@ -203,12 +203,15 @@ export function escapedPath(p: string): string {
 }
 
 /** Why the question cannot offer commands for `folder`, or null when it can. */
-type Unofferable = 'line' | 'invisible' | 'shell' | 'pattern'
+type Unofferable = 'line' | 'invisible' | 'shell' | 'backslash' | 'pattern'
 
 function unofferable(folder: string, platform: NodeJS.Platform = process.platform): Unofferable | null {
   if (LINE_UNSAFE.test(folder)) return 'line'
   if (INVISIBLE.test(folder)) return 'invisible'
   if (platform === 'win32' && WIN32_SHELL_UNSAFE.test(folder)) return 'shell'
+  // `"C:\"`: under the Windows argv rules the trailing backslash escapes the
+  // closing quote, so the folder reaches plur wrong (a drive or UNC root).
+  if (platform === 'win32' && folder.endsWith('\\')) return 'backslash'
   if (PATTERN_CHARS.test(folder)) return 'pattern'
   return null
 }
@@ -217,6 +220,7 @@ const UNOFFERABLE_REASON: Record<Unofferable, string> = {
   line: 'its path holds a control or line-break character.',
   invisible: 'its path holds an invisible or text-direction character, so it can display as something other than what it is.',
   shell: 'its path holds $, `, %, !, " or a curly double quote, which a Windows shell can expand inside the offered command.',
+  backslash: 'its path ends in a backslash, which ends the quoted argument early on Windows.',
   pattern: 'its path holds *, ? or [, which a folder rule would read as a pattern covering other folders too.',
 }
 
@@ -229,19 +233,29 @@ const UNOFFERABLE_REASON: Record<Unofferable, string> = {
 const SCOPE_GRAMMAR = /^(?:global|[a-z][a-z0-9-]*:[A-Za-z0-9][A-Za-z0-9._@/:-]{0,199})$/
 const DOMAIN_GRAMMAR = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/
 
+/**
+ * A host name or IPv4 address, or a bracketed IPv6 address, with an optional
+ * port. `new URL(x).host` keeps `"`, `;`, `&`, `$(`, quotes and backticks for
+ * a non-special scheme (`foo://a";ni('CANARY');"b/`), so the parsed host is
+ * no filter on its own (#1418 review).
+ */
+const HOST_GRAMMAR = /^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$/
+
+// Every value is grammar-checked, then printed with escapedPath() like the
+// folder, so no line of the question runs a command when pasted into a shell.
 function requestedScopeText(scope: string): string {
-  return SCOPE_GRAMMAR.test(scope) ? `scope "${scope}"` : 'an invalid scope'
+  return SCOPE_GRAMMAR.test(scope) ? `scope ${escapedPath(scope)}` : 'an invalid scope'
 }
 
 function requestedDomainText(domain: string): string {
-  return DOMAIN_GRAMMAR.test(domain) ? `domain "${domain}"` : 'an invalid domain'
+  return DOMAIN_GRAMMAR.test(domain) ? `domain ${escapedPath(domain)}` : 'an invalid domain'
 }
 
-/** Only the parsed host of a remote, never the raw string. */
+/** Only the parsed host of a remote, never the raw string, and only a plain host. */
 function requestedRemoteText(url: string): string {
   let host = ''
   try { host = new URL(url).host } catch { /* not a URL */ }
-  return host ? `sending memories to host "${host}"` : 'an invalid remote URL'
+  return host && HOST_GRAMMAR.test(host) ? `sending memories to host ${escapedPath(host)}` : 'an invalid remote URL'
 }
 
 /**

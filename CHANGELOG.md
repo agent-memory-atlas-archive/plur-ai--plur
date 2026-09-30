@@ -22,7 +22,9 @@ what you decided about the folder:
   for **yes** (`plur folders set <folder> --scope <s> --nonce <n>`, or `--on`),
   **not now** (nothing) and **never here** (`--off --nonce <n>`). For an
   untrusted `.plur.yaml` it also offers `--trusted`, names the host the repo
-  wants to send memories to, and never shows its token. What that file
+  wants to send memories to (only a plain host name or IP address with an
+  optional port; anything else is shown as "an invalid remote URL"), and
+  never shows its token. What that file
   requests is shown on its own line, marked as quoted repository text, and
   only as values that fit the scope or domain grammar and the parsed host of
   a URL; anything else is named ("an invalid scope"), never copied, so the
@@ -80,7 +82,10 @@ what you decided about the folder:
   line runs a command named in the folder (`x&touch CANARY`, `x$(...)`) when
   pasted into bash or PowerShell. The untrusted header now reads "the repo
   .plur.yaml is not trusted", and the trust answer "Yes, and trust the
-  .plur.yaml in this repo".
+  .plur.yaml in this repo". The values an untrusted `.plur.yaml` requests
+  are printed the same escaped way. On Windows a folder whose path ends in
+  a backslash (a drive or UNC root) also gets the notice: the backslash
+  would escape the closing quote of the offered command.
 - Asking changes nothing. The question no longer registers the folder's own
   `.plur/engrams.yaml` as a project store in config.yaml (the hooks build
   their scope ranker with store discovery off), so that store never reaches
