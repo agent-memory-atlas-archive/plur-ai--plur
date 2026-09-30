@@ -18,6 +18,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, realpathSync, chmodSync } from 'fs'
 import { join } from 'path'
+import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
 import { load as loadYaml } from 'js-yaml'
 import { resolveFolderPolicy } from '@plur-ai/core'
@@ -26,6 +27,8 @@ import { builtCliPath } from './helpers/built-cli.js'
 
 const CLI = builtCliPath(join(__dirname, '..'))
 const MCP = join(__dirname, '..', '..', 'mcp', 'dist', 'index.js')
+/** `node --import` preload that makes the CLI take its Windows branches (see helpers/win32-platform.mjs). */
+const WIN32_PRELOAD = pathToFileURL(join(__dirname, 'helpers', 'win32-platform.mjs')).href
 
 interface Hook { command: string; timeout?: number }
 interface Entry { matcher?: string; hooks: Hook[] }
@@ -34,6 +37,8 @@ interface Settings { hooks?: Record<string, Entry[]>; mcpServers?: Record<string
 let home: string
 let repo: string
 let env: NodeJS.ProcessEnv
+/** Extra node arguments for every init() run: [] on the host, the win32 preload for the stub. */
+let nodeArgs: string[] = []
 
 const userFile = () => join(home, '.claude', 'settings.json')
 const repoFile = () => join(repo, '.claude', 'settings.json')
@@ -47,7 +52,7 @@ const mapEntries = (): Array<Record<string, unknown>> =>
 const policy = () => resolveFolderPolicy(repo, { root: join(home, '.plur'), home })
 
 function init(...args: string[]): string {
-  const r = runCli('node', [CLI, 'init', '--no-desktop', '--no-prompt', '--no-codex', '--no-cursor', '--no-antigravity', ...args], {
+  const r = runCli('node', [...nodeArgs, CLI, 'init', '--no-desktop', '--no-prompt', '--no-codex', '--no-cursor', '--no-antigravity', ...args], {
     encoding: 'utf-8', env, cwd: repo, input: '',
   })
   expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0)
@@ -75,6 +80,7 @@ beforeEach(() => {
   mkdirSync(join(repo, '.git'), { recursive: true })
   env = { ...process.env, HOME: home, USERPROFILE: home, TMPDIR: join(home, 'tmp'), PLUR_PATH: join(home, '.plur') }
   delete env.CLAUDE_SESSION_ID
+  nodeArgs = []
 })
 afterEach(() => { rmSync(home, { recursive: true, force: true }) })
 
@@ -270,6 +276,9 @@ describe('re-running plur init in a repo that holds PLUR prompt hooks (#1467 mig
       const out = init()
       expect(out).toMatch(/This repo: +FAILED \(/)
       expect(out).toContain(repoFile())
+      // the map was written before the repo file failed, and the line says so
+      expect(out).toMatch(/the folder was already recorded as on in .*folders\.yaml/)
+      expect(mapEntries()).toEqual([{ path: repo, plur: 'on' }])
       expect(raw(repoFile())).toBe(before)
       // the steps after the migration still ran and reported
       expect(out).toMatch(/Skills: /)
@@ -280,6 +289,56 @@ describe('re-running plur init in a repo that holds PLUR prompt hooks (#1467 mig
       chmodSync(repoFile(), 0o644)
     }
   })
+
+  it('a malformed folders.yaml: reported as FAILED like any other failure, hooks stay in the repo (#1469 review)', () => {
+    olderInstall()
+    mkdirSync(join(home, '.plur'), { recursive: true })
+    writeFileSync(mapFile(), 'version: 1\nfolders: [unclosed\n')
+    const before = raw(repoFile())
+    const out = init()
+    expect(out).toMatch(/This repo: +FAILED \(could not record the folder in the folder map: /)
+    expect(out).toContain(`PLUR's hooks are still in ${repoFile()} as well as in user settings`)
+    expect(raw(repoFile())).toBe(before)
+  })
+
+  for (const plat of ['posix', 'win32 stub'] as const) {
+    describe(`plur init with a new --scope in a repo an older init set up (${plat}, #1469 review)`, () => {
+      beforeEach(() => { nodeArgs = plat === 'win32 stub' ? ['--import', WIN32_PRELOAD] : [] })
+
+      it('no .plur.yaml before: the new untrusted .plur.yaml is asked about, as in a fresh repo; hooks move', () => {
+        olderInstall()
+        expect(existsSync(join(repo, '.plur.yaml'))).toBe(false)
+        const out = init('--scope', 'project:newscope')
+        expect(raw(join(repo, '.plur.yaml'))).toContain('scope: project:newscope')
+        expect(plurCommands(read(repoFile()))).toEqual([])
+        expect(hasPrompt(read(userFile()))).toBe(true)
+        expect(mapEntries()).toEqual([])
+        expect(policy()).toMatchObject({ mode: 'ask', reason: 'untrusted-plur-yaml', requested: { scope: 'project:newscope' } })
+        expect(out).toMatch(/not recorded in the folder map: its \.plur\.yaml asks for scope project:newscope/)
+
+        // the same command in a fresh repo gives the same policy
+        const fresh = join(home, 'code', 'fresh')
+        mkdirSync(join(fresh, '.git'), { recursive: true })
+        const r = runCli('node', [...nodeArgs, CLI, 'init', '--no-desktop', '--no-prompt', '--no-codex', '--no-cursor', '--no-antigravity', '--scope', 'project:newscope'], {
+          encoding: 'utf-8', env, cwd: fresh, input: '',
+        })
+        expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0)
+        expect(resolveFolderPolicy(fresh, { root: join(home, '.plur'), home }))
+          .toMatchObject({ mode: 'ask', reason: 'untrusted-plur-yaml', requested: { scope: 'project:newscope' } })
+      })
+
+      it('a trusted .plur.yaml and a new --scope: trust is per folder, so the new scope applies, as in a fresh trusted repo', () => {
+        olderInstall('scope: project:old\n')
+        mkdirSync(join(home, '.plur'), { recursive: true })
+        const parent = join(home, 'code')
+        writeFileSync(mapFile(), `version: 1\nfolders:\n  - path: ${JSON.stringify(parent)}\n    trusted: true\n`)
+        init('--scope', 'project:newscope')
+        expect(plurCommands(read(repoFile()))).toEqual([])
+        expect(mapEntries()).toEqual([{ path: parent, trusted: true }, { path: repo, plur: 'on' }])
+        expect(policy()).toMatchObject({ mode: 'on', scope: 'project:newscope' })
+      })
+    })
+  }
 
   it('plur-mcp init after the migration puts no PLUR hooks back in the repo and adds no duplicates (#1469 review)', () => {
     olderInstall()

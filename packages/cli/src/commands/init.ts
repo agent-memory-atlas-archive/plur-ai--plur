@@ -733,6 +733,12 @@ function findSettingsPath(_flags: GlobalFlags, args: string[]): string {
  * - A folder the map already has, and one the map turns `off`, keep their
  *   entry unchanged. If the map cannot be written, the repo file is left
  *   alone too, so the repo keeps its memory either way.
+ * - The policy is read after this run's `.plur.yaml` is written (run() calls
+ *   installProjectConfig first), so `plur init --scope X` in such a repo is
+ *   decided on the `.plur.yaml` it will have, as in a fresh repo (#1469
+ *   review).
+ * - A failure is reported as `FAILED (…)`, and says whether the folder map
+ *   was already written when the repo file could not be.
  */
 function migrateRepoHooks(flags: GlobalFlags, userPath: string): string | null {
   const folder = process.cwd()
@@ -746,7 +752,9 @@ function migrateRepoHooks(flags: GlobalFlags, userPath: string): string | null {
   if (!hasPlurHooks(settings)) return null
 
   const root = plurRoot(flags)
+  const stillThere = `PLUR's hooks are still in ${repoPath} as well as in user settings`
   let recorded: string
+  let mapWritten = false
   try {
     const target = canonicalize(folder)
     const policy = resolveFolderPolicy(folder, { root })
@@ -764,16 +772,25 @@ function migrateRepoHooks(flags: GlobalFlags, userPath: string): string | null {
       recorded = 'the folder map already has it, left as is'
     } else {
       setFolderEntry(root, folder, { mode: 'on' }, { configuredScopes: [] })
+      mapWritten = true
       recorded = `recorded as on in ${folderMapPath(root)}`
     }
   } catch (err: unknown) {
-    return `left PLUR's hooks in ${repoPath}: could not record the folder in the folder map ` +
-      `(${(err as Error)?.message ?? err}). Fix it, then re-run \`plur init\``
+    return `FAILED (could not record the folder in the folder map: ${(err as Error)?.message ?? err}) — ` +
+      `${stillThere}; fix it and re-run \`plur init\``
   }
 
   const stripped = stripPlurHooks(settings)
   if (stripped.hooks && Object.keys(stripped.hooks).length === 0) delete stripped.hooks
-  writeSettings(repoPath, stripped)
+  try {
+    writeSettings(repoPath, stripped)
+  } catch (err: unknown) {
+    const map = mapWritten
+      ? `the folder was already recorded as on in ${folderMapPath(root)}, so re-running only moves the hooks`
+      : 'the folder map was not changed'
+    return `FAILED (${(err as Error)?.message ?? 'unknown error'}) — ${stillThere}; ${map}; ` +
+      'fix it and re-run `plur init`'
+  }
   return `moved PLUR's hooks from ${repoPath} to user settings (its MCP entry and other settings kept); ${recorded}`
 }
 
@@ -1539,6 +1556,13 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   const PLUR_HOOKS_ENFORCEMENT = buildEnforcementHooks(hookLaunch)
   const PLUR_HOOKS_INJECTION = buildInjectionHooks(hookLaunch)
 
+  // Write project config if --domain or --scope provided. Before the settings
+  // legs: the repo migration below decides on the policy this folder will
+  // have after this run, so a new --scope in a repo an older init set up is
+  // asked about, as in a fresh repo, instead of being hidden behind an `on`
+  // entry recorded from the old state (#1469 review).
+  const projectConfigPath = installProjectConfig(args)
+
   const injectionPath = findSettingsPath(flags, args)
   const enforcementPath = join(homedir(), '.claude', 'settings.json')
   const samePath = injectionPath === enforcementPath
@@ -1668,9 +1692,6 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Contained like the harness legs: an unwritable skills dir must not abort
   // the hooks and MCP registration that are the point of `plur init`.
   const skillsStatus = containLeg('Skills', () => installSkills(injectionPath))
-
-  // Write project config if --domain or --scope provided
-  const projectConfigPath = installProjectConfig(args)
 
   const entry = buildMcpServerEntry()
 
