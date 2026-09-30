@@ -184,7 +184,8 @@ An unknown `--event` no longer echoes the hook payload back to stdout.
 
 **`plur-mcp init` now registers the same rehydrate hook** (#1279). It still
 put rehydrate on `PostCompact`. It now uses `SessionStart` with matcher
-`compact`, `async: true`, `timeout: 90`, the same as `plur init`; a test fails
+`compact`, synchronous with `timeout: 20`, the same as `plur init` (#1313);
+its `UserPromptSubmit` injection moves to the same 20s budget. A test fails
 if the two diverge. Re-running `plur-mcp init` used to stop at "already
 installed". It now removes PLUR's `PostCompact` hooks and, in the same file,
 puts the `SessionStart(compact)` one in place of the old rehydrate. A file
