@@ -178,16 +178,28 @@ delivered. Now:
   before it is posted, so a flush whose local write-back fails afterwards
   still retries with the same key;
 - each queued write is *claimed* before it is pushed: a small file created
-  atomically. So a flush and `learn()`'s own background push, or two flushes,
+  with O_EXCL. So a flush and `learn()`'s own background push, or two flushes,
   never push the same write at once. Before, this race gave two server copies
   in half of the audit's runs. A claim is held while the process that made it
   is alive, however long its push runs, so a POST held open by a slow server
   cannot be re-pushed by a second flusher (a 15-minute cap covers a recycled
-  process id). A stale claim is taken over by renaming a new claim over it, so
-  there is never a moment with no claim for a second writer to slip into;
-- on a key-honouring server every write is stored once. A server that
-  ignores the key may see at most one duplicate per write, and no write is
-  ever dropped.
+  process id). Taking over a stale claim is decided by O_EXCL too: one
+  takeover marker per stale claim, so exactly one writer wins. Measured with 6
+  processes racing for one stale claim: one winner in each of 60 rounds,
+  where the earlier read-compare-rename takeover let 2 or 3 win in 26 of 60.
+  A marker left by a writer that died cannot block the write;
+- a claim is checked against the queued row, not against the flush's
+  snapshot of it. A flush that reaches a write after another writer delivered
+  it and released the claim re-reads the row, finds it gone, and skips it.
+  Before, two racing flushes, three racing flushes, and a flush racing
+  `learn()`'s background push each sent the same write twice, measured in
+  separate processes against a server that ignores the key. Now each sends
+  one POST per write;
+- on a key-honouring server every write is stored once, and no write is ever
+  dropped. A server that ignores the key gets one extra row for each attempt
+  it stored but the client never heard back from, so there is no fixed bound
+  per write: 3 flushes cut after the server stored the write, then 1 flush that
+  completed, left 4 rows (#1463).
 
 `docs/remote-store-contract.md` states this exactly: unique per logical write,
 persisted before the first POST, stable across retries, deduplicated by a
