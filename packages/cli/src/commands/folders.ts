@@ -9,14 +9,19 @@ const USAGE =
   'Without --nonce, set and rm work only from an interactive terminal.'
 
 /**
- * Whether a `set`/`rm` must carry the ask flow's `--nonce`.
+ * Whether a `folders set`/`rm`, `trust` or `untrust` must carry a `--nonce`.
  *
  * Only a person at a terminal may write the map without one. When stdin or
  * stdout is not a TTY, the caller is a script or an agent (the ask flow runs
  * the command from a tool call), and without this an agent could skip the
  * nonce check simply by omitting `--nonce`, and write any folder, `--trusted`
- * included. `plur trust` is the explicit human alias and keeps working in
- * scripts; it does not go through here.
+ * included. Since #1378 `plur trust` and `plur untrust` go through here too.
+ *
+ * What this does NOT stop (#1378): a process that runs the CLI under a
+ * pseudo-terminal (python's pty module, script(1), expect) passes this check
+ * as if it were a person, and anything that can write files as this user can
+ * edit folders.yaml directly. The nonce binds a write to one folder and one
+ * offered answer; it does not prove that a person chose that answer.
  */
 export function nonceRequired(stdinIsTTY: boolean | undefined, stdoutIsTTY: boolean | undefined): boolean {
   return !(stdinIsTTY === true && stdoutIsTTY === true)
@@ -107,11 +112,11 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   }
 }
 
-function refuseWithoutNonce(nonce: string | undefined, json: boolean): void {
+export function refuseWithoutNonce(nonce: string | undefined, json: boolean): void {
   if (nonce !== undefined || !nonceRequired(process.stdin.isTTY, process.stdout.isTTY)) return
   fail(new FolderMapError('nonce-required',
     'Not an interactive terminal: plur folders set/rm needs the --nonce the ask flow issued. ' +
-    'Run it yourself in a terminal to record a decision by hand (or use plur trust <dir> for a trust grant).'), json)
+    'Run it yourself in a terminal to record a decision by hand.'), json)
 }
 
 function describe(f: FolderEntry): string {
@@ -122,7 +127,7 @@ function describe(f: FolderEntry): string {
   return `${f.path}  ${parts.join(', ')}`
 }
 
-function fail(err: unknown, json: boolean): never {
+export function fail(err: unknown, json: boolean): never {
   const msg = err instanceof Error ? err.message : String(err)
   const code = err instanceof FolderMapError ? err.code : 'error'
   if (json) {

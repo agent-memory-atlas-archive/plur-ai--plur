@@ -1,6 +1,6 @@
 import { homedir } from 'os'
 import { canonicalize } from './project-config.js'
-import { loadFolderMap, isTrustedInMap, setFolderEntry, clearFolderTrust, removeLegacyTrustEntry, withFolderMapLock } from './folders.js'
+import { loadFolderMap, isTrustedInMap, setFolderEntry, clearFolderTrust, removeLegacyTrustEntry, withFolderMapLock, verifyFolderNonce } from './folders.js'
 
 /**
  * Directory trust — a one-time, explicit, per-directory grant, the same
@@ -42,10 +42,17 @@ export function isDirectoryTrusted(dir: string, root: string): boolean {
 /**
  * Grant trust to `dir`. Idempotent. Returns the canonicalized path recorded,
  * so a caller can echo back exactly what was trusted.
+ *
+ * A `nonce` (#1378) must be one issued for `dir` and the answer
+ * `{ trusted: true }`; it is consumed once the grant is saved.
  */
-export function trustDirectory(dir: string, root: string): string {
+export function trustDirectory(dir: string, root: string, opts?: { nonce?: string; now?: number }): string {
   const target = canonicalize(dir)
-  setFolderEntry(root, target, { trusted: true }, { configuredScopes: [] })
+  setFolderEntry(root, target, { trusted: true }, {
+    configuredScopes: [],
+    ...(opts?.nonce !== undefined ? { nonce: opts.nonce } : {}),
+    ...(opts?.now !== undefined ? { now: opts.now } : {}),
+  })
   return target
 }
 
@@ -58,10 +65,16 @@ export function trustDirectory(dir: string, root: string): string {
  * for adapters on the previous core), so neither an older reader, a downgrade
  * nor a re-import can bring it back.
  */
-export function untrustDirectory(dir: string, root: string): boolean {
+export function untrustDirectory(dir: string, root: string, opts?: { nonce?: string; now?: number }): boolean {
   return withFolderMapLock(root, () => {
+    // A `nonce` (#1378) must be one issued for `dir` and the answer
+    // `{ trusted: false }`. It is checked before anything is written and
+    // consumed only when a grant was actually removed.
+    const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, dir, { trusted: false }, opts.now) : null
     const fromMap = clearFolderTrust(root, dir)
+    if (fromMap) consume?.()
     const fromLegacy = removeLegacyTrustEntry(root, dir)
+    if (fromLegacy && !fromMap) consume?.()
     return fromMap || fromLegacy
   })
 }

@@ -79,6 +79,11 @@ const ALWAYS_ASYNC = new Set([
   // remote stores, so it could never have been sync; new in this release, so
   // there is no pre-0.16 call site to rewrite.
   'getByIds',
+  // Born async (#1265) — the verified add behind `plur stores add --url`.
+  // Calls the remote server's /me before writing the store entry, so it could
+  // never have been sync; new in this release, so there is no pre-0.16 call
+  // site to rewrite.
+  'addRemoteStore',
 ])
 
 /** Public methods of `Plur`, mapped to whether they are declared `async`. */

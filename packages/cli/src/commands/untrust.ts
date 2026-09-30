@@ -1,5 +1,8 @@
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { shouldOutputJson, outputJson, outputText, exit } from '../output.js'
+import { FolderMapError } from '@plur-ai/core'
+import { fail } from './folders.js'
+import { parseTrustArgs, refuseTrustWithoutNonce } from './trust.js'
 
 /**
  * `plur untrust [dir]` — revoke a directory trust grant made by `plur trust`.
@@ -17,12 +20,17 @@ import { shouldOutputJson, outputJson, outputText, exit } from '../output.js'
  * revokes it, instead of silently doing nothing while claiming success.
  */
 export async function run(args: string[], flags: GlobalFlags): Promise<void> {
+  const parsed = parseTrustArgs(args)
+  if (!parsed) return exit(1, 'Usage: plur untrust [dir] [--nonce <n>]')
+  const dir = parsed.dir || process.cwd()
+  // #1378: outside a terminal a revocation needs a nonce issued for it.
+  refuseTrustWithoutNonce('untrust', parsed.nonce, shouldOutputJson(flags))
   const plur = createPlur(flags)
-  const dir = args[0] || process.cwd()
   let removed: boolean
   try {
-    removed = plur.untrustDirectory(dir)
+    removed = plur.untrustDirectory(dir, parsed.nonce !== undefined ? { nonce: parsed.nonce } : undefined)
   } catch (err) {
+    if (err instanceof FolderMapError && err.code.startsWith('nonce-')) return fail(err, shouldOutputJson(flags))
     return exit(1, (err as Error).message)
   }
 
