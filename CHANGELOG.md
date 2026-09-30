@@ -28,7 +28,10 @@ what you decided about the folder:
   a URL; anything else is named ("an invalid scope"), never copied, so the
   file cannot put an instruction into the question. Its "Yes, without its
   settings" answer never offers the scope the file requested, even when that
-  scope is configured; the only way to it is `--trusted`. The nonce is issued for
+  scope is configured; the only way to it is `--trusted`. On macOS and Linux
+  a folder path that needs quoting is printed in single quotes, so `$(...)`,
+  backticks and `$VAR` in a folder name are not expanded when the command is
+  run; Windows keeps double quotes. The nonce is issued for
   that session and folder and works once. Later prompts in the session say
   nothing; after a yes, the next prompt loads memory.
 

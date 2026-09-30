@@ -122,14 +122,20 @@ export function isResumeStart(input: Record<string, unknown> | null | undefined)
 }
 
 /**
- * A folder path as a shell argument that works in sh, cmd and PowerShell.
- * Bare only when every character is one no shell treats specially; anything
- * else, a backslash included, goes in double quotes. A bare backslash is an
- * escape in a POSIX shell (Git Bash on Windows): `C:\Users\x` reached plur as
- * `C:Usersx`, and the nonce, bound to the exact folder, was refused.
+ * A folder path as a shell argument for the platform's shell. Bare only when
+ * every character is one no shell treats specially.
+ *
+ * - POSIX (macOS, Linux): single quotes, with an embedded `'` written as
+ *   `'\''`. Double quotes are not enough there: sh still expands `$(...)`,
+ *   backticks and `$VAR` inside them, so a folder named like a command ran it
+ *   when the agent pasted the "yes" line (#1418 review).
+ * - Windows (cmd, PowerShell, and Git Bash): double quotes. A bare backslash
+ *   is an escape in a POSIX shell such as Git Bash: `C:\Users\x` reached plur
+ *   as `C:Usersx`, and the nonce, bound to the exact folder, was refused.
  */
-export function quoted(p: string): string {
-  return /^[A-Za-z0-9_./:~-]+$/.test(p) ? p : `"${p}"`
+export function quoted(p: string, platform: NodeJS.Platform = process.platform): string {
+  if (/^[A-Za-z0-9_./:~-]+$/.test(p)) return p
+  return platform === 'win32' ? `"${p}"` : `'${p.replace(/'/g, `'\\''`)}'`
 }
 
 /**
