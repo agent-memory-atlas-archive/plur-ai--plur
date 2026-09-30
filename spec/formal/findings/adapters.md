@@ -675,11 +675,19 @@ counterexamples kept.
 
 ## Owner decisions applied at the main merge (2026-09-30)
 
-- **Conflict J:** the 8 end-to-end hook replays in
+- **Conflict J (decision recorded 2026-09-30):** The owner decided
+  (2026-09-30): the untrusted-scope notice and its tests are removed together,
+  by whichever of #1228 and #1418 lands second, since the folder-map question
+  replaces the notice. Until then the gate and its tests stay.
+
+  So this branch keeps the 8 end-to-end hook replays in
   packages/cli/test/formal-apply-surface-trust.test.ts ("CLI hooks ignore an
-  untrusted .plur.yaml scope", 4 hooks x untrusted/trusted) are dropped. The
-  folder map (#1418) asks the folder question instead of printing the
-  untrusted-scope notice. The 3 `trustedProjectScope` helper tests stay, and
+  untrusted .plur.yaml scope": hook-inject, hook-codex-inject,
+  hook-cursor-session-start and hook-agy-pre-invocation, each untrusted and
+  trusted). An earlier commit on this branch (0d607fde) dropped them before
+  the decision was recorded; they are restored. The notice assertions in
+  formal-gaps-codex-session-start.test.ts and formal-audit-1228c.test.ts stay
+  for the same reason. The 3 `trustedProjectScope` helper tests stay, and
   §9's model is unchanged: it describes the helper's decision, which still
   holds for as long as the helper is called.
 - **8b init-remote:** packages/cli/test/formal-adapters-init-remote.test.ts
