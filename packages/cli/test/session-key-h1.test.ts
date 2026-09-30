@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync, symlinkSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { runCli } from './helpers/spawn.js'
@@ -87,4 +87,71 @@ describe('hook-inject reads a marker written under #1228\'s sid- key (H1 upgrade
     expect(r.status).toBe(0)
     expect(r.stdout).not.toContain('session started')
   }, 60_000)
+})
+
+/**
+ * #1395 carry-over: the legacy-key marker fallback follows the same state-dir
+ * rule as every other hook path. A refused dir is neither written nor READ —
+ * a legacy marker sitting behind a planted symlink must not mark the session
+ * as started — and when both dirs are refused the hook persists nothing and
+ * still exits 0.
+ */
+describe.skipIf(process.platform === 'win32')('legacy marker fallback when the state dir is refused (#1395)', () => {
+  let root: string
+  let evilShared: string
+  let evilFallback: string
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'plur-h1-refused-'))
+    for (const d of ['tmp', 'home', 'store', 'evil-shared', 'evil-fallback']) mkdirSync(join(root, d))
+    evilShared = join(root, 'evil-shared')
+    evilFallback = join(root, 'evil-fallback')
+    writeFileSync(join(root, 'home', '.mcp.json'), JSON.stringify({ mcpServers: { plur: { command: 'plur-mcp' } } }))
+    // A planted legacy marker for the session, in both attacker dirs.
+    for (const d of [evilShared, evilFallback]) {
+      writeFileSync(join(d, 'sid-sess-refused.marker'), JSON.stringify({ task: 'planted', sessionId: 'S-planted' }))
+    }
+    symlinkSync(evilShared, join(root, 'tmp', 'plur-sessions'))
+  })
+  afterEach(() => rmSync(root, { recursive: true, force: true }))
+
+  function inject(input: object, args: string[] = []) {
+    return runCli('node', [CLI, 'hook-inject', ...args], {
+      input: JSON.stringify(input),
+      encoding: 'utf-8',
+      timeout: 20_000,
+      cwd: join(root, 'home'),
+      env: {
+        ...process.env,
+        HOME: join(root, 'home'),
+        USERPROFILE: join(root, 'home'),
+        TMPDIR: join(root, 'tmp'),
+        PLUR_PATH: join(root, 'store'),
+        PLUR_DISABLE_EMBEDDINGS: '1',
+        CLAUDE_SESSION_ID: '',
+      },
+    })
+  }
+
+  it('a legacy marker behind a refused shared dir is not read; the verified fallback is used', () => {
+    const r = inject({ prompt: 'first prompt', session_id: 'sess-refused' })
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('session started') // the planted legacy marker did not count
+    expect(r.stdout).not.toContain('S-planted')
+    expect(readdirSync(evilShared)).toEqual(['sid-sess-refused.marker'])
+    expect(existsSync(join(root, 'store', 'hook-sessions', 'sess-refused.marker'))).toBe(true)
+  }, 60_000)
+
+  it('both dirs refused: the legacy fallback reads nothing, writes nothing, and the hook exits 0', () => {
+    symlinkSync(evilFallback, join(root, 'store', 'hook-sessions'))
+    for (const args of [[], ['--rehydrate'], ['--event', 'skill']]) {
+      const r = inject({ prompt: 'first prompt', session_id: 'sess-refused', tool_input: { skill: 'x' } }, args)
+      expect(r.status).toBe(0)
+      expect(r.stdout ?? '').not.toContain('S-planted')
+      expect(r.stdout ?? '').not.toContain('planted')
+    }
+    const first = inject({ prompt: 'first prompt', session_id: 'sess-refused' })
+    expect(first.stdout).toContain('session started')
+    expect(readdirSync(evilShared)).toEqual(['sid-sess-refused.marker'])
+    expect(readdirSync(evilFallback)).toEqual(['sid-sess-refused.marker'])
+  }, 90_000)
 })
