@@ -7,9 +7,10 @@ theorems hold for every oracle.
 
 Findings and replays: spec/formal/findings/r2-corea.md.
 
-Checked against the outbox lease (decision D2, PR #1231): index.ts gains a lease on outbox
+Checked against the outbox lease (decision D2, PR #1231): index.ts gained a lease on outbox
 rows (`_outboxLease` bookkeeping, taken and released around each push) and `listOutbox` reports
-`leased_until`. No section here models the flush's claim logic — the team-write, egress,
+`leased_until`. Decision C3 (2026-09-30 merge of main) removed the lease again: #1277's per-entry
+claims guard the push, and `leased_until` is read from the claim file. No section here models the flush's claim logic — the team-write, egress,
 refcount and retire-kind theorems concern which rows are queued and what they carry, and a
 lease changes neither — so every theorem still holds. The lease itself: WritePath §1c.
 
