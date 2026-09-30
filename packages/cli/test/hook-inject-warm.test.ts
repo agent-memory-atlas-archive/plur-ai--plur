@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir, hostname } from 'os'
+import { spawn } from 'child_process'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
 
@@ -132,6 +133,58 @@ describe('a first prompt that fell back warms the embedding cache for the next s
     }
     expect(cachedEntries()).toBeGreaterThanOrEqual(N)
   }, 600_000)
+
+  // #1414 review: a build killed mid-way left its marker behind, and the parent
+  // skipped the spawn whenever the marker existed, so warming stopped for good.
+  it('a marker left by a dead build does not block the next fallback', async () => {
+    rmSync(join(store, '.embeddings-cache.json'), { force: true })
+    const dead = runCli('node', ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf-8', timeout: 30_000 })
+    const deadPid = Number(dead.stdout)
+    expect(deadPid).toBeGreaterThan(0)
+    const marker = join(store, '.embeddings-warming')
+    writeFileSync(marker, `${hostname()}:${deadPid}:${Date.now()}`)
+
+    const r = runCli('node', [CLI, 'hook-inject'], {
+      input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'warm-dead', prompt: 'what is the project codeword' }),
+      encoding: 'utf-8', timeout: 30_000, cwd: dir,
+      env: { ...env, PLUR_HOOK_HYBRID_DEADLINE_MS: '1', PLUR_HOOK_CEILING_MS: '3000' },
+    })
+    expect(r.status).toBe(0)
+
+    // A new build takes the marker over (or has already finished and removed it).
+    const claimBy = Date.now() + 60_000
+    const stale = () => { try { return readFileSync(marker, 'utf8').includes(`:${deadPid}:`) } catch { return false } }
+    while (Date.now() < claimBy && stale()) await new Promise(res => setTimeout(res, 250))
+    expect(stale()).toBe(false)
+
+    const until = Date.now() + 540_000
+    while (Date.now() < until && (cachedEntries() < N || existsSync(marker))) {
+      await new Promise(res => setTimeout(res, 500))
+    }
+    expect(cachedEntries()).toBeGreaterThanOrEqual(N)
+    expect(existsSync(marker)).toBe(false)
+  }, 660_000)
+
+  it.skipIf(process.platform === 'win32').each(['SIGTERM', 'SIGINT', 'SIGHUP'] as const)('a build stopped by %s releases its marker', async (signal) => {
+    rmSync(join(store, '.embeddings-cache.json'), { force: true })
+    const marker = join(store, '.embeddings-warming')
+    rmSync(marker, { force: true })
+    const child = spawn('node', [CLI, 'hook-inject', '--warm-embeddings'], { cwd: dir, env, stdio: 'ignore' })
+    const exited = new Promise<{ code: number | null; sig: NodeJS.Signals | null }>(res =>
+      child.on('exit', (code, sig) => res({ code, sig })))
+    try {
+      const held = () => { try { return readFileSync(marker, 'utf8').includes(`:${child.pid}:`) } catch { return false } }
+      const by = Date.now() + 60_000
+      while (Date.now() < by && !held()) await new Promise(res => setTimeout(res, 100))
+      expect(held()).toBe(true)
+      child.kill(signal)
+      await exited
+      expect(existsSync(marker)).toBe(false)
+    } finally {
+      try { child.kill('SIGKILL') } catch { /* already gone */ }
+      rmSync(marker, { force: true })
+    }
+  }, 120_000)
 
   it('a second fallback while a build is running starts no second build', () => {
     // Single flight: a live marker means a build is under way.

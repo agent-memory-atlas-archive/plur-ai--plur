@@ -452,6 +452,25 @@ const WARM_MARKER = '.embeddings-warming'
 // machine. A dead holder is detected at once, so this bounds only a stuck build.
 export const WARM_CEILING_MS = parseInt(process.env.PLUR_WARM_CEILING_MS ?? '', 10) || 60 * 60_000
 
+/**
+ * Is the marker at `path` held by a live build? False when there is no marker,
+ * when its holder is a dead pid on this host, or when it is at least
+ * WARM_CEILING_MS old. A marker on another host cannot be probed, so only its
+ * age counts. The parent's pre-spawn check and the child's claim use this one
+ * test, so a marker left by a killed build never blocks warming (#1414 review).
+ */
+export function warmMarkerHeld(path: string, now = Date.now()): boolean {
+  let raw: string
+  try { raw = readFileSync(path, 'utf8') } catch { return false }
+  const [host, pidRaw, tsRaw] = raw.trim().split(':')
+  const age = now - Number(tsRaw)
+  let alive = host !== hostname() // another host: cannot probe, trust the age
+  if (host === hostname()) {
+    try { process.kill(Number(pidRaw), 0); alive = true } catch (e: any) { alive = e?.code === 'EPERM' }
+  }
+  return alive && Number.isFinite(age) && age < WARM_CEILING_MS
+}
+
 /** Take the single-flight marker, or false when a live build holds it. */
 export function claimWarmMarker(path: string, now = Date.now()): boolean {
   const token = `${hostname()}:${process.pid}:${now}`
@@ -459,13 +478,7 @@ export function claimWarmMarker(path: string, now = Date.now()): boolean {
     if (err?.code !== 'EEXIST') return false
   }
   try {
-    const [host, pidRaw, tsRaw] = readFileSync(path, 'utf8').trim().split(':')
-    const age = now - Number(tsRaw)
-    let alive = host !== hostname() // another host: cannot probe, trust the age
-    if (host === hostname()) {
-      try { process.kill(Number(pidRaw), 0); alive = true } catch (e: any) { alive = e?.code === 'EPERM' }
-    }
-    if (alive && Number.isFinite(age) && age < WARM_CEILING_MS) return false
+    if (warmMarkerHeld(path, now)) return false
     unlinkSync(path)
     writeFileSync(path, token, { flag: 'wx' })
     return true
@@ -483,6 +496,12 @@ async function warmEmbeddingCache(flags: GlobalFlags): Promise<void> {
   }
   const ceiling = setTimeout(() => { release(); process.exit(0) }, WARM_CEILING_MS)
   ceiling.unref()
+  // A signal's default action skips `finally`, which would leave the marker
+  // behind (shutdown, logout, `pkill node`). Release it, then exit the way the
+  // signal would have (128 + its number).
+  for (const [sig, code] of [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]] as const) {
+    process.once(sig, () => { release(); process.exit(code) })
+  }
   // Lowest priority by default: the build must never compete with the editor.
   // PLUR_WARM_NICE (0–19) lets a user who wants it done sooner raise it.
   const nice = parseInt(process.env.PLUR_WARM_NICE ?? '', 10)
@@ -495,8 +514,10 @@ async function warmEmbeddingCache(flags: GlobalFlags): Promise<void> {
 }
 
 function startEmbeddingWarmup(storageRoot: string, flags: GlobalFlags): void {
-  // Cheap single-flight check here; the child re-checks atomically.
-  if (existsSync(join(storageRoot, WARM_MARKER))) return
+  // Cheap single-flight check here, with the same liveness and age test as the
+  // child's claim, so a marker left by a dead build does not block the spawn.
+  // The child still claims atomically.
+  if (warmMarkerHeld(join(storageRoot, WARM_MARKER))) return
   const entry = process.argv[1]
   if (!entry) return
   const args = [entry, 'hook-inject', '--warm-embeddings', ...(flags.path ? ['--path', flags.path] : [])]
