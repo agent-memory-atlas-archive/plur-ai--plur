@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### The primary store is no longer registered a second time as a project store
+
+**On some installs every engram was injected twice, under two ids** (#1319).
+Store auto-discovery walks up from the working directory looking for
+`.plur/engrams.yaml`, and skipped the primary store by comparing path strings.
+When the primary path and the walk spelled the same directory differently —
+a symlinked home, or `/var` versus `/private/var` — the check missed, and the
+primary `engrams.yaml` was written into `config.yaml` as `project:<home>`. It
+was then loaded once as the primary and once as a secondary with namespaced
+ids, costing injection budget and splitting feedback between the two copies.
+
+Now:
+
+- Discovery and `addStore` compare canonical paths. `addStore` refuses the
+  primary file under any spelling. If `config.yaml` already lists the primary
+  file as a store, the error says that entry is ignored and can be removed.
+  A second spelling of an already-registered local store returns
+  `already_registered` with the scope of an entry that is actually loaded,
+  preferring the scope you asked for.
+- A `config.yaml` that already holds such an entry needs no edit. At load, a
+  local store entry is ignored, with one warning, when its file is the
+  primary file, or when both its file and its scope repeat an earlier entry.
+  The entry stays in `config.yaml`, and writebacks start from the file on
+  disk, so nothing is removed.
+- `plur doctor` lists the store entries that are ignored at load (also in
+  `--json`, as `ignoredDuplicateStores`), and the new `plur stores prune`
+  removes the ones that name the primary store file, which stops the
+  warning (#1356). It removes only those entries, leaves every other byte of
+  `config.yaml` as it was (comments included), and writes atomically. If the
+  `stores:` list is not in plain block style it changes nothing and says so.
+  An entry that repeats another store's file and scope is still left for you
+  to remove by hand.
+- One file registered under two different scopes keeps loading under both,
+  as before, because each scope admits different engrams. A warning says the
+  two entries share a file, and that engrams scoped `global` in it appear
+  under both scopes.
+- Path comparison also holds for files that do not exist yet, such as a fresh
+  install's `engrams.yaml`. `canonicalize` used to fall back to the path as
+  written when it could not be resolved. It now resolves the deepest existing
+  folder above it and re-appends the rest, so `/var/…/missing` and
+  `/private/var/…/missing` compare equal. How directory trust matches
+  symlinked and not-yet-existing folders is settled separately, in #1348.
+- Path comparison also folds letter case on a case-insensitive filesystem
+  (macOS, Windows) (#1357). `canonicalize` returns the on-disk case, so
+  `~/Store/engrams.yaml` and `~/store/engrams.yaml` are one store. The CLI's
+  copy of `canonicalize` now matches core's. In the folder map, a checked
+  folder is compared in its on-disk case; an `off` entry still matches every
+  spelling it matched before, and a `trusted` entry recorded in the on-disk
+  case (as `plur trust` records it) now also covers other case spellings.
+  `plur folders set`, `plur folders rm` and `plur untrust` find every entry
+  recorded for a folder, including one that spells it differently: as
+  typed, through a symlink, as `~/dup` beside its absolute path (both kept
+  by the `trust.yaml` import), or in another letter case when the
+  filesystem shows that spelling is the same folder (a sibling `pROJ` or
+  `Ⓟ` on a case-sensitive disk is never taken for `Proj` or `ⓟ`). `rm`
+  removes all of them, and `untrust` clears all their grants. `set` merges
+  them into one entry and keeps what was in effect: a trust grant and a
+  scope come only from entries that applied to the folder, and the scope
+  kept is the one the resolver was using. An entry that matched only by
+  its spelling never applied its grant or scope (only an `off` applies
+  that loosely), so it can only make the mode more restrictive: its `off`
+  or `ask` counts, its `on` does not. The most restrictive mode is kept
+  unless you set one. `--scope` without a mode
+  means `on`, also when it replaces a merged `off`.
+
 ### The secret guard now recognises GitHub, GitLab, Slack, npm, Stripe and AWS temporary keys
 
 **A memory holding a GitHub token was stored, and could sync to a team
@@ -114,7 +179,10 @@ repo's request. Only the CLI writes the map.
     `--no-trusted`, and to `plur folders rm` of a trusted entry (owner decision
     F2). A `trust.yaml` line counts as the same folder under the map's own
     matching, so a `~/…` spelling, or a differently-cased spelling on a
-    case-insensitive disk, is removed too. A revocation never adds anything to
+    case-insensitive disk, is removed too. When a revocation matches several
+    entries for the folder, the line of every entry that held a grant is
+    removed. On a case-sensitive disk, the line of a sibling folder whose name
+    differs only in letter case is kept. A revocation never adds anything to
     `trust.yaml`.
   - The one-time code is used up as soon as `folders.yaml` is saved, before
     `trust.yaml` is written (owner decision F3). If the `trust.yaml` write
