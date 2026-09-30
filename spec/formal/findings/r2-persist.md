@@ -542,16 +542,9 @@ only record. This is documented at `addRenameListener`.
 
 ## Merge with #1354 (main, 2026-09-30)
 
-#1354 (merged to main as #1398) reached the double-holder race of item 1 from the empty-lock side
-and closed it with one `<lock>.takeover` guard, which is the round-1 single guard this round
-replaced. The merge keeps the ladder (`stealGuardPath`, `acquireStealSlot`, `ladder_mutex`) and
-takes the rest of #1354: the lock is published complete by hard link (`publishLockFile`), an empty
-lock is abandoned after `EMPTY_LOCK_GRACE_MS`, a contender that finds its own token holds the lock,
-and the claim checks file identity (inode) as well as contents and restores a live lock by hard
-link.
-
-One modelling note. The ladder's key is the judged instance, and the model takes it as unique per
-acquisition, which a token is. An empty lock has no token, so for an empty lock the key is its
-inode. That is unique while the file exists; after the file is removed the inode can be reused, the
-same exposure #1354's own inode check has. A tokened lock's key is unchanged, so the model and its
-theorems are unchanged. Run: the 12 lock and sync test files from both sides, 108 tests passed.
+#1354 first reached the double-holder race of item 1 from the empty-lock side with one
+`<lock>.takeover` guard, the round-1 single guard this round replaced. Main then adopted this
+round's ladder for it (#1424, owner decisions C1 and C2), so this branch takes main's
+`takeOver` / `takeOverSync` unchanged, with this branch's heartbeat (decision P1) on top. The
+ladder here is keyed by the judged token as modelled; the inode and still-abandoned re-checks under
+the slot are main's.
