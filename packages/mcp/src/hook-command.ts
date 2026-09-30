@@ -29,6 +29,7 @@ export const PLUR_SETTINGS_SUBCOMMANDS = [
   'hook-session-guard',
   'hook-session-mark',
   'hook-session-end',
+  'hook-session-resume',
 ] as const
 
 // BEGIN shared hook matcher — packages/mcp/src/hook-command.ts keeps a

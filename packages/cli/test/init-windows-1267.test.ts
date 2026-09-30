@@ -156,9 +156,9 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     const commands = allCommands(settings)
     expect(commands.some((c) => c.includes(winHome))).toBe(false)
     expect(settings.hooks?.UserPromptSubmit?.filter((e) => e.hooks[0].args?.[1] === 'hook-inject')).toHaveLength(1)
-    // hook-session-remind once, plus (since #1274) the compact rehydrate.
-    expect(settings.hooks?.SessionStart?.map((e) => e.hooks[0].args?.slice(1).join(' '))).toEqual(['hook-session-remind', 'hook-inject --rehydrate'])
-    // hook-learn-check once, plus (since #1310) its own auto-rate entry.
+    // hook-session-remind once, the resume re-ask (#1347), plus (since #1274) the compact rehydrate.
+    expect(settings.hooks?.SessionStart?.map((e) => e.hooks[0].args?.slice(1).join(' '))).toEqual(['hook-session-remind', 'hook-session-resume', 'hook-inject --rehydrate'])
+    // hook-learn-check once (the two legacy copies are gone), plus #1310's auto-rate.
     expect(settings.hooks?.Stop?.map((e) => e.hooks[0].args?.slice(1).join(' '))).toEqual(['hook-learn-check', 'hook-auto-rate claude'])
     // The user's own hook survives.
     expect(commands).toContain('C:\\tools\\my-own-hook.exe')

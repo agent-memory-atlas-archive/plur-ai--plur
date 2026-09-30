@@ -55,22 +55,117 @@ plur remote        # show this folder's connection and check it
   under a trusted folder, exactly as before. Running `plur remote` there prints
   one line saying the connection now lives in your user config and the token
   can be removed from `.plur.yaml`. It never edits or deletes the file.
-- **The folder entry does not yet steer the hooks.** They start reading the
-  folder map in the next #1347 change. Until then, core dials a url store only
-  when the session's scope names that store's org, so a folder with no
-  `.plur.yaml` scope gets the store registered but no remote recall from the
-  hooks or the opencode plugin.
+- **The hooks follow the folder entry.** The Claude Code, Codex, Cursor and
+  Antigravity hooks read the folder map (see "Every editor's hooks follow the
+  folder map" below), so the recorded scope is the session scope and the
+  folder gets recall from that scope's store, with no `.plur.yaml`. The
+  opencode plugin and the MCP server's `plur_session_start` do not read the
+  map yet: there, core dials a url store only when the session's scope names
+  that store's org, so a folder with no `.plur.yaml` scope gets the store
+  registered but no remote recall.
 
 ### `plur trust` and `plur untrust` are hidden from `plur --help` (#1413)
 
 Trust is now granted by `plur folders set <dir> --trusted`, by the automatic
-import of `trust.yaml`, and, once the hooks read the folder map, by answering
-yes to the one-time question.
+import of `trust.yaml`, and by answering yes to the one-time question the
+hooks ask in an undecided folder.
 Both commands keep working. In a terminal they give the same output and exit
 codes as before. Outside a terminal, `plur trust` now needs the nonce the ask
 flow issued for that answer, and `plur untrust` needs none (see "A folder
 nonce now authorises one answer" below). The trust check for a `.plur.yaml`
 that names its own remote is unchanged.
+
+### Every editor's hooks follow the folder map, and a folder with no decision asks once
+
+**Second half of #1347.** The Claude Code, Codex, Cursor and Antigravity hooks
+no longer gate on a project marker. They ask the folder map
+(`resolveFolderPolicy`, with the payload's `cwd` when the editor sends one)
+what you decided about the folder:
+
+- **off:** every hook is silent. No memories, no reminders, no guard, no
+  learning nudge, no observation or session capture.
+- **on:** memory works as before. A map `scope` (or a trusted `.plur.yaml`'s
+  hint) is the session scope, which is also what makes core dial the team
+  store that scope belongs to. A folder connected only through the map, with
+  no `.plur.yaml`, now gets that store's recall.
+- **ask** (no decision yet, including `$HOME`, or a `.plur.yaml` you have not
+  trusted): the first prompt of a session loads no memories. It carries one
+  instruction instead: ask you once whether to use PLUR in the folder, with a
+  suggested scope from the stores you have configured, and the exact commands
+  for **yes** (`plur folders set <folder> --scope <s> --nonce <n>`, or `--on`),
+  **not now** (nothing) and **never here** (`--off --nonce <n>`). For an
+  untrusted `.plur.yaml` it also offers `--trusted`, names the host the repo
+  wants to send memories to (only a plain host name or IP address with an
+  optional port; anything else is shown as "an invalid remote URL"), and
+  never shows its token. What that file
+  requests is shown on its own line, marked as quoted repository text, and
+  only as values that fit the scope or domain grammar and the parsed host of
+  a URL; anything else is named ("an invalid scope"), never copied, so the
+  file cannot put an instruction into the question. Its "Yes, without its
+  settings" answer never offers the scope the file requested, even when that
+  scope is configured; the only way to it is `--trusted`. On macOS and Linux
+  a folder path that needs quoting is printed in single quotes, so `$(...)`,
+  backticks and `$VAR` in a folder name are not expanded when the command is
+  run; Windows keeps double quotes. Each offered command carries its own
+  nonce, issued for that session, that folder and that answer (#1477), and
+  it works once: the "Yes, without its settings" nonce cannot grant
+  `--trusted`, and `--trusted` is issued only where it is offered. Later prompts in the session say
+  nothing; after a yes, the next prompt loads memory.
+
+**What you will notice:**
+- Folders with no `.plur.yaml` and no project MCP config, which got nothing
+  before, now ask once per session. Answer "never here" to silence one for good.
+- **A `.plur.yaml` you have not trusted stops applying its scope and domain**
+  (decision D1). You are asked once instead of seeing the old "Ignored remote
+  memory settings" line. To keep a repo working without the question, run
+  `plur trust <repo>`, or answer yes and trust it.
+- A trusted `.plur.yaml` and a project MCP config give byte-identical hook
+  output to before. Golden tests hold every editor to that.
+- Cursor gets the question through its rule file, as it gets memory. The file
+  is removed again once the folder is not `on`, if it still holds the question.
+- Antigravity without a workspace in the payload is unchanged: the install is
+  the opt-in there, as before.
+- The session-end hooks expire that session's unused nonces.
+- **A resumed session is asked again.** `claude --resume` and Codex's resume
+  keep the session id, and SessionEnd had already deleted its nonces, so the
+  question was never repeated and a "yes" to the old one failed with
+  nonce-unknown. On SessionStart with `source: "resume"` the session's
+  asked-once record is cleared, and its first prompt asks again with a fresh
+  nonce. A startup, clear or compact SessionStart does not re-ask. Nonces stay
+  single-use and bound to one folder, and still die at SessionEnd. `plur init`
+  and `plur-mcp init` register a `SessionStart` hook with matcher `resume`
+  (`hook-session-resume`) next to SessionEnd; re-running either adds it to an
+  older install. Codex's existing SessionStart hook handles `resume` itself.
+  Cursor and Antigravity send no resume signal and delete no nonces at session
+  end, so a resumed conversation there keeps its unexpired question.
+- **Some folders cannot be answered from the question.** A folder rule reads
+  `*` and `?` as a pattern, so a "yes" for a folder named `x*` would also
+  cover its sibling `xyz` (#1493). A path with `*`, `?` or `[`, a control or
+  line-break character, or a bidi or zero-width character (U+200B–U+200F,
+  U+202A–U+202E, U+2066–U+2069, U+FEFF) gets a short notice instead, and so
+  does a path with `$`, a backtick, `%`, `!`, `"` or a curly double quote
+  (U+201C, U+201D, U+201E) on Windows, where the offered command
+  double-quotes the folder and bash, PowerShell or cmd would still expand
+  them (PowerShell ends a double-quoted string at a curly double quote). The
+  path is shown JSON-escaped as quoted data (`$`, backticks, `'` and curly
+  quotes escaped too), and no command or nonce is offered. The
+  folder stays undecided and is asked about once per session. Set it by hand.
+- Outside the commands, the question prints the folder only in that
+  JSON-escaped form, and no line of it holds an apostrophe, so no printed
+  line runs a command named in the folder (`x&touch CANARY`, `x$(...)`) when
+  pasted into bash or PowerShell. The untrusted header now reads "the repo
+  .plur.yaml is not trusted", and the trust answer "Yes, and trust the
+  .plur.yaml in this repo". The values an untrusted `.plur.yaml` requests
+  are printed the same escaped way. On Windows a folder whose path ends in
+  a backslash (a drive or UNC root) also gets the notice: the backslash
+  would escape the closing quote of the offered command.
+- Asking changes nothing. The question no longer registers the folder's own
+  `.plur/engrams.yaml` as a project store in config.yaml (the hooks build
+  their scope ranker with store discovery off), so that store never reaches
+  another folder's session and is never offered as a scope.
+
+Not changed yet: the opencode plugin and the MCP server's `plur_session_start`
+do not read the map.
 
 ### Editors now rate the memory they inject, from the reply
 
@@ -192,6 +287,10 @@ Switches, both environment variables:
   (`plur folders`), or a `.plur.yaml` scope in a trusted folder (`plur trust`). A cloned
   repository cannot choose to publish the agent's reply text to a team store. Captured text
   is never auto-routed into a shared scope, and a folder the map turns off captures nothing.
+
+The end-of-turn hook follows the folder map like every other hook: it rates only
+in a folder the map resolves to on, so a folder you said yes to is rated even
+with no `.plur.yaml` or `.mcp.json`, and an off or undecided folder is left alone.
 
 Run `plur init` again to install the new hook entries.
 

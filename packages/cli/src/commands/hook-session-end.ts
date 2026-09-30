@@ -3,7 +3,8 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { createPlur } from '../plur.js'
-import { isPlurConfigured } from '../lib/plur-configured.js'
+import { hookFolderOn, payloadDir } from '../lib/folder-gate.js'
+import { endFolderNonceSession } from '@plur-ai/core'
 import { safeSessionKey } from '../lib/session-key.js'
 import { flushOutboxForHook, HOOK_OUTBOX_BUDGET_MS } from '../lib/hook-outbox-flush.js'
 import { hookSessionKey, legacyHookSessionKeys } from '../lib/session-key.js' // decision H1
@@ -88,17 +89,17 @@ function readStdinRaw(): string {
 }
 
 export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
-  // Silent pass-through for projects without plur configured (#247) — lets the
-  // hook be installed globally without touching unrelated projects.
-  if (!isPlurConfigured()) return
-
-  await closeSession(flags)
+  // #1347: the folder gate replaces #247's project gate. An off folder gets
+  // nothing, the outbox flush included.
+  const on = await closeSession(flags)
+  if (!on) return
   // #1269: after the close, never instead of it — the checkpoint work is the
   // cheaper, more important half, and the flush has the rest of the budget.
   await flushOutboxForHook(flags, { hook: 'hook-session-end', budgetMs: HOOK_OUTBOX_BUDGET_MS.claudeSessionEnd })
 }
 
-async function closeSession(flags: GlobalFlags): Promise<void> {
+/** Closes the session's checkpoint. False when the folder map says the folder is not on. */
+async function closeSession(flags: GlobalFlags): Promise<boolean> {
   const raw = readStdinRaw()
   let payload: { session_id?: string; cwd?: string; reason?: string } = {}
   try {
@@ -109,8 +110,16 @@ async function closeSession(flags: GlobalFlags): Promise<void> {
   // it has no use once the session is over.
   removeSessionTask(payload.session_id)
 
+  // #1347: the ask flow's nonces for this session expire with it, whatever
+  // the folder's mode. Only removes this session's own nonce file.
+  if (payload.session_id) try { endFolderNonceSession(plurPath(flags), payload.session_id) } catch { /* best-effort */ }
+
+  // Nothing is captured unless the folder map says on (#1347; was #247's
+  // project gate).
+  if (!hookFolderOn(payloadDir(payload as Record<string, unknown>), flags)) return false
+
   const sessionsDir = join(plurPath(flags), 'sessions')
-  if (!existsSync(sessionsDir)) return
+  if (!existsSync(sessionsDir)) return true
 
   // Locate this session's checkpoint. Presence means plur_session_end did NOT
   // run (it unlinks the checkpoint), so we auto-close.
@@ -133,14 +142,14 @@ async function closeSession(flags: GlobalFlags): Promise<void> {
         // session's checkpoint was indistinguishable from corruption. Leave it
         // in place and stop — the next session_start's deferred wrap-up (#216)
         // can still find it, and nothing is captured from unparseable content.
-        return
+        return true
       }
     }
   }
 
   // No checkpoint → clean close already happened, or session too short. Nothing
   // to close.
-  if (!checkpointPath || !checkpoint) return
+  if (!checkpointPath || !checkpoint) return true
 
   // Build a conservative, metadata-only summary — the same information the
   // deferred wrap-up (#216) reports, but captured as a durable episode.
@@ -198,4 +207,5 @@ async function closeSession(flags: GlobalFlags): Promise<void> {
   // Ensure the sessions dir still exists for subsequent sessions (defensive —
   // capture may create the plur root lazily).
   try { mkdirSync(sessionsDir, { recursive: true }) } catch {}
+  return true
 }

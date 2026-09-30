@@ -13,6 +13,16 @@ exports[`plur init on darwin/linux output is unchanged (#1267) > hook commands m
       ]
     },
     {
+      "matcher": "resume",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "<HOME>/.plur/bin/plur-hook hook-session-resume",
+          "timeout": 3
+        }
+      ]
+    },
+    {
       "matcher": "compact",
       "hooks": [
         {
