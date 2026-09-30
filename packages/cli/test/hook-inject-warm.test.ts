@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'fs'
 import { join } from 'path'
+import { pathToFileURL } from 'url'
 import { tmpdir, hostname } from 'os'
 import { spawn } from 'child_process'
 import { runCli } from './helpers/spawn.js'
@@ -24,6 +25,8 @@ describe('a first prompt that fell back warms the embedding cache for the next s
   let dir: string
   let store: string
   let env: NodeJS.ProcessEnv
+  // `node --import <stall> CLI hook-inject`: see stalledHookArgs.
+  let stall: string
 
   beforeAll(() => {
     dir = mkdtempSync(join(tmpdir(), 'plur-inject-warm-'))
@@ -63,7 +66,37 @@ describe('a first prompt that fell back warms the embedding cache for the next s
     delete env.PLUR_DISABLE_EMBEDDINGS
     delete env.PLUR_HOOK_HYBRID
     delete env.CLAUDE_SESSION_ID
+
+    // Makes the hook's own hybrid search provably unable to finish, so the exit
+    // path always finds it still running and the fallback spawn is what these
+    // tests exercise. Timing alone did not do that: on a fast machine the hook's
+    // search over 400 engrams finished (~1.7s) inside the exit wait, cached the
+    // store itself, and started no build. The preload resolves
+    // `@huggingface/transformers` to a module whose top-level await never
+    // settles, so the embedder never loads IN THE HOOK. BM25 does not use it.
+    // It is passed as a node flag, not NODE_OPTIONS, so the detached build
+    // (spawned as `execPath <entry> ...`, without the parent's execArgv or any
+    // flag in its env) loads the real embedder. No product code is involved.
+    stall = join(dir, 'stall-embedder.mjs')
+    const target = 'data:text/javascript,await new Promise(() => {})'
+    const loader = `data:text/javascript,${encodeURIComponent(
+      `export async function resolve(s, c, n) { return s === '@huggingface/transformers' ? { url: ${JSON.stringify(target)}, shortCircuit: true } : n(s, c) }`,
+    )}`
+    writeFileSync(stall, [
+      `import * as m from 'node:module'`,
+      `const target = ${JSON.stringify(target)}`,
+      `if (typeof m.registerHooks === 'function') {`,
+      `  m.registerHooks({ resolve(s, c, n) { return s === '@huggingface/transformers' ? { url: target, shortCircuit: true } : n(s, c) } })`,
+      `} else {`,
+      `  m.register(${JSON.stringify(loader)})`,
+      `}`,
+    ].join('\n'))
   })
+
+  /** Hook args whose hybrid search stalls: it cannot finish before the hook exits. */
+  function stalledHookArgs(): string[] {
+    return ['--import', pathToFileURL(stall).href, CLI, 'hook-inject']
+  }
 
   afterAll(() => {
     // A build still running (a failed run) must not outlive the test and
@@ -85,16 +118,18 @@ describe('a first prompt that fell back warms the embedding cache for the next s
   }
 
   it('the second session takes the hybrid path within budget', async () => {
-    // Session 1: the hybrid search cannot meet a 1ms deadline, and the exit's
-    // wait is capped by a 3s watchdog, far too short to embed the whole store.
-    const first = runCli('node', [CLI, 'hook-inject'], {
+    // Session 1: the hybrid search misses a 1ms deadline and, stalled, is still
+    // running when the hook exits. The 20s watchdog is far past BM25 plus the
+    // 5s exit wait, so the exit goes through the fallback path, not the
+    // watchdog: this test fails if the fallback spawn is removed.
+    const first = runCli('node', stalledHookArgs(), {
       input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'warm-1', prompt: 'what is the project codeword' }),
-      encoding: 'utf-8', timeout: 30_000, cwd: dir,
-      env: { ...env, PLUR_HOOK_HYBRID_DEADLINE_MS: '1', PLUR_HOOK_CEILING_MS: '3000' },
+      encoding: 'utf-8', timeout: 60_000, cwd: dir,
+      env: { ...env, PLUR_HOOK_HYBRID_DEADLINE_MS: '1', PLUR_HOOK_CEILING_MS: '20000' },
     })
     expect(first.status).toBe(0)
-    // Under heavy load the 3s watchdog can end the run before BM25 answers;
-    // either exit must start the build, so only a clean exit is asserted.
+    expect(first.stderr).toContain('hybrid injection exceeded')
+    expect(JSON.parse(first.stdout).hookSpecificOutput.additionalContext).toContain('session started')
 
     // The background build finishes on its own; wait for it (bounded).
     const until = Date.now() + 540_000
@@ -144,12 +179,14 @@ describe('a first prompt that fell back warms the embedding cache for the next s
     const marker = join(store, '.embeddings-warming')
     writeFileSync(marker, `${hostname()}:${deadPid}:${Date.now()}`)
 
-    const r = runCli('node', [CLI, 'hook-inject'], {
+    // Stalled hybrid search, watchdog out of reach: the fallback path runs.
+    const r = runCli('node', stalledHookArgs(), {
       input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'warm-dead', prompt: 'what is the project codeword' }),
-      encoding: 'utf-8', timeout: 30_000, cwd: dir,
-      env: { ...env, PLUR_HOOK_HYBRID_DEADLINE_MS: '1', PLUR_HOOK_CEILING_MS: '3000' },
+      encoding: 'utf-8', timeout: 60_000, cwd: dir,
+      env: { ...env, PLUR_HOOK_HYBRID_DEADLINE_MS: '1', PLUR_HOOK_CEILING_MS: '20000' },
     })
     expect(r.status).toBe(0)
+    expect(r.stderr).toContain('hybrid injection exceeded')
 
     // A new build takes the marker over (or has already finished and removed it).
     const claimBy = Date.now() + 60_000
