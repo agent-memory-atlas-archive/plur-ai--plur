@@ -12,6 +12,10 @@ run the watchdog had already stopped, if its injection then threw.
 
 Hook commands now write the error to stderr as `[plur] <command> failed: …`
 and exit 0. Every other command still prints its error document and exits 1.
+That exit first waits, bounded at 5s, for any store write of the same process
+still in flight, as the hooks' other forced exits do (#1349). Before, a hook
+that threw while its abandoned hybrid search was recording its injection left
+`engrams.yaml.lock` or its publish file behind for every later writer.
 
 ### `plur init` sets up opencode by default
 
