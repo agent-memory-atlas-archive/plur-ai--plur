@@ -645,6 +645,28 @@ describe.skipIf(process.platform === 'win32')('writes: the literal option', () =
     expect(policy(join(home, 'w', 'projX')).mode).toBe('off')
   })
 
+  // #1415 + #1357/#1334: a literal entry and a second literal entry for the
+  // same folder in another letter case merge into ONE literal entry, and the
+  // `?` never starts matching siblings. Needs a case-insensitive filesystem
+  // (two spellings of one folder); on a case-sensitive one they would be two
+  // different folders, which the #1357 sibling tests above already cover.
+  it('a literal proj? and a mis-cased entry for it merge into one literal entry (case-insensitive filesystem)', ({ skip }) => {
+    mkdirSync(join(base, 'CaseProbe'), { recursive: true })
+    if (!existsSync(join(base, 'caseprobe'))) skip()
+    const q = realpathSync(mk('c/Proj?'))
+    const x = mk('c/projX')
+    writeMap([
+      { path: q, plur: 'on', literal: true },
+      { path: join(home, 'c', 'PROJ?'), plur: 'off', literal: true },
+    ])
+    expect(setFolderEntry(root, q, { trusted: true }, { configuredScopes: [], home, literal: true }))
+      .toEqual({ path: q, plur: 'off', trusted: true, literal: true })
+    expect(loadFolderMap(root).folders).toEqual([{ path: q, plur: 'off', trusted: true, literal: true }])
+    expect(policy(q).mode).toBe('off')
+    expect(policy(x).source).toBe('default')
+    expect(isTrustedInMap(loadFolderMap(root).folders, x, home)).toBe(false)
+  })
+
   it('a literal folder without glob characters is stored exactly as before', () => {
     const d = mk('plain')
     expect(setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], home, literal: true }))
