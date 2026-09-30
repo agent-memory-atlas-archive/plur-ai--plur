@@ -7,6 +7,7 @@ import { createInterface } from 'readline'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { outputInfo } from '../output.js'
 import { CLI_VERSION } from '../version.js'
+import { CLAUDE_INJECT_TIMEOUT_S } from '../lib/claude-inject-budget.js'
 import {
   buildMcpServerEntry,
   claudeDesktopConfigPath,
@@ -255,7 +256,7 @@ function installMcpBinary(): { shimPath: string; status: string } {
 // Installed into global ~/.claude/settings.json unconditionally (issue #95) so
 // they fire from any subdirectory project. Each hook silent-passes when
 // isPlurConfigured() is false, so projects without plur are unaffected.
-function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
+export function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
   return {
     SessionStart: [
       {
@@ -304,32 +305,33 @@ function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
 // Injection hooks pull relevant engrams into the conversation context. Installed
 // at the path chosen by --global/--project (default project) because per-project
 // domain/scope tuning may matter for what gets injected.
-function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
+export function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
   return {
     // First message: inject engrams based on the prompt.
-    // Subsequent messages: periodic reminder to call plur_learn (~1ms skip).
+    // Subsequent messages: periodic reminder to call plur_learn (~0.1s).
     //
-    // async: the cold-start CLI loads the BGE embedder for hybrid injection —
-    // ~20s+ once the store grows past a few thousand engrams. A sync hook
-    // would block every first prompt that long (or get killed at the timeout
-    // and inject nothing, which is how this was failing for real users).
-    // Async lets the prompt proceed immediately; the injected context arrives
-    // as soon as the search completes. 90s is a generous ceiling, not a
-    // target — typical completion is well under half that.
+    // Sync (#1313): async context arrives only at the next safe point, so a
+    // first reply without tool calls, and every `claude -p`, had no memory.
+    // hook-inject bounds its own work below the timeout (hybrid on a soft
+    // deadline, then BM25; a self-watchdog). Re-running init rewrites old
+    // `async: true` entries, since every plur hook is stripped and re-added.
     UserPromptSubmit: [
       {
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject`, timeout: 90, async: true },
+          { type: 'command', command: `${cmd} hook-inject`, timeout: CLAUDE_INJECT_TIMEOUT_S },
         ],
       },
     ],
 
     // Re-inject after context compaction so engrams survive long conversations.
-    PostCompact: [
+    // SessionStart with matcher "compact" fires right after compaction and can
+    // carry context; PostCompact cannot (#1274). Re-running init strips the
+    // old PostCompact entry with the rest of the plur hooks.
+    SessionStart: [
       {
-        matcher: 'auto|manual',
+        matcher: 'compact',
         hooks: [
-          { type: 'command', command: `${cmd} hook-inject --rehydrate`, timeout: 90, async: true },
+          { type: 'command', command: `${cmd} hook-inject --rehydrate`, timeout: CLAUDE_INJECT_TIMEOUT_S },
         ],
       },
     ],
@@ -1525,7 +1527,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo('', flags)
   outputInfo(`Injection hooks (9): ${injectionHooksStatus}`, flags)
   outputInfo('  UserPromptSubmit  — inject engrams + auto-start session', flags)
-  outputInfo('  PostCompact       — re-inject engrams after context compaction', flags)
+  outputInfo('  SessionStart      — re-inject engrams after context compaction', flags)
   outputInfo('  PreToolUse        — contextual injection (plan mode, skills, agents)', flags)
   outputInfo('  PreToolUse        — observation capture for pattern learning', flags)
   outputInfo('  PostToolUse       — observation results capture', flags)
