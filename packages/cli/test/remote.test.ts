@@ -19,6 +19,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { spawn } from 'child_process'
 import yaml from 'js-yaml'
+import { issueFolderNonce } from '@plur-ai/core'
 import { StubServer } from '../../core/test/helpers/stub-server.js'
 import { builtCliPath } from './helpers/built-cli.js'
 // Warm the module graph at collection time (see login.test.ts).
@@ -320,7 +321,9 @@ describe('plur remote (#1413)', () => {
 
     it('golden: trusted, it still connects', async () => {
       writeFileSync(join(work, '.plur.yaml'), legacy())
-      const t = await cli(['trust', work, '--json'])
+      // Owner decision #1378: outside a terminal a grant needs the nonce the
+      // ask flow issued for exactly this answer.
+      const t = await cli(['trust', work, '--nonce', issueFolderNonce(plurDir, 'session-r', work, { trusted: true }), '--json'])
       expect(t.status, t.stderr).toBe(0)
       const r = await cli(['remote', '--json'])
       expect(r.status, r.stderr).toBe(0)
@@ -341,11 +344,20 @@ describe('plur remote (#1413)', () => {
   }, TEST_TIMEOUT_MS)
 
   it('plur trust and plur untrust still work', async () => {
-    const t = await cli(['trust', work, '--json'])
+    // Owner decision #1378: outside a terminal a grant needs the nonce the
+    // ask flow issued for exactly this answer; `plur untrust` needs none.
+    const t = await cli(['trust', work, '--nonce', issueFolderNonce(plurDir, 'session-r', work, { trusted: true }), '--json'])
     expect(t.status, t.stderr).toBe(0)
     expect(JSON.parse(t.stdout)).toMatchObject({ success: true, trusted: realpathSync(work) })
     const u = await cli(['untrust', work, '--json'])
     expect(u.status, u.stderr).toBe(0)
     expect(JSON.parse(u.stdout)).toMatchObject({ success: true, removed: true })
+    // The gate itself: without --nonce and without a terminal, plur trust is
+    // refused and folders.yaml is left byte for byte as it was.
+    const before = foldersText()
+    const g = await cli(['trust', work, '--json'])
+    expect(g.status, g.stderr).toBe(1)
+    expect(JSON.parse(g.stdout)).toMatchObject({ code: 'nonce-required' })
+    expect(foldersText()).toBe(before)
   }, TEST_TIMEOUT_MS)
 })
