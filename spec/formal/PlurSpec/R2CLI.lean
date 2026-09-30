@@ -26,6 +26,14 @@ Checked against the merge of main into #1228 (2026-09-30: #1276, #1300, #1353,
 - §4 to §7 hold. The counters still use `ticketCounter`. doctor's
   `hookHarnesses`/`readyLine` are unchanged, and #1270 changed only its hook
   classifier (Adapters §3).
+
+Checked against #1349 (2026-09-30): still holds. The Codex hooks
+(codex-hook-io.ts `runCodexHook`) and hook-inject now exit only once no store
+lock operation of theirs is in flight (bounded, lib/store-lock-exit.ts). The
+hook-inject watchdog marks the run stopping, so a stopped run prints nothing
+and writes no marker. It still releases the inject lock through
+`releaseInjectLock`. Session-dir vetting, keys, the lock and the counters are
+unchanged.
 -/
 
 namespace PlurSpec.R2CLI

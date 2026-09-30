@@ -12,6 +12,9 @@ rows (`_outboxLease` bookkeeping, taken and released around each push) and `list
 `leased_until`. No section here models the flush's claim logic — the team-write, egress,
 refcount and retire-kind theorems concern which rows are queued and what they carry, and a
 lease changes neither — so every theorem still holds. The lease itself: WritePath §1c.
+
+Checked against #1349 (merged into #1228 on 2026-09-30): still holds. index.ts's
+only change is a re-export of `pendingStoreLockOps`, and no modelled branch changed.
 -/
 
 namespace PlurSpec.R2CoreA

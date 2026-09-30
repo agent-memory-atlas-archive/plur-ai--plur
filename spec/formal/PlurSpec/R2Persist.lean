@@ -17,6 +17,12 @@ duplicate-id renames on the next write instead of on every load. This file's Dup
 sections model WHICH ids are renamed and that every record stays readable — not when the history
 event is written — so `resolve_ids_distinct`, `resolve_no_loss`, `restore_both_reachable` and the
 rest still hold.
+
+Checked against #1349 (merged into #1228 on 2026-09-30): still holds.
+`withAsyncLock` now increments and decrements a per-process counter
+(`pendingStoreLockOps`) around the same `processLocks.run(… withFileLock …)`
+call. The counter only observes. Acquire, the crash-safe steal and release
+are unchanged.
 -/
 
 set_option linter.deprecated false

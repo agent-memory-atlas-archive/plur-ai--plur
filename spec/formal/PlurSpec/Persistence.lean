@@ -8,6 +8,11 @@ Findings, verdicts and replays: `spec/formal/findings/persistence.md`.
 Payloads (engram records, YAML bytes, git merges) are abstract: every theorem holds
 for every record type, keep-predicate and merge oracle satisfying the stated
 hypotheses.
+
+Checked against #1349 (merged into #1228 on 2026-09-30): still holds.
+`withAsyncLock` now increments and decrements a per-process counter
+(`pendingStoreLockOps`) around the same `processLocks.run(… withFileLock …)`
+call. The counter only observes. Acquire, steal and release are unchanged.
 -/
 
 namespace PlurSpec.Persistence

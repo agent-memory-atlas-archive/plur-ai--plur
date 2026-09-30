@@ -22,6 +22,10 @@ Checked against the merge of main into #1228 (2026-09-30: #1276, #1300, #1353,
   §3's S4(2).
 - mcp-config.ts: #1270 added the Windows node.exe/cmd-shim healing. The env
   merge of §4(b) is unchanged.
+
+Checked against #1349 (2026-09-30): still holds. hook-inject.ts's change is its
+exit path: the watchdog marks the run stopping and waits, bounded, for the
+store to go idle. The §9 trust gate is untouched.
 -/
 
 namespace PlurSpec.Adapters
