@@ -51,7 +51,11 @@ const CEILING_MS = parseInt(process.env.PLUR_AUTO_RATE_CEILING_MS ?? '', 10) || 
  */
 const WORKER_CEILING_MS = parseInt(process.env.PLUR_AUTO_RATE_WORKER_CEILING_MS ?? '', 10) || 15 * 60_000
 
-/** How long the watchdog waits for an in-flight store write: CEILING_MS plus this stays under 10s. */
+/**
+ * How long the watchdog waits for an in-flight store write. The watchdog is
+ * armed relative to process start (see below), so Node startup + CEILING_MS
+ * + this wait stays under the 10s budget on a slow machine too.
+ */
 const WATCHDOG_LOCK_WAIT_MS = 800
 
 interface Turn {
@@ -108,7 +112,10 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
 
   // #1343: the inline fallback below opens the store, so the watchdog waits
   // (bounded, inside the editor's 10s budget) for no store write in flight.
-  const watchdog = setTimeout(() => { void exitWhenStoreIdle(WATCHDOG_LOCK_WAIT_MS) }, CEILING_MS)
+  // The ceiling counts from process start, not from here: module import and
+  // Node startup (slow on Windows) are part of the editor's budget.
+  const elapsedMs = Math.round(process.uptime() * 1000)
+  const watchdog = setTimeout(() => { void exitWhenStoreIdle(WATCHDOG_LOCK_WAIT_MS) }, Math.max(0, CEILING_MS - elapsedMs))
   watchdog.unref()
 
   await runCodexHook('auto-rate', async () => {
