@@ -26,6 +26,15 @@ Checked against the merge of main into #1228 (2026-09-30: #1276, #1300, #1353,
 Checked against #1349 (2026-09-30): still holds. hook-inject.ts's change is its
 exit path: the watchdog marks the run stopping and waits, bounded, for the
 store to go idle. The §9 trust gate is untouched.
+
+Checked against #1277, #1400, #1414 and #1422 (2026-09-30): still holds.
+- tools.ts: plur_outbox reports retrying/needs_action and flushes with
+  `force`, and session_start mentions undeliverable outbox writes. None of
+  this is in §1 (learn entry points) or §2 (session lifecycle).
+- doctor.ts: an outbox check joins `overall`. `hasAnyPlurHook` (§3 S4(2)) is
+  unchanged.
+- hook-inject.ts: exit and warm-up changes only (R2CLI note). The §9 trust
+  gate is untouched.
 -/
 
 namespace PlurSpec.Adapters
