@@ -672,3 +672,17 @@ counterexamples kept.
 | 9 `.plur.yaml` trust | a | `readTrustedProjectConfig`, `trustedWorkspaceScope`, `trustedProjectScope` calls unchanged; the hook edits are session identity/lock/turn cache (R2CLI) |
 
 `lake env lean PlurSpec/Adapters.lean`: clean.
+
+## Owner decisions applied at the main merge (2026-09-30)
+
+- **Conflict J:** the 8 end-to-end hook replays in
+  packages/cli/test/formal-apply-surface-trust.test.ts ("CLI hooks ignore an
+  untrusted .plur.yaml scope", 4 hooks x untrusted/trusted) are dropped. The
+  folder map (#1418) asks the folder question instead of printing the
+  untrusted-scope notice. The 3 `trustedProjectScope` helper tests stay, and
+  §9's model is unchanged: it describes the helper's decision, which still
+  holds for as long as the helper is called.
+- **8b init-remote:** packages/cli/test/formal-adapters-init-remote.test.ts
+  (4) is deleted. `plur remote` (#1415) replaces the `init-remote` rewrite.
+  §8b's theorems still check; they describe the rewrite in the code that is
+  on main today and become historical once #1415 removes it.
