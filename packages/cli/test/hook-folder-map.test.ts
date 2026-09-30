@@ -214,6 +214,19 @@ describe('Claude Code hooks read the folder map (#1347)', () => {
     expect(ask).not.toContain('secret-query')
     expect(ask).not.toContain('/path')
   })
+
+  // #1418 review, blocking 2: "Yes, without its settings" offered the
+  // repository's own requested scope whenever that scope was configured.
+  it('"Yes, without its settings" never writes the scope the untrusted repository requested', () => {
+    writeFileSync(join(dir, '.plur', 'config.yaml'),
+      'embeddings:\n  enabled: false\nstores:\n  - url: "http://127.0.0.1:9"\n    token: "t"\n    scope: "group:acme/eng"\n')
+    writeFileSync(join(repo, '.plur.yaml'), 'scope: group:acme/eng\n')
+    const ask = context(cli(['hook-inject'], payload(PROMPT, 'cc-without')).stdout)
+    const without = ask.split('\n').find(l => l.startsWith('- Yes, without its settings'))
+    expect(without, ask).toBeDefined()
+    expect(without).not.toContain('group:acme/eng')
+    expect(without).toContain(`plur folders set ${repo} --on --nonce ${nonceOf(ask)}`)
+  })
 })
 
 describe('a folder mapped to a team scope gets remote recall (#1347, found in #1415)', () => {

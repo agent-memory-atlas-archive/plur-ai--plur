@@ -162,6 +162,12 @@ function requestedRemoteText(url: string): string {
  * is one of them, else the best match of the scope ranker over them. Never a
  * scope that is not configured, so a "yes" can never route memory to a store
  * the user did not set up.
+ *
+ * For an untrusted `.plur.yaml` (`untrusted`), nothing it asks for is used:
+ * its scope is neither suggested nor listed, and its domain does not steer the
+ * ranker. Otherwise "Yes, without its settings" wrote the very scope the
+ * repository requested (#1418 review). The only way to that scope is
+ * `--trusted`.
  */
 function suggestScopes(
   plur: Plur | null,
@@ -169,20 +175,22 @@ function suggestScopes(
   folder: string,
   prompt: string,
   requested: FolderPolicy['requested'],
+  untrusted: boolean,
 ): { suggested?: string; others: string[] } {
   let writable: string[] = []
   try {
     const stores = loadConfig(join(root, 'config.yaml')).stores ?? []
     writable = [...new Set(stores.filter(s => s.readonly !== true).map(s => s.scope))]
   } catch { /* no config: nothing to offer */ }
+  if (untrusted && requested?.scope) writable = writable.filter(s => s !== requested.scope)
   if (writable.length === 0) return { others: [] }
   let suggested: string | undefined
-  if (requested?.scope && writable.includes(requested.scope)) suggested = requested.scope
+  if (!untrusted && requested?.scope && writable.includes(requested.scope)) suggested = requested.scope
   if (!suggested && plur) {
     try {
       const ranked = plur.suggestScope({
         statement: `${basename(folder)} ${prompt.slice(0, 300)}`,
-        ...(requested?.domain ? { domain: requested.domain } : {}),
+        ...(!untrusted && requested?.domain ? { domain: requested.domain } : {}),
       })
       suggested = ranked.find(c => writable.includes(c.scope))?.scope
     } catch { /* ranking is advisory */ }
@@ -226,7 +234,7 @@ export function folderAskOnce(opts: FolderAskOptions): string | null {
     process.stderr.write(`[plur] folder map: could not issue a nonce (${(err as Error)?.message ?? err}).\n`)
     return null
   }
-  const { suggested, others } = suggestScopes(opts.plur ?? null, root, folder, opts.prompt ?? '', opts.policy.requested)
+  const { suggested, others } = suggestScopes(opts.plur ?? null, root, folder, opts.prompt ?? '', opts.policy.requested, untrusted)
   const f = quoted(folder)
   const set = (what: string) => `plur folders set ${f} ${what} --nonce ${nonce}`
 

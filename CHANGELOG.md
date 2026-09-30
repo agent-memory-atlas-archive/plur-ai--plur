@@ -26,7 +26,9 @@ what you decided about the folder:
   requests is shown on its own line, marked as quoted repository text, and
   only as values that fit the scope or domain grammar and the parsed host of
   a URL; anything else is named ("an invalid scope"), never copied, so the
-  file cannot put an instruction into the question. The nonce is issued for
+  file cannot put an instruction into the question. Its "Yes, without its
+  settings" answer never offers the scope the file requested, even when that
+  scope is configured; the only way to it is `--trusted`. The nonce is issued for
   that session and folder and works once. Later prompts in the session say
   nothing; after a yes, the next prompt loads memory.
 
