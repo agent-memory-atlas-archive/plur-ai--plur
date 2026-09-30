@@ -17,7 +17,7 @@ Claude Code's `hook-inject` was async with a 90s timeout until #1313.
 | Antigravity | pre-invocation | 20s |
 | Cursor | `sessionStart` | 10s |
 | Claude Code | `UserPromptSubmit`, `SessionStart` (matcher `compact`) | 20s; the hook exits itself at 15s (`PLUR_HOOK_CEILING_MS`) |
-| All four | end-of-turn auto-rate (`hook-auto-rate`, #1310) | 10s (sync), self-capped at 9s |
+| All four | end-of-turn auto-rate (`hook-auto-rate`, #1310) | 10s (sync), self-capped at 9s from process start, plus up to 0.8s waiting for an in-flight store write |
 
 Codex's own default is 600s. PLUR's are deliberately tight so a wedged hook
 cannot hang a turn.
@@ -26,6 +26,13 @@ In Claude Code only the first prompt of a session and the rehydrate after
 compaction do the full injection. Later prompts check the session marker and
 exit: 68 to 101ms on a 10,000-engram store, against 34ms for a bare
 `node -e 0`. Re-run `plur init` to move an existing async registration to sync.
+
+A store with no embedding cache misses the hybrid deadline on its first
+prompt, because the cache is saved only when a hybrid search finishes. The
+Claude Code hook then starts one background build of the cache
+(`hook-inject --warm-embeddings`, lowest CPU priority, marker
+`.embeddings-warming` in the store, stopped after `PLUR_WARM_CEILING_MS`), so
+the next session's first prompt takes the hybrid path.
 
 The auto-rate hook never opens the store. It costs a Node start, a few small
 file reads, and when something is pending, one queue append and the start of a
@@ -39,13 +46,6 @@ plus the feedback call if the server has it.
 - `PLUR_AUTO_RATE_CEILING_MS` moves the hook's self-cap.
 - `PLUR_AUTO_RATE_WORKER_CEILING_MS` (default 15 min) moves the worker's
   guard against an immortal process.
-
-A store with no embedding cache misses the hybrid deadline on its first
-prompt, because the cache is saved only when a hybrid search finishes. The
-Claude Code hook then starts one background build of the cache
-(`hook-inject --warm-embeddings`, lowest CPU priority, marker
-`.embeddings-warming` in the store, stopped after `PLUR_WARM_CEILING_MS`), so
-the next session's first prompt takes the hybrid path.
 
 ## What actually consumes the budget
 

@@ -932,10 +932,10 @@ async function injectSession(
   // hybrid failure, BM25 (local-only by design — inject() never dials)
   // serves the turn.
   const { result, mode, hybrid } = await injectForHook(plur, task, injectOpts)
+  recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
   // A missed deadline leaves the hybrid search running; it must not hold
   // the process (and so the prompt) open until the watchdog.
   abandonedHybrid = mode === 'bm25' && hybridEnabled() ? hybrid : null
-  recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
   storeRoot = plur.storageRoot
   if (result.count > 0) {
     const parts: string[] = []

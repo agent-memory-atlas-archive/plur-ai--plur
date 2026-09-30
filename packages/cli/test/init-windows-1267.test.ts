@@ -111,7 +111,7 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     const shim = join(home, '.plur', 'bin', 'plur-hook.cmd').replace(/\\/g, '/')
     const cursor = JSON.parse(readFileSync(join(home, '.cursor', 'hooks.json'), 'utf-8'))
     const commands = Object.values(cursor.hooks as Record<string, HookSpec[]>).flat().map((h) => h.command)
-    // Four hook-cursor-* hooks plus #1310's auto-rate (merged in with #1418).
+    // Four hook-cursor-* hooks plus the auto-rate afterAgentResponse hook (#1310).
     expect(commands.length).toBe(5)
     for (const c of commands) expect(c.startsWith(`& "${shim}" hook-cursor-`) || c === `& "${shim}" hook-auto-rate cursor`, c).toBe(true)
   })
@@ -123,11 +123,13 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     const second = readSettings()
     expect(second.hooks).toEqual(first.hooks)
     for (const entries of Object.values(second.hooks ?? {})) {
-      // Keyed by matcher AND subcommand: #1310's auto-rate is its own Stop
-      // entry beside hook-learn-check, both with matcher '*' (merged in with #1418).
       const perMatcher = new Map<string, number>()
-      const key = (e: { matcher?: string; hooks: HookSpec[] }) => `${e.matcher ?? ''} ${e.hooks[0]?.args?.slice(1).join(' ') ?? e.hooks[0]?.command}`
-      for (const e of entries) perMatcher.set(key(e), (perMatcher.get(key(e)) ?? 0) + 1)
+      // Keyed by matcher and the hooks' subcommands: Stop carries two '*'
+      // entries by design, hook-learn-check and the auto-rate hook (#1310).
+      for (const e of entries) {
+        const key = `${e.matcher ?? ''}|${e.hooks.map((h) => h.args?.slice(1).join(' ')).join(',')}`
+        perMatcher.set(key, (perMatcher.get(key) ?? 0) + 1)
+      }
       // Every event's PLUR entries are distinct — nothing doubled.
       for (const n of perMatcher.values()) expect(n).toBe(1)
     }
