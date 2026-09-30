@@ -11,7 +11,7 @@
  * No network.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import yaml from 'js-yaml'
@@ -19,6 +19,26 @@ import { Plur } from '../src/index.js'
 import { storePrefix, namespaceEngramId } from '../src/engrams.js'
 import { tokenHealthKey } from '../src/remote-recall.js'
 import { normalizeEndpointUrl } from '../src/store/remote-store.js'
+
+/**
+ * Wait until learn()'s failed first push has settled: the row records the
+ * failure (`last_error`) AND its per-entry claim file is gone. Throws after
+ * 10s naming the condition that never became true.
+ */
+async function settled(plur: Plur, id: string): Promise<void> {
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    const row: any = await plur.getById(id)
+    const failed = !!row?.structured_data?._outbox?.last_error
+    const released = !existsSync(join(plur.outboxClaimsDir(), `${id.replace(/[^\w.-]/g, '_')}.json`))
+    if (failed && released) return
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out after 10s waiting for the failed first push of ${id} to settle: `
+        + (!failed ? 'the row never recorded last_error' : 'its outbox claim file was never released'))
+    }
+    await new Promise(r => setTimeout(r, 5))
+  }
+}
 
 const SCOPE = 'group:plur/eng'
 
@@ -95,8 +115,9 @@ describe('R2-CoreB core-policy#3 in flushOutbox: the 429 cooldown is per credent
       stores: [{ url: URL_, token: 'ta', scope: 'group:acme/team', shared: true, readonly: false }], index: false,
     }))
     const plur = new Plur({ path: dir })
-    await plur.learn('Team fact queued while offline', { scope: 'group:acme/team' })
-    await new Promise(r => setTimeout(r, 50))
+    const queuedRow = await plur.learn('Team fact queued while offline', { scope: 'group:acme/team' })
+    // learn()'s background push holds the per-entry claim until its failure is recorded (C3).
+    await settled(plur, queuedRow.id)
     fail = false
     posts.length = 0
     // Token 'ta' is in a 429 cooldown (per-credential state, CoreB format).

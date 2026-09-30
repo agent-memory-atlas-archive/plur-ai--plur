@@ -12,6 +12,16 @@ decidable equality. Every theorem holds for every oracle.
 The outbox lease (#1231) only exports `LOAD_FETCH_TIMEOUT_MS` from
 remote-store.ts so the lease margin is built from it; the value and every
 behaviour modelled here are unchanged, so these theorems still hold.
+
+Checked against the merge of main into #1228 (2026-09-30, #1277): still holds.
+- remote-recall.ts: a recall 422 is now a refusal (decision C5). It resets the
+  token's 403 streak, as `.ok` does in §4, and does not count toward the host
+  breaker (`Outbox.lean` §7, `recall_refusal_never_counts`).
+- remote-store.ts: typed `RemoteHttpError` and `RemoteAbortedError`, the
+  `Idempotency-Key` header, and an optional caller signal on `fetchBounded`.
+  A caller's abort throws `RemoteAbortedError`, which does not mark the host
+  down, and `load()` passes no caller signal. So §5's rule, that only a thrown
+  network fetch marks, is unchanged.
 -/
 
 namespace PlurSpec.R2CoreB

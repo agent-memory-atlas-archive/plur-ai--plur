@@ -1,4 +1,5 @@
 import PlurSpec.WritePath
+import PlurSpec.Outbox
 import PlurSpec.ScopeInject
 import PlurSpec.Persistence
 import PlurSpec.Adapters

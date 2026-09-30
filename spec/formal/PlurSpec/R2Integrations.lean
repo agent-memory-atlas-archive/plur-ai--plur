@@ -10,6 +10,11 @@ Checked against the merge of main into #1228 (2026-09-30): the model still holds
 Its only tools.ts change is plur_session_end's checkpoint key list, which now
 also tries the `_`-replacing `safeSessionKey` form (#1278; R2CLI §2). No tool's
 annotations, effects or plur_admin dispatch changed.
+
+Checked against #1277 (2026-09-30): still holds. tools.ts changes plur_outbox's
+output (retrying/needs_action) and makes its explicit flush `force`, and adds
+outbox notices to plur_status and plur_session_start. No tool's annotations,
+effects or plur_admin dispatch changed.
 -/
 
 namespace PlurSpec.R2Integrations

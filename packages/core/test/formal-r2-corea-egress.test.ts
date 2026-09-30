@@ -15,7 +15,7 @@
  * Model: spec/formal/PlurSpec/R2CoreA.lean §4. `globalThis.fetch` is mocked.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, utimesSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, utimesSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import yaml from 'js-yaml'
@@ -26,6 +26,26 @@ const REMOTE_A = 'https://a.example.com/sse'
 const REMOTE_B = 'https://b.example.com/sse'
 const SCOPE = 'group:acme/team'
 const INFRA = 'The staging box answers on 10.1.2.3:8080'
+
+/**
+ * Wait until learn()'s failed first push has settled: the row records the
+ * failure (`last_error`) AND its per-entry claim file is gone. Throws after
+ * 10s naming the condition that never became true.
+ */
+async function settled(plur: Plur, id: string): Promise<void> {
+  const deadline = Date.now() + 10_000
+  for (;;) {
+    const row: any = await plur.getById(id)
+    const failed = !!row?.structured_data?._outbox?.last_error
+    const released = !existsSync(join(plur.outboxClaimsDir(), `${id.replace(/[^\w.-]/g, '_')}.json`))
+    if (failed && released) return
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out after 10s waiting for the failed first push of ${id} to settle: `
+        + (!failed ? 'the row never recorded last_error' : 'its outbox claim file was never released'))
+    }
+    await new Promise(r => setTimeout(r, 5))
+  }
+}
 
 function fakeRemote(opts: { failPosts?: boolean } = {}) {
   const posts: Array<{ url: string; body: any }> = []
@@ -95,7 +115,8 @@ describe('core-index#9a — egress guards read the CURRENT config', () => {
     writeConfig(true)
     const plur = new Plur({ path: dir })
     const e = await plur.learn(INFRA, { scope: SCOPE })
-    await new Promise(r => setTimeout(r, 50))
+    // learn()'s background push holds the per-entry claim until its failure is recorded (C3).
+    await settled(plur, e.id)
     expect(((await plur.getById(e.id)) as any)?.structured_data?._outbox).toBeDefined()
     remote.setFailPosts(false)
     remote.posts.length = 0

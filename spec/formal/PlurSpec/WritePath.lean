@@ -298,9 +298,9 @@ theorem handoff_never_drops_owed_retire (t : Nat) (snap : TRow) (c : TConc) (ret
 /-! ### 1b. Two pushers, one row: at most one successful delivery (per process)
 
 Scope: ONE process. `_outboxInFlight` is in-memory, so this section says
-nothing about two processes flushing one store; that gap was a real
-counterexample before decision D2 (`pre_lease_cross_process_double_delivery`)
-and is closed by the on-disk lease, §1c (`leased_at_most_once_across_processes`).
+nothing about two processes flushing one store; across processes the
+per-entry claim and its re-read do (decision C3, §1c,
+`claimed_at_most_once_across_processes`).
 
 Pushers: `L` = learn()'s fire-and-forget push (in flight from the moment the
 row is written), `F` = a flushOutbox() that snapshots while L may be active.
@@ -310,8 +310,7 @@ what it selects. A finished push that succeeds is one delivery to the remote
 
 Checked against round 2 (2026-09-27): still holds because the `_outboxInFlight` claim
 is unchanged (learn() adds before its push and deletes in `finally`; the flush selects
-only unclaimed rows and claims them). The cross-process outbox lease (D2/F3) is NOT on
-this branch, so the in-process scope of this theorem is still the whole guarantee. -/
+only unclaimed rows and claims them). Across processes see §1c (claims, C3). -/
 
 inductive Pusher where
   | L | F
@@ -399,688 +398,293 @@ theorem unguarded_double_delivery :
     (run false init [.startF, .finish .L true, .finish .F true]).delivered = 2 := by
   decide
 
-/-! ### 1c. Decision D2: an on-disk lease — at most once ACROSS processes
+/-! ### 1c. Decision C3: per-entry claims plus a re-read — at most once ACROSS processes
 
-`guarded_at_most_once` (§1b) is per process: `_outboxInFlight` is an in-memory
-set. Two processes flushing one store (an MCP server and a CLI hook) share only
-the store file, so before the lease both selected the same queued row and both
-POSTed it (`pre_lease_cross_process_double_delivery`, replayed in
-`formal-outbox-lease.test.ts`).
+Replaces #1228's on-disk row lease (decision D2), removed by decision C3
+(2026-09-29): #1277's per-entry claims, as merged on main, are the one
+duplicate-push guard.
 
-Code (`outbox-lease.ts`, `_flushOutboxClaimed`, learn()'s remote branch):
-- `take p lag` — under the store lock, p reads the clock and selects the row
-  only when it is queued and `leaseFree`: unleased, its own lease, an expired
-  one, or one further out than `T + M` (no live holder with a sane clock can
-  have written it — the far-future clause), and records
-  `_outboxLease = (p, reading + T)`. learn() writes the row born leased.
-  `fresh` is the code after the audit of #1231 (finding 1): the clock is read
-  INSIDE the lock, after the load, so the reading is `now`. Without it the
-  reading was taken before waiting for the lock, `lag` earlier.
-- `start p` — the network call, only while `now + M ≤ until` (`canStartPush`).
-- `respond p ok` — the remote answers. Accepted: one delivery, and p now owes
-  the hand-off. Failed: p holds its lease again, to retry or release.
-- `merge p` — the merge-back, under the store lock: the accepted row is handed
-  off and p's own lease dropped (`dropLease`). A step of its own since the
-  audit of #1231 (finding 2): the merge-back waits for the store lock after the
-  POST, once per batch, and before that audit the model made the two one atomic
-  `finish`, which the code never was.
-- `abandon p` — a held row not pushed after all (lease ran short, breaker
-  opened mid-batch, a failed push): its lease is released in the merge-back.
-- `crash p` — the process dies; its lease stays on disk until it expires. A
-  holder that dies owing a hand-off is `lost`.
-- `tick d` — time passes. A push unanswered `R` after it started has failed
-  (requests are bounded: 30 s). A hand-off not merged back `R + W` after its
-  push started has failed too — `W` bounds the wait for the store lock (the file
-  lock's acquire timeout, 180 s: the waiter gives up) plus the write — and that
-  holder is `lost`.
+Code (`_claimOutboxEntry`, `_releaseOutboxClaim`, `_outboxRowStillQueued`,
+`_flushOutbox` / `_flushOutboxClaimed`, learn()'s remote branch):
+- `snap p k` — a pusher's snapshot shows the row queued under key `k` (a
+  flush's store load; learn() writes the row itself).
+- `claim p` — the claim file is created with O_EXCL (`link(2)`, or `wx`):
+  it succeeds only when no claim exists. A lapsed claim is taken over under a
+  takeover marker that also has one winner (`spec/formal/PlurSpec/Outbox.lean`
+  §5), so "at most one holder" is the step modelled here.
+- `reread p` — under the claim, the row is read again (`_outboxRowStillQueued`)
+  and pushed only while it is still queued under the same key. Otherwise the
+  pusher lets go.
+- `post p ok` — the POST. Accepted: the row is handed off (deleted) BEFORE the
+  claim is released. Refused: the failure is recorded, the row stays, the
+  claim is let go.
+- `release p` — only the holder's own claim is removed (the token check).
 
-The code picks `M = R + W + skew` (30 + 180 + 30 + 60 s). The guarantee
-(`leased_at_most_once_across_processes`): with fresh clock readings and
-`R + W ≤ M`, for any number of processes and every interleaving, the remote
-receives the engram at most once in every run in which no holder is lost. The
-three hypotheses are each necessary: `stale_clock_double_delivery` (finding 1),
-`short_margin_double_delivery` (finding 2: the pre-audit margin, 2 min, did not
-cover the lock wait), and `lost_handoff_double_delivery` — a holder killed, or
-timed out on the store lock, after the remote accepted and before its
-merge-back re-delivers once the lease expires: the documented at-least-once
-edge the single-process path always had. Retire DELETEs (`_retireRemote`) use
-the same lease and selection, so `delivered` stands for either network effect.
-Assumption: one clock (skew within the margin, see `outbox-lease.ts`).
+Crashes are not modelled here: a pusher that dies after the remote accepted
+but before the hand-off leaves the row queued, and the next pusher posts it
+again with the SAME key (decision C4). A key-honouring server collapses that
+retry, a key-ignoring one stores one more row (Outbox §3). Without crashes,
+every interleaving of any number of pushers POSTs the write at most once. -/
 
-What `P` stands for (review of #1231, 2026-09-28): `P` ranges over PUSHES, one
-lease each, not over `Plur` instances. One instance can run two pushes of the
-same row one after the other (`learn()`'s immediate push, then a flush's
-retry), and the code tells their leases apart by a per-lease `nonce`:
-`dropLease` removes a lease only when holder, nonce and expiry all match the
-lease that push wrote. That is `dropOwn` below with `p` a push. Matching by
-holder id alone, as the code did before that review, is `dropOwn` with `p` an
-instance, and it let a failed push release the lease of a later push by the
-same instance, so another process delivered the row twice. In the code,
-`leaseFree` still treats the instance's own lease as free. Two pushes by one
-instance are kept apart by the in-process claim (`_outboxInFlight`), which a
-push now holds from writing its lease until it has released it. Together, the
-claim and the per-lease release give the per-push `leaseFree` this model
-checks. The model text changed with that review, and no definition or proof
-did; `lake build` was not re-run for the change. -/
-
-inductive Phase where
+inductive CPh where
   | idle
-  | leased (expiry : Nat)
-  | pushing (start expiry : Nat)
-  | handing (start expiry : Nat)
-  | lost
+  | snap (k : Nat)
+  | claimed (k : Nat)
+  | pushing (k : Nat)
+  | handed
   deriving DecidableEq, Repr
 
-structure LState (P : Type) where
-  now       : Nat
-  queued    : Bool
-  lease     : Option (P × Nat)
-  phase     : P → Phase
+structure CState (P : Type) where
+  /-- The queued row's key, or `none` once it was handed off. -/
+  row       : Option Nat
+  claim     : Option P
+  phase     : P → CPh
   delivered : Nat
 
-inductive LEv (P : Type) where
-  | take (p : P) (lag : Nat)
-  | start (p : P)
-  | respond (p : P) (ok : Bool)
-  | merge (p : P)
-  | abandon (p : P)
-  | crash (p : P)
-  | tick (d : Nat)
+inductive CEv (P : Type) where
+  | snap (p : P)
+  | claim (p : P)
+  | reread (p : P)
+  | post (p : P) (ok : Bool)
+  | release (p : P)
 
-/-- `leased = false`: the pre-lease code. `fresh = false`: the clock read before
-the lock wait (pre-#1231-audit). `T` TTL, `M` margin, `R` request bound, `W`
-merge-back bound (store-lock wait + write). -/
-structure LCfg where
-  leased : Bool
-  fresh  : Bool
-  T : Nat
-  M : Nat
-  R : Nat
-  W : Nat
-  deriving DecidableEq, Repr
-
-section Lease
+section Claims
 variable {P : Type} [DecidableEq P]
 
-def upd (f : P → Phase) (p : P) (v : Phase) : P → Phase := fun q => if q = p then v else f q
+def cupd (f : P → CPh) (p : P) (v : CPh) : P → CPh := fun q => if q = p then v else f q
 
-/-- `leaseFree` in `outbox-lease.ts`, far-future clause included. -/
-def leaseFree (c : LCfg) (l : Option (P × Nat)) (p : P) (now : Nat) : Bool :=
-  !c.leased || match l with
-    | none => true
-    | some (q, e) => decide (q = p) || decide (e ≤ now) || decide (now + c.T + c.M < e)
+/-- `reread = false` is a claim with no re-read of the row (the counterexample). -/
+def cstep (reread : Bool) (s : CState P) : CEv P → CState P
+  | .snap p =>
+    match s.phase p, s.row with
+    | .idle, some k => { s with phase := cupd s.phase p (.snap k) }
+    | _, _ => s
+  | .claim p =>
+    match s.phase p, s.claim with
+    | .snap k, none => { s with claim := some p, phase := cupd s.phase p (.claimed k) }
+    | _, _ => s
+  | .reread p =>
+    match s.phase p with
+    | .claimed k =>
+      if !reread || s.row = some k then { s with phase := cupd s.phase p (.pushing k) }
+      else { s with claim := none, phase := cupd s.phase p .idle }
+    | _ => s
+  | .post p ok =>
+    match s.phase p with
+    | .pushing _ =>
+      if ok then { s with row := none, delivered := s.delivered + 1, phase := cupd s.phase p .handed }
+      else { s with claim := none, phase := cupd s.phase p .idle }
+    | _ => s
+  | .release p =>
+    match s.phase p with
+    | .handed => { s with claim := if s.claim = some p then none else s.claim, phase := cupd s.phase p .idle }
+    | _ => s
 
-/-- `dropLease`: only the push's own lease is released (`p` is a push — see §1c). -/
-def dropOwn (l : Option (P × Nat)) (p : P) : Option (P × Nat) :=
-  match l with
-  | some (q, e) => if q = p then none else some (q, e)
-  | none => none
+def crun (reread : Bool) (s : CState P) (es : List (CEv P)) : CState P := es.foldl (cstep reread) s
 
-/-- The clock reading `take` works from. -/
-def reading (c : LCfg) (now lag : Nat) : Nat := if c.fresh then now else now - lag
+/-- The row is queued under key `k`; nobody has touched it. -/
+def cinit (k : Nat) : CState P := { row := some k, claim := none, phase := fun _ => .idle, delivered := 0 }
 
-def lstep (c : LCfg) (s : LState P) : LEv P → LState P
-  | .take p lag =>
-      if s.phase p = .idle ∧ s.queued = true ∧ leaseFree c s.lease p (reading c s.now lag) = true then
-        { s with lease := some (p, reading c s.now lag + c.T),
-                 phase := upd s.phase p (.leased (reading c s.now lag + c.T)) }
-      else s
-  | .start p =>
-      match s.phase p with
-      | .leased u => if s.now + c.M ≤ u then { s with phase := upd s.phase p (.pushing s.now u) } else s
-      | _ => s
-  | .respond p ok =>
-      match s.phase p with
-      | .pushing st u =>
-          if ok then { s with phase := upd s.phase p (.handing st u), delivered := s.delivered + 1 }
-          else { s with phase := upd s.phase p (.leased u) }
-      | _ => s
-  | .merge p =>
-      match s.phase p with
-      | .handing _ _ => { s with phase := upd s.phase p .idle, lease := dropOwn s.lease p, queued := false }
-      | _ => s
-  | .abandon p =>
-      match s.phase p with
-      | .leased _ => { s with phase := upd s.phase p .idle, lease := dropOwn s.lease p }
-      | _ => s
-  | .crash p =>
-      match s.phase p with
-      | .handing _ _ => { s with phase := upd s.phase p .lost }
-      | .lost => s
-      | _ => { s with phase := upd s.phase p .idle }
-  | .tick d =>
-      { s with now := s.now + d,
-               phase := fun q => match s.phase q with
-                 | .pushing st u => if s.now + d < st + c.R then .pushing st u else .leased u
-                 | .handing st u => if s.now + d < st + c.R + c.W then .handing st u else .lost
-                 | ph => ph }
+def holds : CPh → Bool
+  | .claimed _ | .pushing _ | .handed => true
+  | _ => false
 
-def lrun (c : LCfg) (s : LState P) (evs : List (LEv P)) : LState P :=
-  evs.foldl (lstep c) s
+def CInv (s : CState P) : Prop :=
+  (∀ p, holds (s.phase p) = true → s.claim = some p) ∧
+  (∀ p k, s.phase p = .pushing k → s.row = some k ∧ s.delivered = 0) ∧
+  (∀ p, s.phase p = .handed → s.row = none) ∧
+  s.delivered ≤ 1 ∧ (s.delivered = 1 → s.row = none)
 
-/-- A queued row, nobody holding it, at time 0. -/
-def linit : LState P := { now := 0, queued := true, lease := none, phase := fun _ => .idle, delivered := 0 }
+theorem cinv_init (k : Nat) : CInv (cinit k : CState P) := by
+  simp [CInv, cinit, holds]
 
-/-- No holder has lost a hand-off (died, or gave up on the store lock, owing one). -/
-def NoLost (s : LState P) : Prop := ∀ p, s.phase p ≠ .lost
+/-- One pusher `p` changes phase to `v`; the claim, row and count become
+`c'`, `r'`, `d'`. The invariant holds after it when these side conditions do. -/
+theorem cinv_update (s : CState P) (p : P) (v : CPh) (r' : Option Nat) (c' : Option P) (d' : Nat)
+    (ha : holds v = true → c' = some p)
+    (hb : ∀ q, q ≠ p → holds (s.phase q) = true → c' = some q)
+    (hc : ∀ k, v = .pushing k → r' = some k ∧ d' = 0)
+    (hd : ∀ q, q ≠ p → ∀ k, s.phase q = .pushing k → r' = some k ∧ d' = 0)
+    (he : v = .handed → r' = none)
+    (hf : ∀ q, q ≠ p → s.phase q = .handed → r' = none)
+    (hg : d' ≤ 1 ∧ (d' = 1 → r' = none)) :
+    CInv ({ row := r', claim := c', phase := cupd s.phase p v, delivered := d' } : CState P) := by
+  refine ⟨?_, ?_, ?_, hg.1, hg.2⟩
+  · intro q hq
+    by_cases hqp : q = p
+    · subst hqp; exact ha (by simpa [cupd] using hq)
+    · exact hb q hqp (by simpa [cupd, hqp] using hq)
+  · intro q k hq
+    by_cases hqp : q = p
+    · subst hqp; exact hc k (by simpa [cupd] using hq)
+    · exact hd q hqp k (by simpa [cupd, hqp] using hq)
+  · intro q hq
+    by_cases hqp : q = p
+    · subst hqp; exact he (by simpa [cupd] using hq)
+    · exact hf q hqp (by simpa [cupd, hqp] using hq)
 
-omit [DecidableEq P] in
-theorem nolost_init : NoLost (linit : LState P) := by
-  intro p; simp [linit]
+/-- The claim names the only pusher in a holding phase. -/
+theorem only_holder (s : CState P) (h : CInv s) (p : P) (hcp : s.claim = some p) :
+    ∀ q, q ≠ p → holds (s.phase q) = false := by
+  intro q hqp
+  cases hq : holds (s.phase q)
+  · rfl
+  · have := h.1 q hq
+    rw [hcp] at this
+    exact absurd (Option.some.inj this).symm hqp
 
-/-- Lost is final: a lost holder never acts again. -/
-theorem lost_persists (c : LCfg) (s : LState P) (e : LEv P) (q : P) (h : s.phase q = .lost) :
-    (lstep c s e).phase q = .lost := by
+theorem not_holding_phase (s : CState P) (q : P) (hq : holds (s.phase q) = false) :
+    (∀ k, s.phase q ≠ .pushing k) ∧ s.phase q ≠ .handed := by
+  constructor
+  · intro k hk; rw [hk] at hq; simp [holds] at hq
+  · intro hk; rw [hk] at hq; simp [holds] at hq
+
+theorem cinv_step (s : CState P) (e : CEv P) (h : CInv s) : CInv (cstep true s e) := by
+  have hI := h
+  obtain ⟨hh, hp, hd, hle, h1⟩ := h
   cases e with
-  | take p lag =>
-    simp only [lstep]; split
-    · rename_i hg; simp only [upd]; by_cases hqp : q = p
-      · subst hqp; rw [h] at hg; simp at hg
-      · simp [hqp, h]
-    · exact h
-  | start p =>
-    simp only [lstep]; split
-    · split
-      · simp only [upd]; by_cases hqp : q = p
-        · subst hqp; simp_all
-        · simp [hqp, h]
-      · exact h
-    · exact h
-  | respond p ok =>
-    simp only [lstep]; split
-    · split
-      · simp only [upd]; by_cases hqp : q = p
-        · subst hqp; simp_all
-        · simp [hqp, h]
-      · simp only [upd]; by_cases hqp : q = p
-        · subst hqp; simp_all
-        · simp [hqp, h]
-    · exact h
-  | merge p =>
-    simp only [lstep]; split
-    · simp only [upd]; by_cases hqp : q = p
-      · subst hqp; simp_all
-      · simp [hqp, h]
-    · exact h
-  | abandon p =>
-    simp only [lstep]; split
-    · simp only [upd]; by_cases hqp : q = p
-      · subst hqp; simp_all
-      · simp [hqp, h]
-    · exact h
-  | crash p =>
-    simp only [lstep]; split
-    · simp only [upd]; by_cases hqp : q = p
-      · subst hqp; simp_all
-      · simp [hqp, h]
-    · exact h
-    · simp only [upd]; by_cases hqp : q = p
-      · subst hqp; simp_all
-      · simp [hqp, h]
-  | tick d => simp [lstep, h]
-
-theorem nolost_back (c : LCfg) (s : LState P) (e : LEv P) (h : NoLost (lstep c s e)) : NoLost s :=
-  fun q hq => h q (lost_persists c s e q hq)
-
-/-- The invariant, on every run in which no hand-off was lost. -/
-def LCore (c : LCfg) (s : LState P) : Prop :=
-  (s.lease.isSome = true → s.queued = true) ∧
-  (s.queued = false → s.delivered = 1) ∧
-  (s.delivered ≤ 1) ∧
-  (s.queued = true → s.delivered = 1 → ∃ q st u, s.phase q = .handing st u) ∧
-  (∀ p u, s.phase p = .leased u → s.lease = some (p, u) ∨ u ≤ s.now) ∧
-  (∀ p st u, s.phase p = .pushing st u →
-      s.lease = some (p, u) ∧ st + c.M ≤ u ∧ s.now < st + c.R ∧ s.delivered = 0) ∧
-  (∀ p st u, s.phase p = .handing st u →
-      s.lease = some (p, u) ∧ st + c.M ≤ u ∧ s.now < st + c.R + c.W ∧ s.delivered = 1 ∧ s.queued = true) ∧
-  (∀ q e, s.lease = some (q, e) → e ≤ s.now + c.T)
-
-def LInv (c : LCfg) (s : LState P) : Prop := NoLost s → LCore c s
-
-omit [DecidableEq P] in
-theorem linv_init (c : LCfg) : LInv c (linit : LState P) := by
-  intro _
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [linit]
-
-omit [DecidableEq P] in
-/-- Nobody else holds a live push or hand-off: the one lease names its holder. -/
-theorem holder_unique {s : LState P} {p q : P} {u v : Nat}
-    (hp : s.lease = some (p, u)) (hq : s.lease = some (q, v)) : p = q := by
-  rw [hp] at hq; cases hq; rfl
-
-/-- Under the protocol's hypotheses — the lease is honoured, clocks are read in
-the lock, and the margin covers a request plus the merge-back — the invariant
-is preserved by every step. -/
-theorem linv_step (c : LCfg) (hL : c.leased = true) (hF : c.fresh = true)
-    (hR : 0 < c.R) (hRW : c.R + c.W ≤ c.M) (s : LState P) (e : LEv P) (h : LInv c s) :
-    LInv c (lstep c s e) := by
-  intro hNL'
-  have hNL := nolost_back c s e hNL'
-  obtain ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩ := h hNL
-  cases e with
-  | take p lag =>
-    simp only [lstep]
-    split
-    · rename_i hg
-      obtain ⟨hidle, hq, hfree⟩ := hg
-      simp only [reading, hF, ite_true] at hfree ⊢
-      -- the lease blocks unless it is ours (impossible: p idle), expired, or bogus
-      have hblk : ∀ q e, s.lease = some (q, e) → q ≠ p → e ≤ s.now := by
-        intro q e hl hqp
-        rw [hl] at hfree
-        simp [leaseFree, hL, hqp] at hfree
-        have := hT q e hl
-        omega
-      -- nobody is pushing or handing: they would hold a live lease
-      have hnoH : ∀ q st u, s.phase q ≠ .handing st u := by
-        intro q st u hqa
-        obtain ⟨h1, h2, h3, _⟩ := hHa q st u hqa
-        have hqp : q ≠ p := by intro hh; subst hh; rw [hidle] at hqa; cases hqa
-        have := hblk q u h1 hqp; omega
-      have hnoP : ∀ q st u, s.phase q ≠ .pushing st u := by
-        intro q st u hqa
-        obtain ⟨h1, h2, h3, _⟩ := hPu q st u hqa
-        have hqp : q ≠ p := by intro hh; subst hh; rw [hidle] at hqa; cases hqa
-        have := hblk q u h1 hqp; omega
-      have hd0 : s.delivered = 0 := by
-        rcases Nat.lt_or_ge s.delivered 1 with h1 | h1
-        · omega
-        · obtain ⟨q, st, u, hqa⟩ := hH hq (by omega); exact absurd hqa (hnoH q st u)
-      refine ⟨fun _ => hq, fun h => by simp_all, by simp [hd0], fun _ h1 => by simp [hd0] at h1, ?_, ?_, ?_, ?_⟩
-      · intro q u hqu
-        simp only [upd] at hqu
-        by_cases hqp : q = p
-        · subst hqp; simp at hqu; subst hqu; left; rfl
-        · simp [hqp] at hqu
-          rcases hLe q u hqu with h1 | h1
-          · right; exact hblk q u h1 hqp
-          · right; exact h1
-      · intro q st u hqu
-        simp only [upd] at hqu
-        by_cases hqp : q = p
-        · subst hqp; simp at hqu
-        · simp [hqp] at hqu; exact absurd hqu (hnoP q st u)
-      · intro q st u hqu
-        simp only [upd] at hqu
-        by_cases hqp : q = p
-        · subst hqp; simp at hqu
-        · simp [hqp] at hqu; exact absurd hqu (hnoH q st u)
-      · intro q e hl
-        simp at hl; obtain ⟨_, h2⟩ := hl; subst h2; simp
-    · exact ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩
-  | start p =>
-    simp only [lstep]
-    split
-    · rename_i u hpu
-      split
-      · rename_i hle
-        have hlp : s.lease = some (p, u) := by
-          rcases hLe p u hpu with h1 | h1
-          · exact h1
+  | snap p =>
+    cases hph : s.phase p with
+    | idle =>
+      cases hrow : s.row with
+      | none => simpa [cstep, hph, hrow] using hI
+      | some k =>
+        have key := cinv_update s p (.snap k) s.row s.claim s.delivered
+          (by simp [holds]) (fun q _ hq => hh q hq) (by simp)
+          (fun q _ k' hq => hp q k' hq) (by simp) (fun q _ hq => hd q hq) ⟨hle, h1⟩
+        rw [hrow] at key
+        simpa [cstep, hph, hrow] using key
+    | _ => simpa [cstep, hph] using hI
+  | claim p =>
+    cases hph : s.phase p with
+    | snap k =>
+      cases hcl : s.claim with
+      | some _ => simpa [cstep, hph, hcl] using hI
+      | none =>
+        have hfree : ∀ q, holds (s.phase q) = false := by
+          intro q; cases hq : holds (s.phase q)
+          · rfl
+          · have := hh q hq; rw [hcl] at this; exact absurd this (by simp)
+        simp only [cstep, hph, hcl]
+        exact cinv_update s p (.claimed k) s.row (some p) s.delivered
+          (fun _ => rfl)
+          (fun q _ hq => by rw [hfree q] at hq; exact absurd hq (by simp))
+          (by simp)
+          (fun q _ k' hq => absurd hq ((not_holding_phase s q (hfree q)).1 k'))
+          (by simp)
+          (fun q _ hq => absurd hq (not_holding_phase s q (hfree q)).2)
+          ⟨hle, h1⟩
+    | _ => simpa [cstep, hph] using hI
+  | reread p =>
+    cases hph : s.phase p with
+    | claimed k =>
+      have hcp : s.claim = some p := hh p (by rw [hph]; rfl)
+      have honly := only_holder s hI p hcp
+      by_cases hrow : s.row = some k
+      · have hd0 : s.delivered = 0 := by
+          rcases Nat.lt_or_ge s.delivered 1 with hlt | hge
           · omega
-        have hq : s.queued = true := hLq (by simp [hlp])
-        have hd0 : s.delivered = 0 := by
-          rcases Nat.lt_or_ge s.delivered 1 with h1 | h1
-          · omega
-          · obtain ⟨q, st, v, hqa⟩ := hH hq (by omega)
-            have := holder_unique hlp (hHa q st v hqa).1
-            subst this; rw [hpu] at hqa; cases hqa
-        refine ⟨hLq, hQ, hD, ?_, ?_, ?_, ?_, hT⟩
-        · intro _ h1; dsimp only at h1; omega
-        · intro q v hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv
-          · simp [hqp] at hqv; exact hLe q v hqv
-        · intro q st v hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv; obtain ⟨h1, h2⟩ := hqv; subst h1; subst h2
-            exact ⟨hlp, hle, by dsimp only; omega, hd0⟩
-          · simp [hqp] at hqv; exact hPu q st v hqv
-        · intro q st v hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv
-          · simp [hqp] at hqv; exact hHa q st v hqv
-      · exact ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩
-    · exact ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩
-  | respond p ok =>
-    simp only [lstep]
-    split
-    · rename_i st u hpu
-      obtain ⟨hlp, hm, hn, hd0⟩ := hPu p st u hpu
-      have hq : s.queued = true := hLq (by simp [hlp])
-      -- another pusher or hander would hold the same lease
-      have hothers : ∀ q, q ≠ p → (∀ a b, s.phase q ≠ .pushing a b) ∧ (∀ a b, s.phase q ≠ .handing a b) := by
-        intro q hqp
-        refine ⟨fun a b hqa => hqp ?_, fun a b hqa => hqp ?_⟩
-        · exact (holder_unique (hPu q a b hqa).1 hlp)
-        · exact (holder_unique (hHa q a b hqa).1 hlp)
+          · have := h1 (by omega); rw [this] at hrow; exact absurd hrow (by simp)
+        have key := cinv_update s p (.pushing k) s.row s.claim s.delivered
+          (fun _ => hcp) (fun q _ hq => hh q hq)
+          (fun k' hk => by cases hk; exact ⟨hrow, hd0⟩)
+          (fun q _ k' hq => hp q k' hq) (by simp) (fun q _ hq => hd q hq) ⟨hle, h1⟩
+        rw [hrow] at key
+        simpa [cstep, hph, hrow] using key
+      · simp only [cstep, hph, hrow, Bool.not_true, Bool.false_or, decide_false, Bool.false_eq_true, ↓reduceIte]
+        exact cinv_update s p .idle s.row none s.delivered
+          (by simp [holds])
+          (fun q hqp hq => by rw [honly q hqp] at hq; exact absurd hq (by simp))
+          (by simp)
+          (fun q hqp k' hq => absurd hq ((not_holding_phase s q (honly q hqp)).1 k'))
+          (by simp)
+          (fun q hqp hq => absurd hq (not_holding_phase s q (honly q hqp)).2)
+          ⟨hle, h1⟩
+    | _ => simpa [cstep, hph] using hI
+  | post p ok =>
+    cases hph : s.phase p with
+    | pushing k =>
+      have hcp : s.claim = some p := hh p (by rw [hph]; rfl)
+      have honly := only_holder s hI p hcp
+      obtain ⟨_, hd0⟩ := hp p k hph
       cases ok
-      · simp only [Bool.false_eq_true, ite_false]
-        refine ⟨hLq, hQ, hD, ?_, ?_, ?_, ?_, hT⟩
-        · intro _ h1; dsimp only at h1; omega
-        · intro q v hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv; subst hqv; left; exact hlp
-          · simp [hqp] at hqv; exact hLe q v hqv
-        · intro q a b hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv
-          · simp [hqp] at hqv; exact absurd hqv ((hothers q hqp).1 a b)
-        · intro q a b hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv
-          · simp [hqp] at hqv; exact absurd hqv ((hothers q hqp).2 a b)
-      · simp only [ite_true]
-        refine ⟨hLq, fun h1 => by simp [hq] at h1, by simp; omega, ?_, ?_, ?_, ?_, hT⟩
-        · intro _ _; exact ⟨p, st, u, by simp [upd]⟩
-        · intro q v hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv
-          · simp [hqp] at hqv; exact hLe q v hqv
-        · intro q a b hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv
-          · simp [hqp] at hqv; exact absurd hqv ((hothers q hqp).1 a b)
-        · intro q a b hqv
-          simp only [upd] at hqv
-          by_cases hqp : q = p
-          · subst hqp; simp at hqv; obtain ⟨h1, h2⟩ := hqv; subst h1; subst h2
-            exact ⟨hlp, hm, by dsimp only; omega, by simp [hd0], hq⟩
-          · simp [hqp] at hqv; exact absurd hqv ((hothers q hqp).2 a b)
-    · exact ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩
-  | merge p =>
-    simp only [lstep]
-    split
-    · rename_i st u hpu
-      obtain ⟨hlp, _, _, hd1, hq⟩ := hHa p st u hpu
-      have hdrop : dropOwn s.lease p = none := by simp [hlp, dropOwn]
-      have hothers : ∀ q, q ≠ p → (∀ a b, s.phase q ≠ .pushing a b) ∧ (∀ a b, s.phase q ≠ .handing a b) := by
-        intro q hqp
-        refine ⟨fun a b hqa => hqp ?_, fun a b hqa => hqp ?_⟩
-        · exact (holder_unique (hPu q a b hqa).1 hlp)
-        · exact (holder_unique (hHa q a b hqa).1 hlp)
-      refine ⟨by simp [hdrop], fun _ => hd1, hD, fun h1 => by simp at h1, ?_, ?_, ?_, by simp [hdrop]⟩
-      · intro q v hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv
-          rcases hLe q v hqv with h1 | h1
-          · rw [hlp] at h1; cases h1; exact absurd rfl hqp
-          · right; exact h1
-      · intro q a b hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv; exact absurd hqv ((hothers q hqp).1 a b)
-      · intro q a b hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv; exact absurd hqv ((hothers q hqp).2 a b)
-    · exact ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩
-  | abandon p =>
-    simp only [lstep]
-    split
-    · rename_i u hpu
-      have hkeep : ∀ q v, q ≠ p → s.lease = some (q, v) → dropOwn s.lease p = some (q, v) := by
-        intro q v hqp hl; simp [hl, dropOwn, hqp]
-      refine ⟨?_, hQ, hD, ?_, ?_, ?_, ?_, ?_⟩
-      · intro hs; apply hLq
-        cases hl : s.lease with
-        | none => simp [hl, dropOwn] at hs
-        | some x => rfl
-      · intro hq h1
-        obtain ⟨q, st, v, hqa⟩ := hH hq h1
-        refine ⟨q, st, v, ?_⟩
-        have hqp : q ≠ p := by intro hh; subst hh; rw [hpu] at hqa; cases hqa
-        simp [upd, hqp, hqa]
-      · intro q v hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv
-          rcases hLe q v hqv with h1 | h1
-          · left; exact hkeep q v hqp h1
-          · right; exact h1
-      · intro q a b hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv
-          obtain ⟨h1, h2, h3, h4⟩ := hPu q a b hqv
-          exact ⟨hkeep q b hqp h1, h2, h3, h4⟩
-      · intro q a b hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv
-          obtain ⟨h1, h2, h3, h4, h5⟩ := hHa q a b hqv
-          exact ⟨hkeep q b hqp h1, h2, h3, h4, h5⟩
-      · intro q v hl
-        cases hl0 : s.lease with
-        | none => simp [hl0, dropOwn] at hl
-        | some x =>
-          obtain ⟨r, w⟩ := x
-          rw [hl0] at hl
-          simp only [dropOwn] at hl
-          split at hl
-          · simp at hl
-          · exact hT q v (by rw [hl0]; exact hl)
-    · exact ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩
-  | crash p =>
-    simp only [lstep]
-    split
-    · -- crashed owing a hand-off: lost, excluded by `hNL'`
-      rename_i st u hpu
-      exact absurd (by simp [lstep, hpu, upd]) (hNL' p)
-    · exact ⟨hLq, hQ, hD, hH, hLe, hPu, hHa, hT⟩
-    · rename_i hnh hnl
-      refine ⟨hLq, hQ, hD, ?_, ?_, ?_, ?_, hT⟩
-      · intro hq h1
-        obtain ⟨q, st, v, hqa⟩ := hH hq h1
-        have hqp : q ≠ p := by intro hh; subst hh; exact hnh st v hqa
-        exact ⟨q, st, v, by simp [upd, hqp, hqa]⟩
-      · intro q v hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv; exact hLe q v hqv
-      · intro q a b hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv; exact hPu q a b hqv
-      · intro q a b hqv
-        simp only [upd] at hqv
-        by_cases hqp : q = p
-        · subst hqp; simp at hqv
-        · simp [hqp] at hqv; exact hHa q a b hqv
-  | tick d =>
-    simp only [lstep]
-    refine ⟨hLq, hQ, hD, ?_, ?_, ?_, ?_, ?_⟩
-    · intro hq h1
-      obtain ⟨q, st, v, hqa⟩ := hH hq h1
-      refine ⟨q, st, v, ?_⟩
-      by_cases hlt : s.now + d < st + c.R + c.W
-      · simp [hqa, hlt]
-      · exact absurd (by simp [lstep, hqa, hlt]) (hNL' q)
-    · intro q v hqv
-      simp only at hqv
-      split at hqv
-      · rename_i st u hpu
-        split at hqv
-        · simp at hqv
-        · simp at hqv; subst hqv
-          left; exact (hPu q st u hpu).1
-      · rename_i st u hpu
-        split at hqv <;> simp at hqv
-      · rename_i hnp hnh
-        rcases hLe q v hqv with h1 | h1
-        · left; exact h1
-        · right; simp; omega
-    · intro q st v hqv
-      simp only at hqv
-      split at hqv
-      · rename_i st' u hpu
-        split at hqv
-        · rename_i hlt
-          simp at hqv; obtain ⟨h1, h2⟩ := hqv; subst h1; subst h2
-          obtain ⟨h1, h2, _, h4⟩ := hPu q st' u hpu
-          exact ⟨h1, h2, by simp; omega, h4⟩
-        · simp at hqv
-      · rename_i st' u hpu
-        split at hqv <;> simp at hqv
-      · simp_all
-    · intro q st v hqv
-      simp only at hqv
-      split at hqv
-      · rename_i st' u hpu
-        split at hqv <;> simp at hqv
-      · rename_i st' u hpu
-        split at hqv
-        · rename_i hlt
-          simp at hqv; obtain ⟨h1, h2⟩ := hqv; subst h1; subst h2
-          obtain ⟨h1, h2, _, h4, h5⟩ := hHa q st' u hpu
-          exact ⟨h1, h2, by simp; omega, h4, h5⟩
-        · simp at hqv
-      · simp_all
-    · intro q v hl
-      have := hT q v hl; simp; omega
+      · simp only [cstep, hph, Bool.false_eq_true, ↓reduceIte]
+        exact cinv_update s p .idle s.row none s.delivered
+          (by simp [holds])
+          (fun q hqp hq => by rw [honly q hqp] at hq; exact absurd hq (by simp))
+          (by simp)
+          (fun q hqp k' hq => absurd hq ((not_holding_phase s q (honly q hqp)).1 k'))
+          (by simp)
+          (fun q hqp hq => absurd hq (not_holding_phase s q (honly q hqp)).2)
+          ⟨hle, h1⟩
+      · simp only [cstep, hph, ↓reduceIte]
+        exact cinv_update s p .handed none s.claim (s.delivered + 1)
+          (fun _ => hcp)
+          (fun q hqp hq => by rw [honly q hqp] at hq; exact absurd hq (by simp))
+          (by simp)
+          (fun q hqp k' hq => absurd hq ((not_holding_phase s q (honly q hqp)).1 k'))
+          (fun _ => rfl)
+          (fun _ _ _ => rfl)
+          ⟨by omega, fun _ => rfl⟩
+    | _ => simpa [cstep, hph] using hI
+  | release p =>
+    cases hph : s.phase p with
+    | handed =>
+      have hcp : s.claim = some p := hh p (by rw [hph]; rfl)
+      have honly := only_holder s hI p hcp
+      simp only [cstep, hph, hcp, ↓reduceIte]
+      exact cinv_update s p .idle s.row none s.delivered
+        (by simp [holds])
+        (fun q hqp hq => by rw [honly q hqp] at hq; exact absurd hq (by simp))
+        (by simp)
+        (fun q hqp k' hq => absurd hq ((not_holding_phase s q (honly q hqp)).1 k'))
+        (by simp)
+        (fun q hqp hq => absurd hq (not_holding_phase s q (honly q hqp)).2)
+        ⟨hle, h1⟩
+    | _ => simpa [cstep, hph] using hI
 
-theorem linv_run (c : LCfg) (hL : c.leased = true) (hF : c.fresh = true)
-    (hR : 0 < c.R) (hRW : c.R + c.W ≤ c.M) (s : LState P) (evs : List (LEv P)) (h : LInv c s) :
-    LInv c (lrun c s evs) := by
-  induction evs generalizing s with
-  | nil => simpa [lrun] using h
+theorem cinv_run (es : List (CEv P)) : ∀ s : CState P, CInv s → CInv (crun true s es) := by
+  induction es with
+  | nil => intro s h; simpa [crun] using h
   | cons e es ih =>
-    simp only [lrun, List.foldl_cons]
-    exact ih _ (linv_step c hL hF hR hRW s e h)
+    intro s h
+    simp only [crun, List.foldl_cons]
+    exact ih _ (cinv_step s e h)
 
-/-- Decision D2 with the audit of #1231 applied: the lease honoured, the clock
-read inside the store lock, and a margin covering a request plus the merge-back
-(`R + W ≤ M`). Then for ANY number of processes, any lease length `T`, and
-EVERY interleaving of takes, pushes, answers, merge-backs, abandons, crashes and
-clock ticks in which no holder lost a hand-off, the remote receives the engram
-at most once. -/
-theorem leased_at_most_once_across_processes (c : LCfg) (hL : c.leased = true) (hF : c.fresh = true)
-    (hR : 0 < c.R) (hRW : c.R + c.W ≤ c.M) (evs : List (LEv P))
-    (hNL : NoLost (lrun c (linit : LState P) evs)) :
-    (lrun c (linit : LState P) evs).delivered ≤ 1 :=
-  (linv_run c hL hF hR hRW linit evs (linv_init c) hNL).2.2.1
+/-- **Decision C3.** With per-entry claims and the re-read under the claim, for
+any number of pushers (flushes in any process, learn()'s own push) and every
+interleaving without a crash, the remote receives the write at most once. -/
+theorem claimed_at_most_once_across_processes (k : Nat) (es : List (CEv P)) :
+    (crun true (cinit k) es).delivered ≤ 1 :=
+  (cinv_run es _ (cinv_init k)).2.2.2.1
 
-/-- A live foreign lease is honoured: while `q` holds an unexpired lease no
-further out than a live holder can write, `take` by anyone else changes nothing. -/
-theorem live_foreign_lease_blocks (c : LCfg) (hL : c.leased = true) (hF : c.fresh = true)
-    (s : LState P) (p q : P) (e lag : Nat)
-    (hpq : p ≠ q) (hl : s.lease = some (q, e)) (hlive : s.now < e) (hsane : e ≤ s.now + c.T + c.M) :
-    lstep c s (.take p lag) = s := by
-  have : leaseFree c s.lease p (reading c s.now lag) = false := by
-    simp [leaseFree, reading, hL, hF, hl, Ne.symm hpq]; omega
-  simp [lstep, this]
+end Claims
 
-/-- The far-future clause: a lease further out than any live holder with a sane
-clock can write does not park the row. -/
-theorem far_future_lease_ignored (c : LCfg) (hF : c.fresh = true) (s : LState P) (p q : P) (e lag : Nat)
-    (hq : s.queued = true) (hidle : s.phase p = .idle) (hl : s.lease = some (q, e))
-    (hfar : s.now + c.T + c.M < e) :
-    (lstep c s (.take p lag)).lease = some (p, s.now + c.T) := by
-  have : leaseFree c s.lease p s.now = true := by
-    simp [leaseFree, hl]; omega
-  simp [lstep, hidle, hq, this, reading, hF]
-
-/-- A crashed holder does not block forever: once its lease has expired, an
-idle process takes the queued row. -/
-theorem expired_lease_taken_over (c : LCfg) (hF : c.fresh = true) (s : LState P) (p q : P) (e lag : Nat)
-    (hq : s.queued = true) (hidle : s.phase p = .idle) (hl : s.lease = some (q, e)) (hexp : e ≤ s.now) :
-    (lstep c s (.take p lag)).lease = some (p, s.now + c.T) ∧
-    (lstep c s (.take p lag)).phase p = .leased (s.now + c.T) := by
-  have : leaseFree c s.lease p s.now = true := by simp [leaseFree, hl, hexp]
-  simp [lstep, hidle, hq, this, upd, reading, hF]
-
-/-- The lease is released on merge-back: after `merge` (success) or `abandon`
-(not pushed, or a failed push), the holder holds no lease on the row. -/
-theorem merge_releases_lease (c : LCfg) (s : LState P) (h : LCore c s) (p : P)
-    (a b : Nat) (hpu : s.phase p = .handing a b) :
-    (lstep c s (.merge p)).lease = none := by
-  have hlp := (h.2.2.2.2.2.2.1 p a b hpu).1
-  simp [lstep, hpu, hlp, dropOwn]
-
-theorem abandon_releases_lease (c : LCfg) (s : LState P) (p : P) (u : Nat)
-    (hpu : s.phase p = .leased u) (hlp : s.lease = some (p, u)) :
-    (lstep c s (.abandon p)).lease = none := by
-  simp [lstep, hpu, hlp, dropOwn]
-
-/-- The protocol as shipped after the audit of #1231, in small numbers
-(`T = 10`, `M = 4`, `R = 1`, `W = 2`). -/
-def cfgFixed : LCfg := { leased := true, fresh := true, T := 10, M := 4, R := 1, W := 2 }
-
-/-- Non-vacuity: the leased protocol delivers; a holder that crashed before
-pushing is taken over after its lease expires and the row is delivered once; a
-failed push is retried by another process after its lease is released. -/
-theorem leased_delivers :
-    (lrun cfgFixed (linit : LState Bool) [.take true 0, .start true, .respond true true, .merge true]).delivered = 1 ∧
-    (lrun cfgFixed (linit : LState Bool)
-      [.take true 0, .crash true, .take false 0, .tick 10, .take false 0, .start false,
-       .respond false true, .merge false]).delivered = 1 ∧
-    (lrun cfgFixed (linit : LState Bool)
-      [.take true 0, .start true, .respond true false, .abandon true, .take false 0, .start false,
-       .respond false true, .merge false]).delivered = 1 := by
+/-- Non-vacuity: a pusher does deliver, and a refused first push is retried by
+another pusher that then delivers. -/
+theorem claimed_delivers :
+    (crun true (cinit 7 : CState Bool) [.snap true, .claim true, .reread true, .post true true]).delivered = 1 ∧
+    (crun true (cinit 7 : CState Bool)
+      [.snap true, .claim true, .reread true, .post true false,
+       .snap false, .claim false, .reread false, .post false true]).delivered = 1 := by
   decide
 
-/-- Counterexample on the PRE-LEASE code (the cross-process gap left open by
-`guarded_at_most_once`, replayed as the first test of
-`formal-outbox-lease.test.ts`): two processes each select the row and each POST it. -/
-theorem pre_lease_cross_process_double_delivery :
-    (lrun { cfgFixed with leased := false } (linit : LState Bool)
-      [.take true 0, .take false 0, .start true, .start false, .respond true true,
-       .respond false true]).delivered = 2 := by
+/-- Counterexample (review of #1277; replayed in `outbox-claim-races.test.ts`):
+without the re-read, a pusher whose snapshot predates another's delivery takes
+the claim after it was released and posts the write a second time. -/
+theorem claim_without_reread_double_delivery :
+    (crun false (cinit 7 : CState Bool)
+      [.snap true, .snap false, .claim true, .reread true, .post true true, .release true,
+       .claim false, .reread false, .post false true]).delivered = 2 := by
   decide
 
-/-- Audit of #1231, finding 1 (replayed in `formal-outbox-lease.test.ts`): a
-clock read BEFORE waiting for the store lock. `false` read the clock at 0 and
-waited; meanwhile `true` took the row at 5 and is pushing it. To the stale
-reading, `true`'s live lease looks more than `T + M` away — the far-future
-clause frees it — and both deliver. No holder is lost. -/
-theorem stale_clock_double_delivery :
-    let s := lrun { cfgFixed with fresh := false } (linit : LState Bool)
-      [.tick 5, .take true 0, .start true, .take false 5, .start false,
-       .respond true true, .respond false true]
-    s.delivered = 2 ∧ s.phase true ≠ .lost ∧ s.phase false ≠ .lost := by
+/-- The same schedule with the re-read: the late pusher finds the row gone and
+lets go. -/
+theorem reread_blocks_late_pusher :
+    (crun true (cinit 7 : CState Bool)
+      [.snap true, .snap false, .claim true, .reread true, .post true true, .release true,
+       .claim false, .reread false, .post false true]).delivered = 1 := by
   decide
-
-/-- Audit of #1231, finding 2 (replayed in `formal-outbox-lease.test.ts`): the
-pre-audit margin (2 min) covered the request but not the wait for the store
-lock (`M < R + W`). The last push starts as late as the margin allows, the
-remote accepts, the merge-back waits for the lock past the lease's end, and
-another process takes the row and delivers it again — though nobody crashed
-and no wait exceeded its bound. -/
-theorem short_margin_double_delivery :
-    let s := lrun { cfgFixed with M := 2, R := 1, W := 3 } (linit : LState Bool)
-      [.take true 0, .tick 8, .start true, .respond true true, .tick 2,
-       .take false 0, .start false, .respond false true]
-    s.delivered = 2 ∧ s.phase true ≠ .lost ∧ s.phase false ≠ .lost := by
-  decide
-
-/-- The documented at-least-once edge, which `NoLost` excludes: the remote
-accepted, then the holder died (or gave up on the store lock) before its
-merge-back. Its lease expires and another process delivers the row again. -/
-theorem lost_handoff_double_delivery :
-    let s := lrun cfgFixed (linit : LState Bool)
-      [.take true 0, .start true, .respond true true, .crash true, .tick 10,
-       .take false 0, .start false, .respond false true]
-    s.delivered = 2 ∧ s.phase true = .lost := by
-  decide
-
-end Lease
 
 /-! ## 2. Invariant `_outbox ⇒ scope = _outbox.target_scope` (core-index#3)
 

@@ -342,3 +342,15 @@ Tests (`formal-outbox-lease.test.ts`): "a failed learn() push does not release t
 Mutation checks: reverting both `learn()` fixes makes the interleaving test fail (the remote accepts two copies). Reverting only the early claim release, with the nonce kept, leaves it green, because either fix alone closes this interleaving. Removing either margin gate fails its own test. `dropLease` matching by holder only fails the unit test.
 
 Not done: #1248 (the in-process mutex queue in front of the file lock has no bound, so the margin's lock-wait budget covers only the file-lock part). Bounding it changes every store writer, not only the outbox, so it stays filed.
+
+## Decision C3 applied (2026-09-30): claims replace the lease
+
+Owner decision C3: #1277's per-entry claims, as merged on main, are the one duplicate-push guard. The merge of main into #1228 removed the on-disk row lease (`outbox-lease.ts`, `_outboxLease`) from learn(), flushOutbox() and listOutbox(). The lease sections above are history.
+
+Model (§1c of `PlurSpec/WritePath.lean`, rewritten): pushers of any type with decidable equality; events snap / claim (O_EXCL: only when no claim exists) / reread (push only while the row is still queued under the same key) / post ok|fail (accepted: the row is handed off BEFORE the claim is released) / release (only the holder's own claim). Invariant `CInv` (`cinv_init`, `cinv_update`, `cinv_step`, `cinv_run`).
+- `claimed_at_most_once_across_processes`: for any number of pushers and every crash-free interleaving, the remote receives the write at most once.
+- `claimed_delivers`: non-vacuity (a delivery; a refused push retried by another pusher).
+- `claim_without_reread_double_delivery`: the counterexample for a claim without the re-read (a pusher whose snapshot predates another's delivery posts again). `reread_blocks_late_pusher`: the same schedule with the re-read.
+- Crashes after an accepted POST re-deliver with the same key (decision C4): `Outbox.lean` §3.
+
+Kept from #1228 on top of main's claims: only the writer that took a claim releases it (`Outbox.lean` §5, `only_taker_releases`; main's rule let an instance with no token remove another's claim, `main_rule_foreign_release`, replayed in `outbox-claim-ownership.test.ts`), and `listOutbox().leased_until` read from the claim file alone (§6).

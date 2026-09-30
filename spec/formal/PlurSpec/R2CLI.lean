@@ -34,6 +34,17 @@ hook-inject watchdog marks the run stopping, so a stopped run prints nothing
 and writes no marker. It still releases the inject lock through
 `releaseInjectLock`. Session-dir vetting, keys, the lock and the counters are
 unchanged.
+
+Checked against #1277, #1400, #1414 and #1422 (merged into #1228 on 2026-09-30): still holds.
+- hook-session-end now tries `hookSessionKey`, then `legacyHookSessionKeys`, then
+  each of `[payload, env, ppid]` in the `_`-replacing and the stripped form. That
+  is a superset of §2's `closerKeys`, so `closer_finds_writer` still holds. It
+  then flushes the outbox, which is not modelled here.
+- hook-inject: a stopped run prints nothing (#1422). The embedding warm-up
+  (#1414) takes a single-flight marker with `wx` in the store root, not in the
+  hook state dir of §1. The inject lock and its release (§3) are unchanged.
+- doctor: `overall` also requires a deliverable outbox (#1299). §5's
+  `readyLine`/`hookHarnesses` claim is unchanged.
 -/
 
 namespace PlurSpec.R2CLI

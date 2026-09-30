@@ -26,6 +26,13 @@ compaction do the full injection. Later prompts check the session marker and
 exit: 68 to 101ms on a 10,000-engram store, against 34ms for a bare
 `node -e 0`. Re-run `plur init` to move an existing async registration to sync.
 
+A store with no embedding cache misses the hybrid deadline on its first
+prompt, because the cache is saved only when a hybrid search finishes. The
+Claude Code hook then starts one background build of the cache
+(`hook-inject --warm-embeddings`, lowest CPU priority, marker
+`.embeddings-warming` in the store, stopped after `PLUR_WARM_CEILING_MS`), so
+the next session's first prompt takes the hybrid path.
+
 ## What actually consumes the budget
 
 A synchronous injection runs hybrid search first and falls back to BM25 on a
@@ -113,3 +120,33 @@ time plur inject 'test'     # BM25-only cost for your store
 
 A store whose BM25 pass alone approaches the harness budget wants
 `plur forget`/decay attention, not a larger timeout.
+
+## Outbox flush at session end (#1269)
+
+Session-end and stop hooks also retry queued team writes (the outbox). They
+are bounded so they cannot cost the hook its budget:
+
+| Harness | Hook | Hook timeout | Flush budget |
+|---|---|---|---|
+| Claude Code | `SessionEnd` | 5s | 2.5s |
+| Codex | `SessionEnd` | 3s (clamped by Codex) | 1.2s |
+| Cursor | `stop` | 3s | 1.2s |
+
+With nothing queued the flush is skipped after one file read. Cursor's `stop`
+fires on every turn, so it retries at most once every five minutes. A throttle
+marker dated in the future, from clock skew, counts as expired. When the budget
+runs out the in-flight push is cut, nothing further starts, and every
+undelivered write stays queued. A cut is our time running out, not a failure
+of the remote, so it does not count toward the host's circuit breaker. The
+budget starts after the local store load. A push cut mid-flight is recorded
+and retried on the next flush with the same idempotency key, so a
+key-honouring server keeps one copy however slow it is
+(`docs/remote-store-contract.md`).
+
+```sh
+PLUR_HOOK_OUTBOX_FLUSH=0        # turn the hook flush off
+PLUR_HOOK_OUTBOX_FLUSH_MS=800   # smaller budget; keep it well below the hook timeout
+```
+
+`plur sync` and `plur outbox --flush` flush without a budget (each request is
+still bounded at 30s).
