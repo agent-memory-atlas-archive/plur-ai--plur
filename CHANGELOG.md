@@ -65,9 +65,13 @@ what you decided about the folder:
   end, so a resumed conversation there keeps its unexpired question.
 - **Some folders cannot be answered from the question.** A folder rule reads
   `*` and `?` as a pattern, so a "yes" for a folder named `x*` would also
-  cover its sibling `xyz` (#1493). A path with `*`, `?` or `[`, or with a
-  control or line-break character, gets a short notice instead: the path is
-  shown JSON-escaped as quoted data, and no command or nonce is offered. The
+  cover its sibling `xyz` (#1493). A path with `*`, `?` or `[`, a control or
+  line-break character, or a bidi or zero-width character (U+200B–U+200F,
+  U+202A–U+202E, U+2066–U+2069, U+FEFF) gets a short notice instead, and so
+  does a path with `$`, a backtick, `%`, `!` or `"` on Windows, where the
+  offered command double-quotes the folder and bash, PowerShell or cmd would
+  still expand them. The path is shown JSON-escaped as quoted data (`$` and
+  backticks escaped too), and no command or nonce is offered. The
   folder stays undecided and is asked about once per session. Set it by hand.
 - Asking changes nothing. The question no longer registers the folder's own
   `.plur/engrams.yaml` as a project store in config.yaml (the hooks build

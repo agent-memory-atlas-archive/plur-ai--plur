@@ -24,6 +24,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, realpathSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { spawnSync } from 'child_process'
+import { pathToFileURL } from 'url'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
 
@@ -34,6 +36,9 @@ const posix = process.platform !== 'win32'
 let dir: string
 let plurRoot: string
 let env: NodeJS.ProcessEnv
+/** Node flags before the CLI path: the win32 stub preload, or nothing. */
+let nodePre: string[] = []
+const WIN32_PRELOAD = pathToFileURL(join(__dirname, 'helpers', 'win32-platform.mjs')).href
 
 function setup(base: string): void {
   dir = base
@@ -53,7 +58,7 @@ function setup(base: string): void {
 }
 
 function cli(args: string[], input: unknown, cwd: string, extraEnv: NodeJS.ProcessEnv = {}): { stdout: string; stderr: string; status: number } {
-  const r = runCli('node', [CLI, ...args], {
+  const r = runCli('node', [...nodePre, CLI, ...args], {
     encoding: 'utf-8', env: { ...env, ...extraEnv }, cwd,
     input: typeof input === 'string' ? input : JSON.stringify(input),
   })
@@ -213,5 +218,115 @@ describe('asking in an undecided folder does not register its .plur store (#1418
     const on = context(cli(['hook-inject'], { session_id: 'cc-on', cwd: onProj, hook_event_name: 'UserPromptSubmit', prompt: 'codeword fixture deploys leaked repo store' }, onProj).stdout)
     expect(on).toContain('ZEPHYRQUILL')
     expect(on).not.toContain('ORCHIDLANTERN')
+  })
+})
+
+/**
+ * Runs every line of `text` through bash, with `plur` stubbed to do nothing,
+ * in `cwd`. The folder question is pasted into a shell by the agent, so no
+ * line of it may run a command hidden in a folder name.
+ */
+function runLinesInBash(text: string, cwd: string): void {
+  for (const line of text.split('\n')) {
+    spawnSync('bash', ['-c', `plur() { :; }; ${line}`], { cwd, encoding: 'utf8' })
+  }
+}
+
+describe.skipIf(!posix)('on Windows, a folder named with shell metacharacters is offered no command (#1418 review)', () => {
+  let repo: string
+  beforeEach(() => {
+    setup(realpathSync(mkdtempSync(join(tmpdir(), 'plur-ask-win-'))))
+    repo = join(dir, 'repo')
+    mkdirSync(join(repo, '.git'), { recursive: true })
+    nodePre = ['--import', WIN32_PRELOAD]
+  })
+  afterEach(() => { nodePre = []; rmSync(dir, { recursive: true, force: true }) })
+
+  it.each([
+    ['command substitution', 'x$(touch CANARY)', true],
+    ['backtick', 'x`touch CANARY`', true],
+    ['cmd %VAR%', 'x%PATH%', false],
+    ['cmd !VAR!', 'x!PATH!', false],
+    ['double quote', 'x"q', false],
+  ])('%s: %s', (label, name, canary) => {
+    const folder = join(repo, name)
+    mkdirSync(folder, { recursive: true })
+    const out = askAll(folder, `win-${label.replace(/\W/g, '')}`)
+    for (const [editor, { text, rule }] of Object.entries(out)) {
+      expect(text, editor).toContain('cannot be registered from this question')
+      expect(text, editor).toContain('Windows shell')
+      expect(text, editor).not.toMatch(/plur folders set|--nonce/)
+      if (rule !== undefined) expect(rule, editor).not.toMatch(/plur folders set|--nonce/)
+      if (canary) {
+        const run = join(dir, `bash-${editor}`)
+        mkdirSync(run)
+        runLinesInBash(text, run)
+        expect(existsSync(join(run, 'CANARY')), editor).toBe(false)
+      }
+    }
+    expect(noncesIssued()).toBe(0)
+    expect(existsSync(join(plurRoot, 'folders.yaml'))).toBe(false)
+  })
+
+  it('a folder with none of them is still offered its commands', () => {
+    const folder = join(repo, 'plain')
+    mkdirSync(folder, { recursive: true })
+    const text = context(cli(['hook-inject'], { session_id: 'cc-plain', cwd: folder, hook_event_name: 'UserPromptSubmit', prompt: PROMPT }, folder).stdout)
+    expect(text).toMatch(/plur folders set \S+ --on --nonce [0-9a-f]{32}/)
+  })
+})
+
+describe.skipIf(!posix)('on macOS and Linux, shell metacharacters stay offerable, single-quoted (#1418 review)', () => {
+  let repo: string
+  beforeEach(() => {
+    setup(realpathSync(mkdtempSync(join(tmpdir(), 'plur-ask-posix-'))))
+    repo = join(dir, 'repo')
+    mkdirSync(join(repo, '.git'), { recursive: true })
+  })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it.each(['x$(touch CANARY)', 'x`touch CANARY`', 'x%PATH%!PATH!"q'])('%s', (name) => {
+    const folder = join(repo, name)
+    mkdirSync(folder, { recursive: true })
+    const text = context(cli(['hook-inject'], { session_id: 'cc-posix', cwd: folder, hook_event_name: 'UserPromptSubmit', prompt: PROMPT }, folder).stdout)
+    const yes = /^- Yes: (plur folders set .* --on --nonce [0-9a-f]{32})$/m.exec(text)
+    expect(yes, text).not.toBeNull()
+    const run = join(dir, 'bash')
+    mkdirSync(run)
+    // The offered command reaches plur with the folder unchanged, and runs nothing.
+    const r = spawnSync('bash', ['-c', `plur() { printf '%s\\n' "$3"; }; ${yes![1]}`], { cwd: run, encoding: 'utf8' })
+    expect(r.stdout).toBe(`${folder}\n`)
+    expect(existsSync(join(run, 'CANARY'))).toBe(false)
+  })
+})
+
+describe.skipIf(!posix)('a folder path with a bidi or zero-width character is shown escaped, with no command (#1418 review)', () => {
+  let repo: string
+  beforeEach(() => {
+    setup(realpathSync(mkdtempSync(join(tmpdir(), 'plur-ask-bidi-'))))
+    repo = join(dir, 'repo')
+    mkdirSync(join(repo, '.git'), { recursive: true })
+  })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it.each([
+    ['U+202E', 'exe.\u202Etxt', '\\u202e'],
+    ['U+2066', 'a\u2066b', '\\u2066'],
+    ['U+200B', 'a\u200Bb', '\\u200b'],
+    ['U+200F', 'a\u200Fb', '\\u200f'],
+    ['U+FEFF', 'a\uFEFFb', '\\ufeff'],
+  ])('%s', (label, name, escaped) => {
+    const folder = join(repo, name)
+    mkdirSync(folder, { recursive: true })
+    const out = askAll(folder, `bidi-${label.slice(2)}`)
+    for (const [editor, { text, rule }] of Object.entries(out)) {
+      expect(text, editor).toContain('cannot be registered from this question')
+      expect(text, editor).toContain(escaped)
+      for (const t of [text, rule ?? '']) {
+        expect(t, editor).not.toMatch(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/)
+        expect(t, editor).not.toMatch(/plur folders set|--nonce/)
+      }
+    }
+    expect(noncesIssued()).toBe(0)
   })
 })
