@@ -1,11 +1,12 @@
 import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync } from 'fs'
 import { dirname, join, resolve } from 'path'
-import { tmpdir, homedir, hostname, setPriority } from 'os'
+import { homedir, hostname, setPriority } from 'os'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
 import { safeSessionKey } from '../lib/session-key.js'
+import { hookSessionDir, readSessionTask, writeSessionTask } from '../lib/session-task.js'
 import { injectWithFallback, hybridEnabled, type Injectable, type InjectOutcome } from '../lib/codex-hook-io.js'
 import { correctionReminder } from './hook-correction-detect.js'
 
@@ -116,16 +117,10 @@ function claudeHookEventName(
  */
 const NO_CONTEXT_EVENTS = new Set(['PostCompact'])
 
-/**
- * The last task seen for a Claude Code session, keyed on the payload
- * `session_id`. The SessionStart(compact) payload carries no compact_summary,
- * so rehydration queries with this. It is rewritten on every prompt; the
- * session marker keeps only the first one.
- */
-function sessionTaskPath(input: Record<string, unknown>): string | null {
-  const id = input.session_id
-  return typeof id === 'string' && id ? join(sessionDir(), `${safeSessionKey(id)}.task`) : null
-}
+// The last task seen for a Claude Code session, keyed on the payload
+// `session_id` (lib/session-task.ts): the SessionStart(compact) payload carries
+// no compact_summary, so rehydration queries with it. Rewritten on every
+// prompt, length-capped, 0600 in a verified 0700 dir, removed at SessionEnd.
 
 /**
  * #1278: the key for this session's marker, reminder clock and inject lock.
@@ -219,21 +214,25 @@ function surfaceRemoteOutcomes(plur: Plur): string[] {
   }
 }
 
-function sessionDir(): string {
-  const dir = join(tmpdir(), 'plur-sessions')
-  // Fail-open: an unwritable $TMPDIR (read-only tmpfs, full disk) must never
-  // crash the prompt. Swallow the mkdir error and return the path anyway —
-  // downstream state-dir writes are individually wrapped and degrade to no-ops.
-  try { mkdirSync(dir, { recursive: true }) } catch { /* fail-open */ }
-  return dir
+function sessionDir(): string | null {
+  // 0700, owned by this user, never a symlink; a refused shared dir falls back
+  // to a private one, and null when both are refused (lib/session-task.ts).
+  // Null means persist nothing — never write elsewhere. Fail-open: state
+  // writes are individually wrapped and the prompt is never broken.
+  return hookSessionDir()
 }
 
-function sessionMarkerPath(key: string): string {
-  return join(sessionDir(), `${key}.marker`)
+function sessionStatePath(key: string, ext: string): string | null {
+  const dir = sessionDir()
+  return dir ? join(dir, `${key}.${ext}`) : null
 }
 
-function lastReminderPath(key: string): string {
-  return join(sessionDir(), `${key}.reminded`)
+function sessionMarkerPath(key: string): string | null {
+  return sessionStatePath(key, 'marker')
+}
+
+function lastReminderPath(key: string): string | null {
+  return sessionStatePath(key, 'reminded')
 }
 
 function readStdinSync(): Record<string, unknown> {
@@ -258,6 +257,7 @@ function readStdinSync(): Record<string, unknown> {
 
 function isReminderDue(key: string): boolean {
   const path = lastReminderPath(key)
+  if (!path) return false // no state dir: nothing marks the session, never reached
   try {
     const stat = statSync(path)
     return Date.now() - stat.mtimeMs > REMINDER_INTERVAL_MS
@@ -270,7 +270,8 @@ function isReminderDue(key: string): boolean {
 function touchReminder(key: string): void {
   // Fail-open: a state-dir write failing (unwritable $TMPDIR) must never crash
   // the prompt. The reminder timer is best-effort bookkeeping.
-  try { writeFileSync(lastReminderPath(key), String(Date.now())) } catch { /* fail-open */ }
+  const path = lastReminderPath(key)
+  if (path) try { writeFileSync(path, String(Date.now())) } catch { /* fail-open */ }
 }
 
 function extractEventTask(input: Record<string, unknown>, event: string): string {
@@ -318,7 +319,7 @@ function extractEventTask(input: Record<string, unknown>, event: string): string
  * Does not attempt LLM-quality summaries — that context is gone.
  */
 function processDeferredWrapups(): string | null {
-  const plurDir = process.env.PLUR_PATH ?? join(homedir(), '.plur')
+  const plurDir = process.env.PLUR_PATH || join(homedir(), '.plur') // `||`: empty means unset (H3)
   const sessionsDir = join(plurDir, 'sessions')
   if (!existsSync(sessionsDir)) return null
 
@@ -546,12 +547,16 @@ let heldInjectLock: string | null = null
 // the full injection on every prompt of the session.
 const MAX_INJECT_ATTEMPTS = 2
 
-function attemptsPath(key: string): string {
-  return join(sessionDir(), `${key}.attempts`)
+// Null when there is no usable state dir (#1395): nothing is counted, so the
+// cap cannot apply, exactly as no marker can be written there either.
+function attemptsPath(key: string): string | null {
+  return sessionStatePath(key, 'attempts')
 }
 
 function readAttempts(key: string): number {
-  try { return parseInt(readFileSync(attemptsPath(key), 'utf8'), 10) || 0 } catch { return 0 }
+  const path = attemptsPath(key)
+  if (!path) return 0
+  try { return parseInt(readFileSync(path, 'utf8'), 10) || 0 } catch { return 0 }
 }
 
 export async function run(args: string[], flags: GlobalFlags): Promise<void> {
@@ -614,7 +619,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     // the memory receipt can count (engram, session) pairs from hook traffic —
     // which is the large majority of all injections.
     let eventSessionId: string | undefined
-    try { eventSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
+    if (marker) try { eventSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
     const result = await plur.inject(task, { budget: 3000, source: 'hook', session_id: eventSessionId })
     if (result.count > 0) {
       const parts: string[] = []
@@ -630,13 +635,10 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   }
 
   // Session already started — check if periodic reminder is due
-  if (!isRehydrate && existsSync(marker)) {
+  if (!isRehydrate && marker && existsSync(marker)) {
     // Keep the latest prompt for rehydration after compaction (#1274 reads it).
     const prompt = input.prompt
-    const taskPath = sessionTaskPath(input)
-    if (taskPath && typeof prompt === 'string' && prompt) {
-      try { writeFileSync(taskPath, prompt) } catch { /* fail-open */ }
-    }
+    if (typeof prompt === 'string') writeSessionTask(input.session_id, prompt)
     const lines: string[] = []
     if (isReminderDue(key)) {
       touchReminder(key)
@@ -657,14 +659,16 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Multiple rapid async firings (datacore#33) otherwise pile up at ~160 MB
   // RSS each and trigger an OOM cascade. Lock is stale after HOOK_CEILING_MS
   // so a crashed process never permanently blocks subsequent invocations.
-  const injectLock = join(sessionDir(), `${key}.injecting`)
+  const injectLock = sessionStatePath(key, 'injecting')
   let injectLockAcquired = false
-  try {
-    const s = statSync(injectLock)
-    if (Date.now() - s.mtimeMs < LOCK_STALE_MS) return
-  } catch { /* no lock file — proceed */ }
-  try { writeFileSync(injectLock, ''); injectLockAcquired = true } catch { /* fail-open */ }
-  if (injectLockAcquired) heldInjectLock = injectLock
+  if (injectLock) {
+    try {
+      const s = statSync(injectLock)
+      if (Date.now() - s.mtimeMs < LOCK_STALE_MS) return
+    } catch { /* no lock file — proceed */ }
+    try { writeFileSync(injectLock, ''); injectLockAcquired = true } catch { /* fail-open */ }
+    if (injectLockAcquired) heldInjectLock = injectLock
+  }
 
   // Release the lock on every exit, including a throw from the injection —
   // a lock left behind would make the retry on the next prompt bail silently
@@ -678,11 +682,12 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       }
       // Counted BEFORE the heavy work: a run that is killed never gets to
       // record anything afterwards.
-      try { writeFileSync(attemptsPath(key), String(attempts + 1)) } catch { /* fail-open */ }
+      const counter = attemptsPath(key)
+      if (counter) try { writeFileSync(counter, String(attempts + 1)) } catch { /* fail-open */ }
     }
     await injectSession(input, key, marker, isRehydrate, flags)
   } finally {
-    if (injectLockAcquired) try { unlinkSync(injectLock) } catch {}
+    if (injectLockAcquired && injectLock) try { unlinkSync(injectLock) } catch {}
     heldInjectLock = null
   }
   // #1313: the output (if any) has been flushed — emitContextConfirmed waits
@@ -750,9 +755,9 @@ export async function waitForOwnStoreLock(lockPath: string, maxMs: number): Prom
  * for the hook timeout, a store that does not load) would make a keyword-only
  * fallback fail the same way, so none is attempted.
  */
-async function skipCappedSession(input: Record<string, unknown>, key: string, marker: string): Promise<void> {
+async function skipCappedSession(input: Record<string, unknown>, key: string, marker: string | null): Promise<void> {
   const task = (typeof input.prompt === 'string' && input.prompt) || 'general session'
-  try { writeFileSync(marker, JSON.stringify({ task, sessionId: randomUUID(), injection: 'skipped' })) } catch { /* fail-open */ }
+  if (marker) try { writeFileSync(marker, JSON.stringify({ task, sessionId: randomUUID(), injection: 'skipped' })) } catch { /* fail-open */ }
   touchReminder(key)
   await emitContextConfirmed(
     claudeHookEventName(input, { rehydrate: false, event: null }),
@@ -764,7 +769,7 @@ async function skipCappedSession(input: Record<string, unknown>, key: string, ma
 async function injectSession(
   input: Record<string, unknown>,
   key: string,
-  marker: string,
+  marker: string | null,
   isRehydrate: boolean,
   flags: GlobalFlags,
 ): Promise<void> {
@@ -782,10 +787,8 @@ async function injectSession(
   let newSessionId: string | undefined
   if (isRehydrate) {
     const summary = (input.compact_summary as string) || ''
-    let original = ''
-    const taskPath = sessionTaskPath(input)
-    try { if (taskPath) original = readFileSync(taskPath, 'utf8') } catch {}
-    if (!original) {
+    let original = readSessionTask(input.session_id)
+    if (!original && marker) {
       try {
         const raw = readFileSync(marker, 'utf8')
         // Marker is JSON since 0.8.2 (was plain text before)
@@ -806,8 +809,7 @@ async function injectSession(
     // next prompt simply tries again.
     newSessionId = randomUUID()
     pendingMarker = JSON.stringify({ task, sessionId: newSessionId })
-    const taskPath = sessionTaskPath(input)
-    if (taskPath) try { writeFileSync(taskPath, task) } catch { /* fail-open */ }
+    writeSessionTask(input.session_id, task)
     touchReminder(key) // Reset reminder timer on first message
   }
 
@@ -827,7 +829,7 @@ async function injectSession(
   const remoteRefusedFrom = projectRemote.refusedFrom
 
   let injectSessionId: string | undefined = newSessionId
-  if (!injectSessionId) {
+  if (!injectSessionId && marker) {
     try { injectSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
   }
   // #776: the remote leg rides INSIDE injectHybrid — at most one remote call
@@ -913,5 +915,5 @@ async function injectSession(
 
   const delivered = await emitContextConfirmed(hookEventName, parts.join('\n'))
   // Fail-open: an unwritable state dir just means the next prompt re-injects.
-  if (delivered && pendingMarker) try { writeFileSync(marker, pendingMarker) } catch { /* fail-open */ }
+  if (delivered && pendingMarker && marker) try { writeFileSync(marker, pendingMarker) } catch { /* fail-open */ }
 }
