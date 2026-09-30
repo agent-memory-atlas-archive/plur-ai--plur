@@ -17,9 +17,10 @@ import {
   readConfig,
 } from '../mcp-config.js'
 import { hasPlurCursorHooks, readCursorHooksConfig } from '../cursor-hooks.js'
+import { isPlurHookCommand, isPlurHookSpec } from '../lib/hook-command.js'
 import { hasPlurCodexHooks, readCodexHooksConfig } from '../codex-hooks.js'
 import { hasPlurAgyHooks, readAgyHooksConfig } from '../antigravity-hooks.js'
-import { codexHome } from '../mcp-config.js'
+import { codexHome, missingNodeEntryPaths, readCodexPlurMcpCommand, isOwnWin32CmdShimCommand } from '../mcp-config.js'
 import { opencodeConfigDir, opencodeConfigPath, readOpencodeConfig, PLUR_OPENCODE_PLUGIN } from '../opencode-config.js'
 import { computeContentHash, detectPlurStorage, loadEngrams, resolveBackendTier, loadConfig, classifyStoreDuplicates } from '@plur-ai/core'
 
@@ -63,6 +64,14 @@ interface DoctorReport {
   datacoreCollision: boolean
   staleNpxHooks: boolean
   staleNpxMcp: boolean
+  /**
+   * Config files whose `plur` entry is PLUR's own Windows node form
+   * (`{ command: <node.exe>, args: [<@plur-ai/mcp js entry>] }`, #1267) and
+   * names a path that no longer exists — typically the version-specific
+   * node binary after a Node upgrade. Checked statically, so it is reported
+   * under `--no-handshake` too, and it fails `overall`.
+   */
+  brokenNodeMcp: Array<{ label: string; path: string; missing: string[] }>
   hookShim: HookShimReport
   mcpShim: HookShimReport
   handshake: { ok: boolean; serverName?: string; serverVersion?: string; toolCount?: number; error?: string }
@@ -110,6 +119,20 @@ interface DoctorReport {
    */
   codexDetected: boolean
   codexWired: boolean
+  /**
+   * Codex's config.toml registers the `plur-mcp.cmd` shim an older
+   * `plur init` wrote on Windows, which current Node cannot spawn
+   * (`spawn EINVAL`, #1267). `plur init --codex` replaces it.
+   */
+  codexCmdShimMcp: boolean
+  /**
+   * Windows only (decision H3): the editors whose PLUR hook path still
+   * contains whitespace because no 8.3 short path was available — `plur
+   * init` wrote PowerShell's `& "<path>"` (Codex, Cursor) or the plain path
+   * (Antigravity, where no quoted form runs). Those hooks may not run.
+   * Empty elsewhere and when every hook path is a single unquoted word.
+   */
+  windowsHookFallback: string[]
   /**
    * Antigravity CLI (agy). Same machine-level detection rationale as Codex —
    * reported as its own line, deliberately NOT folded into `overall`. Unlike
@@ -197,6 +220,12 @@ interface OpencodeReport {
   /** `mcp.plur` is present — the explicit `plur_*` tool surface. */
   mcpPlurDeclared: boolean
   /**
+   * Paths PLUR's own win32 node-form `mcp.plur` entry names that no longer
+   * exist — the version-specific node binary after a Node upgrade (#1339).
+   * `plur init` rewrites such an entry. Empty when healthy.
+   */
+  mcpPlurMissingPaths: string[]
+  /**
    * Whether the declared plugin will actually resolve when opencode starts.
    * This is the load-bearing check — a `pluginDeclared: true` entry that
    * cannot resolve is worthless and, worse, invisible to the user.
@@ -219,15 +248,58 @@ interface OpencodeReport {
 }
 
 function hasAnyPlurHook(config: Record<string, unknown>): boolean {
-  const hooks = (config.hooks ?? {}) as Record<string, Array<{ hooks?: Array<{ command?: string }> }>>
+  const hooks = (config.hooks ?? {}) as Record<string, Array<{ hooks?: Array<{ command?: string; args?: unknown }> }>>
   for (const entries of Object.values(hooks)) {
     for (const entry of entries) {
       for (const h of entry.hooks ?? []) {
-        if (h.command && (h.command.includes('@plur-ai/cli') || h.command.includes('.plur/bin/plur-hook'))) return true
+        // The same matcher init uses: PLUR's launcher (shim, npx, or the
+        // Windows exec form) plus any hook-* (decisions H2, H3).
+        if (isPlurHookSpec(h)) return true
       }
     }
   }
   return false
+}
+
+/** Every string under a `command` key, anywhere in a parsed hooks file. */
+function collectHookCommands(value: unknown, out: string[] = []): string[] {
+  if (Array.isArray(value)) for (const v of value) collectHookCommands(v, out)
+  else if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === 'command' && typeof v === 'string') out.push(v)
+      else collectHookCommands(v, out)
+    }
+  }
+  return out
+}
+
+/**
+ * The string-hook editors (Cursor, Codex, Antigravity) whose PLUR hook
+ * launcher path still contains whitespace — the fallback `plur init` writes
+ * on Windows when no 8.3 short path exists (decision H3). Such a hook relies
+ * on PowerShell's `& "<path>"` (Codex, Cursor) or cannot run at all
+ * (Antigravity, whose `cmd /C` escapes quotes).
+ */
+function windowsHookFallbackEditors(configs: ConfigFileReport[]): string[] {
+  const editors: Array<[string, string]> = [
+    ['Cursor', 'Cursor (.cursor/hooks.json)'],
+    ['Codex', 'Codex (~/.codex/hooks.json)'],
+    ['Antigravity', 'Antigravity (~/.gemini/config/hooks.json)'],
+  ]
+  const out: string[] = []
+  for (const [name, label] of editors) {
+    const c = configs.find((x) => x.label === label)
+    if (!c?.exists) continue
+    let parsed: unknown
+    try { parsed = JSON.parse(readFileSync(c.path, 'utf8')) } catch { continue }
+    const fallback = collectHookCommands(parsed).some((cmd) => {
+      if (!isPlurHookCommand(cmd)) return false
+      const launcher = cmd.slice(0, cmd.search(/\shook-[a-z0-9]/i)).replace(/^&\s+/, '').replace(/"/g, '')
+      return /\s/.test(launcher)
+    })
+    if (fallback) out.push(name)
+  }
+  return out
 }
 
 function hasStaleNpxHooks(config: Record<string, unknown>): boolean {
@@ -857,6 +929,7 @@ async function buildOpencodeReport(skipNetworkCheck: boolean): Promise<OpencodeR
     ok: snapshot.ok,
     pluginDeclared: snapshot.pluginDeclared,
     mcpPlurDeclared: snapshot.mcpPlurDeclared,
+    mcpPlurMissingPaths: snapshot.mcpPlurMissingPaths,
     pluginResolvable,
     resolvedVia,
   }
@@ -881,6 +954,22 @@ function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<Doctor
     const config = readConfig(c.path)
     return hasStaleNpxMcp(config)
   })
+
+  // PLUR's Windows node-form entry pins a version-specific node binary
+  // (#1267): a Node upgrade leaves it pointing at nothing.
+  const brokenNodeMcp: DoctorReport['brokenNodeMcp'] = []
+  const seenConfigs = new Set<string>()
+  for (const c of configs) {
+    if (!c.exists || !c.hasPlurMcp) continue
+    // Run from HOME, the project and global Claude Code settings are one file.
+    let real = c.path
+    try { real = realpathSync(c.path) } catch { /* keep the path as given */ }
+    if (seenConfigs.has(real)) continue
+    seenConfigs.add(real)
+    const entry = readPlurMcpEntry(readConfig(c.path))
+    const missing = entry ? missingNodeEntryPaths(entry) : []
+    if (missing.length > 0) brokenNodeMcp.push({ label: c.label, path: c.path, missing })
+  }
 
   const hookShim = validateHookShim()
   const mcpShim = validateMcpShim()
@@ -936,10 +1025,26 @@ function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<Doctor
   const codexDetected = existsSync(codexHome())
   const codexHooksReport = configs.find((c) => c.label === 'Codex (~/.codex/hooks.json)')
   const codexTomlReport = configs.find((c) => c.label === 'Codex (~/.codex/config.toml)')
+  // The `plur-mcp.cmd` entry an older init wrote on Windows is registered but
+  // cannot start (spawn EINVAL, #1267). Only PLUR's own shim command is
+  // matched, whatever else the entry carries (env, other keys, args): it
+  // fails either way, even when init will not heal it automatically (#1366).
+  let codexCmdShimMcp = false
+  if (codexTomlReport?.exists && codexTomlReport.hasPlurMcp) {
+    try {
+      const command = readCodexPlurMcpCommand(readFileSync(codexTomlReport.path, 'utf8'))
+      codexCmdShimMcp = command !== null && isOwnWin32CmdShimCommand(command)
+    } catch { /* unreadable — nothing to flag */ }
+  }
   const codexWired = Boolean(
     codexHooksReport?.exists && codexHooksReport.hasPlurHooks &&
-    codexTomlReport?.exists && codexTomlReport.hasPlurMcp,
+    codexTomlReport?.exists && codexTomlReport.hasPlurMcp && !codexCmdShimMcp,
   )
+
+  // Decision H3: on Windows a string-editor hook must be a single unquoted
+  // path. When init had to fall back (the path has whitespace and no 8.3
+  // short name exists), name the editor: its hooks may not run.
+  const windowsHookFallback = platform() === 'win32' ? windowsHookFallbackEditors(configs) : []
 
   // Antigravity health, from agy's OWN two files only.
   const agyDetected = existsSync(join(homedir(), '.gemini', 'antigravity-cli'))
@@ -975,6 +1080,7 @@ function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<Doctor
     // recall is disabled until the model loads.
     const overall: 'ok' | 'fail' =
       hooksInstalled && mcpRegistered && (skipHandshake || handshake.ok) &&
+      brokenNodeMcp.length === 0 &&
       (!cursorProjectDetected || cursorWired)
         ? 'ok' : 'fail'
     // NOTE: codexWired is deliberately NOT in `overall`, unlike cursorWired.
@@ -1030,9 +1136,9 @@ function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<Doctor
     const ignoredDuplicateStores = findIgnoredDuplicateStores(flags)
 
     return {
-      configs, hooksInstalled, mcpRegistered, datacoreCollision, staleNpxHooks, staleNpxMcp,
+      configs, hooksInstalled, mcpRegistered, datacoreCollision, staleNpxHooks, staleNpxMcp, brokenNodeMcp,
       hookShim, mcpShim, handshake, cursorHandshake, embedder,
-      cursorProjectDetected, cursorWired, codexDetected, codexWired, agyDetected, agyWired,
+      cursorProjectDetected, cursorWired, codexDetected, codexWired, codexCmdShimMcp, windowsHookFallback, agyDetected, agyWired,
       pgliteGemmaReembedNeeded, staleContentHashes, pgliteOrphan, ignoredDuplicateStores, opencode, overall,
     }
   })
@@ -1103,7 +1209,13 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
 
   if (report.codexDetected) {
     outputText(`${tick(report.codexWired)} Codex: ~/.codex/hooks.json + config.toml wired to plur`)
-    if (!report.codexWired) {
+    if (report.codexCmdShimMcp) {
+      outputText('  config.toml registers the old ~/.plur/bin/plur-mcp.cmd shim, which current Node')
+      outputText('  cannot start (spawn EINVAL). Fix: run `plur init --codex`. It replaces a plain entry')
+      outputText('  through `codex mcp remove` + `codex mcp add`; an entry that also carries other settings')
+      outputText('  (env, other keys, a multi-line args array) is left alone, and init prints the command')
+      outputText('  and args lines to change by hand so those settings are kept.')
+    } else if (!report.codexWired) {
       outputText('  Codex is installed on this machine but PLUR is not wired into it — it')
       outputText('  would get MCP tools with no injection, enforcement, or learn nudges.')
       outputText('  If you use Codex, run `plur init --codex`. (Advisory: this does not')
@@ -1126,6 +1238,12 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
     const oc = report.opencode
     outputText(`${tick(oc.pluginDeclared)} opencode: plugin declared (${oc.configPath})`)
     outputText(`${tick(oc.mcpPlurDeclared)} opencode: mcp.plur declared`)
+    if (oc.mcpPlurMissingPaths.length > 0) {
+      outputText('  ✗ opencode\'s mcp.plur points at a path that no longer exists:')
+      for (const m of oc.mcpPlurMissingPaths) outputText(`     ${m}`)
+      outputText('    The node binary path is version-specific, so a Node upgrade or a version-manager')
+      outputText('    switch breaks it. Fix: re-run `plur init`, which rewrites the entry.')
+    }
     if (!oc.ok) {
       outputText('  Config exists but PLUR could not safely read it — invalid JSON (JSONC comments')
       outputText('  and trailing commas are not supported here) or a `plugin`/`mcp` field in an')
@@ -1180,6 +1298,24 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
     outputText(`✓ MCP shim:  ${report.mcpShim.shimPath}`)
   } else {
     outputText(`✗ MCP shim:  ${report.mcpShim.error}`)
+  }
+
+  for (const editor of report.windowsHookFallback ?? []) {
+    outputText('')
+    outputText(`✗ ${editor} hooks: the PLUR hook path contains a space and no 8.3 short name is available,`)
+    outputText(editor === 'Antigravity'
+      ? '   and Antigravity runs hooks through cmd /C, where no quoted path works — its hooks will not run.'
+      : '   so init wrote PowerShell\'s `& "<path>"` form, which runs only if the editor uses PowerShell.')
+    outputText('   Fix: enable 8.3 names on the volume (`fsutil 8dot3name set`), or install to a path without spaces,')
+    outputText('   then re-run `plur init`.')
+  }
+
+  for (const b of report.brokenNodeMcp) {
+    outputText('')
+    outputText(`✗ plur MCP entry in ${b.label} (${b.path}) points at a path that no longer exists:`)
+    for (const m of b.missing) outputText(`   ${m}`)
+    outputText('   The node binary path is version-specific, so a Node upgrade or a version-manager')
+    outputText('   switch breaks it. Fix: re-run `plur init`, which rewrites the entry.')
   }
 
   if (report.staleNpxMcp) {
