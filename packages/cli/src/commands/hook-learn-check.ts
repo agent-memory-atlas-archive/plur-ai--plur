@@ -1,9 +1,11 @@
-import { readSync, readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, statSync, renameSync, unlinkSync } from 'fs'
+import { readSync, readFileSync, writeFileSync, existsSync, appendFileSync, statSync, renameSync, unlinkSync } from 'fs'
 import { join } from 'path'
-import { tmpdir, homedir } from 'os'
+import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
-import { safeSessionKey } from '../lib/session-key.js'
+import { hookSessionKey } from '../lib/session-key.js'
+import { hookSessionDir } from '../lib/session-task.js'
+import { ensureSessionDir } from '../lib/codex-hook-io.js'
 
 /**
  * plur hook-learn-check — Stop hook that prompts learning reflection
@@ -21,6 +23,11 @@ import { safeSessionKey } from '../lib/session-key.js'
  * (#1266). Claude Code does not export CLAUDE_SESSION_ID to hooks, and each
  * Stop runs in a fresh shell, so the old ppid fallback gave every Stop its own
  * counter and the nudge never fired.
+ *
+ * Directories (decision H3): the counter lives in the hook state dir
+ * (`hookSessionDir()`), and the checkpoint in `<PLUR root>/sessions`. Each is
+ * written only if its directory passes the ownership check. When no trusted
+ * directory exists, the hook persists nothing and prints nothing.
  *
  * Delivery (#1266, verified against a real Claude Code session): a Stop
  * hook's TOP-LEVEL `additionalContext` is ignored — recorded as plain hook
@@ -45,17 +52,19 @@ const CHECKPOINT_INTERVAL = parseInt(process.env.PLUR_CHECKPOINT_INTERVAL || '10
  * precedence the checkpoint readers (hook-session-end, plur_session_end) use.
  */
 function sessionKey(payloadSessionId?: unknown): string {
-  const raw =
-    (typeof payloadSessionId === 'string' && payloadSessionId) ||
-    process.env.CLAUDE_SESSION_ID ||
-    String(process.ppid || 'unknown')
-  return safeSessionKey(raw).slice(0, 64)
+  // Owner decision H1 ("payload", 2026-09-29): the one shared helper, so the
+  // counter/checkpoint writer and every reader agree. The stop counter is not
+  // migrated from legacy keys: an orphaned counter delays one nudge at most.
+  return hookSessionKey(payloadSessionId)
 }
 
-function counterPath(key: string): string {
-  const dir = join(tmpdir(), 'plur-sessions')
-  mkdirSync(dir, { recursive: true })
-  return join(dir, `${key}.stop-count`)
+// Decision H3: the counter lives in the hook state dir and follows its proved
+// rule (lib/session-task.ts hookSessionDir): the shared dir if it passes the
+// ownership check, else the private fallback if it passes, else null — and
+// null means persist nothing (formal conflict H).
+function counterPath(key: string): string | null {
+  const dir = hookSessionDir()
+  return dir ? join(dir, `${key}.stop-count`) : null
 }
 
 /**
@@ -82,17 +91,22 @@ function incrementCounter(path: string): number {
 }
 
 function plurPath(): string {
-  return process.env.PLUR_PATH ?? join(homedir(), '.plur')
+  // `||`, not `??`: an empty PLUR_PATH means unset, never "the cwd" (H3).
+  return process.env.PLUR_PATH || join(homedir(), '.plur')
 }
 
-function checkpointDir(): string {
+// The checkpoint stays where its readers look (hook-session-end,
+// plur_session_end, hook-inject's deferred wrap-up) but is written only when
+// that directory passes the same check (H3): a planted symlink or a directory
+// someone else owns is refused, and the checkpoint is skipped.
+function checkpointDir(): string | null {
   const dir = join(plurPath(), 'sessions')
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return ensureSessionDir(dir) ? dir : null
 }
 
 function writeCheckpoint(id: string, count: number, cwd: string): void {
   const dir = checkpointDir()
+  if (!dir) return
   const path = join(dir, `${id}.checkpoint.json`)
 
   const now = new Date().toISOString()
@@ -181,9 +195,11 @@ export async function run(_args: string[], _flags: GlobalFlags): Promise<void> {
   // a Stop hook MUST NOT crash the response — print nothing and exit 0.
   // counterPath() creates the dir and incrementCounter() appends; either can
   // throw on an unwritable filesystem, so wrap both.
+  const counter = counterPath(key)
+  if (!counter) return // no trusted state dir: persist nothing, stay silent (H3)
   let count: number
   try {
-    count = incrementCounter(counterPath(key))
+    count = incrementCounter(counter)
   } catch {
     return
   }

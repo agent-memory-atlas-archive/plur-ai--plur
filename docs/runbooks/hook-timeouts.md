@@ -5,21 +5,26 @@ Reported against Codex; the reasoning applies to every synchronous harness.
 
 ## Why these hooks are synchronous, and therefore bounded
 
-Claude Code's `hook-inject` is **async with a 90s timeout**, so it can absorb a
-slow first recall. That trade does not transfer to Codex or Antigravity: an
-async hook's `additionalContext` is delivered at the harness's "next safe point",
-which is **not the turn that triggered it** — and for a `codex exec` one-shot,
-never. So those hooks are synchronous, and a synchronous hook has a hard budget.
+An async hook's `additionalContext` is delivered at the harness's "next safe
+point", which is **not the turn that triggered it**: a first reply that uses no
+tools gets no memory, and a one-shot (`codex exec`, `claude -p`) never does. So
+every injection hook is synchronous, and a synchronous hook has a hard budget.
+Claude Code's `hook-inject` was async with a 90s timeout until #1313.
 
 | Harness | Hook | Budget |
 |---|---|---|
 | Codex | `SessionStart`, `UserPromptSubmit` | 25s |
 | Antigravity | pre-invocation | 20s |
 | Cursor | `sessionStart` | 10s |
-| Claude Code | `UserPromptSubmit` | 90s (async) |
+| Claude Code | `UserPromptSubmit`, `SessionStart` (matcher `compact`) | 20s; the hook exits itself at 15s (`PLUR_HOOK_CEILING_MS`) |
 
 Codex's own default is 600s. PLUR's are deliberately tight so a wedged hook
 cannot hang a turn.
+
+In Claude Code only the first prompt of a session and the rehydrate after
+compaction do the full injection. Later prompts check the session marker and
+exit: 68 to 101ms on a 10,000-engram store, against 34ms for a bare
+`node -e 0`. Re-run `plur init` to move an existing async registration to sync.
 
 ## What actually consumes the budget
 
@@ -69,6 +74,24 @@ embeddings:
 
 The stderr message in case A recommends *raising* the deadline. That advice is
 correct for A and wrong for B — read which one you have before acting on it.
+
+## A hook that exits on its own must not leave the store lock
+
+Every Codex and Antigravity hook force-exits when it is done, and the Claude
+Code hook force-exits past a missed hybrid deadline and on its 15s watchdog.
+`process.exit()` does not wait for in-flight work, and the abandoned hybrid
+search still records its injection under `engrams.yaml.lock`. Exiting inside
+that write leaves the lock behind — often empty, which core cannot attribute,
+so every later writer waits out the 60s stale threshold and the next prompts
+come back with no memory.
+
+So each of those exits first waits, bounded, until the process has no lock
+operation in flight (core's `pendingStoreLockOps()`, which also sees a create
+that is issued but not yet on disk) and no lock file of its own
+(`lib/store-lock-exit.ts`): 5s after a finished run, 3s once the Claude Code
+watchdog has fired (15s + 3s stays below the 20s budget). A lock left by a
+hook that was *killed* at the harness budget is not covered — that is case B
+above. If one is there and no PLUR process is running, it is safe to delete.
 
 ## If the store is remote
 
