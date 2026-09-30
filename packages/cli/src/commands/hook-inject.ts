@@ -8,6 +8,7 @@ import { isPlurConfigured } from '../lib/plur-configured.js'
 import { safeSessionKey } from '../lib/session-key.js'
 import { hookSessionDir, readSessionTask, writeSessionTask } from '../lib/session-task.js'
 import { injectWithFallback, hybridEnabled, type Injectable, type InjectOutcome } from '../lib/codex-hook-io.js'
+import { waitForOwnStoreLock, exitWhenStoreIdle, EXIT_LOCK_WAIT_MS } from '../lib/store-lock-exit.js'
 import { correctionReminder } from './hook-correction-detect.js'
 
 // Remote budget for the recall leg inside injectHybrid (#776). The hook is
@@ -137,6 +138,11 @@ function sessionKey(input: Record<string, unknown>): string {
   return hookSessionKey(input.session_id)
 }
 
+// Set when the watchdog fires (#1343). The watchdog then waits, bounded, for
+// any store write in flight before exiting; the run it stopped must not print
+// or mark the session during that wait — a stopped run is a failed attempt.
+let stopping = false
+
 /**
  * #1312: the `hook-correction-detect` reminder for this prompt, or null.
  * Folded into this hook's UserPromptSubmit output instead of registering a
@@ -149,6 +155,7 @@ function promptCorrection(input: Record<string, unknown>): string | null {
 }
 
 function emitContext(hookEventName: string, additionalContext: string): void {
+  if (stopping) return
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext } }))
 }
 
@@ -158,6 +165,7 @@ function emitContext(hookEventName: string, additionalContext: string): void {
  * The session marker is written only after this resolves true (#1278).
  */
 function emitContextConfirmed(hookEventName: string, additionalContext: string): Promise<boolean> {
+  if (stopping) return Promise.resolve(false)
   return new Promise(resolvePromise => {
     try {
       process.stdout.write(
@@ -427,6 +435,10 @@ function processDeferredWrapups(): string | null {
 // Claude Code kills the hook and shows an error. Override via env.
 // The timer is unref()ed so a normal clean exit isn't delayed.
 export const HOOK_CEILING_DEFAULT_MS = 15_000
+// How long the watchdog, once fired, waits for this process's own store lock
+// before exiting (#1343). Ceiling + this must still land before Claude Code's
+// 20s kill, or the user sees a hook error instead of a quiet exit.
+export const WATCHDOG_LOCK_WAIT_MS = 3_000
 const HOOK_CEILING_MS = parseInt(process.env.PLUR_HOOK_CEILING_MS ?? '', 10) || HOOK_CEILING_DEFAULT_MS
 
 /**
@@ -621,12 +633,18 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Installed after isPlurConfigured() so it only fires for
   // sessions that actually do work. unref() prevents it from delaying clean exit.
   runStartedAt = Date.now()
+  // #1343: the watchdog can fire mid-way through a store write, and exiting
+  // there leaves the lock behind. Wait (bounded) until the store is idle first.
   const watchdog = setTimeout(() => {
+    stopping = true
     if (heldInjectLock) try { unlinkSync(heldInjectLock) } catch { /* fail-open */ }
     // A hybrid search still running at the ceiling is embedding a cold store:
-    // same as a missed deadline, the cache would stay cold (#1313 audit).
-    if (hybridInFlight && storeRoot) startEmbeddingWarmup(storeRoot, runFlags)
-    process.exit(0)
+    // same as a missed deadline, the cache would stay cold (#1313 audit). The
+    // check runs at the exit itself, after the store-idle wait (#1343).
+    void exitWhenStoreIdle(WATCHDOG_LOCK_WAIT_MS, () => {
+      if (hybridInFlight && storeRoot) startEmbeddingWarmup(storeRoot, runFlags)
+      process.exit(0)
+    })
   }, HOOK_CEILING_MS)
   watchdog.unref()
 
@@ -745,52 +763,29 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   if (abandonedHybrid) {
     const left = () => Math.max(0, runStartedAt + HOOK_CEILING_MS - 1_000 - Date.now())
     const settled = await settleWithin(abandonedHybrid, Math.min(ABANDONED_HYBRID_WAIT_MS, left()))
-    if (storeLockPath) await waitForOwnStoreLock(storeLockPath, Math.min(5_000, left()))
-    // Still running = still embedding the store: the cache is cold and would
-    // stay cold, since it is saved only when a search finishes. Build it in
-    // the background so the next session's hybrid search meets the deadline.
-    if (!settled && storeRoot) startEmbeddingWarmup(storeRoot, flags)
-    process.exit(0)
+    // Then the general guard (#1343): no lock operation of this process in
+    // flight and no lock file of ours on disk, checked in the same step as
+    // the exit. A search still running at that exit is still embedding the
+    // store: the cache is cold and would stay cold, since it is saved only
+    // when a search finishes. Build it in the background so the next
+    // session's hybrid search meets the deadline (#1313 audit).
+    await exitWhenStoreIdle(Math.min(EXIT_LOCK_WAIT_MS, left()), () => {
+      if (!settled && hybridInFlight && storeRoot) startEmbeddingWarmup(storeRoot, flags)
+      process.exit(0)
+    })
   }
 }
 
 // The hybrid search that missed its deadline and is still running (#1313).
 let abandonedHybrid: Promise<unknown> | null = null
-let storeLockPath: string | null = null
 let storeRoot: string | null = null
 let runFlags: GlobalFlags = {}
 // True while a hybrid search started by injectForHook has not settled.
 let hybridInFlight = false
 let runStartedAt = Date.now()
 
-/**
- * Wait (bounded) while this process may hold the store's cross-process lock.
- *
- * The abandoned hybrid search still records its injection, under
- * `engrams.yaml.lock`. Measured on a 10,000-engram store: force-exiting right
- * after the BM25 answer left an EMPTY lock file — the O_EXCL open had
- * happened, the token write had not — and core cannot tell who owns an empty
- * lock, so it waits out its 60s stale threshold. Every following first prompt
- * hit the 15s watchdog and injected nothing.
- *
- * Ours = the token names this host and pid. Empty and fresh = possibly ours,
- * mid-acquire. An empty lock older than 2s belongs to someone else.
- */
-export async function waitForOwnStoreLock(lockPath: string, maxMs: number): Promise<void> {
-  const until = Date.now() + maxMs
-  const ours = `${hostname()}:${process.pid}:`
-  while (Date.now() < until) {
-    let mayBeOurs = false
-    try {
-      const token = readFileSync(lockPath, 'utf8').trim()
-      mayBeOurs = token === ''
-        ? Date.now() - statSync(lockPath).mtimeMs < 2_000
-        : token.startsWith(ours)
-    } catch { /* no lock file — nothing to wait for */ }
-    if (!mayBeOurs) return
-    await new Promise(r => setTimeout(r, 25))
-  }
-}
+// Moved to lib/store-lock-exit.ts (#1343) so every force-exiting hook shares it.
+export { waitForOwnStoreLock }
 
 /**
  * The cap is reached: mark the session so later prompts take the cheap
@@ -903,7 +898,6 @@ async function injectSession(
   // A missed deadline leaves the hybrid search running; it must not hold
   // the process (and so the prompt) open until the watchdog.
   abandonedHybrid = mode === 'bm25' && hybridEnabled() ? hybrid : null
-  storeLockPath = join(plur.storageRoot, 'engrams.yaml.lock')
   storeRoot = plur.storageRoot
   if (result.count > 0) {
     const parts: string[] = []
