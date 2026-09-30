@@ -5,6 +5,7 @@ import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
+import { recordInjected } from '../lib/auto-rate.js'
 import { safeSessionKey } from '../lib/session-key.js'
 import { hookSessionDir, readSessionTask, writeSessionTask } from '../lib/session-task.js'
 import { injectWithFallback, hybridEnabled, type Injectable, type InjectOutcome } from '../lib/codex-hook-io.js'
@@ -683,6 +684,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     let eventSessionId: string | undefined
     if (marker) try { eventSessionId = JSON.parse(readFileSync(marker, 'utf8')).sessionId } catch { /* fail-open */ }
     const result = await plur.inject(task, { budget: 3000, source: 'hook', session_id: eventSessionId })
+    recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
     if (result.count > 0) {
       const parts: string[] = []
       if (result.directives) parts.push(result.directives)
@@ -895,6 +897,7 @@ async function injectSession(
   // hybrid failure, BM25 (local-only by design — inject() never dials)
   // serves the turn.
   const { result, mode, hybrid } = await injectForHook(plur, task, injectOpts)
+  recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
   // A missed deadline leaves the hybrid search running; it must not hold
   // the process (and so the prompt) open until the watchdog.
   abandonedHybrid = mode === 'bm25' && hybridEnabled() ? hybrid : null

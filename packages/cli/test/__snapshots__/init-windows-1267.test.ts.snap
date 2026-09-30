@@ -141,6 +141,16 @@ exports[`plur init on darwin/linux output is unchanged (#1267) > hook commands m
           "timeout": 2
         }
       ]
+    },
+    {
+      "matcher": "*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "<HOME>/.plur/bin/plur-hook hook-auto-rate claude",
+          "timeout": 10
+        }
+      ]
     }
   ]
 }"
