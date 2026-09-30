@@ -22,7 +22,11 @@ what you decided about the folder:
   for **yes** (`plur folders set <folder> --scope <s> --nonce <n>`, or `--on`),
   **not now** (nothing) and **never here** (`--off --nonce <n>`). For an
   untrusted `.plur.yaml` it also offers `--trusted`, names the host the repo
-  wants to send memories to, and never shows its token. The nonce is issued for
+  wants to send memories to, and never shows its token. What that file
+  requests is shown on its own line, marked as quoted repository text, and
+  only as values that fit the scope or domain grammar and the parsed host of
+  a URL; anything else is named ("an invalid scope"), never copied, so the
+  file cannot put an instruction into the question. The nonce is issued for
   that session and folder and works once. Later prompts in the session say
   nothing; after a yes, the next prompt loads memory.
 

@@ -123,7 +123,7 @@ describe('hook-inject refuses an untrusted project\'s remote settings (#1196)', 
 
   it('does not apply the scope it requests until trusted (D1)', () => {
     const out = runHook('some prompt', 'trust-scope')
-    expect(out).toContain('the scope project:innocent-looking')
+    expect(out).toContain('scope \\"project:innocent-looking\\"') // JSON-escaped quoted repository text
     expect(out).not.toMatch(/Project scope: project:innocent-looking/)
   })
 
