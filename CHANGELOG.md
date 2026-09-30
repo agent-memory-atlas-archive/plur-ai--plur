@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### A folder nonce now authorises one answer, and `plur trust` / `plur untrust` need one outside a terminal
+### A folder nonce now authorises one answer, and `plur trust` needs one outside a terminal
 
 **A nonce issued for the folder question authorised any answer, `--trusted`
 included, and `plur trust <dir>` needed no nonce at all from a script**
@@ -14,14 +14,26 @@ included, and `plur trust <dir>` needed no nonce at all from a script**
   flags given (`nonce-answer`, exit 1) and leaves folders.yaml unchanged; the
   nonce stays valid for its own answer. `plur folders rm` needs a nonce issued
   for removing the entry. `--scope X` and `--scope X --on` are the same answer.
-- **Scripted use changes:** `plur trust <dir>` and `plur untrust <dir>` now
-  have the same gate as `plur folders set`. From an interactive terminal
-  nothing changes. Without one (stdin or stdout is not a terminal: a script,
-  CI, an agent's tool call) they exit 1 with `nonce-required` unless given
-  `--nonce <n>` issued for that folder and `{ trusted: true }` (trust) or
-  `{ trusted: false }` (untrust). Output and exit codes are otherwise
+- The folder a nonce names is checked against the folder the write records.
+  Before, a quoted `~/x` was checked as `<current directory>/~/x` but written
+  as `$HOME/x`, so a nonce for one folder could write another (through a
+  planted `./~/x` link), and a nonce for `$HOME/x` was refused for `'~/x'`.
+  Both now use the same key: `~` expanded to the home, then canonicalised.
+- **Scripted use changes:** `plur trust <dir>` now has the same gate as
+  `plur folders set`. From an interactive terminal nothing changes. Without
+  one (stdin or stdout is not a terminal: a script, CI, an agent's tool call)
+  it exits 1 with `nonce-required` unless given `--nonce <n>` issued for that
+  folder and `{ trusted: true }`. Output and exit codes are otherwise
   unchanged. `plur trust --list` needs no nonce. A script that granted trust
   can call core's `trustDirectory(dir, root)` directly.
+- `plur untrust <dir>` is not gated and works from a script as before. A
+  revocation only removes trust, the owner decision on #1378 gated only the
+  grant, and the folder-map design keeps `plur trust` / `plur untrust` working
+  as aliases so that existing scripts and runbooks keep running. Nothing
+  issues a revocation nonce, so gating it would have left no way to revoke
+  trust outside a terminal. A `--nonce` passed to `plur untrust` is accepted
+  and ignored (neither checked nor consumed). `folders set --no-trusted` and
+  `folders rm` keep the gate, like every other folder-map write.
 - Core: `issueFolderNonce(root, sessionId, folder, answer)` now takes the
   answer (`FolderAnswer`), and `verifyFolderNonce` / `consumeFolderNonce` take
   the answer they check. The ask flow issues one nonce per answer it offers.

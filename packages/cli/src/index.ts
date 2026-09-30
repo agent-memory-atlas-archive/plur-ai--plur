@@ -68,7 +68,7 @@ Commands:
   stores add --url <u>    Add a remote store (verified; --scope, --token-env)
   stores prune            Remove config.yaml store entries that name the primary store file (#1356)
   trust [dir]             Trust a directory's .plur.yaml scope/domain (default: cwd) [--list] [--nonce <n>]
-  untrust [dir]           Revoke a directory's trust grant (default: cwd) [--nonce <n>]
+  untrust [dir]           Revoke a directory's trust grant (default: cwd)
   folders list            Your per-folder decisions (~/.plur/folders.yaml, #1347)
   folders set <folder>    --scope <s> | --on | --off | --ask  [--trusted|--no-trusted] [--nonce <n>]
   folders rm <folder>     Remove a folder's entry
