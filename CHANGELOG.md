@@ -215,6 +215,10 @@ Switches, both environment variables:
   repository cannot choose to publish the agent's reply text to a team store. Captured text
   is never auto-routed into a shared scope, and a folder the map turns off captures nothing.
 
+The end-of-turn hook follows the folder map like every other hook: it rates only
+in a folder the map resolves to on, so a folder you said yes to is rated even
+with no `.plur.yaml` or `.mcp.json`, and an off or undecided folder is left alone.
+
 Run `plur init` again to install the new hook entries.
 
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
