@@ -207,6 +207,36 @@ export class RemoteTimeoutError extends Error {
 }
 
 /**
+ * The CALLER's budget ran out, not the remote's (#1269).
+ *
+ * Distinct from {@link RemoteTimeoutError} on purpose: a request cut because a
+ * hook had 1.5s left says nothing about whether the host is reachable, so it
+ * must not mark the host down or feed the circuit breaker.
+ */
+export class RemoteAbortedError extends Error {
+  constructor(url: string) {
+    super(`request to ${url} was cut at the caller's time budget`)
+    this.name = 'RemoteAbortedError'
+  }
+}
+
+/**
+ * The remote answered a write with a non-2xx status (#1299).
+ *
+ * Same message as the plain Error it replaces, so nothing that reads the text
+ * changes; the status is carried as a field so the outbox can record it and
+ * tell a refusal (403) from a transient failure (503) without parsing prose.
+ */
+export class RemoteHttpError extends Error {
+  readonly status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'RemoteHttpError'
+    this.status = status
+  }
+}
+
+/**
  * A response whose body has already been read, inside the request deadline.
  *
  * `json` is present only for a 2xx (and is `undefined` when the payload would
@@ -349,6 +379,9 @@ export class RemoteStore {
     url: string,
     init: RequestInit,
     consume: (res: Response) => Promise<T>,
+    /** The caller's own budget (#1269). Aborting it cuts the request with a
+     *  {@link RemoteAbortedError}, which does not mark the host down. */
+    callerSignal?: AbortSignal,
   ): Promise<T> {
     // #1069: a network-level failure here MARKS the host down (so the passive
     // read path fast-fails), but this method never fast-fails itself. It
@@ -359,12 +392,19 @@ export class RemoteStore {
     // clean; on failure the mark is refreshed.
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), LOAD_FETCH_TIMEOUT_MS)
-    const timedOut = () => new RemoteTimeoutError(url, LOAD_FETCH_TIMEOUT_MS)
+    const timedOut = () => callerSignal?.aborted
+      ? new RemoteAbortedError(url)
+      : new RemoteTimeoutError(url, LOAD_FETCH_TIMEOUT_MS)
+    const onCallerAbort = () => ctrl.abort()
+    if (callerSignal?.aborted) ctrl.abort()
+    else callerSignal?.addEventListener('abort', onCallerAbort, { once: true })
     try {
       let res: Response
       try {
         res = await fetch(url, { ...init, signal: ctrl.signal })
       } catch (err) {
+        // A cut at the CALLER's budget says nothing about the host (#1269).
+        if (callerSignal?.aborted) throw new RemoteAbortedError(url)
         // fetch only throws on network-level failures (and our abort) — an HTTP
         // error status resolves normally — so any throw here marks the host.
         markRemoteHostDown(url)
@@ -392,6 +432,7 @@ export class RemoteStore {
       }
     } finally {
       clearTimeout(timer)
+      callerSignal?.removeEventListener('abort', onCallerAbort)
     }
   }
 
@@ -653,7 +694,10 @@ export class RemoteStore {
    * placeholder will fail — the engram only exists on the server with
    * the server's ID.
    */
-  async appendAndGetServerId(engram: Engram): Promise<{ id: string }> {
+  async appendAndGetServerId(
+    engram: Engram,
+    opts?: { signal?: AbortSignal; idempotencyKey?: string },
+  ): Promise<{ id: string }> {
     // #768: transmit the full engram, not just the core four — pinned,
     // rationale, tags, commitment, validity windows and supersedes were
     // silently dropped, so team-scope pins never round-tripped. Optional
@@ -678,7 +722,11 @@ export class RemoteStore {
     // an engram written by an older path, or replayed from an outbox predating
     // this, sends nothing rather than claiming `explicit` it cannot vouch for.
     const scope_source = e.structured_data?._scopeSource as string | undefined
+    const idempotencyKey = opts?.idempotencyKey
     const body = JSON.stringify({
+      // docs/remote-store-contract.md: the key is also recorded with the row,
+      // so a retry can find what an earlier, cut attempt stored.
+      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
       statement: e.statement,
       scope:     engram.scope,
       domain:    e.domain,
@@ -732,10 +780,18 @@ export class RemoteStore {
     })
     const r = await this.fetchBounded(`${this.apiBase}/engrams`, {
       method: 'POST',
-      headers: this.headers({ 'Content-Type': 'application/json' }),
+      // Unique per LOGICAL write and stable across that write's retries — a
+      // random UUID the caller mints once and persists (docs/remote-store-
+      // contract.md). NEVER derived from the engram id: that is `__pending__`
+      // on every direct write and a per-day sequence that collides across
+      // machines (2026-09-29 audits). No key, no header.
+      headers: this.headers({
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      }),
       body,
-    }, RemoteStore.readBounded)
-    if (!r.ok) throw new Error(`Remote store append failed: ${r.status} ${r.text}`)
+    }, RemoteStore.readBounded, opts?.signal)
+    if (!r.ok) throw new RemoteHttpError(r.status, `Remote store append failed: ${r.status} ${r.text}`)
     const data = (r.json ?? {}) as { id?: unknown }
     // #404: validate the server-assigned id's SHAPE, not just truthiness. It
     // becomes this engram's id (cached, rendered, used as a key), so a non-string,

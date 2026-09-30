@@ -89,6 +89,24 @@ embeddings:
 The stderr message in case A recommends *raising* the deadline. That advice is
 correct for A and wrong for B — read which one you have before acting on it.
 
+## A hook that exits on its own must not leave the store lock
+
+Every Codex and Antigravity hook force-exits when it is done, and the Claude
+Code hook force-exits past a missed hybrid deadline and on its 15s watchdog.
+`process.exit()` does not wait for in-flight work, and the abandoned hybrid
+search still records its injection under `engrams.yaml.lock`. Exiting inside
+that write leaves the lock behind — often empty, which core cannot attribute,
+so every later writer waits out the 60s stale threshold and the next prompts
+come back with no memory.
+
+So each of those exits first waits, bounded, until the process has no lock
+operation in flight (core's `pendingStoreLockOps()`, which also sees a create
+that is issued but not yet on disk) and no lock file of its own
+(`lib/store-lock-exit.ts`): 5s after a finished run, 3s once the Claude Code
+watchdog has fired (15s + 3s stays below the 20s budget). A lock left by a
+hook that was *killed* at the harness budget is not covered — that is case B
+above. If one is there and no PLUR process is running, it is safe to delete.
+
 ## If the store is remote
 
 A slow or unreachable PLUR Enterprise host cannot hang the hook — the dial is
@@ -109,3 +127,33 @@ time plur inject 'test'     # BM25-only cost for your store
 
 A store whose BM25 pass alone approaches the harness budget wants
 `plur forget`/decay attention, not a larger timeout.
+
+## Outbox flush at session end (#1269)
+
+Session-end and stop hooks also retry queued team writes (the outbox). They
+are bounded so they cannot cost the hook its budget:
+
+| Harness | Hook | Hook timeout | Flush budget |
+|---|---|---|---|
+| Claude Code | `SessionEnd` | 5s | 2.5s |
+| Codex | `SessionEnd` | 3s (clamped by Codex) | 1.2s |
+| Cursor | `stop` | 3s | 1.2s |
+
+With nothing queued the flush is skipped after one file read. Cursor's `stop`
+fires on every turn, so it retries at most once every five minutes. A throttle
+marker dated in the future, from clock skew, counts as expired. When the budget
+runs out the in-flight push is cut, nothing further starts, and every
+undelivered write stays queued. A cut is our time running out, not a failure
+of the remote, so it does not count toward the host's circuit breaker. The
+budget starts after the local store load. A push cut mid-flight is recorded
+and retried on the next flush with the same idempotency key, so a
+key-honouring server keeps one copy however slow it is
+(`docs/remote-store-contract.md`).
+
+```sh
+PLUR_HOOK_OUTBOX_FLUSH=0        # turn the hook flush off
+PLUR_HOOK_OUTBOX_FLUSH_MS=800   # smaller budget; keep it well below the hook timeout
+```
+
+`plur sync` and `plur outbox --flush` flush without a budget (each request is
+still bounded at 30s).
