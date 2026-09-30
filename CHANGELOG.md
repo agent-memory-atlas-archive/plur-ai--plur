@@ -189,6 +189,36 @@ This applies to the YAML store, and to PGLite, which keeps YAML as its source
 of truth and takes the same lock. A Postgres primary store serializes writers
 with a Postgres advisory lock and does not use this lock file.
 
+### A team save that stays on this machine now says so (#1264)
+
+**A write to a shared scope with no store registered for it never left the
+machine, and nothing said so.** An enterprise deployment reported engrams that
+were created and never reached the team. A `learn` to `group:`/`project:`/`org:`…
+with no writable url store for exactly that scope falls through to the local
+store — deliberately, since nothing is auto-routed into a shared store — but
+`plur_learn` answered `decision: "ADD"` and `plur learn` printed nothing else.
+
+Every learn result now carries `delivery`: `remote` (a store accepted it),
+`outbox` (saved here and queued for a store — the push is deferred or failed and
+will be retried) or `local` (on this machine only). A shared scope that lands
+`local` also carries a warning naming the scope and how to register a store for
+it. `plur_learn` returns both (`delivery`, `delivery_warning`); `plur learn
+--json` does too, and plain `plur learn` prints the warning even with `--quiet`.
+Core exposes the same answer as `plur.deliveryOf(engram, requestedScope?)`.
+
+When a save to a shared scope comes back as an engram in a *different* scope —
+recorded as a recurrence on another team's engram, or on a `global` one — the
+result is `local` and the warning names the scope you asked for and says nothing
+was written there. Before, the warning named the other team's scope (the one
+you did not write to), or there was no warning at all.
+
+A save that matched an existing row is classified by the store that actually
+holds that row. With a url store and a local path store registered for the same
+scope, a match on the path store's row is reported `local`, not `remote` —
+nothing was sent anywhere.
+
+Nothing about where engrams are written changes. The field is additive.
+
 ### `plur stores add` can register a remote store, and checks the token first (#1265)
 
 **An installer script can now connect a machine to a team store without MCP**
