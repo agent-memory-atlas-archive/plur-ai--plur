@@ -146,6 +146,7 @@ export {
   setFolderEntry,
   removeFolderEntry,
   clearFolderTrust,
+  coversHomeOrRoot,
   findPlurMarker,
   folderPatternMatches,
   folderPatternSpecificity,
@@ -10400,6 +10401,25 @@ Generate an improved version of the procedure that prevents this failure. Return
      *  `scope_conflict`). Applied only after /me has verified the token. */
     overwriteScope?: boolean
   }): Promise<{ status: 'added' | 'already_registered' | 'token_rotated' | 'overwritten'; scope: string; username?: string; authorised: string[] }> {
+    const { username, authorised } = await this.verifyRemoteStore(opts)
+    const { url, token, scope } = opts
+    const { status } = this.addStore('', scope, {
+      url, token, shared: opts.shared, readonly: opts.readonly,
+      ...(opts.overwriteScope === true ? { overwriteScope: true } : {}),
+    })
+    return { status, scope, ...(username ? { username } : {}), authorised }
+  }
+
+  /**
+   * Every check {@link addRemoteStore} makes, and no write (#1413): the URL,
+   * the token against `/me`, `scope` among the authorised scopes, and no
+   * other store already holding `scope` (unless `overwriteScope`). Throws the
+   * same {@link AddRemoteStoreError}s. `plur remote --scopes a,b` runs it for
+   * every scope first, so one refused scope leaves config.yaml untouched.
+   */
+  async verifyRemoteStore(opts: {
+    url: string; token: string; scope: string; timeoutMs?: number; overwriteScope?: boolean
+  }): Promise<{ scope: string; username?: string; authorised: string[] }> {
     const { url, token, scope } = opts
     const timeoutMs = opts.timeoutMs ?? 5000
     // Every encoding of the token, not only the exact string (audit of #1272).
@@ -10466,11 +10486,7 @@ Generate an improved version of the procedure that prevents this failure. Return
         )
       }
     }
-    const { status } = this.addStore('', scope, {
-      url, token, shared: opts.shared, readonly: opts.readonly,
-      ...(opts.overwriteScope === true ? { overwriteScope: true } : {}),
-    })
-    return { status, scope, ...(username ? { username } : {}), authorised }
+    return { scope, ...(username ? { username } : {}), authorised }
   }
 
   /**
@@ -10590,7 +10606,10 @@ Generate an improved version of the procedure that prevents this failure. Return
    * name a store configured in config.yaml; a `nonce` (from the ask flow)
    * must be the one issued for this folder. Throws FolderMapError on refusal.
    */
-  setFolder(folder: string, change: FolderChange, options?: { nonce?: string; home?: string }): FolderEntry {
+  setFolder(
+    folder: string, change: FolderChange,
+    options?: { nonce?: string; home?: string; literal?: boolean; refuseCoveringHome?: boolean },
+  ): FolderEntry {
     this.reloadConfigIfChanged()
     const configuredScopes = (this.config.stores ?? []).map(s => s.scope)
     return _setFolderEntry(this.paths.root, folder, change, { configuredScopes, ...options })
@@ -10606,8 +10625,8 @@ Generate an improved version of the procedure that prevents this failure. Return
    * exactly `answer` on exactly `folder` (#1378). The ask flow issues one per
    * answer it offers; see folders.ts issueFolderNonce.
    */
-  issueFolderNonce(sessionId: string, folder: string, answer: FolderAnswer): string {
-    return _issueFolderNonce(this.paths.root, sessionId, folder, answer)
+  issueFolderNonce(sessionId: string, folder: string, answer: FolderAnswer, options?: { home?: string; literal?: boolean }): string {
+    return _issueFolderNonce(this.paths.root, sessionId, folder, answer, undefined, options)
   }
 
   /** Expire every folder nonce of `sessionId` (call at session end). */

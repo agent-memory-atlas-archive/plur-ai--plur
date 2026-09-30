@@ -13,7 +13,7 @@ import { tmpdir } from 'os'
 import {
   resolveFolderPolicy, loadFolderMap, saveFolderMap, folderMapPath, setFolderEntry, removeFolderEntry,
   folderPatternMatches, folderPatternSpecificity, issueFolderNonce, consumeFolderNonce,
-  endFolderNonceSession, FolderMapError, isTrustedInMap, clearFolderTrust, FOLDER_NONCE_TTL_MS, type FolderEntry,
+  endFolderNonceSession, FolderMapError, isTrustedInMap, clearFolderTrust, FOLDER_NONCE_TTL_MS, coversHomeOrRoot, type FolderEntry,
 } from '../src/folders.js'
 import { isDirectoryTrusted, trustDirectory, untrustDirectory, listTrustedDirectories } from '../src/trust.js'
 import { canonicalize } from '../src/project-config.js'
@@ -618,6 +618,62 @@ describe('win32 paths (pure matcher)', () => {
   })
 })
 
+// #1415 review: `plur remote` records the current folder, and a folder really
+// named `proj?` must not become a glob covering its siblings. `?` is not a
+// legal file name character on Windows.
+describe.skipIf(process.platform === 'win32')('writes: the literal option', () => {
+  it('records a folder named proj? literally, so its siblings stay unmapped', () => {
+    const q = mk('w/proj?')
+    const x = mk('w/projX')
+    const deep = mk('w/projY/deep')
+    const sub = mk('w/proj?/sub')
+    expect(setFolderEntry(root, q, { mode: 'off' }, { configuredScopes: [], home, literal: true }))
+      .toEqual({ path: realpathSync(q), plur: 'off', literal: true })
+    expect(policy(q).mode).toBe('off')
+    expect(policy(sub).mode).toBe('off')
+    expect(policy(x).mode).not.toBe('off')
+    expect(policy(deep).mode).not.toBe('off')
+    // A second literal write updates the same entry.
+    setFolderEntry(root, q, { mode: 'on' }, { configuredScopes: [], home, literal: true })
+    expect(loadFolderMap(root).folders).toEqual([{ path: realpathSync(q), plur: 'on', literal: true }])
+  })
+
+  it('without it, a path with ? is still stored as a glob (plur folders set)', () => {
+    mk('w/projX')
+    const glob = join(home, 'w', 'proj?')
+    expect(setFolderEntry(root, glob, { mode: 'off' }, { configuredScopes: [], home })).toEqual({ path: glob, plur: 'off' })
+    expect(policy(join(home, 'w', 'projX')).mode).toBe('off')
+  })
+
+  // #1415 + #1357/#1334: a literal entry and a second literal entry for the
+  // same folder in another letter case merge into ONE literal entry, and the
+  // `?` never starts matching siblings. Needs a case-insensitive filesystem
+  // (two spellings of one folder); on a case-sensitive one they would be two
+  // different folders, which the #1357 sibling tests above already cover.
+  it('a literal proj? and a mis-cased entry for it merge into one literal entry (case-insensitive filesystem)', ({ skip }) => {
+    mkdirSync(join(base, 'CaseProbe'), { recursive: true })
+    if (!existsSync(join(base, 'caseprobe'))) skip()
+    const q = realpathSync(mk('c/Proj?'))
+    const x = mk('c/projX')
+    writeMap([
+      { path: q, plur: 'on', literal: true },
+      { path: join(home, 'c', 'PROJ?'), plur: 'off', literal: true },
+    ])
+    expect(setFolderEntry(root, q, { trusted: true }, { configuredScopes: [], home, literal: true }))
+      .toEqual({ path: q, plur: 'off', trusted: true, literal: true })
+    expect(loadFolderMap(root).folders).toEqual([{ path: q, plur: 'off', trusted: true, literal: true }])
+    expect(policy(q).mode).toBe('off')
+    expect(policy(x).source).toBe('default')
+    expect(isTrustedInMap(loadFolderMap(root).folders, x, home)).toBe(false)
+  })
+
+  it('a literal folder without glob characters is stored exactly as before', () => {
+    const d = mk('plain')
+    expect(setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], home, literal: true }))
+      .toEqual({ path: realpathSync(d), plur: 'on' })
+  })
+})
+
 describe('writes: nonce and shared-scope guards', () => {
   it('a hand-run set without a nonce is accepted', () => {
     const d = mk('hand')
@@ -991,5 +1047,94 @@ describe('nonce binding to the answer (#1378)', () => {
     writeFileSync(join(root, 'folder-nonces', 'old.yaml'),
       yaml.dump({ session: 'old', nonces: [{ nonce: 'abc123', folder: realpathSync(d), issued_at: Date.now() }] }))
     expect(() => setFolderEntry(root, d, { mode: 'on' }, opts('abc123'))).toThrow(expect.objectContaining({ code: 'nonce-answer' }))
+  })
+})
+
+// #1415 review (blocking 1): `plur remote` checked $HOME/root BEFORE the /me
+// round trip, then setFolder canonicalised the folder again when it wrote. A
+// folder swapped for a symlink to $HOME in between was recorded as $HOME. The
+// refusal now also runs inside the write, under the lock, on the key written.
+describe.skipIf(process.platform === 'win32')('writes: refuseCoveringHome', () => {
+  const opts = () => ({ configuredScopes: [], home, literal: true, refuseCoveringHome: true })
+
+  it('refuses $HOME, a symlink to it, an ancestor and the filesystem root; nothing is written', () => {
+    const link = join(base, 'to-home')
+    symlinkSync(home, link)
+    for (const dir of [home, link, `${home}/`, base, '/']) {
+      expect(() => setFolderEntry(root, dir, { mode: 'on' }, opts()), dir)
+        .toThrow(expect.objectContaining({ code: 'covers-home' }))
+    }
+    expect(existsSync(folderMapPath(root))).toBe(false)
+  })
+
+  it('still records a subfolder of $HOME, including one named sub?', () => {
+    const d = mk('proj')
+    const q = mk('w/sub?')
+    expect(setFolderEntry(root, d, { mode: 'on' }, opts())).toEqual({ path: realpathSync(d), plur: 'on' })
+    expect(setFolderEntry(root, q, { mode: 'on' }, opts())).toEqual({ path: realpathSync(q), plur: 'on', literal: true })
+  })
+
+  it('is checked on the key written: a folder swapped for a symlink to $HOME after the caller checked it is refused', () => {
+    const b = join(base, 'a', 'b')
+    mkdirSync(b, { recursive: true })
+    // The caller's own (early) check passes for the real folder ...
+    expect(coversHomeOrRoot(realpathSync(b), home)).toBe(false)
+    // ... then the folder is replaced by a symlink to $HOME before the write.
+    rmSync(b, { recursive: true })
+    symlinkSync(home, b)
+    expect(() => setFolderEntry(root, b, { scope: 'project:x' }, opts()))
+      .toThrow(expect.objectContaining({ code: 'covers-home' }))
+    expect(existsSync(folderMapPath(root))).toBe(false)
+    expect(policy(mk('sub')).mode).toBe('ask')
+  })
+
+  it('without the option, a write for $HOME is recorded as before (plur folders set)', () => {
+    expect(setFolderEntry(root, home, { mode: 'off' }, { configuredScopes: [], home }).plur).toBe('off')
+  })
+})
+
+// #1415 review (blocking 4): a literal write records the canonical folder,
+// so its nonce must be issued and checked against that key too. Before, the
+// nonce was issued and checked against the raw `sub?` (a glob as typed) while
+// the write recorded the canonical folder, so a nonce for one folder `sub?`
+// authorised a literal write of another.
+describe.skipIf(process.platform === 'win32')('nonces for literal writes', () => {
+  const lit = (nonce: string) => ({ configuredScopes: [], home, literal: true, nonce })
+
+  it('a nonce for sub? issued in one folder does not authorise a literal write of sub? in another', () => {
+    const a = mk('a', 'sub?')
+    const b = mk('b', 'sub?')
+    const cwd = process.cwd()
+    try {
+      process.chdir(join(home, 'a'))
+      const n = issueFolderNonce(root, 'sess-lit', 'sub?', { mode: 'on' }, Date.now(), { home, literal: true })
+      process.chdir(join(home, 'b'))
+      expect(() => setFolderEntry(root, 'sub?', { mode: 'on' }, lit(n)))
+        .toThrow(expect.objectContaining({ code: 'nonce-folder' }))
+      expect(existsSync(folderMapPath(root))).toBe(false)
+      process.chdir(join(home, 'a'))
+      expect(setFolderEntry(root, 'sub?', { mode: 'on' }, lit(n))).toEqual({ path: realpathSync(a), plur: 'on', literal: true })
+      expect(loadFolderMap(root).folders.map(e => e.path)).not.toContain(realpathSync(b))
+    } finally {
+      process.chdir(cwd)
+    }
+  })
+
+  it('the nonce records the key the literal write records, not the path as typed', () => {
+    const real = mk('real', 'sub?')
+    const link = join(base, 'link')
+    symlinkSync(join(home, 'real'), link)
+    const typed = join(link, 'sub?')
+    // Issued for the glob (not literal): it names `typed` as typed, which is
+    // not what a literal write records, so the literal write refuses it.
+    const glob = issueFolderNonce(root, 'sess-lit2', typed, { mode: 'on' })
+    expect(() => setFolderEntry(root, typed, { mode: 'on' }, lit(glob)))
+      .toThrow(expect.objectContaining({ code: 'nonce-folder' }))
+    // Issued literally: bound to the canonical folder, which is what is written.
+    const n = issueFolderNonce(root, 'sess-lit2', typed, { mode: 'on' }, Date.now(), { home, literal: true })
+    const file = join(root, 'folder-nonces', 'sess-lit2.yaml')
+    const recs = (yaml.load(readFileSync(file, 'utf8')) as { nonces: Array<{ nonce: string; folder: string }> }).nonces
+    expect(recs.find(r => r.nonce === n)?.folder).toBe(realpathSync(real))
+    expect(setFolderEntry(root, typed, { mode: 'on' }, lit(n)).path).toBe(realpathSync(real))
   })
 })

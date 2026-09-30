@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, rmSync, mkdirSync, lstatSync, realpathSync } from 'fs'
-import { basename, dirname, join, resolve, sep } from 'path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 import yaml from 'js-yaml'
@@ -41,6 +41,11 @@ export interface FolderEntry {
   plur?: FolderMode
   scope?: string
   trusted?: boolean
+  /**
+   * The path is a literal folder even though it contains `*` or `?` (a folder
+   * really named `proj?`): it is never read as a glob (#1415 review).
+   */
+  literal?: boolean
 }
 
 export interface FolderMap {
@@ -73,6 +78,7 @@ const FolderEntrySchema = z.object({
   plur: z.enum(['on', 'off', 'ask']).optional(),
   scope: z.string().min(1).optional(),
   trusted: z.boolean().optional(),
+  literal: z.boolean().optional(),
 }).passthrough()
 
 const FolderMapSchema = z.object({
@@ -132,10 +138,10 @@ function globToRegex(pattern: string): RegExp {
  * expanded. A literal directory covers itself and everything below it; a glob
  * covers any path it matches and everything below a match.
  */
-export function folderPatternMatches(pattern: string, target: string, platform: Platform = process.platform): boolean {
+export function folderPatternMatches(pattern: string, target: string, platform: Platform = process.platform, literal = false): boolean {
   const p = norm(pattern, platform)
   const t = norm(target, platform)
-  if (firstGlobIndex(p) === -1) {
+  if (literal || firstGlobIndex(p) === -1) {
     if (t === p) return true
     return t.startsWith(p.endsWith('/') ? p : p + '/')
   }
@@ -153,9 +159,9 @@ export function folderPatternMatches(pattern: string, target: string, platform: 
 }
 
 /** Specificity: literal prefix length, then segment count (design r2 §Resolution 4). */
-export function folderPatternSpecificity(pattern: string, platform: Platform = process.platform): [number, number] {
+export function folderPatternSpecificity(pattern: string, platform: Platform = process.platform, literal = false): [number, number] {
   const p = norm(pattern, platform)
-  const g = firstGlobIndex(p)
+  const g = literal ? -1 : firstGlobIndex(p)
   return [g === -1 ? p.length : g, p.split('/').filter(Boolean).length]
 }
 
@@ -188,14 +194,14 @@ export function expandHome(p: string, home: string): string {
  * `lax` (used only for `off`, where matching MORE is the safe direction) also
  * accepts the entry with its parent, or all of it, canonicalised.
  */
-function entryForms(entryPath: string, home: string, lax: boolean): string[] {
+function entryForms(entryPath: string, home: string, lax: boolean, literalPath = false): string[] {
   const homes = entryPath === '~' || entryPath.startsWith('~/') || entryPath.startsWith('~\\')
     ? [...new Set([home, canonicalize(home)])]
     : [home]
   const forms = new Set<string>()
   for (const h of homes) {
     const expanded = expandHome(entryPath, h)
-    const g = firstGlobIndex(expanded)
+    const g = literalPath ? -1 : firstGlobIndex(expanded)
     let literal: string
     let tail: string
     if (g === -1) {
@@ -220,14 +226,21 @@ function entryForms(entryPath: string, home: string, lax: boolean): string[] {
 }
 
 function entryCovers(entry: FolderEntry, targets: string[], home: string, lax: boolean): boolean {
-  const forms = entryForms(entry.path, home, lax)
-  return forms.some(f => targets.some(t => folderPatternMatches(f, t)))
+  const lit = entry.literal === true
+  const forms = entryForms(entry.path, home, lax, lit)
+  return forms.some(f => targets.some(t => folderPatternMatches(f, t, process.platform, lit)))
+}
+
+/** True when the entry's path is read as a glob. */
+function entryIsGlob(e: FolderEntry): boolean {
+  return e.literal !== true && hasGlob(e.path)
 }
 
 function mostSpecific(entries: Array<{ e: FolderEntry; i: number }>, home: string): FolderEntry | undefined {
   let best: { e: FolderEntry; i: number; s: [number, number] } | undefined
   for (const c of entries) {
-    const s = folderPatternSpecificity(entryForms(c.e.path, home, false)[0])
+    const lit = c.e.literal === true
+    const s = folderPatternSpecificity(entryForms(c.e.path, home, false, lit)[0], process.platform, lit)
     if (!best || s[0] > best.s[0] || (s[0] === best.s[0] && s[1] > best.s[1]) ||
         (s[0] === best.s[0] && s[1] === best.s[1] && c.i > best.i)) {
       best = { ...c, s }
@@ -340,7 +353,7 @@ export function saveFolderMap(root: string, map: FolderMap): void {
 
 function cleanEntry(e: FolderEntry): FolderEntry {
   const out: FolderEntry = { ...e }
-  for (const k of ['plur', 'scope', 'trusted'] as const) if (out[k] === undefined) delete out[k]
+  for (const k of ['plur', 'scope', 'trusted', 'literal'] as const) if (out[k] === undefined) delete out[k]
   return out
 }
 
@@ -473,7 +486,7 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
 // Writes (CLI only): set / remove, with the nonce and shared-scope guards.
 // ---------------------------------------------------------------------------
 
-export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'nonce-answer' | 'scope-unconfigured' | 'invalid'
+export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'nonce-answer' | 'scope-unconfigured' | 'invalid' | 'covers-home'
 
 export class FolderMapError extends Error {
   constructor(public readonly code: FolderMapErrorCode, message: string) {
@@ -527,6 +540,40 @@ export interface SetFolderOptions {
   nonce?: string
   home?: string
   now?: number
+  /**
+   * Record `folder` as a literal folder even when its name contains `*` or
+   * `?` (`plur remote` records the current folder this way). Without it such
+   * a path is stored as a glob, as `plur folders set` intends.
+   */
+  literal?: boolean
+  /**
+   * Refuse (FolderMapError 'covers-home', nothing written) when the path this
+   * write records is the home folder, a filesystem root or an ancestor of the
+   * home: such an entry would cover every folder under it. Checked under the
+   * folder-map lock on the key actually written, so a folder swapped for a
+   * symlink to the home after the caller's own check is still refused
+   * (#1415 review). `plur remote` sets it.
+   */
+  refuseCoveringHome?: boolean
+}
+
+/**
+ * True when `dir` is `home`, a filesystem root, or an ancestor of `home`.
+ * `dir` is compared as given (resolved) and canonicalised, against the home
+ * as given and canonicalised, so a symlink, `..` or another letter case does
+ * not hide it.
+ */
+export function coversHomeOrRoot(dir: string, home: string = homedir()): boolean {
+  const dirs = new Set([resolve(dir), canonicalize(dir)])
+  const homes = new Set([resolve(home), canonicalize(home)])
+  for (const d of dirs) {
+    if (dirname(d) === d) return true // a root: its parent is itself
+    for (const h of homes) {
+      const rel = relative(d, h)
+      if (rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return true
+    }
+  }
+  return false
 }
 
 function hasGlob(p: string): boolean {
@@ -534,13 +581,13 @@ function hasGlob(p: string): boolean {
 }
 
 /** The path a CLI write records: literal folders are canonicalised, globs kept as typed. */
-export function folderEntryKey(folder: string, home: string = homedir()): string {
-  return hasGlob(folder) ? folder : canonicalize(expandHome(folder, home))
+export function folderEntryKey(folder: string, home: string = homedir(), literal = false): string {
+  return !literal && hasGlob(folder) ? folder : canonicalize(expandHome(folder, home))
 }
 
 function entryIsFolder(e: FolderEntry, folder: string, raw: string, target: string, home: string): boolean {
-  return e.path === folder ||
-    (!hasGlob(e.path) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false).includes(target)))
+  return (e.path === folder && !entryIsGlob(e)) ||
+    (!entryIsGlob(e) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false, e.literal === true).includes(target)))
 }
 
 /**
@@ -586,8 +633,11 @@ function sameFolderIgnoringCase(form: string, target: string): boolean {
  * an edit or removal must find it rather than add a second entry beside it.
  * Compared as written apart from letter case — never resolved on disk.
  */
-function findEntryIndex(entries: FolderEntry[], folder: string, home: string): { applied: number[]; nameOnly: number[] } {
-  if (hasGlob(folder)) return { applied: entries.flatMap((e, i) => (e.path === folder ? [i] : [])), nameOnly: [] }
+function findEntryIndex(
+  entries: FolderEntry[], folder: string, home: string, literal = false,
+): { applied: number[]; nameOnly: number[] } {
+  // A glob edit (not a literal one, #1415) names only the glob entry as typed.
+  if (!literal && hasGlob(folder)) return { applied: entries.flatMap((e, i) => (e.path === folder ? [i] : [])), nameOnly: [] }
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
   // EVERY entry for this folder, not just the first: a second entry would
@@ -602,9 +652,11 @@ function findEntryIndex(entries: FolderEntry[], folder: string, home: string): {
   const applied: number[] = []
   const nameOnly: number[] = []
   entries.forEach((e, i) => {
-    if (!hasGlob(e.path) && entryForms(e.path, home, false).includes(target)) applied.push(i)
+    // A literal entry (#1415) is a plain folder even when its name has `*`/`?`.
+    const lit = e.literal === true
+    if (!entryIsGlob(e) && entryForms(e.path, home, false, lit).includes(target)) applied.push(i)
     else if (entryIsFolder(e, folder, raw, target, home) ||
-      (!hasGlob(e.path) && entryForms(e.path, home, false).some(f => sameFolderIgnoringCase(f, target)))) nameOnly.push(i)
+      (!entryIsGlob(e) && entryForms(e.path, home, false, lit).some(f => sameFolderIgnoringCase(f, target)))) nameOnly.push(i)
   })
   return { applied, nameOnly }
 }
@@ -653,9 +705,10 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   // Refuse a malformed map and check the nonce first, but CONSUME the nonce
   // only after the map is saved: a refused or failed write never burns it.
   const map = loadForWrite(root)
-  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, change, opts.now, home) : null
-  const key = folderEntryKey(folder, home)
-  const { applied, nameOnly } = findEntryIndex(map.folders, folder, home)
+  const literal = opts.literal === true
+  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, change, opts.now, home, literal) : null
+  const key = folderEntryKey(folder, home, literal)
+  const { applied, nameOnly } = findEntryIndex(map.folders, folder, home, literal)
   // Every entry for this folder merges into ONE, which keeps exactly what is
   // in effect now, except what this change sets:
   //  - path, `trusted` and `scope` come ONLY from entries that applied. The
@@ -673,6 +726,21 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   const appliedEntries = applied.map(i => ({ e: map.folders[i], i }))
   const grantedPaths = [...applied, ...nameOnly].filter(i => map.folders[i].trusted === true).map(i => map.folders[i].path)
   const entry: FolderEntry = { path: appliedEntries[0]?.e.path ?? key }
+  // The merged path stays a literal folder (#1415) when it has `*`/`?` and
+  // either this edit is literal or the applied entry it came from was.
+  if (hasGlob(entry.path) && (literal || appliedEntries[0]?.e.literal === true)) entry.literal = true
+  // #1415 review: the refusal holds on the path this write records, computed
+  // here under the lock — not on a check the caller made before it.
+  if (opts.refuseCoveringHome) {
+    const written = new Set([key, entry.path].filter(p => literal || entry.literal === true || !hasGlob(p)).map(p => expandHome(p, home)))
+    for (const p of written) {
+      if (coversHomeOrRoot(p, home)) {
+        throw new FolderMapError('covers-home',
+          `${p} is your home folder, a filesystem root or a folder above your home, and an entry for it would cover ` +
+          'every folder under it; nothing was changed.')
+      }
+    }
+  }
   if (appliedEntries.some(c => c.e.trusted === true)) entry.trusted = true
   const scope = mostSpecific(appliedEntries.filter(c => c.e.scope !== undefined), home)?.scope
   if (scope !== undefined) entry.scope = scope
@@ -703,7 +771,7 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   consume?.()
   // Dual-write (see addLegacyTrustEntry): keep trust.yaml in step for
   // adapters on the previous core.
-  if (change.trusted === true && !hasGlob(entry.path)) addLegacyTrustEntryUnlocked(root, entry.path)
+  if (change.trusted === true && !entryIsGlob(entry)) addLegacyTrustEntryUnlocked(root, entry.path)
   if (change.trusted === false) {
     // A revocation: the folder's own line, and the line of every matched
     // entry that held a grant (applied or name-only), as `rm` does.
@@ -762,7 +830,7 @@ function clearFolderTrustUnlocked(root: string, folder: string, home: string): b
     // for identity like findEntryIndex's fallback (#1357). Its grant never
     // applied, but `plur untrust` must still clear it and say so.
     const hit = e.trusted === true && (entryIsFolder(e, folder, raw, target, home) ||
-      (!hasGlob(e.path) && entryForms(e.path, home, false).some(f => sameFolderIgnoringCase(f, target))))
+      (!entryIsGlob(e) && entryForms(e.path, home, false, e.literal === true).some(f => sameFolderIgnoringCase(f, target))))
     if (!hit) return true
     changed = true
     cleared.push(e.path)
@@ -898,22 +966,27 @@ function writeNonceFile(file: string, data: NonceFile): void {
  * `{ trusted: false }` and `plur folders rm` is `{ remove: true }`. The folder
  * is recorded as the key a write of it records (folderEntryKey: `~` expanded,
  * canonicalised, a glob as typed), which is what verifyFolderNonce compares.
+ * `literal` must match the write's own `literal` option (#1415 review): a
+ * literal write of `sub?` records the canonical folder, a glob write `sub?`
+ * as typed, and the nonce is bound to the same key.
  */
 export function issueFolderNonce(
   root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number = Date.now(),
+  options: { home?: string; literal?: boolean } = {},
 ): string {
   if (answerKey(answer) === null) throw new FolderMapError('invalid', 'A folder nonce needs the answer it authorises.')
-  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, folder, answer, now))
+  const key = folderEntryKey(folder, options.home ?? homedir(), options.literal === true)
+  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, key, answer, now))
 }
 
-function issueFolderNonceUnlocked(root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number): string {
+function issueFolderNonceUnlocked(root: string, sessionId: string, key: string, answer: FolderAnswer, now: number): string {
   mkdirSync(nonceDir(root), { recursive: true, mode: 0o700 })
   const file = nonceFile(root, sessionId)
   const data = readNonceFile(file) ?? { session: safeSessionKey(sessionId), nonces: [] }
   const nonce = randomBytes(16).toString('hex')
   // The same key a write of this folder records (#1477 review): `~` expands
   // to the home, a literal folder is canonicalised, a glob is kept as typed.
-  data.nonces.push({ nonce, folder: folderEntryKey(folder), answer: cleanAnswer(answer), issued_at: now })
+  data.nonces.push({ nonce, folder: key, answer: cleanAnswer(answer), issued_at: now })
   writeNonceFile(file, data)
   return nonce
 }
@@ -936,8 +1009,11 @@ export function endFolderNonceSession(root: string, sessionId: string): void {
 /**
  * Verify and consume `nonce` for `answer` on `folder` in one step. See verifyFolderNonce.
  */
-export function consumeFolderNonce(root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now()): void {
-  locked(root, () => verifyFolderNonce(root, nonce, folder, answer, now)())
+export function consumeFolderNonce(
+  root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now(),
+  options: { home?: string; literal?: boolean } = {},
+): void {
+  locked(root, () => verifyFolderNonce(root, nonce, folder, answer, now, options.home ?? homedir(), options.literal === true)())
 }
 
 /**
@@ -951,11 +1027,14 @@ export function consumeFolderNonce(root: string, nonce: string, folder: string, 
  */
 export function verifyFolderNonce(
   root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now(), home: string = homedir(),
+  literal = false,
 ): () => void {
   // Checked against exactly the key the write records (#1477 review). With
   // canonicalize(folder) alone, a quoted `~/x` was checked as `<cwd>/~/x`
   // but written as `$HOME/x`, so a nonce for one folder could write another.
-  const key = folderEntryKey(folder, home)
+  // `literal` is the write's own (#1415 review): a literal write of `sub?`
+  // records the canonical folder, so it is checked against that, not `sub?`.
+  const key = folderEntryKey(folder, home, literal)
   const dir = nonceDir(root)
   let files: string[] = []
   try { files = readdirSync(dir).filter(f => f.endsWith('.yaml')) } catch { /* no nonces issued */ }

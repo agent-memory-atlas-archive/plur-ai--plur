@@ -24,6 +24,79 @@ second run changes nothing. A folder the map has `off` keeps that entry. After
 the upgrade, **other folders get the folder question** on their first prompt:
 answer it once per folder, or "never here" to silence one for good.
 
+### `plur init-remote` is now `plur remote`, and the token stays out of the repo (#1413)
+
+**One command connects a folder to a team store** (folder-map design r3).
+`plur init-remote` wrote the URL and bearer token into the repo's
+`.plur.yaml`, relying on `.gitignore` to keep the token out of git. `plur
+remote` keeps both in your own config instead:
+
+```
+plur remote --url https://plur.example.test --token <t> --scope group:example/eng
+plur remote --url https://plur.example.test --token <t> --scopes group:example/eng,group:example/ops
+plur remote        # show this folder's connection and check it
+```
+
+- **Nothing is written until the server agrees.** Every scope is checked
+  against the server's `/me` first (`Plur.verifyRemoteStore`, the checks of
+  #1272's `addRemoteStore` without the write). A rejected token, an unreachable
+  server, or one scope in `--scopes` the token is not authorised for exits 1
+  and leaves every file as it was.
+- **Then** each scope is registered as a url store in `config.yaml` (the token
+  is kept there), and the current folder is recorded in `folders.yaml` with the
+  scope: `--scope`, or the first of `--scopes`. **Nothing is written to
+  `.plur.yaml` or `.gitignore`.** Running it again changes nothing. No trust
+  grant is needed: the URL and token are yours, in your config.
+- The token can also come from `--token-env <VAR>` or stdin (`--token -`). It
+  is never printed: not in text, not in `--json`, not in an error.
+- **It refuses `$HOME`, a filesystem root and any folder above `$HOME`**:
+  an entry there would connect every folder under it. The check runs before
+  the server is contacted and again when `folders.yaml` is written, under its
+  lock, on the path actually recorded (`Plur.setFolder`'s new
+  `refuseCoveringHome` option, error code `covers-home`). A folder replaced by
+  a symlink to `$HOME` while the server answers is therefore still refused;
+  the store stays registered in `config.yaml` and no folder is mapped.
+- **The current folder is recorded literally**, so a folder named `proj?` does
+  not also connect `projX`. A nonce for such a write is bound to the same key:
+  `issueFolderNonce` and `verifyFolderNonce` take the write's `literal` option.
+- **Text from outside this machine is printed only when it fits a grammar.**
+  Bare `plur remote` shows an untrusted `.plur.yaml`'s requested scope and
+  domain only when they are valid scope or domain names, and of its
+  `remote_url` only the host (`requested.remote_host`); anything else is shown
+  as `invalid`. A username returned by the server is shown only when it is a
+  plain user name, otherwise as `invalid`.
+- **`plur remote` with no flags** prints the folder's policy (`on`/`off`/`ask`,
+  the scope, and where that came from) and checks each store serving the
+  folder: the url stores for its scope, and a trusted `.plur.yaml` remote.
+  Exit 0 when all are reachable, 2 when one is not, 1 when none serves it.
+- **`plur init-remote` is a hidden alias.** The same flags give the same
+  result, `--verify` is bare `plur remote`, and `--no-gitignore` is accepted
+  and does nothing. **It no longer writes `.plur.yaml`** and no longer grants
+  trust, and it now supports `--json`.
+- **An existing `.plur.yaml` with `remote_url` / `remote_token` keeps working**
+  under a trusted folder, exactly as before. Running `plur remote` there prints
+  one line saying the connection now lives in your user config and the token
+  can be removed from `.plur.yaml`. It never edits or deletes the file.
+- **The hooks follow the folder entry.** The Claude Code, Codex, Cursor and
+  Antigravity hooks read the folder map (see "Every editor's hooks follow the
+  folder map" below), so the recorded scope is the session scope and the
+  folder gets recall from that scope's store, with no `.plur.yaml`. The
+  opencode plugin and the MCP server's `plur_session_start` do not read the
+  map yet: there, core dials a url store only when the session's scope names
+  that store's org, so a folder with no `.plur.yaml` scope gets the store
+  registered but no remote recall.
+
+### `plur trust` and `plur untrust` are hidden from `plur --help` (#1413)
+
+Trust is now granted by `plur folders set <dir> --trusted`, by the automatic
+import of `trust.yaml`, and by answering yes to the one-time question the
+hooks ask in an undecided folder.
+Both commands keep working. In a terminal they give the same output and exit
+codes as before. Outside a terminal, `plur trust` now needs the nonce the ask
+flow issued for that answer, and `plur untrust` needs none (see "A folder
+nonce now authorises one answer" below). The trust check for a `.plur.yaml`
+that names its own remote is unchanged.
+
 ### Every editor's hooks follow the folder map, and a folder with no decision asks once
 
 **Second half of #1347.** The Claude Code, Codex, Cursor and Antigravity hooks
