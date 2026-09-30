@@ -4,7 +4,9 @@
  * #1228's O_EXCL `takeInjectLock`. With a stat-then-write lock, hooks that
  * fire together all see "no lock", all write one and all run the full
  * injection. With O_EXCL exactly one wins; the rest bail before counting an
- * attempt, so the cap is charged once.
+ * attempt, so the cap is charged once. The barrier preload
+ * (helpers/inject-lock-barrier.mjs) lines the runs up at the lock; on main's
+ * stat-then-write lock this test fails with every run injecting.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync, readFileSync, existsSync } from 'fs'
@@ -55,8 +57,10 @@ describe('concurrent hook-inject runs on one session key', () => {
     barrierDir = mkdtempSync(join(home, 'barrier-'))
     const outs = await Promise.all(Array.from({ length: N }, () => injectAsync()))
     const started = outs.filter(o => o.includes('session started'))
-    expect(started).toHaveLength(1)
     const dir = join(home, 'tmp', 'plur-sessions')
+    const seen = JSON.stringify({ outs: outs.map(o => o.slice(0, 80)), barrier: readdirSync(barrierDir), state: existsSync(dir) ? readdirSync(dir) : [] })
+    expect(started, seen).toHaveLength(1)
+    expect(outs.filter(o => o !== ''), seen).toHaveLength(1) // the others print nothing
     // One attempt counted (cap is 2), and no lock left behind.
     expect(readFileSync(join(dir, 'race-key.attempts'), 'utf8')).toBe('1')
     expect(existsSync(dir) ? readdirSync(dir).filter(f => f.includes('.injecting')) : []).toEqual([])
