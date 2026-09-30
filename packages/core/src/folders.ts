@@ -473,7 +473,7 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
 // Writes (CLI only): set / remove, with the nonce and shared-scope guards.
 // ---------------------------------------------------------------------------
 
-export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'scope-unconfigured' | 'invalid'
+export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'nonce-answer' | 'scope-unconfigured' | 'invalid'
 
 export class FolderMapError extends Error {
   constructor(public readonly code: FolderMapErrorCode, message: string) {
@@ -487,6 +487,37 @@ export interface FolderChange {
   scope?: string
   /** true sets `trusted`, false clears it. */
   trusted?: boolean
+}
+
+/**
+ * The one answer a nonce authorises (#1378): a `set` (the same shape as the
+ * FolderChange it will be compared with) or the removal of the entry.
+ * `plur trust` is the answer `{ trusted: true }`. `folders set --no-trusted`
+ * is `{ trusted: false }`; `plur untrust` needs no nonce (#1477 review).
+ */
+export type FolderAnswer = FolderChange | { remove: true }
+
+/**
+ * The comparable form of an answer. `--scope X` means on, so it equals
+ * `--scope X --on`; everything else must match exactly, `trusted` included
+ * (absent, true and false are three different answers).
+ */
+function answerKey(a: FolderAnswer | undefined | null): string | null {
+  if (!a || typeof a !== 'object') return null
+  if ('remove' in a) return a.remove === true ? 'remove' : null
+  const mode = a.mode ?? (a.scope !== undefined ? 'on' : null)
+  return JSON.stringify(['set', mode, a.scope ?? null, a.trusted ?? null])
+}
+
+function describeAnswer(a: FolderAnswer | undefined | null): string {
+  if (!a || typeof a !== 'object') return 'no answer'
+  if ('remove' in a) return 'removing the entry'
+  const parts: string[] = []
+  if (a.scope !== undefined) parts.push(`--scope ${a.scope}`)
+  else if (a.mode !== undefined) parts.push(`--${a.mode}`)
+  if (a.trusted === true) parts.push('--trusted')
+  if (a.trusted === false) parts.push('--no-trusted')
+  return parts.join(' ') || 'no answer'
 }
 
 export interface SetFolderOptions {
@@ -622,7 +653,7 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   // Refuse a malformed map and check the nonce first, but CONSUME the nonce
   // only after the map is saved: a refused or failed write never burns it.
   const map = loadForWrite(root)
-  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
+  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, change, opts.now, home) : null
   const key = folderEntryKey(folder, home)
   const { applied, nameOnly } = findEntryIndex(map.folders, folder, home)
   // Every entry for this folder merges into ONE, which keeps exactly what is
@@ -697,7 +728,7 @@ function removeFolderEntryUnlocked(
   root: string, folder: string, home: string, opts?: { nonce?: string; now?: number },
 ): boolean {
   const map = loadForWrite(root)
-  const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
+  const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, { remove: true }, opts.now, home) : null
   const { applied, nameOnly } = findEntryIndex(map.folders, folder, home)
   const matched = [...applied, ...nameOnly]
   if (matched.length === 0) return false
@@ -832,7 +863,7 @@ export function safeSessionKey(sessionId: string): string {
   return safe || 'unknown'
 }
 
-interface NonceRecord { nonce: string; folder: string; issued_at: number }
+interface NonceRecord { nonce: string; folder: string; answer?: FolderAnswer; issued_at: number }
 interface NonceFile { session: string; nonces: NonceRecord[] }
 
 function nonceDir(root: string): string {
@@ -859,21 +890,42 @@ function writeNonceFile(file: string, data: NonceFile): void {
 }
 
 /**
- * Issue a single-use nonce that lets the ask flow of `sessionId` record a
- * decision for exactly `folder`.
+ * Issue a single-use nonce that lets the ask flow of `sessionId` record
+ * exactly `answer` for exactly `folder` (#1378). The ask flow issues one nonce
+ * per answer it offers, and prints each next to its command: a nonce issued
+ * for `{ mode: 'on' }` does not authorise `--trusted`, `--off`, another scope
+ * or `rm`. `plur trust` is `{ trusted: true }`, `folders set --no-trusted` is
+ * `{ trusted: false }` and `plur folders rm` is `{ remove: true }`. The folder
+ * is recorded as the key a write of it records (folderEntryKey: `~` expanded,
+ * canonicalised, a glob as typed), which is what verifyFolderNonce compares.
  */
-export function issueFolderNonce(root: string, sessionId: string, folder: string, now: number = Date.now()): string {
-  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, folder, now))
+export function issueFolderNonce(
+  root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number = Date.now(),
+): string {
+  if (answerKey(answer) === null) throw new FolderMapError('invalid', 'A folder nonce needs the answer it authorises.')
+  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, folder, answer, now))
 }
 
-function issueFolderNonceUnlocked(root: string, sessionId: string, folder: string, now: number): string {
+function issueFolderNonceUnlocked(root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number): string {
   mkdirSync(nonceDir(root), { recursive: true, mode: 0o700 })
   const file = nonceFile(root, sessionId)
   const data = readNonceFile(file) ?? { session: safeSessionKey(sessionId), nonces: [] }
   const nonce = randomBytes(16).toString('hex')
-  data.nonces.push({ nonce, folder: canonicalize(folder), issued_at: now })
+  // The same key a write of this folder records (#1477 review): `~` expands
+  // to the home, a literal folder is canonicalised, a glob is kept as typed.
+  data.nonces.push({ nonce, folder: folderEntryKey(folder), answer: cleanAnswer(answer), issued_at: now })
   writeNonceFile(file, data)
   return nonce
+}
+
+/** Only the fields an answer has, so the nonce file holds nothing else. */
+function cleanAnswer(a: FolderAnswer): FolderAnswer {
+  if ('remove' in a) return { remove: true }
+  return {
+    ...(a.mode !== undefined ? { mode: a.mode } : {}),
+    ...(a.scope !== undefined ? { scope: a.scope } : {}),
+    ...(a.trusted !== undefined ? { trusted: a.trusted } : {}),
+  }
 }
 
 /** Drop every nonce of `sessionId` — called when the session ends. */
@@ -882,20 +934,28 @@ export function endFolderNonceSession(root: string, sessionId: string): void {
 }
 
 /**
- * Verify and consume `nonce` for `folder` in one step. See verifyFolderNonce.
+ * Verify and consume `nonce` for `answer` on `folder` in one step. See verifyFolderNonce.
  */
-export function consumeFolderNonce(root: string, nonce: string, folder: string, now: number = Date.now()): void {
-  locked(root, () => verifyFolderNonce(root, nonce, folder, now)())
+export function consumeFolderNonce(root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now()): void {
+  locked(root, () => verifyFolderNonce(root, nonce, folder, answer, now)())
 }
 
 /**
- * Verify `nonce` for `folder` and return the function that consumes it.
- * Writers call that only after their write succeeded, so a failed write never
- * burns the nonce. Throws a FolderMapError when the nonce is unknown (never
- * issued, already used, or its session ended), expired (removed on the spot),
- * or was issued for a different folder (left in place).
+ * Verify `nonce` for `answer` on `folder` and return the function that
+ * consumes it. Writers call that only after their write succeeded, so a
+ * failed write never burns the nonce. Throws a FolderMapError when the nonce
+ * is unknown (never issued, already used, or its session ended), expired
+ * (removed on the spot), or was issued for a different folder or a different
+ * answer (left in place, so the answer it was issued for still works). A
+ * record with no bound answer (written before #1378) authorises nothing.
  */
-export function verifyFolderNonce(root: string, nonce: string, folder: string, now: number = Date.now()): () => void {
+export function verifyFolderNonce(
+  root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now(), home: string = homedir(),
+): () => void {
+  // Checked against exactly the key the write records (#1477 review). With
+  // canonicalize(folder) alone, a quoted `~/x` was checked as `<cwd>/~/x`
+  // but written as `$HOME/x`, so a nonce for one folder could write another.
+  const key = folderEntryKey(folder, home)
   const dir = nonceDir(root)
   let files: string[] = []
   try { files = readdirSync(dir).filter(f => f.endsWith('.yaml')) } catch { /* no nonces issued */ }
@@ -911,8 +971,13 @@ export function verifyFolderNonce(root: string, nonce: string, folder: string, n
       writeNonceFile(file, data)
       throw new FolderMapError('nonce-expired', 'That nonce has expired; nothing was changed.')
     }
-    if (rec.folder !== canonicalize(folder)) {
-      throw new FolderMapError('nonce-folder', `That nonce was issued for ${rec.folder}, not ${canonicalize(folder)}; nothing was changed.`)
+    if (rec.folder !== key) {
+      throw new FolderMapError('nonce-folder', `That nonce was issued for ${rec.folder}, not ${key}; nothing was changed.`)
+    }
+    const bound = answerKey(rec.answer)
+    if (bound === null || bound !== answerKey(answer)) {
+      throw new FolderMapError('nonce-answer',
+        `That nonce was issued for ${describeAnswer(rec.answer)}, not ${describeAnswer(answer)}; nothing was changed.`)
     }
     return () => {
       // Re-read: another writer may have changed this session's file since.
