@@ -45,8 +45,9 @@ const SHIM_FILE = '(?:plur-hook(?:\\.cmd)?|(?<=/(?:\\.plur|plur~\\d+)/bin/)plur-
  * The shim path in the forms any command may use, whoever's machine wrote it:
  *  - unquoted, no whitespace (darwin/linux, and Windows short or space-free paths);
  *  - quoted, any characters but a quote (a path with whitespace).
- * The third form, an unquoted path WITH spaces, is not in this pattern: it
- * is claimed only when it is this machine's own shim (see `spacedShimPaths`).
+ * An unquoted path with a space or a shell metacharacter is not in this
+ * pattern: it is claimed only when it is this machine's own shim (see
+ * `homeShimPaths`).
  */
 const SHIM_PATH = [
   `(?:${PLAIN}*/)?${SHIM_FILE}`,
@@ -58,26 +59,30 @@ const SHIM_FORM = new RegExp(`^(?:&[ \\t]+)?(?:${SHIM_PATH})${HOOK_TAIL}`)
 /** The `npx [-y] @plur-ai/cli[@version] hook-*` fallback, in every form init wrote. */
 const NPX_FORM = new RegExp(`^npx(?:[ \\t]+-y)?[ \\t]+@plur-ai/cli(?:@${PLAIN}+)?${HOOK_TAIL}`)
 
-/** The subcommand and arguments after a spaced shim path. */
-const SPACED_TAIL = new RegExp(`^${HOOK_TAIL}`)
+/** The subcommand and arguments after this home's own shim path. */
+const HOME_SHIM_TAIL = new RegExp(`^${HOOK_TAIL}`)
 
 /**
- * The unquoted shim path with spaces — what versions before #1267 wrote on
- * Windows (`C:\Users\John Smith\.plur\bin\plur-hook.cmd hook-inject`),
- * and the Antigravity fallback of decision H3. Unquoted, a space cannot tell
- * the path from an argument: `/usr/bin/time ~/.plur/bin/plur-hook hook-x`
- * and `C:/Tools/log.exe %USERPROFILE%/.plur/bin/plur-hook.cmd hook-x` are
- * another binary running the shim. So this form is claimed only when the
- * path is exactly the shim init installs, `<homedir>/.plur/bin/plur-hook`
- * (`.cmd` on Windows), compared without regard to slash style or case (like
- * the recorded-entry check of decision F4). When in doubt the command is the
+ * This machine's own shim, `<homedir>/.plur/bin/plur-hook` (`.cmd` on
+ * Windows), normalised like the command (forward slashes, lower case). Init
+ * writes it unquoted whenever it holds no whitespace (hookCommandPrefix,
+ * windowsHookCommand), and versions before #1267 wrote it unquoted even with
+ * spaces (as does the Antigravity fallback of decision H3). Such a path can
+ * hold a space (`C:\Users\John Smith`) or a character PLAIN rejects
+ * (`C:\Users\O'Brien`, `a&b`, `x(1)`), so the patterns cannot recognise it.
+ * A command is claimed through this path only when it STARTS with it,
+ * compared as a literal string (never built into a regex), followed by the
+ * hook tail, which still admits no separator or newline. A space alone
+ * cannot tell a path from an argument, which is why this is the only way an
+ * unquoted spaced path is claimed: `/usr/bin/time ~/.plur/bin/plur-hook
+ * hook-x` and `C:/Tools/log.exe %USERPROFILE%/.plur/bin/plur-hook.cmd hook-x`
+ * are another binary running the shim. When in doubt the command is the
  * user's: a PLUR hook left unclaimed costs at worst a duplicate entry, a
- * user's hook wrongly claimed is deleted by init. A home directory holding a
- * quote or shell metacharacter never takes this form.
+ * user's hook wrongly claimed is deleted by init.
  */
-function spacedShimPaths(): string[] {
+function homeShimPaths(): string[] {
   const bin = `${homedir().replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '')}/.plur/bin/`
-  if (/["'`$&;|<>()\r\n]/.test(bin)) return []
+  if (/[\r\n]/.test(bin)) return []
   return [`${bin}plur-hook.cmd`, `${bin}plur-hook`]
 }
 
@@ -112,7 +117,7 @@ export function isPlurHookCommand(command: string): boolean {
 export function matchesPlurHookLauncher(command: string): boolean {
   const normalised = command.trim().replace(/\\/g, '/').toLowerCase()
   if (SHIM_FORM.test(normalised) || NPX_FORM.test(normalised)) return true
-  return spacedShimPaths().some((p) => normalised.startsWith(p) && SPACED_TAIL.test(normalised.slice(p.length)))
+  return homeShimPaths().some((p) => normalised.startsWith(p) && HOME_SHIM_TAIL.test(normalised.slice(p.length)))
 }
 
 // END shared hook matcher

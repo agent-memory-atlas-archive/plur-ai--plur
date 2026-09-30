@@ -329,7 +329,7 @@ describe('F4: the PLUR-hook matcher is anchored', () => {
     ['& then spaces', '& ' + ' '.repeat(MiB) + '"C:/a/.plur/bin/plur-hook" hook-x;'],
     ['spaces and tabs between arguments', '/a/.plur/bin/plur-hook hook-x' + fill(' \t', MiB) + ';'],
   ])('the patterns run in linear time on 1 MiB: %s', (_label, hostile) => {
-    for (const home of ['/nowhere', 'C:/a']) {
+    for (const home of ['/nowhere', 'C:/a', "C:/a'b&c(1)"]) {
       withHome(home, () => {
         for (const match of [matchesPlurHookLauncher, mcpMatchesPlurHookLauncher]) {
           const start = performance.now()
@@ -425,6 +425,41 @@ describe('#1270 review: the unquoted spaced shim path is claimed only as this ho
       withHome(home, () => expect(both(cmd)).toEqual([false, false]))
     }
   })
+
+  // #1270 re-review: a home with a quote or shell metacharacter but no space
+  // gets its shim written unquoted; PLAIN rejects it, so only the exact
+  // home-shim check recognises it. Without it every re-init added a set.
+  it.each([
+    ["C:\\Users\\O'Brien", "C:/Users/O'Brien/.plur/bin/plur-hook.cmd hook-inject"],
+    ["C:\\Users\\O'Brien", "C:\\Users\\O'Brien\\.plur\\bin\\plur-hook.cmd hook-codex-stop --x"],
+    ["/home/o'brien", "/home/o'brien/.plur/bin/plur-hook hook-inject --rehydrate"],
+    ['C:\\Users\\a&b', 'C:/Users/a&b/.plur/bin/plur-hook.cmd hook-cursor-stop'],
+    ['C:\\Users\\x(1)', 'C:/Users/x(1)/.plur/bin/plur-hook.cmd hook-agy-guard'],
+    ['/home/a;b', '/home/a;b/.plur/bin/plur-hook hook-inject'],
+    ['/home/a|b$c`d', '/home/a|b$c`d/.plur/bin/plur-hook hook-inject'],
+  ])('metacharacter home %s: claims its own shim %s', (home, cmd) => {
+    withHome(home, () => expect(both(cmd)).toEqual([true, true]))
+  })
+
+  it.each([["C:\\Users\\O'Brien"], ['C:\\Users\\a&b'], ['C:\\Users\\x(1)'], ['/home/a;b'], ["/home/o'brien"]])(
+    'metacharacter home %s: wrappers, chained tails and look-alikes stay the user\'s', (home) => {
+      withHome(home, () => {
+        const shim = `${home.replace(/\\/g, '/')}/.plur/bin/plur-hook${home.startsWith('C:') ? '.cmd' : ''}`
+        expect(both(`${shim} hook-inject`)).toEqual([true, true])
+        for (const cmd of [
+          `/usr/bin/time ${shim} hook-inject`,
+          `C:/Tools/log.exe ${shim} hook-inject`,
+          `env ${shim} hook-inject`,
+          `${shim}x hook-inject`,
+          `${shim}.bak hook-inject`,
+          `${shim} status`,
+          `${shim} hook-inject; x`, `${shim} hook-inject && x`, `${shim} hook-inject | x`,
+          `${shim} hook-inject & x`, `${shim} hook-inject $(x)`, `${shim} hook-inject \`x\``,
+          `${shim} hook-inject > out`, `${shim} hook-inject\nx`, `${shim} hook-inject\rx`,
+          `${shim} hook-inject 'a'`, `${shim} hook-inject (x)`,
+        ]) expect(both(cmd)).toEqual([false, false])
+      })
+    })
 
   it('does not claim a spaced shim path of another home (a duplicate at worst)', () => {
     withHome('C:\\Users\\someone', () => {
