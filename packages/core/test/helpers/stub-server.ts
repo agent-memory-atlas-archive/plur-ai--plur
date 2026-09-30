@@ -89,6 +89,13 @@ export class StubServer {
   /** With `appendDelayMs`: store the engram only when the delayed answer is
    *  sent, so a client that gives up first leaves nothing on the server. */
   appendDropWhileDelayed = false
+  /** Statement of every POST /engrams body received, in arrival order. The
+   *  server ignores the key unless `honourIdempotency` is set, so this counts
+   *  every push that reached it — duplicates included. */
+  appendStatements: string[] = []
+  /** Pending holds, consumed one per POST /engrams in arrival order: the
+   *  engram is stored on receipt, but the answer waits for `release()`. */
+  private appendHolds: Array<{ arrived: (statement: string) => void; released: Promise<void> }> = []
   /** `Idempotency-Key` header of the most recent POST /engrams. */
   lastAppendIdempotencyKey: string | null = null
   /** Every `Idempotency-Key` received on an accepted POST /engrams, in order. */
@@ -190,6 +197,26 @@ export class StubServer {
     })
   }
 
+  /**
+   * Hold the answer to the next POST /engrams that arrives (after any holds
+   * already queued). `arrived` resolves with its statement once the engram is
+   * stored; the client gets its answer only after `release()`. For ordering
+   * separate writer processes deterministically.
+   */
+  holdNextAppend(): { arrived: Promise<string>; release: () => void } {
+    let arrived!: (statement: string) => void
+    let release!: () => void
+    const arrivedP = new Promise<string>(r => { arrived = r })
+    const released = new Promise<void>(r => { release = r })
+    this.appendHolds.push({ arrived, released })
+    return { arrived: arrivedP, release }
+  }
+
+  /** How many POST /engrams bodies with this statement arrived. */
+  appendCountFor(statement: string): number {
+    return this.appendStatements.filter(s => s === statement).length
+  }
+
   /** Reset all data without restarting. */
   reset(): void {
     this.engrams.clear()
@@ -200,6 +227,8 @@ export class StubServer {
     this.appendDelayMs = 0
     this.appendCalls = 0
     this.appendDropWhileDelayed = false
+    this.appendStatements = []
+    this.appendHolds = []
     this.lastAppendIdempotencyKey = null
     this.appendKeys = []
     this.honourIdempotency = false
@@ -310,6 +339,8 @@ export class StubServer {
           return
         }
         const { statement, scope, domain, type, source } = body
+        if (typeof statement === 'string') this.appendStatements.push(statement)
+        const hold = this.appendHolds.shift()
         const refusal = typeof scope === 'string' ? this.appendErrorByScope[scope] : undefined
         if (refusal) {
           res.writeHead(refusal.status, { 'Content-Type': 'text/plain' })
@@ -350,7 +381,10 @@ export class StubServer {
             this.json(res, 201, { id: returnedId, scope: engram.scope, status: engram.status, data: engram.data })
           }
         }
-        if (this.appendDelayMs > 0) setTimeout(respond, this.appendDelayMs).unref()
+        if (hold) {
+          hold.arrived(typeof statement === 'string' ? statement : '')
+          void hold.released.then(respond)
+        } else if (this.appendDelayMs > 0) setTimeout(respond, this.appendDelayMs).unref()
         else respond()
       })
       return
