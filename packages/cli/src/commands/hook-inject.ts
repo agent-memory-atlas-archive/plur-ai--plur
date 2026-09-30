@@ -621,6 +621,14 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   const isRehydrate = args.includes('--rehydrate')
   const eventIdx = args.indexOf('--event')
   const event = eventIdx >= 0 ? args[eventIdx + 1] : null
+  // Background embedding-cache build started by an earlier fallback (#1313
+  // audit). Not a hook invocation: no stdin, no output, its own ceiling. It
+  // runs before the folder gate (#1347): the warmer is a detached child with
+  // no payload, and the folder that spawned it was already on.
+  if (args.includes('--warm-embeddings')) {
+    await warmEmbeddingCache(flags)
+    return
+  }
   // Every path needs the payload (#1278): the session key comes from its
   // `session_id`, and the folder decision from its `cwd`. Reading stdin is a
   // single synchronous read.
@@ -634,13 +642,6 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   if (policy.mode === 'off') return
   if (policy.mode === 'ask') {
     if (!isRehydrate && !event) await askFolder(input, dir, policy, flags)
-    return
-  }
-
-  // Background embedding-cache build started by an earlier fallback (#1313
-  // audit). Not a hook invocation: no stdin, no output, its own ceiling.
-  if (args.includes('--warm-embeddings')) {
-    await warmEmbeddingCache(flags)
     return
   }
 

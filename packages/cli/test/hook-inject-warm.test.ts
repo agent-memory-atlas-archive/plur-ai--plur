@@ -237,4 +237,21 @@ describe('a first prompt that fell back warms the embedding cache for the next s
       rmSync(join(store, '.embeddings-warming'), { force: true })
     }
   }, 60_000)
+
+  it('the background build runs whatever the folder map says about its working folder', () => {
+    // #1414 x #1347: the warmer is a detached child with no hook payload, so
+    // the folder gate would resolve its cwd and return before building. A
+    // folder with no decision is `ask`, which is silent for a hook.
+    const bare = mkdtempSync(join(tmpdir(), 'plur-warm-bare-'))
+    rmSync(join(store, '.embeddings-cache.json'), { force: true })
+    try {
+      const r = runCli('node', [CLI, 'hook-inject', '--warm-embeddings'], {
+        input: '', encoding: 'utf-8', timeout: 120_000, cwd: bare, env,
+      })
+      expect(r.status).toBe(0)
+      expect(cachedEntries()).toBeGreaterThanOrEqual(N)
+    } finally {
+      rmSync(bare, { recursive: true, force: true })
+    }
+  }, 180_000)
 })
