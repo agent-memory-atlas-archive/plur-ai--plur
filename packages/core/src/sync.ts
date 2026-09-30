@@ -1,11 +1,15 @@
 import { execFileSync } from 'child_process'
-import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync, statSync, readdirSync, openSync, closeSync, fsyncSync, chmodSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync, statSync, readdirSync, openSync, closeSync, fsyncSync, chmodSync, linkSync } from 'fs'
 import { join, dirname, relative } from 'path'
 import * as yaml from 'js-yaml'
 import { isSharedScope } from './scope-util.js'
 import { engramStoreEntries, sameEngramContent, recordIdRenames, mergeHeldRecords, readHeldRecovery, writeHeldRecovery, heldRecoveryPath, SYNC_HELD_RENAME_REASON, type IdRename, type HeldFile } from './engrams.js'
 import { recordLastWritten } from './backup.js'
-import { DEFAULT_STALE_THRESHOLD, holderIsAlive, makeToken, startHeartbeat, heartbeatHeldLocks, stealGuardPath, judgeStealSlot, STEAL_GUARD_SLOTS, GIT_COMMAND_TIMEOUT_MS } from './store/async-lock.js'
+import {
+  DEFAULT_STALE_THRESHOLD, holderIsAlive, makeToken, startHeartbeat, heartbeatHeldLocks, stealGuardPath, judgeStealSlot,
+  STEAL_GUARD_SLOTS, GIT_COMMAND_TIMEOUT_MS, publishLockFileSync, abandonedByAge, isAbandoned, inspectLockSync,
+  privateSibling, LINK_UNSUPPORTED,
+} from './store/async-lock.js'
 
 export interface SyncStatus {
   initialized: boolean
@@ -1070,25 +1074,27 @@ export interface LockOptions {
  * `lockPath`. Losing the claim is normal: the caller loops and takes the usual
  * O_EXCL path, which is what actually decides who holds the lock.
  */
-function stealLockSync(lockPath: string, expected: string, token: string): void {
+function stealLockSync(lockPath: string, expected: string, expectedIno: number, token: string): boolean {
   // Serialized by a guard and re-read under it — the same fix, for the same
   // replayed double-holder interleaving, as `stealLock` in store/async-lock.ts
   // (formal-verification finding, spec/formal/findings/persistence.md candidate 3).
   // Round 2 (findings/r2-persist.md item 1): the guard is the same ladder of slots
   // keyed by the judged token, so an abandoned guard is never unlinked by anyone
-  // but its writer while the judged lock is still in place.
-  const slot = acquireStealSlotSync(lockPath, expected, token)
-  if (!slot) return
+  // but its writer while the judged lock is still in place. #1354: the judged
+  // instance is (token, inode) — see `stealGuardPath` and `stealLock`.
+  // Returns false when another contender holds the guard.
+  const slot = acquireStealSlotSync(lockPath, expected, expectedIno, token)
+  if (!slot) return false
   try {
-    let now: string | null = null
-    try { now = readFileSync(lockPath, 'utf8').trim() } catch { now = null }
-    if (now !== expected) return
-    if (claimAndRemoveSync(lockPath, expected, token)) {
+    const now = inspectLockSync(lockPath)
+    if (!now || now.holder !== expected || now.ino !== expectedIno) return true
+    if (claimAndRemoveSync(lockPath, expected, expectedIno, token)) {
       for (let k = 0; k < STEAL_GUARD_SLOTS; k++) {
-        const other = stealGuardPath(lockPath, expected, k)
+        const other = stealGuardPath(lockPath, expected, k, expectedIno)
         if (other !== slot) { try { unlinkSync(other) } catch { /* absent */ } }
       }
     }
+    return true
   } finally {
     try { if (readFileSync(slot, 'utf8').trim() === token) unlinkSync(slot) } catch { /* gone */ }
   }
@@ -1104,9 +1110,9 @@ function stealSlotStateSync(slot: string): 'dead' | 'live' | 'gone' {
 }
 
 /** Synchronous twin of `acquireStealSlot` (store/async-lock.ts). */
-function acquireStealSlotSync(lockPath: string, expected: string, token: string): string | null {
+function acquireStealSlotSync(lockPath: string, expected: string, ino: number, token: string): string | null {
   for (let k = 0; k < STEAL_GUARD_SLOTS; k++) {
-    const slot = stealGuardPath(lockPath, expected, k)
+    const slot = stealGuardPath(lockPath, expected, k, ino)
     try {
       writeFileSync(slot, token, { flag: 'wx' })
     } catch (err: any) {
@@ -1115,7 +1121,7 @@ function acquireStealSlotSync(lockPath: string, expected: string, token: string)
       return null
     }
     for (let i = 0; i < k; i++) {
-      if (stealSlotStateSync(stealGuardPath(lockPath, expected, i)) !== 'dead') {
+      if (stealSlotStateSync(stealGuardPath(lockPath, expected, i, ino)) !== 'dead') {
         try { if (readFileSync(slot, 'utf8').trim() === token) unlinkSync(slot) } catch { /* gone */ }
         return null
       }
@@ -1126,25 +1132,33 @@ function acquireStealSlotSync(lockPath: string, expected: string, token: string)
 }
 
 /** Returns true iff the file moved aside was the judged one (the claim is confirmed). */
-function claimAndRemoveSync(lockPath: string, expected: string, token: string): boolean {
-  const claim = `${lockPath}.steal.${token.replace(/[^\w.-]/g, '_')}`
+function claimAndRemoveSync(lockPath: string, expected: string, expectedIno: number, token: string): boolean {
+  const claim = privateSibling(lockPath, 'steal', token)
   try {
     renameSync(lockPath, claim)
   } catch {
     return false // another contender claimed it, or the holder released — re-evaluate
   }
   try {
+    // Same FILE, not just the same contents (#1354): two empty locks read alike.
     const current = readFileSync(claim, 'utf8').trim()
-    if (current === expected) {
+    if (current === expected && statSync(claim).ino === expectedIno) {
       unlinkSync(claim) // confirmed the one we judged stale
       return true
     }
-    // A live holder's lock, not the stale one. Put it back — but never over a
-    // lock someone has since acquired, so create exclusively and accept EEXIST.
+    // A live holder's lock, not the stale one. Put it back — the SAME file, by
+    // hard link, which never overwrites a lock someone has since acquired
+    // (EEXIST: theirs wins). Without hard links, create exclusively instead.
     try {
-      const fd = openSync(lockPath, 'wx')
-      try { writeFileSync(fd, current) } finally { closeSync(fd) }
-    } catch { /* someone acquired meanwhile — theirs wins */ }
+      linkSync(claim, lockPath)
+    } catch (err: any) {
+      if (LINK_UNSUPPORTED.has(err?.code)) {
+        try {
+          const fd = openSync(lockPath, 'wx')
+          try { writeFileSync(fd, current) } finally { closeSync(fd) }
+        } catch { /* someone acquired meanwhile — theirs wins */ }
+      }
+    }
     try { unlinkSync(claim) } catch { /* already gone */ }
   } catch {
     // The claim file is uniquely named; nothing else would ever clean it up.
@@ -1180,7 +1194,9 @@ export function withLock<T>(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      writeFileSync(lockPath, token, { flag: 'wx' })
+      // Published complete, never as an empty file (#1354) — see
+      // `publishLockFile` in store/async-lock.ts.
+      publishLockFileSync(lockPath, token)
       acquired = true
       break
     } catch (err: any) {
@@ -1192,17 +1208,27 @@ export function withLock<T>(
         // without it would take crash recovery on THESE paths (episodes,
         // tensions, config) from 10s to 60s.
         const holder = readFileSync(lockPath, 'utf8').trim()
+        // Our own unique token, put back by a takeover on the no-hard-link
+        // fallback: the lock is ours (see withFileLock in store/async-lock.ts).
+        if (holder === token) { acquired = true; break }
         const alive = holderIsAlive(holder)
         // Age is consulted ONLY when liveness is unknown — another host, or the
         // bare pid an older client wrote. A confirmed-live holder is never
         // stolen from for being slow: that corrupts the artifact it is midway
         // through writing, whereas waiting on a wedged holder surfaces as a
-        // loud failure the operator can act on.
+        // loud failure the operator can act on. An EMPTY lock is judged on a
+        // short grace period instead of the full threshold (#1354).
         const steal = alive === false
-          || (alive === undefined && Date.now() - stat.mtimeMs > staleThreshold)
+          || (alive === undefined && abandonedByAge(holder, Date.now() - stat.mtimeMs, staleThreshold))
+        // A hint only: judge ONE file (contents and identity together, #1354)
+        // and steal it under the guard ladder shared with the async lock, which
+        // re-inspects and claims by single-winner rename (see `stealLock` in
+        // store/async-lock.ts; audit 2026-08-03 finding 1). When another process
+        // holds the guard, fall through to the normal backoff.
         if (steal) {
-          stealLockSync(lockPath, holder, token)
-          continue
+          const cur = inspectLockSync(lockPath)
+          if (!cur || !isAbandoned(cur.holder, cur.mtimeMs, staleThreshold)) continue
+          if (stealLockSync(lockPath, cur.holder, cur.ino, token)) continue
         }
       } catch {
         continue
