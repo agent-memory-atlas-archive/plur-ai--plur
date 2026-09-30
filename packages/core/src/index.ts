@@ -1,5 +1,5 @@
 import * as fs from 'fs'
-import { randomUUID } from 'crypto'
+import { randomUUID, createHash } from 'crypto'
 import { tmpdir, hostname } from 'os'
 import { join, dirname, basename } from 'path'
 import yaml from 'js-yaml'
@@ -731,6 +731,28 @@ const OUTBOX_CLAIM_LEASE_MS = 60_000
  * entry forever.
  */
 const OUTBOX_CLAIM_MAX_AGE_MS = 15 * 60_000
+
+/**
+ * How many dead takeover markers a claimer walks past before it gives up.
+ * Each level is a racer that died inside a critical section a few syscalls
+ * long, so reaching this means something is badly wrong; the entry waits.
+ */
+const OUTBOX_TAKEOVER_MAX_DEPTH = 8
+
+/** id → idempotency key of every row still queued in the outbox (not retired). */
+function queuedOutboxKeys(rows: Engram[]): Map<string, string | undefined> {
+  const out = new Map<string, string | undefined>()
+  for (const e of rows) {
+    const ob = (e as any).structured_data?._outbox
+    if (ob && e.status !== 'retired') out.set(e.id, typeof ob.idempotency_key === 'string' ? ob.idempotency_key : undefined)
+  }
+  return out
+}
+
+/** Names one exact claim (or marker) content, for its takeover marker. */
+function outboxClaimTag(raw: string): string {
+  return createHash('sha256').update(raw).digest('hex').slice(0, 16)
+}
 
 /** Is this process still running? (`kill 0` probes without signalling.) */
 function pidAlive(pid: number): boolean {
@@ -3292,8 +3314,8 @@ export class Plur {
             })
           } catch (err) {
             // Retried by the next flush with the same key (decision C4): a
-            // key-honouring server collapses it; one that ignores keys may
-            // hold one duplicate.
+            // key-honouring server collapses it; one that ignores keys gets
+            // a duplicate row.
             logger.warning(
               `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
               + `${(err as Error).message}. The next flush will retry it with the same idempotency key.`,
@@ -4621,12 +4643,16 @@ export class Plur {
    * or a flush and learn()'s background push, in one process or several —
    * cannot both push an entry at once. It is released once the push's outcome
    * is recorded (or the flush ends); a claim left by a process that died is
-   * taken over after its lease lapses, and the write is simply retried with
-   * the key already on its outbox row (decision C4).
+   * taken over (see `_claimOutboxEntry`), and the write is simply retried with
+   * the key already on its outbox row (decision C4). A claim guards the row,
+   * not a snapshot: whoever takes it re-reads the row before pushing.
    */
   outboxClaimsDir(): string {
     return join(this.paths.root, 'cache', 'outbox-claims')
   }
+
+  /** Token of each claim this instance holds, so a release removes only its own. */
+  private _outboxClaimTokens = new Map<string, string>()
 
   private _outboxClaimPath(id: string): string {
     return join(this.outboxClaimsDir(), `${id.replace(/[^\w.-]/g, '_')}.json`)
@@ -4634,15 +4660,28 @@ export class Plur {
 
   /**
    * Take the claim on an outbox entry. `busy` when another live writer holds
-   * it. A lapsed claim (lease expired, or its process is gone) is taken over.
-   * `keyFor` supplies the key recorded in the claim.
+   * it. A lapsed claim (its process is gone, or its lease expired) is taken
+   * over. `keyFor` supplies the key recorded in the claim.
    *
-   * Decision C3: the takeover is ATOMIC. The stale claim file is never
-   * removed; a fresh one is written beside it and renamed over it, so the
-   * path is never empty and no second claimer can slip a fresh claim into a
-   * gap. Before the rename the stale content is re-read and must be
-   * unchanged, and after it the file is read back: of two claimers taking
-   * over the same stale claim, only the one whose token is in the file wins.
+   * Every decision is made by O_EXCL, never by reading and comparing (decision
+   * C3; the review of #1277 measured more than one winner in 79 of 80 rounds
+   * of 6 processes racing the read-compare-rename takeover this replaces):
+   *
+   * - **A free entry**: the claim is published with `link(2)`, which fails
+   *   with EEXIST when the path exists. Its content is written first, so no
+   *   reader ever sees a half-written claim and mistakes it for a lapsed one.
+   * - **A lapsed claim**: the right to replace it is a takeover marker,
+   *   `<claim>.takeover-<tag>`, where `<tag>` names that exact stale content.
+   *   Of any number of racers exactly one can create it. The winner re-reads
+   *   the claim under it (it must still be the stale one), renames a fresh
+   *   claim over it, and removes the marker. The claim path is never empty
+   *   during a takeover. A late racer that creates the marker after it was
+   *   removed finds a different claim on the re-read and backs off.
+   * - **A marker whose holder died** before it renamed would wedge the entry,
+   *   so it is judged by the same liveness rule as a claim and replaced the
+   *   same way: by a marker named after IT (`…-<tag>-<tag>`), created with
+   *   O_EXCL. A dead marker is removed only once the stale claim it guards
+   *   has changed hands, so two racers can never win at two levels at once.
    *
    * Never throws: if the claim cannot be recorded at all, the push goes ahead
    * unclaimed rather than never.
@@ -4652,45 +4691,85 @@ export class Plur {
     keyFor: () => string,
   ): { status: 'busy' } | { status: 'claimed'; key: string } {
     const path = this._outboxClaimPath(id)
-    const readRaw = (): string | undefined => {
-      try { return fs.readFileSync(path, 'utf8') } catch (err) {
+    const readRaw = (at: string): string | undefined => {
+      try { return fs.readFileSync(at, 'utf8') } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined
         throw err
       }
     }
+    const heldBy = (raw: string): boolean => {
+      let held: { pid?: number; host?: string; until?: number; at?: number } = {}
+      try { held = JSON.parse(raw) } catch { /* unreadable: lapsed */ }
+      return this._outboxClaimHeld(held, Date.now())
+    }
+    /** Create `target` holding `body` only if nothing is there (O_EXCL). */
+    const publishExclusive = (target: string, body: string): boolean => {
+      const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`
+      fs.writeFileSync(tmp, body)
+      try {
+        fs.linkSync(tmp, target)
+        return true
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'EEXIST') return false
+        // A filesystem without hard links: O_EXCL on open instead.
+        if (code === 'EPERM' || code === 'ENOTSUP' || code === 'ENOSYS') {
+          try { fs.writeFileSync(target, body, { flag: 'wx' }); return true } catch (e) {
+            if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false
+            throw e
+          }
+        }
+        throw err
+      } finally {
+        fs.rmSync(tmp, { force: true })
+      }
+    }
     try {
       fs.mkdirSync(this.outboxClaimsDir(), { recursive: true })
-      const stale = readRaw()
-      if (stale !== undefined) {
-        let held: { key?: string; pid?: number; host?: string; until?: number; at?: number } = {}
-        try { held = JSON.parse(stale) } catch { /* unreadable: lapsed */ }
-        if (this._outboxClaimHeld(held, Date.now())) return { status: 'busy' }
-      }
+      const stale = readRaw(path)
+      if (stale !== undefined && heldBy(stale)) return { status: 'busy' }
       const key = keyFor()
       const token = randomUUID()
       const at = Date.now()
-      const body = JSON.stringify({
-        key, token, pid: process.pid, host: hostname(), at, until: at + OUTBOX_CLAIM_LEASE_MS,
-      })
+      const owner = { token, pid: process.pid, host: hostname(), at, until: at + OUTBOX_CLAIM_LEASE_MS }
+      const body = JSON.stringify({ key, ...owner })
       if (stale === undefined) {
-        fs.writeFileSync(path, body, { flag: 'wx' }) // EEXIST: someone else got it first
+        if (!publishExclusive(path, body)) return { status: 'busy' } // someone else got it first
+        this._outboxClaimTokens.set(id, token)
         return { status: 'claimed', key }
       }
-      // Atomic takeover (C3): rename over the stale file, never remove it.
-      const tmp = `${path}.${process.pid}.${token}.tmp`
-      fs.writeFileSync(tmp, body)
-      if (readRaw() !== stale) {
-        // Someone took it over (or released it) since we looked.
-        fs.rmSync(tmp, { force: true })
-        return { status: 'busy' }
+
+      // Takeover (C3): win the marker for this exact stale claim.
+      const passed: string[] = []
+      let marker = `${path}.takeover-${outboxClaimTag(stale)}`
+      let won = false
+      for (let depth = 0; depth < OUTBOX_TAKEOVER_MAX_DEPTH; depth++) {
+        if (publishExclusive(marker, JSON.stringify(owner))) { won = true; break }
+        const m = readRaw(marker)
+        // Gone means its holder finished: the claim has changed hands.
+        if (m === undefined || heldBy(m)) return { status: 'busy' }
+        passed.push(marker)
+        marker = `${marker}-${outboxClaimTag(m)}`
       }
-      fs.renameSync(tmp, path)
+      if (!won) return { status: 'busy' }
+      let changedHands = false
       try {
-        if ((JSON.parse(readRaw() ?? '{}') as { token?: string }).token !== token) return { status: 'busy' }
-      } catch { return { status: 'busy' } }
-      return { status: 'claimed', key }
+        // Under the marker: is it still the claim we judged stale?
+        if (readRaw(path) !== stale) { changedHands = true; return { status: 'busy' } }
+        const tmp = `${path}.${process.pid}.${token}.tmp`
+        fs.writeFileSync(tmp, body)
+        fs.renameSync(tmp, path)
+        changedHands = true
+        this._outboxClaimTokens.set(id, token)
+        return { status: 'claimed', key }
+      } finally {
+        fs.rmSync(marker, { force: true })
+        // The dead markers we walked past are cleared only once the stale
+        // claim they guard is gone. Before that, clearing one would let a
+        // second racer win a level we already passed.
+        if (changedHands) for (const p of passed) fs.rmSync(p, { force: true })
+      }
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return { status: 'busy' } // lost the race
       logger.warning(`[plur:outbox] could not record a push claim for ${id}: ${(err as Error).message}`)
       return { status: 'claimed', key: keyFor() }
     }
@@ -4727,13 +4806,34 @@ export class Plur {
       && held.until - now <= 2 * OUTBOX_CLAIM_LEASE_MS
   }
 
-  /** Release a claim this process holds. Never throws. */
+  /**
+   * Release a claim this process holds. Never throws.
+   *
+   * Also clears takeover markers left by a racer that died after its rename
+   * but before its cleanup. Only markers guarding a claim that is no longer in
+   * place (their tag differs from the current claim's) are removed: a racer
+   * that re-creates one then fails its re-read, so this cannot make a second
+   * winner.
+   */
   private _releaseOutboxClaim(id: string): void {
+    const path = this._outboxClaimPath(id)
+    const token = this._outboxClaimTokens.get(id)
+    this._outboxClaimTokens.delete(id)
     try {
-      const path = this._outboxClaimPath(id)
-      const held = JSON.parse(fs.readFileSync(path, 'utf8')) as { pid?: number; host?: string }
-      if (held.pid === process.pid && held.host === hostname()) fs.rmSync(path, { force: true })
+      const held = JSON.parse(fs.readFileSync(path, 'utf8')) as { pid?: number; host?: string; token?: string }
+      if (held.pid === process.pid && held.host === hostname() && (token === undefined || held.token === token)) {
+        fs.rmSync(path, { force: true })
+      }
     } catch { /* already gone */ }
+    try {
+      let current: string | undefined
+      try { current = outboxClaimTag(fs.readFileSync(path, 'utf8')) } catch { /* no claim now */ }
+      const prefix = `${basename(path)}.takeover-`
+      for (const f of fs.readdirSync(this.outboxClaimsDir())) {
+        if (!f.startsWith(prefix) || f.endsWith('.tmp')) continue
+        if (f.slice(prefix.length).split('-')[0] !== current) fs.rmSync(join(this.outboxClaimsDir(), f), { force: true })
+      }
+    } catch { /* best effort */ }
   }
 
   /** Read the persisted local→server map. Never throws; `{}` on any problem. */
@@ -8093,7 +8193,10 @@ export class Plur {
   private async _flushOutbox(budget: AbortSignal, startBudget: () => void, force: boolean, claimed: Set<string>): Promise<{
     flushed: number; failed: number; deferred: number; skipped: number; held: number; expired_warnings: string[]
   }> {
+    // Stamped BEFORE the load, so the rows are at least as new as the stamp.
+    const rowsSeen = { stamp: this._engramsFileStamp(), keys: new Map<string, string | undefined>() }
     const engrams = await this._primaryStore.load()
+    rowsSeen.keys = queuedOutboxKeys(engrams)
     // The network budget starts NOW, after the local load (review of #1277).
     startBudget()
     // #766: skip retired engrams — a retired engram must not be pushed to the
@@ -8169,6 +8272,12 @@ export class Plur {
      * not.
      */
     const demotedIds = new Set<string>()
+    /**
+     * Entries found already delivered (or re-queued) by another writer once
+     * claimed. Left out of the merge-back entirely: this flush's snapshot of
+     * them is stale and must not be written over the current row.
+     */
+    const leftToOthers = new Set<string>()
     const expired_warnings: string[] = []
     const now = new Date()
     const TTL_MS = 7 * 24 * 60 * 60 * 1000
@@ -8201,6 +8310,17 @@ export class Plur {
         continue
       }
       claimed.add(engram.id)
+
+      // The claim guards the ROW, not this flush's snapshot of it (review of
+      // #1277). The snapshot was loaded before any network round-trip; since
+      // then another writer may have pushed this entry, removed its row and
+      // released its claim. Both removal paths delete the row BEFORE they
+      // release, so reading it now, under our claim, sees that. Gone, or
+      // re-queued under a different key: someone else owns it — leave it.
+      if (!(await this._outboxRowStillQueued(engram.id, outbox.idempotency_key, rowsSeen))) {
+        leftToOthers.add(engram.id)
+        continue
+      }
 
       // Check TTL warning
       const ageMs = now.getTime() - new Date(outbox.queued_at).getTime()
@@ -8447,7 +8567,7 @@ export class Plur {
     // demotion marker, and (for a demotion) scope/visibility — so those are
     // what it writes back, and nothing else.
     if (flushed > 0 || failed > 0 || metadataDirty) {
-      const consideredIds = new Set(pending.map(e => e.id))
+      const consideredIds = new Set(pending.map(e => e.id).filter(id => !leftToOthers.has(id)))
       const survivorsById = new Map(
         engrams.filter(e => consideredIds.has(e.id)).map(e => [e.id, e] as const),
       )
@@ -8491,6 +8611,57 @@ export class Plur {
     if (idMapDirty) this._writeOutboxIdMap(persistedIdMap)
 
     return { flushed, failed, deferred, skipped, held, expired_warnings }
+  }
+
+  /**
+   * Identity of the YAML store file's current contents (inode, size, mtime in
+   * ns): any write changes it. `undefined` when the primary store is not the
+   * default YAML file, or it cannot be stat'ed — the caller then reads.
+   */
+  private _engramsFileStamp(): string | undefined {
+    if (!(this._primaryStore instanceof YamlPrimaryStore)) return undefined
+    try {
+      const st = fs.statSync(this._primaryStore.location, { bigint: true })
+      return `${st.ino}:${st.size}:${st.mtimeNs}`
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : undefined
+    }
+  }
+
+  /**
+   * Is this outbox row still queued, under this key, in the store as it is
+   * NOW? False when the row is gone (delivered and removed by another
+   * writer), retired, no longer queued, or queued under a different key (a
+   * different logical write). False also when the store cannot be read:
+   * skipping costs a flush, pushing blind can cost a duplicate.
+   *
+   * `seen` is the newest read this flush has made and the file stamp taken
+   * just before it. While the YAML file's stamp is unchanged nothing has been
+   * written since, so that read is current and the store is not loaded again:
+   * a large store is not re-parsed per entry inside the network budget
+   * (#1269). A store supplied by the embedder has no file to stamp and is
+   * read every time.
+   */
+  private async _outboxRowStillQueued(
+    id: string,
+    key: string,
+    seen: { stamp: string | undefined; keys: Map<string, string | undefined> },
+  ): Promise<boolean> {
+    try {
+      const stamp = this._engramsFileStamp()
+      if (stamp === undefined) {
+        const row = (await this._loadTargeted([id])).find(e => e.id === id)
+        return row !== undefined && queuedOutboxKeys([row]).get(id) === key
+      }
+      if (stamp !== seen.stamp) {
+        seen.stamp = stamp
+        seen.keys = queuedOutboxKeys(await this._primaryStore.load())
+      }
+      return seen.keys.get(id) === key
+    } catch (err) {
+      logger.warning(`[plur:outbox] could not re-read ${id} before pushing it — left for the next flush: ${(err as Error).message}`)
+      return false
+    }
   }
 
   /**
