@@ -62,6 +62,66 @@ cache: detached, at the lowest CPU priority, one per store at a time (the
 (`PLUR_WARM_CEILING_MS`). It takes no store write lock. The next session's
 hybrid search then meets its deadline.
 
+### A folder map records your per-folder decisions, and `trust.yaml` folds into it
+
+**First half of #1347: core and CLI only. No hook reads the map yet.** A new
+file, `~/.plur/folders.yaml`, holds your own decisions about folders: `on`,
+`off` or `ask`, a default write `scope`, and `trusted`. `trusted` is the grant
+that used to live in `trust.yaml`. `.plur.yaml` is unchanged and stays the
+repo's request. Only the CLI writes the map.
+
+- **`resolveFolderPolicy(dir)`** (core, and `Plur.resolveFolderPolicy`) returns
+  `{ mode, scope?, remoteAllowed, source }`, resolved in this order:
+  1. Any matching `off` entry wins.
+  2. A `.plur.yaml` means on. A map `scope` beats its scope hint, and its remote
+     is allowed only under a `trusted` entry.
+  3. A project MCP config means on.
+  4. Otherwise the most specific matching entry decides.
+  5. Otherwise the answer is `ask`, and that includes `$HOME`.
+
+  Paths may be globs (`*`, `**`, `?`) and may start with `~`. A plain folder
+  also covers everything below it.
+- **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
+  `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
+  `--no-trusted`.
+  - **Outside an interactive terminal, `set` and `rm` need `--nonce <n>`.** That
+    is how the ask flow calls them, and it stops an agent from writing any
+    folder, `--trusted` included, by leaving `--nonce` out. A person at a
+    terminal needs no nonce. `plur trust` is the explicit alias for a person
+    and still works in scripts.
+  - A nonce names one folder and works once. It is used up only after the map
+    is saved, so a failed write does not burn it. It expires when its session
+    ends, after 24 hours at most.
+  - `set` refuses a team scope (`group:`, `org:`, `team:`, `space:`, `public`)
+    that no store in `config.yaml` serves. `project:` scopes live in the local
+    store and need none.
+  - Neither command writes to a folders.yaml it cannot read; it is never
+    overwritten.
+- **Upgrade needs no steps.** The first read of a missing `folders.yaml` imports
+  the `trust.yaml` entries as `trusted: true` entries. Nothing is ever added to
+  `trust.yaml`. `plur untrust` removes the grant from both files, so neither a
+  downgrade (an older version reading `trust.yaml`) nor a fresh import brings a
+  revoked grant back.
+- **`plur trust`, `plur untrust` and `plur init-remote`** now set and clear
+  `trusted` in the map. Their output and exit codes are unchanged, with one
+  exception: `plur trust` and `plur untrust` exit 1 on a folders.yaml they
+  cannot read, rather than overwrite it. `plur init-remote` still writes
+  `.plur.yaml` and exits 0, but warns that it could not record trust and leaves
+  remote memory off until you run `plur trust`. It fails safe.
+- A folders.yaml that cannot be read counts as empty and logs one warning. It
+  never throws.
+- **Trust matching is now in one place, the map, and it fails closed.** A
+  stored entry is compared exactly as written with the checked folder's
+  canonical path. It is never resolved on disk, and neither is its parent. So a
+  trusted folder, or its parent, later replaced by a symlink does not pass its
+  trust on to wherever the link points.
+  - An entry imported from `trust.yaml` keeps its spelling. If an older version
+    stored an entry under a symlinked parent for a folder that did not exist
+    yet, run `plur trust` again once that folder exists.
+  - `plur untrust` also removes an entry stored under the plain spelling of
+    the folder you give it.
+  - A `~` in the map expands to your home as written and to its canonical path.
+
 ### Claude Code: one full injection per session, and the reminder fires
 
 **Every prompt in a Claude Code session re-ran the full "session started"
@@ -131,6 +191,25 @@ synchronous: see "Claude Code: memory is in place for the first reply" above
 (#1313).
 
 An unknown `--event` no longer echoes the hook payload back to stdout.
+
+**`plur-mcp init` now registers the same rehydrate hook** (#1279). It still
+put rehydrate on `PostCompact`. It now uses `SessionStart` with matcher
+`compact`, synchronous with `timeout: 20`, the same as `plur init` (#1313);
+its `UserPromptSubmit` injection moves to the same 20s budget. A test fails
+if the two diverge. Re-running `plur-mcp init` used to stop at "already
+installed". It now removes PLUR's `PostCompact` hooks and, in the same file,
+puts the `SessionStart(compact)` one in place of the old rehydrate. A file
+with PLUR hooks but no rehydrate gets none added. That covers the global
+settings file, where `plur init` puts only its enforcement hooks, so
+rehydrate does not run twice. Hooks with no `command` (`type: "prompt"` or
+`"agent"`) no longer make init throw. It removes PLUR's hooks one at a time and only
+those: a hook counts as PLUR's when it runs the PLUR binary (the
+`~/.plur/bin/plur-hook` shim or `npx @plur-ai/cli`) with a subcommand init
+writes. Your own hooks, including your own `PostCompact` hooks and one that
+shares an entry with a PLUR hook, are left in place. Installs that use the
+local shim, including the backslash and quoted Windows paths, now count as
+installed too, so re-running no longer adds a second set (#1303, on Windows
+as well).
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
