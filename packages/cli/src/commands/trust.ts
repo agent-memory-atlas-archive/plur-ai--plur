@@ -26,16 +26,17 @@ export function parseTrustArgs(args: string[]): { dir?: string; nonce?: string }
 }
 
 /**
- * The terminal-or-nonce gate `plur folders set` has, for `plur trust` and
- * `plur untrust` (#1378). Outside an interactive terminal the command needs
- * a `--nonce` issued for this folder and this answer; a person at a terminal
- * needs none. See nonceRequired for what the gate does not stop.
+ * The terminal-or-nonce gate `plur folders set` has, for `plur trust`
+ * (#1378). Outside an interactive terminal a grant needs a `--nonce` issued
+ * for this folder and `{ trusted: true }`; a person at a terminal needs none.
+ * `plur untrust` is not gated: a revocation only removes trust (#1477 review).
+ * See nonceRequired for what the gate does not stop.
  */
-export function refuseTrustWithoutNonce(cmd: 'trust' | 'untrust', nonce: string | undefined, json: boolean): void {
+export function refuseTrustWithoutNonce(nonce: string | undefined, json: boolean): void {
   if (nonce !== undefined || !nonceRequired(process.stdin.isTTY, process.stdout.isTTY)) return
   fail(new FolderMapError('nonce-required',
-    `Not an interactive terminal: plur ${cmd} needs the --nonce the ask flow issued for this answer. ` +
-    `Run plur ${cmd} yourself in a terminal to ${cmd === 'trust' ? 'grant' : 'revoke'} trust by hand.`), json)
+    'Not an interactive terminal: plur trust needs the --nonce the ask flow issued for this answer. ' +
+    'Run plur trust yourself in a terminal to grant trust by hand.'), json)
 }
 
 /**
@@ -73,7 +74,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   const parsed = parseTrustArgs(args)
   if (!parsed) return exit(1, 'Usage: plur trust [dir] [--nonce <n>] | plur trust --list')
   const dir = parsed.dir || process.cwd()
-  refuseTrustWithoutNonce('trust', parsed.nonce, shouldOutputJson(flags))
+  refuseTrustWithoutNonce(parsed.nonce, shouldOutputJson(flags))
   const plur = createPlur(flags)
   // #1347: the grant is `trusted: true` in the folder map. A map that cannot
   // be read is refused rather than overwritten.

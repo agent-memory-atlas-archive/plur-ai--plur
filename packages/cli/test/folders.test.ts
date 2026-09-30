@@ -6,7 +6,7 @@
  * the real ~/.plur is never touched.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, realpathSync, symlinkSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { runCli } from './helpers/spawn.js'
@@ -221,29 +221,80 @@ describe('plur folders (#1347)', () => {
     expect(run(['folders', 'set', target, '--on', '--nonce', withoutSettings]).status).toBe(0)
   }, 60_000)
 
-  it('outside a terminal, plur trust and plur untrust need a nonce bound to that grant or revocation', () => {
+  it('outside a terminal, plur trust needs a nonce bound to the grant; plur untrust needs none', () => {
     const t0 = run(['trust', target])
     expect(t0.status).toBe(1)
     expect(t0.out.code).toBe('nonce-required')
     expect(existsSync(join(plurHome, 'folders.yaml'))).toBe(false)
+    const wrongGrant = run(['trust', target, '--nonce', issueFolderNonce(plurHome, 'session-u', target, { mode: 'on' })])
+    expect(wrongGrant.status).toBe(1)
+    expect(wrongGrant.out.code).toBe('nonce-answer')
 
     const t = run(['trust', target, '--nonce', issueFolderNonce(plurHome, 'session-u', target, { trusted: true })])
     expect(t.status).toBe(0)
     expect(t.out).toEqual({ success: true, trusted: target })
-
-    const u0 = run(['untrust', target])
-    expect(u0.status).toBe(1)
-    expect(u0.out.code).toBe('nonce-required')
-    const wrong = run(['untrust', target, '--nonce', issueFolderNonce(plurHome, 'session-u', target, { trusted: true })])
-    expect(wrong.status).toBe(1)
-    expect(wrong.out.code).toBe('nonce-answer')
     expect(run(['trust', '--list']).out.trusted).toEqual([target])
+    expect(yaml.load(readFileSync(join(plurHome, 'trust.yaml'), 'utf8'))).toEqual({ version: 1, trusted: [target] })
 
-    const u = run(['untrust', target, '--nonce', issueFolderNonce(plurHome, 'session-u', target, { trusted: false })])
-    expect(u.status).toBe(0)
+    // #1477 review: a revocation only removes trust, so a script revokes with
+    // no nonce and no terminal, in folders.yaml and in trust.yaml (dual-write).
+    const u = run(['untrust', target])
+    expect(u.status, u.stderr).toBe(0)
     expect(u.out).toEqual({ success: true, removed: true })
+    expect(readFileSync(join(plurHome, 'folders.yaml'), 'utf8')).not.toContain('trusted: true')
+    expect(yaml.load(readFileSync(join(plurHome, 'trust.yaml'), 'utf8'))).toEqual({ version: 1, trusted: [] })
     // Listing stays open: it writes nothing.
     expect(run(['trust', '--list']).out).toEqual({ trusted: [], count: 0 })
+
+    // A --nonce given to untrust is accepted and ignored: it neither blocks the
+    // revocation nor is consumed, so a grant nonce stays valid for its grant.
+    const grant = issueFolderNonce(plurHome, 'session-u', target, { trusted: true })
+    const t2 = run(['trust', target, '--nonce', issueFolderNonce(plurHome, 'session-u', target, { trusted: true })])
+    expect(t2.status).toBe(0)
+    const u2 = run(['untrust', target, '--nonce', grant])
+    expect(u2.status, u2.stderr).toBe(0)
+    expect(u2.out).toEqual({ success: true, removed: true })
+    expect(run(['untrust', target, '--nonce', 'not-a-nonce']).status).toBe(0)
+    expect(run(['trust', target, '--nonce', grant]).status).toBe(0)
+  }, 60_000)
+
+  // #1477 review: the nonce is checked against the folder the write records.
+  // `~` expands to the home for the write, so it must for the check too.
+  it('a quoted ~/<dir> is checked as the folder written: a nonce for another folder cannot reach $HOME/<dir>', () => {
+    const other = join(dir, 'other')
+    mkdirSync(other)
+    const victim = join(dir, 'victim') // HOME is dir, so ~/victim is this
+    mkdirSync(victim)
+    // A cwd holding a literal "~" directory whose victim entry links to `other`.
+    const cwd = join(dir, 'cwd')
+    mkdirSync(join(cwd, '~'), { recursive: true })
+    symlinkSync(other, join(cwd, '~', 'victim'))
+    const runIn = (args: string[]) => {
+      const r = runCli('node', [CLI, ...args, '--json'], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: dir, USERPROFILE: dir, TMPDIR: join(dir, 'tmp'), PLUR_PATH: plurHome },
+        cwd,
+      })
+      let out: any = null
+      try { out = JSON.parse((r.stdout ?? '').trim()) } catch { /* not json */ }
+      return { status: r.status, out }
+    }
+    const forOther = issueFolderNonce(plurHome, 'session-h', other, { trusted: true })
+    const bad = runIn(['folders', 'set', '~/victim', '--trusted', '--nonce', forOther])
+    expect(bad.status).toBe(1)
+    expect(bad.out.code).toBe('nonce-folder')
+    expect(existsSync(join(plurHome, 'folders.yaml'))).toBe(false)
+    const badRm = runIn(['folders', 'rm', '~/victim', '--nonce', issueFolderNonce(plurHome, 'session-h', other, { remove: true })])
+    expect(badRm.status).toBe(1)
+    expect(badRm.out.code).toBe('nonce-folder')
+
+    // A nonce issued for the home folder is accepted for its quoted ~ spelling.
+    const forHome = issueFolderNonce(plurHome, 'session-h', victim, { mode: 'on' })
+    const ok = runIn(['folders', 'set', '~/victim', '--on', '--nonce', forHome])
+    expect(ok.status).toBe(0)
+    expect(ok.out.entry).toEqual({ path: victim, plur: 'on' })
+    const okRm = runIn(['folders', 'rm', '~/victim', '--nonce', issueFolderNonce(plurHome, 'session-h', victim, { remove: true })])
+    expect(okRm.out).toEqual({ success: true, removed: true })
   }, 60_000)
 
   it.skipIf(!hasPythonPty)('in an interactive terminal, plur trust and untrust need no nonce', () => {
