@@ -1,6 +1,7 @@
 import { shouldOutputJson, outputJson, setQuiet, exit } from './output.js'
 import { parseGlobalFlags, createPlur } from './plur.js'
 import { unknownFlagMessage } from './known-flags.js'
+import { exitWhenStoreIdle } from './lib/store-lock-exit.js'
 
 export type { GlobalFlags } from './plur.js'
 export { parseGlobalFlags, createPlur } from './plur.js'
@@ -246,6 +247,22 @@ try {
   // isn't, the fingerprint guard makes an unchanged YAML nearly free.
   await drainPendingIndexWork()
 } catch (err: any) {
+  // Hook commands never print errors to stdout (owner decision H1, formal
+  // field report cluster 5). An editor parses a hook's stdout as its result
+  // and shows a non-zero exit as a hook error, so an `{"error"}` document
+  // there — e.g. from an injection that threw after the watchdog had stopped
+  // the run — breaks the turn instead of failing open. Stderr, exit 0.
+  // Every other command keeps its error document and exit 1.
+  //
+  // The exit goes through exitWhenStoreIdle (#1349): the throw can arrive
+  // while a store write of this process is still in flight (the hybrid search
+  // a hook abandoned at its deadline records its injection under
+  // `engrams.yaml.lock`), and exiting there leaves that lock behind for every
+  // later writer. Bounded, and immediate when the store is idle.
+  if (command.startsWith('hook-')) {
+    process.stderr.write(`[plur] ${command} failed: ${err?.message ?? 'unknown error'}\n`)
+    await exitWhenStoreIdle()
+  }
   if (shouldOutputJson(flags)) {
     outputJson({ error: err.message })
   } else {

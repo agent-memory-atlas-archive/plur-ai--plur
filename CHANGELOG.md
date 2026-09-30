@@ -67,6 +67,21 @@ what you decided about the folder:
 Not changed yet: the opencode plugin and the MCP server's `plur_session_start`
 do not read the map.
 
+### A failed hook no longer prints an error document to the editor
+
+**When a `plur hook-*` command threw, the CLI printed `{"error": …}` on
+stdout and exited 1**. Editors read a hook's stdout as its result and show
+a non-zero exit as a hook error. So a hook-inject whose store would not load
+showed the user a hook error instead of failing open. The same happened to a
+run the watchdog had already stopped, if its injection then threw.
+
+Hook commands now write the error to stderr as `[plur] <command> failed: …`
+and exit 0. Every other command still prints its error document and exits 1.
+That exit first waits, bounded at 5s, for any store write of the same process
+still in flight, as the hooks' other forced exits do (#1349). Before, a hook
+that threw while its abandoned hybrid search was recording its injection left
+`engrams.yaml.lock` or its publish file behind for every later writer.
+
 ### `plur init` sets up opencode by default
 
 **An enterprise deployment reported editors that were never set up** (#1311).
