@@ -31,8 +31,10 @@ what you decided about the folder:
   scope is configured; the only way to it is `--trusted`. On macOS and Linux
   a folder path that needs quoting is printed in single quotes, so `$(...)`,
   backticks and `$VAR` in a folder name are not expanded when the command is
-  run; Windows keeps double quotes. The nonce is issued for
-  that session and folder and works once. Later prompts in the session say
+  run; Windows keeps double quotes. Each offered command carries its own
+  nonce, issued for that session, that folder and that answer (#1477), and
+  it works once: the "Yes, without its settings" nonce cannot grant
+  `--trusted`, and `--trusted` is issued only where it is offered. Later prompts in the session say
   nothing; after a yes, the next prompt loads memory.
 
 **What you will notice:**
