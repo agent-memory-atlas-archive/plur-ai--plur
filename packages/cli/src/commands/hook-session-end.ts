@@ -4,6 +4,7 @@ import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
 import { createPlur } from '../plur.js'
 import { isPlurConfigured } from '../lib/plur-configured.js'
+import { removeSessionTask } from '../lib/session-task.js'
 
 /**
  * plur hook-session-end — Claude Code SessionEnd hook (shipped v1.0.85).
@@ -45,7 +46,7 @@ function sessionKeys(payloadSessionId?: string): string[] {
 }
 
 function plurPath(flags: GlobalFlags): string {
-  // `||`, as createPlur and the checkpoint writer resolve it (cli#6): an
+  // `||`, as createPlur and the checkpoint writer resolve it (cli#6, H3): an
   // empty PLUR_PATH means "unset" everywhere, not "the current directory".
   return flags.path || process.env.PLUR_PATH || join(homedir(), '.plur')
 }
@@ -79,6 +80,10 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   try {
     payload = JSON.parse(raw)
   } catch { /* fall back to env-derived keys */ }
+
+  // The hook-inject rehydrate query is a copy of the user's latest prompt;
+  // it has no use once the session is over.
+  removeSessionTask(payload.session_id)
 
   const sessionsDir = join(plurPath(flags), 'sessions')
   if (!existsSync(sessionsDir)) return
