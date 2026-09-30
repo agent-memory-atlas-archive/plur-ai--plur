@@ -22,6 +22,7 @@ import { tmpdir } from 'os'
 import { createServer, type Server } from 'http'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
+import { issueFolderNonce } from '@plur-ai/core'
 
 const CLI = builtCliPath(join(__dirname, '..'))
 
@@ -85,7 +86,9 @@ describe('hook-inject refuses an untrusted project\'s remote settings (#1196)', 
   }
 
   function runTrust(): void {
-    runCli('node', [CLI, 'trust', repo], {
+    // #1378: outside a terminal, plur trust needs a nonce bound to the grant.
+    const nonce = issueFolderNonce(join(dir, '.plur'), 'hook-inject-trust', repo, { trusted: true })
+    runCli('node', [CLI, 'trust', repo, '--nonce', nonce], {
       encoding: 'utf-8',
       timeout: 20_000,
       env: {

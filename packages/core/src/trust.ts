@@ -42,10 +42,17 @@ export function isDirectoryTrusted(dir: string, root: string): boolean {
 /**
  * Grant trust to `dir`. Idempotent. Returns the canonicalized path recorded,
  * so a caller can echo back exactly what was trusted.
+ *
+ * A `nonce` (#1378) must be one issued for `dir` and the answer
+ * `{ trusted: true }`; it is consumed once the grant is saved.
  */
-export function trustDirectory(dir: string, root: string): string {
+export function trustDirectory(dir: string, root: string, opts?: { nonce?: string; now?: number }): string {
   const target = canonicalize(dir)
-  setFolderEntry(root, target, { trusted: true }, { configuredScopes: [] })
+  setFolderEntry(root, target, { trusted: true }, {
+    configuredScopes: [],
+    ...(opts?.nonce !== undefined ? { nonce: opts.nonce } : {}),
+    ...(opts?.now !== undefined ? { now: opts.now } : {}),
+  })
   return target
 }
 
@@ -57,6 +64,9 @@ export function trustDirectory(dir: string, root: string): string {
  * The grant is removed from folders.yaml AND from trust.yaml (the dual-write
  * for adapters on the previous core), so neither an older reader, a downgrade
  * nor a re-import can bring it back.
+ *
+ * Takes no nonce (#1477 review): a revocation only removes trust, so, like a
+ * grant before #1378, it works from a script. Only a grant is gated.
  */
 export function untrustDirectory(dir: string, root: string): boolean {
   return withFolderMapLock(root, () => {
