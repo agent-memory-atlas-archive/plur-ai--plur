@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, rmSync, mkdirSync, realpathSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, rmSync, mkdirSync, lstatSync, realpathSync } from 'fs'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { homedir } from 'os'
 import { randomBytes } from 'crypto'
@@ -6,7 +6,7 @@ import yaml from 'js-yaml'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { atomicWrite, withLock } from './sync.js'
-import { canonicalize, findProjectConfigPath, readProjectConfigFromPath } from './project-config.js'
+import { canonicalize, canonicalSpellings, findProjectConfigPath, readProjectConfigFromPath } from './project-config.js'
 import { resolveProjectRemoteFromConfig } from './project-remote.js'
 import { isSharedScope } from './scope-util.js'
 import { isLocalOnlyScope } from './scope-target.js'
@@ -216,8 +216,10 @@ function entryForms(entryPath: string, home: string, lax: boolean, literalPath =
     forms.add(literal + tail)
     if (lax) {
       const parent = dirname(literal)
-      if (parent !== literal) forms.add(join(canonicalize(parent), basename(literal)) + tail)
-      forms.add(canonicalize(literal) + tail)
+      // Both canonical spellings (#1357): the case-folded one and the
+      // case-preserving one, so folding case never drops an `off` match.
+      if (parent !== literal) for (const c of canonicalSpellings(parent)) forms.add(join(c, basename(literal)) + tail)
+      for (const c of canonicalSpellings(literal)) forms.add(c + tail)
     }
   }
   return [...forms]
@@ -433,7 +435,7 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
   const home = opts.home ?? homedir()
   const entries = loadFolderMap(opts.root).folders
   const strict = [canonicalize(dir)]
-  const lax = [...new Set([strict[0], resolve(dir)])]
+  const lax = [...new Set([strict[0], ...canonicalSpellings(dir), resolve(dir)])]
 
   if (entries.some(e => e.plur === 'off' && entryCovers(e, lax, home, true))) {
     return { mode: 'off', remoteAllowed: false, source: 'map' }
@@ -484,7 +486,7 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
 // Writes (CLI only): set / remove, with the nonce and shared-scope guards.
 // ---------------------------------------------------------------------------
 
-export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'scope-unconfigured' | 'invalid'
+export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'nonce-answer' | 'scope-unconfigured' | 'invalid'
 
 export class FolderMapError extends Error {
   constructor(public readonly code: FolderMapErrorCode, message: string) {
@@ -498,6 +500,37 @@ export interface FolderChange {
   scope?: string
   /** true sets `trusted`, false clears it. */
   trusted?: boolean
+}
+
+/**
+ * The one answer a nonce authorises (#1378): a `set` (the same shape as the
+ * FolderChange it will be compared with) or the removal of the entry.
+ * `plur trust` is the answer `{ trusted: true }`. `folders set --no-trusted`
+ * is `{ trusted: false }`; `plur untrust` needs no nonce (#1477 review).
+ */
+export type FolderAnswer = FolderChange | { remove: true }
+
+/**
+ * The comparable form of an answer. `--scope X` means on, so it equals
+ * `--scope X --on`; everything else must match exactly, `trusted` included
+ * (absent, true and false are three different answers).
+ */
+function answerKey(a: FolderAnswer | undefined | null): string | null {
+  if (!a || typeof a !== 'object') return null
+  if ('remove' in a) return a.remove === true ? 'remove' : null
+  const mode = a.mode ?? (a.scope !== undefined ? 'on' : null)
+  return JSON.stringify(['set', mode, a.scope ?? null, a.trusted ?? null])
+}
+
+function describeAnswer(a: FolderAnswer | undefined | null): string {
+  if (!a || typeof a !== 'object') return 'no answer'
+  if ('remove' in a) return 'removing the entry'
+  const parts: string[] = []
+  if (a.scope !== undefined) parts.push(`--scope ${a.scope}`)
+  else if (a.mode !== undefined) parts.push(`--${a.mode}`)
+  if (a.trusted === true) parts.push('--trusted')
+  if (a.trusted === false) parts.push('--no-trusted')
+  return parts.join(' ') || 'no answer'
 }
 
 export interface SetFolderOptions {
@@ -524,14 +557,86 @@ export function folderEntryKey(folder: string, home: string = homedir(), literal
   return !literal && hasGlob(folder) ? folder : canonicalize(expandHome(folder, home))
 }
 
-function findEntryIndex(entries: FolderEntry[], folder: string, home: string, literal = false): number {
-  if (!literal && hasGlob(folder)) return entries.findIndex(e => e.path === folder)
+function entryIsFolder(e: FolderEntry, folder: string, raw: string, target: string, home: string): boolean {
+  return (e.path === folder && !entryIsGlob(e)) ||
+    (!entryIsGlob(e) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false, e.literal === true).includes(target)))
+}
+
+/**
+ * True when stored entry form `form` names the folder `target` (canonical,
+ * existing) and differs from it only in letter case (#1357).
+ *
+ * Every path component that differs is checked for IDENTITY, not existence:
+ * under the target's canonical parent, the target's component and the
+ * entry's own spelling of it must be the same directory entry (same device
+ * and inode, by lstat). On a case-sensitive filesystem `Proj` and `pROJ` —
+ * or `Ⓟ` and `ⓟ`, which are cased but not letters — can be two sibling
+ * folders, and treating one's entry as the other's would move an `off` or a
+ * trust grant to the wrong folder. lstat does not follow a symlink, so a
+ * link at the entry's spelling has its own inode and never matches, and the
+ * parent is the target's canonical one: the stored entry is never resolved
+ * through a link (#778). Device and inode are compared as bigints (a 64-bit
+ * NTFS file id can exceed 2^53). Any error: false.
+ */
+function sameFolderIgnoringCase(form: string, target: string): boolean {
+  if (form === target || form.toLowerCase() !== target.toLowerCase()) return false
+  const a = form.split(sep)
+  const b = target.split(sep)
+  if (a.length !== b.length) return false
+  for (let i = 0; i < b.length; i++) {
+    if (a[i] === b[i]) continue
+    const prefix = b.slice(0, i)
+    try {
+      const x = lstatSync([...prefix, b[i]].join(sep) || sep, { bigint: true })
+      const y = lstatSync([...prefix, a[i]].join(sep) || sep, { bigint: true })
+      if (x.dev !== y.dev || x.ino !== y.ino) return false
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * The entry a CLI edit of `folder` refers to. After #1357 a checked folder is
+ * canonical in its ON-DISK case, so an entry recorded in another case (by hand,
+ * or before #1357 from a mis-cased typed path) no longer equals it. On a
+ * case-insensitive filesystem such an entry is still this folder's entry, so
+ * an edit or removal must find it rather than add a second entry beside it.
+ * Compared as written apart from letter case — never resolved on disk.
+ */
+function findEntryIndex(
+  entries: FolderEntry[], folder: string, home: string, literal = false,
+): { applied: number[]; nameOnly: number[] } {
+  // A glob edit (not a literal one, #1415) names only the glob entry as typed.
+  if (!literal && hasGlob(folder)) return { applied: entries.flatMap((e, i) => (e.path === folder ? [i] : [])), nameOnly: [] }
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
-  return entries.findIndex(e =>
-    (e.path === folder && !entryIsGlob(e)) ||
-    (!entryIsGlob(e) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false, e.literal === true).includes(target))),
-  )
+  // EVERY entry for this folder, not just the first: a second entry would
+  // keep a decision the user just changed (a revoked grant, a replaced `off`).
+  //
+  // `applied`: the entry covers the canonical target under the strict,
+  // fail-closed comparison, so its `trusted` and `scope` are in effect now.
+  // `nameOnly`: the entry names the folder only by another spelling — as
+  // typed, through a symlink, or in another letter case (identity-checked,
+  // #1357). The strict comparison never matched it, so its grant and scope
+  // never applied; only an `off` did, through the loose match `off` uses.
+  const applied: number[] = []
+  const nameOnly: number[] = []
+  entries.forEach((e, i) => {
+    // A literal entry (#1415) is a plain folder even when its name has `*`/`?`.
+    const lit = e.literal === true
+    if (!entryIsGlob(e) && entryForms(e.path, home, false, lit).includes(target)) applied.push(i)
+    else if (entryIsFolder(e, folder, raw, target, home) ||
+      (!entryIsGlob(e) && entryForms(e.path, home, false, lit).some(f => sameFolderIgnoringCase(f, target)))) nameOnly.push(i)
+  })
+  return { applied, nameOnly }
+}
+
+/** The most restrictive of the modes: off, then ask, then on. */
+function mostRestrictive(modes: Array<FolderMode | undefined>): FolderMode | undefined {
+  for (const m of ['off', 'ask', 'on'] as const) if (modes.includes(m)) return m
+  return undefined
 }
 
 function loadForWrite(root: string): FolderMap {
@@ -572,11 +677,40 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   // Refuse a malformed map and check the nonce first, but CONSUME the nonce
   // only after the map is saved: a refused or failed write never burns it.
   const map = loadForWrite(root)
-  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
+  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, change, opts.now, home) : null
   const literal = opts.literal === true
   const key = folderEntryKey(folder, home, literal)
-  const idx = findEntryIndex(map.folders, folder, home, literal)
-  const entry: FolderEntry = idx >= 0 ? { ...map.folders[idx] } : { path: key, ...(literal && hasGlob(key) ? { literal: true } : {}) }
+  const { applied, nameOnly } = findEntryIndex(map.folders, folder, home, literal)
+  // Every entry for this folder merges into ONE, which keeps exactly what is
+  // in effect now, except what this change sets:
+  //  - path, `trusted` and `scope` come ONLY from entries that applied. The
+  //    scope is the one the resolver picks among them (`mostSpecific`), so a
+  //    merge never reroutes writes; the grant is kept when any applied entry
+  //    had one, as `isTrustedInMap` does. With none, the path is the canonical
+  //    key and there is no grant or scope.
+  //  - entries matched only by name (typed spelling, symlink, letter case)
+  //    contribute their mode at most. Their grant and scope never applied,
+  //    and a merge must not bring them to life (#778, #1357).
+  //  - the mode is the most restrictive of the applied modes and the
+  //    name-only `off`/`ask` (never a name-only `on`); a mode this change sets
+  //    wins, and `--scope` without a mode means `on` — also when it replaces a
+  //    merged `off`.
+  const appliedEntries = applied.map(i => ({ e: map.folders[i], i }))
+  const grantedPaths = [...applied, ...nameOnly].filter(i => map.folders[i].trusted === true).map(i => map.folders[i].path)
+  const entry: FolderEntry = { path: appliedEntries[0]?.e.path ?? key }
+  // The merged path stays a literal folder (#1415) when it has `*`/`?` and
+  // either this edit is literal or the applied entry it came from was.
+  if (hasGlob(entry.path) && (literal || appliedEntries[0]?.e.literal === true)) entry.literal = true
+  if (appliedEntries.some(c => c.e.trusted === true)) entry.trusted = true
+  const scope = mostSpecific(appliedEntries.filter(c => c.e.scope !== undefined), home)?.scope
+  if (scope !== undefined) entry.scope = scope
+  // A name-only entry can only make the mode MORE restrictive: its `on` never
+  // applied (only `off` matches loosely), so it must not become the mode.
+  const mode = mostRestrictive([
+    ...applied.map(i => map.folders[i].plur),
+    ...nameOnly.map(i => map.folders[i].plur).filter(m => m !== 'on'),
+  ])
+  if (mode !== undefined) entry.plur = mode
   if (change.scope !== undefined) {
     entry.scope = change.scope
     if (change.mode === undefined) delete entry.plur
@@ -584,8 +718,11 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   if (change.mode !== undefined) entry.plur = change.mode
   if (change.trusted === true) entry.trusted = true
   if (change.trusted === false) delete entry.trusted
-  if (idx >= 0) map.folders[idx] = entry
-  else map.folders.push(entry)
+  const matched = [...applied, ...nameOnly]
+  if (matched.length) {
+    const at = Math.min(...matched)
+    map.folders = map.folders.flatMap((e, i) => (i === at ? [entry] : matched.includes(i) ? [] : [e]))
+  } else map.folders.push(entry)
   saveFolderMap(root, map)
   // Decision F3: the nonce is used up as soon as the map is saved — the
   // decision it authorised is now recorded — and BEFORE the trust.yaml write.
@@ -595,7 +732,12 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   // Dual-write (see addLegacyTrustEntry): keep trust.yaml in step for
   // adapters on the previous core.
   if (change.trusted === true && !entryIsGlob(entry)) addLegacyTrustEntryUnlocked(root, entry.path)
-  if (change.trusted === false) removeLegacyTrustEntryUnlocked(root, folder, home)
+  if (change.trusted === false) {
+    // A revocation: the folder's own line, and the line of every matched
+    // entry that held a grant (applied or name-only), as `rm` does.
+    removeLegacyTrustEntryUnlocked(root, folder, home)
+    for (const p of grantedPaths) removeLegacyTrustEntryUnlocked(root, p, home)
+  }
   return cleanEntry(entry)
 }
 
@@ -614,15 +756,18 @@ function removeFolderEntryUnlocked(
   root: string, folder: string, home: string, opts?: { nonce?: string; now?: number },
 ): boolean {
   const map = loadForWrite(root)
-  const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
-  const idx = findEntryIndex(map.folders, folder, home)
-  if (idx < 0) return false
-  const [removed] = map.folders.splice(idx, 1)
+  const consume = opts?.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, { remove: true }, opts.now, home) : null
+  const { applied, nameOnly } = findEntryIndex(map.folders, folder, home)
+  const matched = [...applied, ...nameOnly]
+  if (matched.length === 0) return false
+  const removed = map.folders.filter((_, i) => matched.includes(i))
+  map.folders = map.folders.filter((_, i) => !matched.includes(i))
   saveFolderMap(root, map)
   consume?.()   // F3: consumed once the map is saved, before trust.yaml
   // Decision F2: removing a trusted entry is a revocation, so it is completed
-  // in trust.yaml too (never an addition).
-  if (removed.trusted === true) removeLegacyTrustEntryUnlocked(root, removed.path, home)
+  // in trust.yaml too (never an addition) — for EVERY removed entry that held
+  // a grant, applied or name-only, so no spelling of it survives there.
+  for (const e of removed) if (e.trusted === true) removeLegacyTrustEntryUnlocked(root, e.path, home)
   return true
 }
 
@@ -637,17 +782,28 @@ export function clearFolderTrust(root: string, folder: string, home: string = ho
 function clearFolderTrustUnlocked(root: string, folder: string, home: string): boolean {
   const map = loadForWrite(root)
   let changed = false
+  const cleared: string[] = []
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
   map.folders = map.folders.filter(e => {
-    const hit = e.trusted === true && (e.path === folder ||
-      (!entryIsGlob(e) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false, e.literal === true).includes(target))))
+    // Also an entry for this folder recorded in another letter case, checked
+    // for identity like findEntryIndex's fallback (#1357). Its grant never
+    // applied, but `plur untrust` must still clear it and say so.
+    const hit = e.trusted === true && (entryIsFolder(e, folder, raw, target, home) ||
+      (!entryIsGlob(e) && entryForms(e.path, home, false, e.literal === true).some(f => sameFolderIgnoringCase(f, target))))
     if (!hit) return true
     changed = true
+    cleared.push(e.path)
     delete e.trusted
     return e.plur !== undefined || e.scope !== undefined
   })
-  if (changed) saveFolderMap(root, map)
+  if (changed) {
+    saveFolderMap(root, map)
+    // Dual-write (F2): the revocation is completed in trust.yaml for EVERY
+    // cleared entry, applied or name-only (untrustDirectory also removes the
+    // line for the folder as given).
+    for (const p of cleared) removeLegacyTrustEntryUnlocked(root, p, home)
+  }
   return changed
 }
 
@@ -673,11 +829,12 @@ function nativeRealpath(p: string): string | null {
 /**
  * Whether a trust.yaml `line` names the same folder as `folder`, for a
  * REVOCATION (decision F2). It uses the map's own matcher: `~` expands against
- * the home (as given and canonical), both spellings are normalised the way the
- * map compares paths (case-folded on win32), and each side is also compared
- * in its canonical and on-disk forms, so a differently-cased line on a
+ * the home (as given and canonical), and each side is also compared in its
+ * canonical and on-disk forms, so a differently-cased line on a
  * case-insensitive filesystem goes too. Matching wide is the safe direction
- * here: this only ever REMOVES a grant.
+ * here — this only ever REMOVES a grant — but never across folders: a line
+ * differing only in letter case must be the SAME directory entry (#1357's
+ * identity check), so a case-sensitive volume keeps a sibling's grant.
  */
 function namesSameFolder(line: string, folder: string, home: string): boolean {
   if (hasGlob(line)) return false
@@ -688,7 +845,12 @@ function namesSameFolder(line: string, folder: string, home: string): boolean {
     const n = nativeRealpath(form)
     if (n) forms.push(n)
   }
-  return forms.some(a => targets.some(b => norm(a, process.platform) === norm(b, process.platform)))
+  // Case is never folded blindly (#1357): on a case-sensitive volume `Proj`
+  // and `pROJ` can be two folders, and revoking one must not remove the
+  // other's grant. A differently-cased line that exists resolves to the
+  // on-disk case above; anything else must pass the identity check.
+  const same = (a: string, b: string) => norm(a, 'linux') === norm(b, 'linux') || sameFolderIgnoringCase(a, b)
+  return forms.some(a => targets.some(b => same(a, b)))
 }
 
 /**
@@ -729,7 +891,7 @@ export function safeSessionKey(sessionId: string): string {
   return safe || 'unknown'
 }
 
-interface NonceRecord { nonce: string; folder: string; issued_at: number }
+interface NonceRecord { nonce: string; folder: string; answer?: FolderAnswer; issued_at: number }
 interface NonceFile { session: string; nonces: NonceRecord[] }
 
 function nonceDir(root: string): string {
@@ -756,21 +918,42 @@ function writeNonceFile(file: string, data: NonceFile): void {
 }
 
 /**
- * Issue a single-use nonce that lets the ask flow of `sessionId` record a
- * decision for exactly `folder`.
+ * Issue a single-use nonce that lets the ask flow of `sessionId` record
+ * exactly `answer` for exactly `folder` (#1378). The ask flow issues one nonce
+ * per answer it offers, and prints each next to its command: a nonce issued
+ * for `{ mode: 'on' }` does not authorise `--trusted`, `--off`, another scope
+ * or `rm`. `plur trust` is `{ trusted: true }`, `folders set --no-trusted` is
+ * `{ trusted: false }` and `plur folders rm` is `{ remove: true }`. The folder
+ * is recorded as the key a write of it records (folderEntryKey: `~` expanded,
+ * canonicalised, a glob as typed), which is what verifyFolderNonce compares.
  */
-export function issueFolderNonce(root: string, sessionId: string, folder: string, now: number = Date.now()): string {
-  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, folder, now))
+export function issueFolderNonce(
+  root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number = Date.now(),
+): string {
+  if (answerKey(answer) === null) throw new FolderMapError('invalid', 'A folder nonce needs the answer it authorises.')
+  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, folder, answer, now))
 }
 
-function issueFolderNonceUnlocked(root: string, sessionId: string, folder: string, now: number): string {
+function issueFolderNonceUnlocked(root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number): string {
   mkdirSync(nonceDir(root), { recursive: true, mode: 0o700 })
   const file = nonceFile(root, sessionId)
   const data = readNonceFile(file) ?? { session: safeSessionKey(sessionId), nonces: [] }
   const nonce = randomBytes(16).toString('hex')
-  data.nonces.push({ nonce, folder: canonicalize(folder), issued_at: now })
+  // The same key a write of this folder records (#1477 review): `~` expands
+  // to the home, a literal folder is canonicalised, a glob is kept as typed.
+  data.nonces.push({ nonce, folder: folderEntryKey(folder), answer: cleanAnswer(answer), issued_at: now })
   writeNonceFile(file, data)
   return nonce
+}
+
+/** Only the fields an answer has, so the nonce file holds nothing else. */
+function cleanAnswer(a: FolderAnswer): FolderAnswer {
+  if ('remove' in a) return { remove: true }
+  return {
+    ...(a.mode !== undefined ? { mode: a.mode } : {}),
+    ...(a.scope !== undefined ? { scope: a.scope } : {}),
+    ...(a.trusted !== undefined ? { trusted: a.trusted } : {}),
+  }
 }
 
 /** Drop every nonce of `sessionId` — called when the session ends. */
@@ -779,20 +962,28 @@ export function endFolderNonceSession(root: string, sessionId: string): void {
 }
 
 /**
- * Verify and consume `nonce` for `folder` in one step. See verifyFolderNonce.
+ * Verify and consume `nonce` for `answer` on `folder` in one step. See verifyFolderNonce.
  */
-export function consumeFolderNonce(root: string, nonce: string, folder: string, now: number = Date.now()): void {
-  locked(root, () => verifyFolderNonce(root, nonce, folder, now)())
+export function consumeFolderNonce(root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now()): void {
+  locked(root, () => verifyFolderNonce(root, nonce, folder, answer, now)())
 }
 
 /**
- * Verify `nonce` for `folder` and return the function that consumes it.
- * Writers call that only after their write succeeded, so a failed write never
- * burns the nonce. Throws a FolderMapError when the nonce is unknown (never
- * issued, already used, or its session ended), expired (removed on the spot),
- * or was issued for a different folder (left in place).
+ * Verify `nonce` for `answer` on `folder` and return the function that
+ * consumes it. Writers call that only after their write succeeded, so a
+ * failed write never burns the nonce. Throws a FolderMapError when the nonce
+ * is unknown (never issued, already used, or its session ended), expired
+ * (removed on the spot), or was issued for a different folder or a different
+ * answer (left in place, so the answer it was issued for still works). A
+ * record with no bound answer (written before #1378) authorises nothing.
  */
-export function verifyFolderNonce(root: string, nonce: string, folder: string, now: number = Date.now()): () => void {
+export function verifyFolderNonce(
+  root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now(), home: string = homedir(),
+): () => void {
+  // Checked against exactly the key the write records (#1477 review). With
+  // canonicalize(folder) alone, a quoted `~/x` was checked as `<cwd>/~/x`
+  // but written as `$HOME/x`, so a nonce for one folder could write another.
+  const key = folderEntryKey(folder, home)
   const dir = nonceDir(root)
   let files: string[] = []
   try { files = readdirSync(dir).filter(f => f.endsWith('.yaml')) } catch { /* no nonces issued */ }
@@ -808,8 +999,13 @@ export function verifyFolderNonce(root: string, nonce: string, folder: string, n
       writeNonceFile(file, data)
       throw new FolderMapError('nonce-expired', 'That nonce has expired; nothing was changed.')
     }
-    if (rec.folder !== canonicalize(folder)) {
-      throw new FolderMapError('nonce-folder', `That nonce was issued for ${rec.folder}, not ${canonicalize(folder)}; nothing was changed.`)
+    if (rec.folder !== key) {
+      throw new FolderMapError('nonce-folder', `That nonce was issued for ${rec.folder}, not ${key}; nothing was changed.`)
+    }
+    const bound = answerKey(rec.answer)
+    if (bound === null || bound !== answerKey(answer)) {
+      throw new FolderMapError('nonce-answer',
+        `That nonce was issued for ${describeAnswer(rec.answer)}, not ${describeAnswer(answer)}; nothing was changed.`)
     }
     return () => {
       // Re-read: another writer may have changed this session's file since.

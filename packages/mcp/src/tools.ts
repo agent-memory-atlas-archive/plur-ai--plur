@@ -1,7 +1,7 @@
 import { existsSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { Plur, extractMetaEngrams, validateMetaEngram, confidenceBand, generateProfile, getProfileForInjection, markProfileDirty, selectModelForOperation, readHistoryForEngram, getCachedUpdateCheck, minorVersionsBehind, scanForTensions, CapabilityCanary, readProjectConfig, isSharedScope, resolveRerankerName, getReranker, classifyRerankerFailure, hfCacheDirName, SUGGEST_DISPLAY_MIN_CONFIDENCE, mcpRemoteWarningLine, doctorRemoteRemediation, normalizeEndpointUrl, REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES, bareEngramId, summariseProvenance, renderProvenanceSummary, type LearnContext } from '@plur-ai/core'
+import { Plur, extractMetaEngrams, validateMetaEngram, confidenceBand, generateProfile, getProfileForInjection, markProfileDirty, selectModelForOperation, readHistoryForEngram, getCachedUpdateCheck, minorVersionsBehind, scanForTensions, CapabilityCanary, readProjectConfig, isSharedScope, resolveRerankerName, getReranker, classifyRerankerFailure, hfCacheDirName, SUGGEST_DISPLAY_MIN_CONFIDENCE, mcpRemoteWarningLine, doctorRemoteRemediation, normalizeEndpointUrl, REMOTE_STATUS_TTL_MS, PROBE_CLEARABLE_STATES, bareEngramId, summariseProvenance, renderProvenanceSummary, describeNeedsAction, summarizeOutbox, type LearnContext, type OutboxSummary } from '@plur-ai/core'
 import type { LlmFunction, MetaField, TensionStatus, RerankerEvalResult, HistoryEvent, Receipt, RemoteStoreStatusEntry } from '@plur-ai/core'
 import { recordTelemetry } from './telemetry.js'
 import { VERSION } from './version.js'
@@ -1271,6 +1271,9 @@ function getAllToolDefinitions(): ToolDefinition[] {
 
         try {
           const engram = await plur.learnRouted(statement, context)
+          // #1264: where the engram went. Read off the returned object before
+          // anything copies it — a copy loses the remote-confirmed evidence.
+          const delivered = plur.deliveryOf(engram, context?.scope)
           const isOutbox = !!(engram as any).structured_data?._outbox
           const demoted = (engram as any).structured_data?._demoted as { from: string; to: string; patterns: string } | undefined
           const routed = (engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
@@ -1329,6 +1332,11 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // See the note on recall results: same fact, not same record.
             content_hash: (engram as { content_hash?: string }).content_hash,
             decision: 'ADD',
+            // #1264: always present. The warning sits BEFORE the others so a
+            // more specific `warning` below (outbox, demotion, refusal) still
+            // wins that key; `delivery_warning` keeps this one either way.
+            delivery: delivered.delivery,
+            ...(delivered.warning ? { delivery_warning: delivered.warning, warning: delivered.warning } : {}),
             ...(dedup?.near_duplicates?.length ? { dedup } : {}),
             ...(redraft ? { redraft } : {}),
             ...(() => { const c = composeHints(statement, context?.rationale, context?.source); return c ? { composition: c } : {} })(),
@@ -1349,6 +1357,7 @@ function getAllToolDefinitions(): ToolDefinition[] {
 // learnRouted now saves to outbox on remote failure, so this
           // path should rarely be reached. Keep as defense-in-depth.
           const engram = await plur.learn(statement, context)
+          const delivered = plur.deliveryOf(engram, context?.scope)
           const isOutbox = !!(engram as any).structured_data?._outbox
           const routedFallback = (engram as any).structured_data?._routed as { scope: string; confidence: number; reason: string } | undefined
           mcpCanary.signal('learn_activity')
@@ -1361,6 +1370,8 @@ function getAllToolDefinitions(): ToolDefinition[] {
             // Outbox engrams stay local-form (same rule as line 1149).
             id: isOutbox ? engram.id : plur.readIdFor(engram), statement: engram.statement,
             scope: engram.scope, type: engram.type, decision: 'ADD',
+            delivery: delivered.delivery,
+            ...(delivered.warning ? { delivery_warning: delivered.warning } : {}),
             ...temporalEcho(engram),
             ...scopeHint(engram.scope, !!routedFallback),
             ...domainHint(!!routedFallback),
@@ -2233,9 +2244,20 @@ function getAllToolDefinitions(): ToolDefinition[] {
         // caller nothing about what just moved.
         const before = await plur.listOutbox()
         if (args.flush !== true) {
-          return { pending: before.length, entries: before }
+          // #1299: counts by state, so a caller can tell "will deliver when
+          // the network is back" from "will never deliver as it stands".
+          const summary = summarizeOutbox(before)
+          return {
+            pending: before.length,
+            retrying: summary.retrying,
+            needs_action: summary.needs_action,
+            ...(summary.needs_action > 0 ? { needs_action_scopes: summary.scopes } : {}),
+            entries: before,
+          }
         }
-        const result = await plur.flushOutbox()
+        // An explicit flush retries needs_action entries too (#1299): the
+        // caller may just have fixed the cause.
+        const result = await plur.flushOutbox({ force: true })
         return {
           pending: await plur.outboxCount(),
           flushed: result.flushed,
@@ -2465,6 +2487,9 @@ function getAllToolDefinitions(): ToolDefinition[] {
           tension_count: status.tension_count,
           versioned_engram_count: status.versioned_engram_count ?? 0,
           outbox_count: status.outbox_count ?? 0,
+          // #1299: queued writes a retry cannot deliver, per scope.
+          outbox_needs_action: status.outbox_needs_action ?? 0,
+          ...(status.outbox_attention ? { outbox_attention: status.outbox_attention } : {}),
           // Injection-provenance event/label counts (#452) — #202's volume gate.
           history_events: status.history_events ?? {
             co_injection: 0,
@@ -3008,6 +3033,14 @@ function getAllToolDefinitions(): ToolDefinition[] {
           // `flushOutbox` is not a report to the caller.
           outbox_error = (err as Error).message
         }
+        // #1299: queued writes that no retry will deliver (401/403/404/422, a
+        // write refusal, no writable store). Read AFTER the flush, so it
+        // reports what is still stuck. Best-effort: never fails session start.
+        let outbox_needs: OutboxSummary | undefined
+        try {
+          const summary = await plur.outboxSummary()
+          if (summary.needs_action > 0) outbox_needs = summary
+        } catch { /* reported via outbox_error when the store itself is the problem */ }
 
         // Surface writable remote scopes so AI caller knows what's available (#229)
         // NOTE: we do NOT auto-set session scope FROM REMOTE STORES — the AI
@@ -3314,6 +3347,12 @@ function getAllToolDefinitions(): ToolDefinition[] {
         // is the first tool an agent calls — one line here tells it the
         // gateway exists BEFORE it ever misses a name and concludes the MCP
         // is down. Silent under 'full', where nothing is hidden.
+        if (outbox_needs) {
+          guide += `\n\n⚠️ OUTBOX: ${outbox_needs.needs_action} queued team write(s) cannot be delivered by retrying. `
+            + describeNeedsAction(outbox_needs).join(' ')
+            + ' Tell the user; nothing is dropped automatically. `plur outbox` lists them.'
+        }
+
         const session_tool_profile = activeToolProfile()
         if (session_tool_profile !== 'full') {
           guide += `\n\nTool profile "${session_tool_profile}": most plur_* tools are not exposed by name — ` +
@@ -3352,6 +3391,10 @@ function getAllToolDefinitions(): ToolDefinition[] {
             outbox_warning:
               `The outbox flush failed — ${outbox_error}. Engrams routed to a remote store are `
               + `still queued locally and were NOT pushed. They retry on the next session_start or plur_sync.`,
+          } : {}),
+          // #1299: writes a retry cannot deliver — count, scope, reason, next step.
+          ...(outbox_needs ? {
+            outbox_needs_action: { count: outbox_needs.needs_action, scopes: outbox_needs.scopes },
           } : {}),
           // Version staleness warning (issue #151)
           ...(version_warning ? { version_warning, version: VERSION } : {}),
@@ -3627,10 +3670,17 @@ Include at least one engram_suggestion if ANYTHING was learned. An empty suggest
         try {
           const plurDir = process.env.PLUR_PATH ?? join(homedir(), '.plur')
           const sessionsDir = join(plurDir, 'sessions')
-          // Try session_id first, then CLAUDE_SESSION_ID, then ppid
+          // Try session_id first, then CLAUDE_SESSION_ID, then ppid. #1278:
+          // the Stop hook writes the checkpoint under safeSessionKey(id),
+          // which REPLACES unsafe characters with '_'; try that form first,
+          // then the stripped form older writers used.
           const keys = [session_id, process.env.CLAUDE_SESSION_ID, String(process.ppid)]
             .filter(Boolean)
-            .map(k => k!.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64))
+            .flatMap(k => [
+              (k!.replace(/[^A-Za-z0-9_-]/g, '_') || 'unknown').slice(0, 64),
+              k!.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64),
+            ])
+            .filter(Boolean)
           for (const key of keys) {
             const cp = join(sessionsDir, `${key}.checkpoint.json`)
             if (existsSync(cp)) { unlinkSync(cp); break }

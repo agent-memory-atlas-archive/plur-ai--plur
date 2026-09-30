@@ -1,5 +1,6 @@
 import * as fs from 'fs'
-import { tmpdir } from 'os'
+import { randomUUID, createHash } from 'crypto'
+import { tmpdir, hostname } from 'os'
 import { join, dirname, basename } from 'path'
 import yaml from 'js-yaml'
 import { collapseLineTerminators } from './sanitize.js'
@@ -7,6 +8,8 @@ import { detectPlurStorage, type PlurPaths } from './storage.js'
 import { IndexedStorage } from './storage-indexed.js'
 import { PGLiteAdapter } from './storage-pglite.js'
 import { loadConfig } from './config.js'
+import { canonicalize } from './project-config.js'
+import { classifyStoreDuplicates, removePrimaryStoreEntries } from './store-duplicates.js'
 import { generateEngramId, engramIdDatePrefix, loadAllPacks, storePrefix, namespaceEngramId, bareEngramId, initFilesystemStore } from './engrams.js'
 import { maybeDailyBackup } from './backup.js'
 import { logger } from './logger.js'
@@ -52,7 +55,8 @@ import { engramDate } from './tensions.js'
 import { resolveValidity, buildTemporal, normalizeIsoDate, type ResolvedValidity } from './expiry.js'
 import { isCurrentlyValid } from './validity.js'
 import { decodeJwtExpiry, decodeJwtPayload } from './jwt.js'
-import { RemoteStore, normalizeEndpointUrl } from './store/remote-store.js'
+import { RemoteStore, RemoteAbortedError, RemoteHttpError, RemoteTimeoutError, normalizeEndpointUrl } from './store/remote-store.js'
+import { classifyOutboxFailure, NEEDS_ACTION_RETRY_MS, NEEDS_ACTION_STATUSES, summarizeOutbox, type OutboxState, type OutboxSummary } from './outbox-health.js'
 import { redactToken, containsToken } from './redact-token.js'
 import {
   remoteRecall, isRemoteRecallDisabled, resolveRemoteRecallTimeoutMs, scopeOrg,
@@ -84,6 +88,7 @@ import {
   type FolderPolicy,
   type FolderEntry,
   type FolderChange,
+  type FolderAnswer,
 } from './folders.js'
 import type { Engram } from './schemas/engram.js'
 import { ATTRIBUTION_UNIDENTIFIED, MeasuredUnderSchema, type MeasuredUnder } from './schemas/engram.js'
@@ -112,6 +117,7 @@ export { computeConfidence, computeMetaConfidence, confidenceBand } from './conf
 export { SessionBreadcrumbs } from './session-state.js'
 export { SessionScopeRegistry } from './session-scopes.js'
 export { AsyncMutex, KeyedAsyncMutex } from './async-mutex.js'
+export { pendingStoreLockOps } from './store/async-lock.js'
 export { findProjectConfigPath, readProjectConfig, readProjectConfigFromPath, canonicalize, type ProjectConfig } from './project-config.js'
 // The trust gate a project's REMOTE settings must pass before an adapter may
 // route prompt text to the host they name (#1196/#1198). Lives here, not in
@@ -157,6 +163,7 @@ export {
   type FolderPolicy,
   type FolderPolicySource,
   type FolderChange,
+  type FolderAnswer,
   type FolderMapErrorCode,
 } from './folders.js'
 export { generateGuardrails } from './guardrails.js'
@@ -206,6 +213,12 @@ import { gatherReceipt } from './receipt-io.js'
 export { computeContentHash, normalizeStatement, isHashable } from './content-hash.js'
 export { isLocalOnlyScope, assertScopeNamesATarget } from './scope-target.js'
 export { orderBySupersedes } from './outbox-order.js'
+export {
+  classifyOutboxFailure, summarizeOutbox, describeNeedsAction, statusFromErrorText,
+  NEEDS_ACTION_RETRY_MS, NEEDS_ACTION_STATUSES,
+  type OutboxState, type OutboxVerdict, type OutboxSummary, type OutboxFailureInput,
+} from './outbox-health.js'
+export { RemoteHttpError } from './store/remote-store.js'
 export { parseDedupResponse, buildDedupPrompt, buildBatchDedupPrompt } from './dedup.js'
 export { runMigrations, rollbackMigrations, getSchemaVersion, setSchemaVersion, ALL_MIGRATIONS, CURRENT_SCHEMA_VERSION, type Migration, type MigrationResult } from './migrations/index.js'
 export { detectSecrets, detectSensitive, detectPromptInjection, sensitivityCategory } from './secrets.js'
@@ -225,6 +238,7 @@ export { detectPlurStorage, type PlurPaths } from './storage.js'
 // `plur reindex-tokens` came to report a false all-clear on a store whose
 // connection lived in config.yaml rather than the environment.
 export { loadConfig } from './config.js'
+export { classifyStoreDuplicates, removePrimaryStoreEntries, type IgnoredStoreEntry, type StoreDuplicateReport } from './store-duplicates.js'
 export { IndexedStorage } from './storage-indexed.js'
 export { PGLiteAdapter, type PGLiteAdapterOptions, type VectorPrecision } from './storage-pglite.js'
 export type {
@@ -449,6 +463,10 @@ export interface StatusResult {
   tension_count?: number
   versioned_engram_count?: number
   outbox_count?: number
+  /** Queued writes a retry cannot deliver (401/403/404/422, refusal, no store) (#1299). */
+  outbox_needs_action?: number
+  /** Present when `outbox_needs_action` > 0: one row per scope and reason, with its next step. */
+  outbox_attention?: OutboxSummary['scopes']
   /** Present when the most recent background index pass failed (#272). */
   index_error?: IndexSyncError
   /** Injection-provenance event/label counts (#452) — feeds #202's volume gate. */
@@ -706,6 +724,49 @@ const REMOTE_GUARD_BUDGET_MS = 45_000
 
 const OUTBOX_ID_MAP_MAX = 5000
 
+/**
+ * How long a push claim is honoured when its owner is on ANOTHER host, whose
+ * pid cannot be checked: longer than one bounded request (30s). An owner on
+ * this host holds its claim while its process is alive (see
+ * `_outboxClaimHeld`).
+ */
+const OUTBOX_CLAIM_LEASE_MS = 60_000
+
+/**
+ * Hard cap on a live same-host owner's claim: far above one push's worst case
+ * (a 30s request plus the 180s store-lock wait before the merge-back), so it
+ * never cuts a real push short, but finite so a recycled pid cannot hold an
+ * entry forever.
+ */
+const OUTBOX_CLAIM_MAX_AGE_MS = 15 * 60_000
+
+/**
+ * How many dead takeover markers a claimer walks past before it gives up.
+ * Each level is a racer that died inside a critical section a few syscalls
+ * long, so reaching this means something is badly wrong; the entry waits.
+ */
+const OUTBOX_TAKEOVER_MAX_DEPTH = 8
+
+/** id → idempotency key of every row still queued in the outbox (not retired). */
+function queuedOutboxKeys(rows: Engram[]): Map<string, string | undefined> {
+  const out = new Map<string, string | undefined>()
+  for (const e of rows) {
+    const ob = (e as any).structured_data?._outbox
+    if (ob && e.status !== 'retired') out.set(e.id, typeof ob.idempotency_key === 'string' ? ob.idempotency_key : undefined)
+  }
+  return out
+}
+
+/** Names one exact claim (or marker) content, for its takeover marker. */
+function outboxClaimTag(raw: string): string {
+  return createHash('sha256').update(raw).digest('hex').slice(0, 16)
+}
+
+/** Is this process still running? (`kill 0` probes without signalling.) */
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM' }
+}
+
 const LLM_BREAKER_THRESHOLD = 3
 const LLM_BREAKER_WINDOW_MS = 5 * 60 * 1000
 const LLM_BREAKER_COOLDOWN_MS = 60 * 60 * 1000
@@ -955,6 +1016,13 @@ export {
   type ProvenanceSummary,
 } from './provenance.js'
 
+/**
+ * Where a learn result went (#1264). `remote`: a url store accepted it.
+ * `outbox`: it is saved here and queued for a url store (the push is deferred,
+ * or failed and will be retried). `local`: it exists on this machine only.
+ */
+export type LearnDelivery = 'remote' | 'outbox' | 'local'
+
 /** Refusal from {@link Plur.addRemoteStore} (#1265). `code` is stable for
  *  callers; `message` never contains the token. */
 export class AddRemoteStoreError extends Error {
@@ -969,6 +1037,13 @@ export class AddRemoteStoreError extends Error {
 }
 
 export class Plur {
+  /**
+   * Engrams a url store confirmed on the write path (#1264). The server's reply
+   * is the only evidence a write left the machine, and it leaves no mark on the
+   * engram itself, so it is remembered here — per returned object, never
+   * persisted.
+   */
+  private _remoteDelivered = new WeakSet<object>()
   private paths: PlurPaths
   private config: PlurConfig
   private indexedStorage: IndexedStorage | null = null
@@ -1066,6 +1141,11 @@ export class Plur {
   private _rerankerEvalAdvisoryDone = false
   /** mtime (ms) of config.yaml at last load — drives reloadConfigIfChanged (#307). */
   private configMtimeMs = 0
+  /** Local store entries dropped at load because they name the primary file
+   *  or a store already registered under another spelling (#1319). Kept on
+   *  disk; see {@link _loadConfig}. */
+  private _ignoredDuplicates: Array<{ entry: StoreEntry; duplicateOf: string }> = []
+  private _warnedDuplicateStores = new Set<string>()
   /** Whether constructor-time cwd store discovery is enabled for this instance. */
   private _autoDiscover = true
   /**
@@ -1188,7 +1268,7 @@ export class Plur {
         )
       }
     }
-    this.config = loadConfig(this.paths.config)
+    this.config = this._loadConfig()
     this._autoDiscover = Plur.resolveAutoDiscover(options?.autoDiscover)
     // Auto-discover project stores from CWD (skips temp dirs for test safety).
     //
@@ -1201,8 +1281,8 @@ export class Plur {
     // silently reconfigure a shared deployment.
     if (this._autoDiscover) this.autoDiscoverStores(options?.cwd)
     // Re-read config after potential store additions
-    if (this.config.stores?.length !== loadConfig(this.paths.config).stores?.length) {
-      this.config = loadConfig(this.paths.config)
+    if (this.config.stores?.length !== this._loadConfig().stores?.length) {
+      this.config = this._loadConfig()
     }
     this.configMtimeMs = this.statConfigMtime()
     const selection = this._resolveBackend()
@@ -1441,6 +1521,12 @@ export class Plur {
         cloned.id = cloned.id.replace(/^(ENG|ABS|META)-/, `$1-${prefix}-`)
         cloned._originalId = originalId
         cloned._storeScope = store.scope
+        // Which store served the row, not just its scope: several stores may
+        // share one scope (a url store and a path store both load), and
+        // delivery reporting must classify by the one that held the row. A
+        // boolean, not the url: every field of a loaded row is content-scanned
+        // on the explicit-update path, and a url is not content.
+        if (store.url) cloned._fromRemoteStore = true
         all.push(cloned)
       }
     }
@@ -2075,7 +2161,7 @@ export class Plur {
       configData.provenance = provenance
       atomicWrite(this.paths.config, yaml.dump(configData, { lineWidth: 120, noRefs: true }), { mode: CONFIG_FILE_MODE })
     })
-    this.config = loadConfig(this.paths.config)
+    this.config = this._loadConfig()
     this.configMtimeMs = this.statConfigMtime()
     return { ...this.identity(), ...(warning ? { warning } : {}) }
   }
@@ -2197,14 +2283,219 @@ export class Plur {
     // commitment. A false positive here is louder than a missed one.
     if (!isHashable(statement)) return null
     const hash = computeContentHash(statement)
+    // #1268: for a SHARED write, a shared hit is preferred. Either way the hit
+    // is only CREDITED — decision A1 (2026-09-29): a team save is never
+    // absorbed, not even into another team's engram. See `_isTeamValidation`.
+    const sharedWrite = isSharedScope(currentScope)
+    let fallback: Engram | null = null
     for (const e of engrams) {
       if (e.status === 'active'
           && (e as any).content_hash === hash
           && e.scope !== currentScope) {
-        return e
+        if (!sharedWrite || isSharedScope(e.scope)) return e
+        fallback ??= e
       }
     }
-    return null
+    return fallback
+  }
+
+  /**
+   * #1268: a shared-scope save that matched an engram in another scope. The
+   * match is credited as a recurrence (counted, a `validated_by` source,
+   * commitment escalated by the ladder up to `recurrence.max_commitment`) and
+   * the team copy is written anyway. Decision A1 (2026-09-29): this holds for
+   * EVERY match — personal, global, or another team's engram — so a team save
+   * always reaches its own team store. The user may then hold several engrams
+   * with the same text; that is intended.
+   */
+  private _isTeamValidation(scope: string, _hit: Engram): boolean {
+    return isSharedScope(scope)
+  }
+
+  /** Decision A3 (2026-09-29): the ladder's ceiling, from `recurrence.max_commitment`. */
+  private _maxRecurrenceCommitment(): 'locked' | 'decided' {
+    return (this.config as any).recurrence?.max_commitment === 'decided' ? 'decided' : 'locked'
+  }
+
+  /**
+   * One step up the commitment ladder (exploring → leaning → decided →
+   * locked), never past `recurrence.max_commitment`, and never into `locked`
+   * while `lockBlocked` (an unresolved tension, #181).
+   */
+  private _stepCommitment(c: Engram['commitment'] | undefined, lockBlocked: boolean): Engram['commitment'] {
+    // Only the four ladder rungs advance. `draft` (pending human approval) and
+    // any unknown/extension value are not the ladder's to move — the same rule
+    // as `feedback.ts` `nextCommitment` (formal replay, field-report cluster 1).
+    switch (c as string | undefined) {
+      case undefined:   return 'leaning'
+      case 'exploring': return 'leaning'
+      case 'leaning':   return 'decided'
+      case 'decided':   return lockBlocked || this._maxRecurrenceCommitment() === 'decided' ? 'decided' : 'locked'
+      default:          return c   // 'locked', 'draft', and anything unknown: unchanged
+    }
+  }
+
+  /**
+   * #1268 guard: an engram bound for a remote team store — queued in the
+   * outbox for one, served by one, or in a scope a url store is registered for
+   * — must never be rewritten to `global` by the recurrence ladder. Otherwise
+   * the outbox pushes `scope: global` into the team store.
+   */
+  private _isTeamStoreBound(e: Engram): boolean {
+    // Owner decision (2026-09-29): what is in a team store stays there. A team
+    // store is any url store or any `shared: true` file-path store; an engram
+    // it serves, or one queued for it, keeps its scope. The ladder may still
+    // credit it, and a personal/global copy can exist alongside.
+    const a = e as any
+    if (a.structured_data?._outbox) return true
+    const teamStores = (this.config.stores ?? []).filter(s => !!s.url || s.shared === true)
+    if (teamStores.some(s => isScopeWithin(e.scope, s.scope))) return true
+    if (typeof a._storeScope === 'string' && teamStores.some(s => s.scope === a._storeScope)) return true
+    return false
+  }
+
+  /**
+   * #1268 copy-on-promote. `hit` is an engram the ladder would broaden to
+   * global, but either it is bound for a team store (what is in a team store
+   * stays there) or a global engram with the same text already exists. Leave
+   * `hit` in its scope, store and file, and credit a `global` engram in the
+   * LOCAL primary store instead — the existing twin if there is one, else a
+   * copy created now.
+   *
+   * Decision A2 (2026-09-29, "both"): a team engram still QUEUED for its store
+   * (an `_outbox` row in the primary store) also records the recurrence on
+   * itself — count and source only; its scope, commitment and outbox entry
+   * are kept — before the global copy is created or credited.
+   *
+   * The copy links back with `derived_from: <hit id>` (the existing lineage
+   * field) and its first source carries `promoted_from: <hit scope>`.
+   * Commitment is escalated as the ladder would, up to
+   * `recurrence.max_commitment` (decision A3). The
+   * copy is appended directly — never given an `_outbox` marker — and its
+   * scope is `global`, which no team store serves, so it is never pushed.
+   *
+   * Carried from `hit`: statement, type, domain, tags, rationale, the validity
+   * window (`valid_from`/`valid_until` — an expiring team engram must not yield
+   * a copy that never expires), `knowledge_anchors` and `dual_coding` (content
+   * that cites and explains the statement). NOT carried: `pinned` — a pin is
+   * the owner's own injection-budget choice and is quota-gated, so a
+   * teammate's pin must not spend it — and `relations`, whose edges name
+   * team-store ids and whose `supersedes` edges have side effects; the copy's
+   * one edge is `derived_from`.
+   *
+   * Uses the same id allocation and storage seams as `learn()`: on a store
+   * with the write-path seams it asks the store for the id and never loads the
+   * corpus (review finding 3).
+   */
+  private async _promoteTeamCopy(
+    hit: Engram,
+    engrams: Engram[],
+    scope: string,
+    context: LearnContext | undefined,
+    twin: Engram | null,
+  ): Promise<Engram> {
+    const source = this._buildSourceEntry(scope, context)
+    const lockedAt = new Date().toISOString()
+    const step = (e: any, lockBlocked: boolean, count: number): void => {
+      e.commitment = this._stepCommitment(e.commitment, lockBlocked)
+      if (e.commitment === 'locked' && !e.locked_at) {
+        e.locked_at = lockedAt
+        e.locked_reason = `Auto-locked: cross-scope recurrence detected (${count}x)`
+      }
+    }
+
+    // A2: the queued team row records the recurrence on itself.
+    const h = hit as any
+    // Tension gate (#181) at every escalation site: an unresolved tension on
+    // the SOURCE engram blocks the copy's — or the twin's — step into locked,
+    // as it blocks the in-place promotion it replaces.
+    const sourceTension = this.hasUnresolvedTension(hit.id)
+      || (typeof h._originalId === 'string' && this.hasUnresolvedTension(h._originalId))
+    let hitCount = h.recurrence_count ?? 0
+    if (h.structured_data?._outbox) {
+      let row = engrams.find(e => e.id === hit.id) as any
+      if (!row && this._primaryStore.loadByIds) row = (await this._primaryStore.loadByIds([hit.id]))[0]
+      if (row) {
+        row.recurrence_count = (row.recurrence_count ?? 0) + 1
+        row.write_count = (row.write_count ?? 1) + 1
+        row.sources = [...(row.sources ?? []), source]
+        hitCount = row.recurrence_count - 1
+        await this._updateEngrams(engrams, [row as Engram])
+      }
+    }
+
+    if (twin) {
+      const e = twin as any
+      e.recurrence_count = (e.recurrence_count ?? 0) + 1
+      e.write_count = (e.write_count ?? 1) + 1
+      e.sources = [...(e.sources ?? []), source]
+      step(e, sourceTension || this.hasUnresolvedTension(twin.id), e.recurrence_count)
+      await this._updateEngrams(engrams, [twin])
+      await this._syncIndex()
+      return twin
+    }
+
+    const now = new Date().toISOString()
+    const ps = this._primaryStore
+    const id = this._canDelegateLearn()
+      ? await ps.nextEngramId!(engramIdDatePrefix())
+      : generateEngramId(engrams, this._mintedTodayIds())
+    this._rememberMintedId(id)
+    const copy: Engram = {
+      ...this._buildEngramShape(hit.statement, 'global', {
+        scope: 'global',
+        type: hit.type,
+        domain: hit.domain,
+        tags: hit.tags,
+        rationale: h.rationale,
+        knowledge_anchors: h.knowledge_anchors?.length ? h.knowledge_anchors : undefined,
+        dual_coding: h.dual_coding,
+        derived_from: hit.id,
+        commitment: hit.commitment,
+      } as LearnContext, now, {
+        ...(h.temporal?.valid_from ? { valid_from: h.temporal.valid_from } : {}),
+        ...(h.temporal?.valid_until ? { valid_until: h.temporal.valid_until } : {}),
+      }, eid => this._ancestorsOf(engrams, eid), 'default'),
+      id,
+    }
+    const c = copy as any
+    c.recurrence_count = hitCount + 1
+    c.write_count = (h.write_count ?? 1) + 1
+    step(c, sourceTension, c.recurrence_count)
+    c.sources = [
+      { scope: hit.scope, session_id: null, stored_at: now, promoted_from: hit.scope },
+      source,
+    ]
+    await this._appendEngram(engrams, copy)
+    await this._syncIndex()
+    this._appendHistory({
+      event: 'engram_created',
+      engram_id: id,
+      timestamp: now,
+      data: { type: copy.type, scope: 'global', source: copy.source, promoted_from: { engram_id: hit.id, scope: hit.scope } },
+    })
+    return copy
+  }
+
+  /** The store capability set `learn()` delegates on (#828) — see there. */
+  private _canDelegateLearn(): boolean {
+    const ps = this._primaryStore
+    return Boolean(ps.findActiveByContentHash && ps.nextEngramId && ps.append && ps.updateMany && ps.loadByIds)
+  }
+
+  /**
+   * An active `global` engram in the primary store with `hit`'s text (#1268
+   * review finding 2). Asked of the store when it has the seam, so this never
+   * loads the corpus there; otherwise found in the corpus in hand.
+   */
+  private async _findGlobalTwin(hit: Engram, engrams: Engram[]): Promise<Engram | null> {
+    if (!isHashable(hit.statement)) return null
+    const hash = (hit as any).content_hash ?? computeContentHash(hit.statement)
+    if (this._canDelegateLearn()) {
+      return await this._primaryStore.findActiveByContentHash!(hash, 'global')
+    }
+    return engrams.find(e => e.status === 'active' && e.scope === 'global'
+      && e.id !== hit.id && (e as any).content_hash === hash) ?? null
   }
 
   /** Record a cross-scope recurrence: append source, increment counters,
@@ -2228,6 +2519,23 @@ export class Plur {
   ): Promise<Engram> {
     const previousScope = hit.scope
     const previousCommitment = hit.commitment
+    const teamValidation = this._isTeamValidation(scope, hit)
+
+    // #1268 copy-on-promote (owner decision 2026-09-29): what is in a team
+    // store stays there. When this hit would broaden a team-bound engram to
+    // global, the team engram is left untouched and a global copy in the local
+    // primary store takes the promotion instead.
+    //
+    // The same path handles a global twin (review finding 2): when a global
+    // engram with the same text already exists, broadening `hit` in place
+    // would make a second one. The existing global engram is credited instead
+    // and `hit` is left where it is.
+    if (((hit as any).recurrence_count ?? 0) + 1 >= 2 && isSharedScope(hit.scope)) {
+      const twin = await this._findGlobalTwin(hit, engrams)
+      if (twin || this._isTeamStoreBound(hit)) {
+        return await this._promoteTeamCopy(hit, engrams, scope, context, twin)
+      }
+    }
 
     // Audit iter-4 fix (Critic + Data convergence): mutate ONCE on the canonical
     // writable target (primary or secondary store engram), then sync hit from
@@ -2244,7 +2552,9 @@ export class Plur {
     // applyMutation is pure-ish: takes everything it needs as parameters,
     // returns the new recurrence count so callers don't need to read back via
     // unsafe cast.
-    const sourceEntry = this._buildSourceEntry(scope, context)
+    const sourceEntry: { scope: string; session_id: string | null; stored_at: string; validated_by?: string } =
+      this._buildSourceEntry(scope, context)
+    if (teamValidation) sourceEntry.validated_by = scope
     const lockTimestamp = new Date().toISOString()
     // #181 (audit #213 item 3): an engram in an unresolved persisted tension
     // must not escalate INTO 'locked' — contradicted knowledge freezing at
@@ -2261,16 +2571,13 @@ export class Plur {
         // Only promote SHARED scopes (project:*, space:*, etc.) to global —
         // personal-family scopes (local, user:*) stay within their family.
         // See issue #362 item (ii): personal-scope ceiling for cross-scope recurrence.
-        if (isSharedScope(e.scope)) e.scope = 'global'
+        // #1268 guard: never broaden an engram bound for a remote team store.
+        if (isSharedScope(e.scope) && !this._isTeamStoreBound(e)) e.scope = 'global'
         if (e.commitment !== 'locked') {
-          // Forward-only ladder: exploring → leaning → decided → locked.
-          e.commitment = e.commitment === 'exploring'
-            ? 'leaning'
-            : e.commitment === 'leaning'
-              ? 'decided'
-              : e.commitment === 'decided'
-                ? (lockBlockedByTension ? 'decided' : 'locked')
-                : (e.commitment ?? 'leaning')
+          // Forward-only ladder: exploring → leaning → decided → locked, capped
+          // by `recurrence.max_commitment` (decision A3, 2026-09-29) — team
+          // validations included.
+          e.commitment = this._stepCommitment(e.commitment, lockBlockedByTension)
           if (lockBlockedByTension && e.commitment === 'decided') {
             logger.info(`[plur:tensions] lock escalation blocked for ${e.id} — unresolved tension (#181)`)
           }
@@ -2292,6 +2599,7 @@ export class Plur {
       ;(hit as any).recurrence_count = (mutated as any).recurrence_count
       hit.write_count = mutated.write_count
       ;(hit as any).sources = (mutated as any).sources
+      ;(hit as any).structured_data = (mutated as any).structured_data
       if (mutated.locked_at !== undefined) hit.locked_at = mutated.locked_at
       if (mutated.locked_reason !== undefined) hit.locked_reason = mutated.locked_reason
     }
@@ -3091,7 +3399,13 @@ export class Plur {
       // `engrams` is empty under delegation, so `_recordCrossScopeRecurrence`
       // takes its secondary-store branch — which is where every match it can
       // still see actually lives.
-      if (crossMatch) return await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
+      if (crossMatch && !this._isTeamValidation(scope, crossMatch)) {
+        return await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
+      }
+      // #1268: a shared save credits the engram it matched — personal, global
+      // or another team's (decision A1) — and then falls through to write its
+      // own team copy below.
+      if (crossMatch) await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
 
       const id = canDelegate
         ? await ps.nextEngramId!(engramIdDatePrefix())
@@ -3177,6 +3491,9 @@ export class Plur {
         // scope), but we still guard for null because config drift between
         // resolver-time and outbox-time is possible if config is reloaded.
         const storeEntry = (this.config.stores ?? []).find(s => s.url && s.scope === scope && !s.readonly)
+        // Idempotency key for this write (2026-09-29 audits): random, minted
+        // once, persisted on the outbox entry, never derived from an id.
+        const pushKey = randomUUID()
         if (!storeEntry) {
           // Resolver gave us a driver (probably readonly), but we can't queue
           // an outbox entry without a writable target. Skip outbox; the
@@ -3192,6 +3509,8 @@ export class Plur {
               last_attempt: now,
               attempt_count: 0,
               last_error: '',
+              // One key per logical write, reused by every retry of it.
+              idempotency_key: pushKey,
             },
           }
         }
@@ -3219,9 +3538,12 @@ export class Plur {
         // process on modern Node. A background task must not be able to take
         // the host down.
         void (async () => {
+          // One pusher per entry (2026-09-29 panel, M6): a flush that started
+          // between the local write and this push must not POST it too.
+          if (this._claimOutboxEntry(engram.id, () => pushKey).status === 'busy') return
           let pushed = false
           try {
-            await remoteDriver.append(engram)
+            await remoteDriver.appendAndGetServerId(engram, { idempotencyKey: pushKey })
             pushed = true
           } catch (err) {
             // Already saved locally with outbox metadata — will be retried.
@@ -3233,10 +3555,14 @@ export class Plur {
               if (target?.structured_data?._outbox) {
                 target.structured_data._outbox.last_error = (err as Error).message
                 target.structured_data._outbox.attempt_count = 1
+                // #1299: the status, when the remote gave one — it is what
+                // tells a refusal from a blip.
+                if (err instanceof RemoteHttpError) target.structured_data._outbox.last_status = err.status
                 // Incremental write (#740): only the outbox bookkeeping changed.
                 await this._updateEngrams(fresh, [target as Engram])
               }
             })
+            this._releaseOutboxClaim(engram.id)
             return
           }
 
@@ -3261,10 +3587,15 @@ export class Plur {
               }
             })
           } catch (err) {
+            // Retried by the next flush with the same key (decision C4): a
+            // key-honouring server collapses it; one that ignores keys gets
+            // a duplicate row.
             logger.warning(
               `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
-              + `${(err as Error).message}. It will be retried, which may create a duplicate on the remote.`,
+              + `${(err as Error).message}. The next flush will retry it with the same idempotency key.`,
             )
+          } finally {
+            this._releaseOutboxClaim(engram.id)
           }
         })().catch(err => {
           logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
@@ -3468,10 +3799,17 @@ export class Plur {
     // #176: cross-scope recurrence (same semantics as the local learn() path).
     const crossMatch = this._crossScopeRecurrenceDetect(statement, allEngrams, scope)
     if (crossMatch) {
-      return await this._withStoreLock(this.paths.engrams, async () => {
+      // #1268: decided BEFORE the recurrence is recorded, exactly as learn()
+      // does — recording can broaden `crossMatch` to global, and reading the
+      // flag afterwards turned an absorbed save into a second team write.
+      const teamValidation = this._isTeamValidation(scope, crossMatch)
+      const credited = await this._withStoreLock(this.paths.engrams, async () => {
         const engrams = await this._primaryStore.load()
         return await this._recordCrossScopeRecurrence(crossMatch, engrams, scope, context)
       })
+      // A team validation of a non-shared engram does not stand in for the
+      // team write — fall through and POST the team copy.
+      if (!teamValidation) return credited
     }
     const now = new Date().toISOString()
     const localPlaceholder = this._buildEngramShape(statement, scope, context, now, undefined, undefined, guarded.scopeSource)
@@ -3490,8 +3828,12 @@ export class Plur {
       }
     }
     let serverEngram: Engram
+    // Idempotency key for this write (2026-09-29 audits). The placeholder's id
+    // is `__pending__` on EVERY direct write, so it can never be the key: a
+    // server honouring the contract would collapse them all into the first.
+    const writeKey = randomUUID()
     try {
-      const { id: serverId } = await remoteDriver.appendAndGetServerId(localPlaceholder)
+      const { id: serverId } = await remoteDriver.appendAndGetServerId(localPlaceholder, { idempotencyKey: writeKey })
       serverEngram = { ...localPlaceholder, id: serverId }
     } catch (err) {
       // Remote failed — save locally with outbox metadata for retry.
@@ -3515,6 +3857,12 @@ export class Plur {
               last_attempt: now,
               attempt_count: 1,
               last_error: (err as Error).message,
+              // The same key the failed attempt carried: if that POST did land
+              // (a timeout after the server stored it), the retry is collapsed.
+              idempotency_key: writeKey,
+              // #1299: recorded so the outbox can be classified without
+              // parsing the message.
+              ...(err instanceof RemoteHttpError ? { last_status: err.status } : {}),
               // #295: flag auth failures distinctly so the queue isn't read as a
               // transient network blip — a 401/403 means the token needs reauth,
               // and surfacing it (session_start/doctor) is the actionable signal.
@@ -3561,7 +3909,75 @@ export class Plur {
         `written: ${(err as Error).message}. The engram is safe; the local audit trail is incomplete.`,
       )
     }
+    this._remoteDelivered.add(serverEngram)
     return serverEngram
+  }
+
+  /**
+   * Where a learn result went, and a warning when that is not where a reader
+   * would assume (#1264).
+   *
+   * A write to a shared scope (`group:`, `project:`, `org:` …) with no writable
+   * url store registered for exactly that scope falls through to the local
+   * primary store. That is deliberate — nothing is auto-routed into a shared
+   * store — but it used to be silent, so a team save could sit on one machine
+   * indefinitely while the caller was told only `ADD`. This reports it.
+   *
+   * Pure: reads the returned engram and the store config, never the network,
+   * and changes nothing about where anything was written. Pass the object
+   * `learn()` / `learnRouted()` returned; a copy loses the `remote` evidence.
+   *
+   * `requestedScope` (audit F8): the scope the caller asked for. When the save
+   * came back as an engram in a DIFFERENT scope — recorded as a recurrence on
+   * another team's engram, or on a `global` one — nothing was written to the
+   * requested shared scope, so the result is `local` for that scope and the
+   * warning names the requested scope, not the one it landed in. A sensitive-
+   * content demotion is excluded: it already carries its own warning.
+   */
+  deliveryOf(engram: Engram, requestedScope?: string): { delivery: LearnDelivery; warning?: string } {
+    const e = engram as any
+    const stores = this.config.stores ?? []
+    if (requestedScope && requestedScope !== engram.scope && isSharedScope(requestedScope)
+        && !e.structured_data?._demoted) {
+      return {
+        delivery: 'local',
+        warning: `You saved to shared scope "${requestedScope}", but this matched an existing engram in ` +
+          `"${engram.scope}" and was recorded on it as a recurrence. Nothing was written to ` +
+          `"${requestedScope}" or sent to its store, so that team will not see it.`,
+      }
+    }
+    let delivery: LearnDelivery
+    if (this._remoteDelivered.has(engram)) delivery = 'remote'
+    else if (e.structured_data?._outbox) delivery = 'outbox'
+    else if (typeof e._storeScope === 'string') {
+      // A dedup/recurrence hit on a row read from a secondary store: it lives
+      // wherever the store that SERVED it lives. Classified by the loader's
+      // `_fromRemoteStore` marker, never by the scope's first store entry — a
+      // url store and a path store can share one scope (formal replay, cluster 1).
+      delivery = e._fromRemoteStore === true ? 'remote' : 'local'
+    } else delivery = 'local'
+    if (delivery !== 'local' || !isSharedScope(engram.scope)) return { delivery }
+
+    const scope = engram.scope
+    const urlStores = stores.filter(s => !!s.url && s.scope === scope)
+    let why: string
+    // `visibility` defaults to 'private' on every engram, so it cannot tell an
+    // explicitly private write apart here; the store config can.
+    if (urlStores.length > 0 && urlStores.every(s => s.readonly === true)) {
+      why = 'the store registered for it is read-only, so this engram was saved on this machine only'
+    } else if (urlStores.length > 0) {
+      why = 'this engram was not sent to the store registered for it (an explicitly private write, or a match ' +
+        'with a copy already saved on this machine)'
+    } else {
+      why = 'no remote store is registered for exactly that scope, so this engram was saved on this machine only'
+    }
+    return {
+      delivery,
+      warning: `Scope "${scope}" is shared, but ${why}. No one else will see it. ` +
+        `To share this scope, register a writable store for "${scope}" ` +
+        `(plur_stores_add with url, token and scope "${scope}", or a url store in ~/.plur/config.yaml). ` +
+        `Engrams already saved here are not moved automatically.`,
+    }
   }
 
   /**
@@ -4568,6 +4984,205 @@ export class Plur {
    */
   outboxIdMapPath(): string {
     return join(this.paths.root, 'cache', 'outbox-id-map.json')
+  }
+
+  /**
+   * Per-entry push claims — the one duplicate-push guard (decision C3). A
+   * claim is a small file created with O_EXCL, so two writers — two flushes,
+   * or a flush and learn()'s background push, in one process or several —
+   * cannot both push an entry at once. It is released once the push's outcome
+   * is recorded (or the flush ends); a claim left by a process that died is
+   * taken over (see `_claimOutboxEntry`), and the write is simply retried with
+   * the key already on its outbox row (decision C4). A claim guards the row,
+   * not a snapshot: whoever takes it re-reads the row before pushing.
+   */
+  outboxClaimsDir(): string {
+    return join(this.paths.root, 'cache', 'outbox-claims')
+  }
+
+  /** Token of each claim this instance holds, so a release removes only its own. */
+  private _outboxClaimTokens = new Map<string, string>()
+
+  private _outboxClaimPath(id: string): string {
+    return join(this.outboxClaimsDir(), `${id.replace(/[^\w.-]/g, '_')}.json`)
+  }
+
+  /**
+   * Take the claim on an outbox entry. `busy` when another live writer holds
+   * it. A lapsed claim (its process is gone, or its lease expired) is taken
+   * over. `keyFor` supplies the key recorded in the claim.
+   *
+   * Every decision is made by O_EXCL, never by reading and comparing (decision
+   * C3; the review of #1277 measured more than one winner in 79 of 80 rounds
+   * of 6 processes racing the read-compare-rename takeover this replaces):
+   *
+   * - **A free entry**: the claim is published with `link(2)`, which fails
+   *   with EEXIST when the path exists. Its content is written first, so no
+   *   reader ever sees a half-written claim and mistakes it for a lapsed one.
+   * - **A lapsed claim**: the right to replace it is a takeover marker,
+   *   `<claim>.takeover-<tag>`, where `<tag>` names that exact stale content.
+   *   Of any number of racers exactly one can create it. The winner re-reads
+   *   the claim under it (it must still be the stale one), renames a fresh
+   *   claim over it, and removes the marker. The claim path is never empty
+   *   during a takeover. A late racer that creates the marker after it was
+   *   removed finds a different claim on the re-read and backs off.
+   * - **A marker whose holder died** before it renamed would wedge the entry,
+   *   so it is judged by the same liveness rule as a claim and replaced the
+   *   same way: by a marker named after IT (`…-<tag>-<tag>`), created with
+   *   O_EXCL. A dead marker is removed only once the stale claim it guards
+   *   has changed hands, so two racers can never win at two levels at once.
+   *
+   * Never throws: if the claim cannot be recorded at all, the push goes ahead
+   * unclaimed rather than never.
+   */
+  private _claimOutboxEntry(
+    id: string,
+    keyFor: () => string,
+  ): { status: 'busy' } | { status: 'claimed'; key: string } {
+    const path = this._outboxClaimPath(id)
+    const readRaw = (at: string): string | undefined => {
+      try { return fs.readFileSync(at, 'utf8') } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+        throw err
+      }
+    }
+    const heldBy = (raw: string): boolean => {
+      let held: { pid?: number; host?: string; until?: number; at?: number } = {}
+      try { held = JSON.parse(raw) } catch { /* unreadable: lapsed */ }
+      return this._outboxClaimHeld(held, Date.now())
+    }
+    /** Create `target` holding `body` only if nothing is there (O_EXCL). */
+    const publishExclusive = (target: string, body: string): boolean => {
+      const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`
+      fs.writeFileSync(tmp, body)
+      try {
+        fs.linkSync(tmp, target)
+        return true
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'EEXIST') return false
+        // A filesystem without hard links: O_EXCL on open instead.
+        if (code === 'EPERM' || code === 'ENOTSUP' || code === 'ENOSYS') {
+          try { fs.writeFileSync(target, body, { flag: 'wx' }); return true } catch (e) {
+            if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false
+            throw e
+          }
+        }
+        throw err
+      } finally {
+        fs.rmSync(tmp, { force: true })
+      }
+    }
+    try {
+      fs.mkdirSync(this.outboxClaimsDir(), { recursive: true })
+      const stale = readRaw(path)
+      if (stale !== undefined && heldBy(stale)) return { status: 'busy' }
+      const key = keyFor()
+      const token = randomUUID()
+      const at = Date.now()
+      const owner = { token, pid: process.pid, host: hostname(), at, until: at + OUTBOX_CLAIM_LEASE_MS }
+      const body = JSON.stringify({ key, ...owner })
+      if (stale === undefined) {
+        if (!publishExclusive(path, body)) return { status: 'busy' } // someone else got it first
+        this._outboxClaimTokens.set(id, token)
+        return { status: 'claimed', key }
+      }
+
+      // Takeover (C3): win the marker for this exact stale claim.
+      const passed: string[] = []
+      let marker = `${path}.takeover-${outboxClaimTag(stale)}`
+      let won = false
+      for (let depth = 0; depth < OUTBOX_TAKEOVER_MAX_DEPTH; depth++) {
+        if (publishExclusive(marker, JSON.stringify(owner))) { won = true; break }
+        const m = readRaw(marker)
+        // Gone means its holder finished: the claim has changed hands.
+        if (m === undefined || heldBy(m)) return { status: 'busy' }
+        passed.push(marker)
+        marker = `${marker}-${outboxClaimTag(m)}`
+      }
+      if (!won) return { status: 'busy' }
+      let changedHands = false
+      try {
+        // Under the marker: is it still the claim we judged stale?
+        if (readRaw(path) !== stale) { changedHands = true; return { status: 'busy' } }
+        const tmp = `${path}.${process.pid}.${token}.tmp`
+        fs.writeFileSync(tmp, body)
+        fs.renameSync(tmp, path)
+        changedHands = true
+        this._outboxClaimTokens.set(id, token)
+        return { status: 'claimed', key }
+      } finally {
+        fs.rmSync(marker, { force: true })
+        // The dead markers we walked past are cleared only once the stale
+        // claim they guard is gone. Before that, clearing one would let a
+        // second racer win a level we already passed.
+        if (changedHands) for (const p of passed) fs.rmSync(p, { force: true })
+      }
+    } catch (err) {
+      logger.warning(`[plur:outbox] could not record a push claim for ${id}: ${(err as Error).message}`)
+      return { status: 'claimed', key: keyFor() }
+    }
+  }
+
+  /**
+   * Is this claim still held by a live writer?
+   *
+   * - **Owner on this host:** held while its process is alive, however long
+   *   its push runs. The lease is NOT the bound here: a POST held open past
+   *   it by a slow but alive server would otherwise let a second flusher
+   *   take the claim over and re-push the same entry. A dead owner's claim is
+   *   stale at once. A hard age cap ({@link OUTBOX_CLAIM_MAX_AGE_MS}) still
+   *   applies, so a recycled pid cannot block an entry forever.
+   * - **Owner on another host** (a shared store directory): its pid cannot be
+   *   checked, so the lease decides.
+   *
+   * A timestamp dated implausibly far ahead is clock skew, not a live writer.
+   */
+  private _outboxClaimHeld(
+    held: { pid?: number; host?: string; until?: number; at?: number },
+    now: number,
+  ): boolean {
+    if (held.host === hostname()) {
+      if (typeof held.pid !== 'number' || !pidAlive(held.pid)) return false
+      const at = typeof held.at === 'number'
+        ? held.at
+        : typeof held.until === 'number' ? held.until - OUTBOX_CLAIM_LEASE_MS : undefined
+      if (at === undefined) return false
+      const age = now - at
+      return age >= -OUTBOX_CLAIM_LEASE_MS && age < OUTBOX_CLAIM_MAX_AGE_MS
+    }
+    return typeof held.until === 'number' && held.until > now
+      && held.until - now <= 2 * OUTBOX_CLAIM_LEASE_MS
+  }
+
+  /**
+   * Release a claim this process holds. Never throws.
+   *
+   * Also clears takeover markers left by a racer that died after its rename
+   * but before its cleanup. Only markers guarding a claim that is no longer in
+   * place (their tag differs from the current claim's) are removed: a racer
+   * that re-creates one then fails its re-read, so this cannot make a second
+   * winner.
+   */
+  private _releaseOutboxClaim(id: string): void {
+    const path = this._outboxClaimPath(id)
+    const token = this._outboxClaimTokens.get(id)
+    this._outboxClaimTokens.delete(id)
+    try {
+      const held = JSON.parse(fs.readFileSync(path, 'utf8')) as { pid?: number; host?: string; token?: string }
+      if (held.pid === process.pid && held.host === hostname() && (token === undefined || held.token === token)) {
+        fs.rmSync(path, { force: true })
+      }
+    } catch { /* already gone */ }
+    try {
+      let current: string | undefined
+      try { current = outboxClaimTag(fs.readFileSync(path, 'utf8')) } catch { /* no claim now */ }
+      const prefix = `${basename(path)}.takeover-`
+      for (const f of fs.readdirSync(this.outboxClaimsDir())) {
+        if (!f.startsWith(prefix) || f.endsWith('.tmp')) continue
+        if (f.slice(prefix.length).split('-')[0] !== current) fs.rmSync(join(this.outboxClaimsDir(), f), { force: true })
+      }
+    } catch { /* best effort */ }
   }
 
   /** Read the persisted local→server map. Never throws; `{}` on any problem. */
@@ -7783,7 +8398,20 @@ export class Plur {
     queued_at: string
     attempt_count: number
     last_error?: string
+    /** HTTP status of the last failed push, when the remote gave one (#1299). */
+    last_status?: number
     age_days: number
+    /**
+     * #1299: `retrying` — the next flush may succeed; `needs_action` — it
+     * cannot (401/403/404/422, a write refusal, no writable store).
+     */
+    state: OutboxState
+    /** One line, `needs_action` only: why retrying will not help. */
+    reason?: string
+    /** One line, `needs_action` only: what would. */
+    next_step?: string
+    /** `needs_action` only: the earliest time an automatic flush retries it. */
+    next_retry_at?: string
   }>> {
     const engrams = await this._loadCached(this.paths.engrams)
     const now = Date.now()
@@ -7791,16 +8419,31 @@ export class Plur {
     for (const e of engrams) {
       const ob = (e as any).structured_data?._outbox as {
         target_scope?: string; queued_at?: string; attempt_count?: number; last_error?: string
+        last_status?: unknown; last_attempt?: string
       } | undefined
       if (!ob || e.status === 'retired') continue
       const queued_at = typeof ob.queued_at === 'string' ? ob.queued_at : ''
       const queuedMs = queued_at ? Date.parse(queued_at) : NaN
+      const target_scope = ob.target_scope ?? '(unknown)'
+      const last_status = typeof ob.last_status === 'number' ? ob.last_status : undefined
+      const verdict = classifyOutboxFailure({
+        last_status,
+        last_error: ob.last_error,
+        has_store: this._hasWritableStoreFor(target_scope),
+        scope: target_scope,
+      })
+      const nextRetry = verdict.state === 'needs_action' ? this._needsActionRetryAt(ob) : undefined
       out.push({
         id: e.id,
-        target_scope: ob.target_scope ?? '(unknown)',
+        target_scope,
         queued_at,
         attempt_count: typeof ob.attempt_count === 'number' ? ob.attempt_count : 0,
         ...(ob.last_error ? { last_error: ob.last_error } : {}),
+        ...(last_status !== undefined ? { last_status } : {}),
+        state: verdict.state,
+        ...(verdict.reason ? { reason: verdict.reason } : {}),
+        ...(verdict.next_step ? { next_step: verdict.next_step } : {}),
+        ...(nextRetry !== undefined && nextRetry > now ? { next_retry_at: new Date(nextRetry).toISOString() } : {}),
         // A malformed or missing timestamp reports 0, not NaN: this number is
         // rendered, and NaN in a report reads as a bug in the reporter rather
         // than as the missing data it actually is.
@@ -7810,6 +8453,26 @@ export class Plur {
     return out
   }
 
+  /** Counts by state plus one line per needs_action scope (#1299). */
+  async outboxSummary(): Promise<OutboxSummary> {
+    return summarizeOutbox(await this.listOutbox())
+  }
+
+  /** A url store accepting writes for exactly this scope — the flush's own lookup. */
+  private _hasWritableStoreFor(scope: string): boolean {
+    return (this.config.stores ?? []).some(s => s.url && s.scope === scope && !s.readonly)
+  }
+
+  /**
+   * When an automatic flush may next dial a `needs_action` entry (#1299):
+   * one attempt per NEEDS_ACTION_RETRY_MS, counted from the last attempt.
+   * An entry with no readable last attempt is due now.
+   */
+  private _needsActionRetryAt(ob: { last_attempt?: string }): number | undefined {
+    const last = typeof ob.last_attempt === 'string' ? Date.parse(ob.last_attempt) : NaN
+    return Number.isFinite(last) ? last + NEEDS_ACTION_RETRY_MS : undefined
+  }
+
   /**
    * Flush the outbox — retry pushing pending engrams to their target remote
    * stores. Called automatically on session_start and plur_sync.
@@ -7817,10 +8480,74 @@ export class Plur {
    * On success: removes the local copy (remote is source of truth).
    * On failure: updates attempt metadata for next retry.
    * After 7 days: includes warning in expired_warnings.
+   *
+   * `timeoutMs` (#1269) bounds the NETWORK part of the flush, for callers that
+   * run under a harness timeout (editor session-end and stop hooks). The clock
+   * starts after the local store load, so a large store does not spend the
+   * budget on disk. When it runs out, the in-flight push is cut and nothing
+   * further is started; every entry not delivered is counted in `deferred`
+   * and left queued. A cut is not a strike against the host — running out of
+   * OUR time says nothing about THEIRS. The merge-back after is not covered:
+   * it must run to completion or a delivered entry would be pushed again.
+   *
+   * Decision C4: a push that was cut, timed out or threw is simply retried
+   * on the next flush — there is no "maybe delivered" state and no lookup
+   * before a re-post. What makes the retry safe is the idempotency key: a
+   * random UUID minted when the write is queued, persisted on the outbox row
+   * BEFORE the first POST (a row from an older client gets one minted and
+   * persisted here, before it is posted), and sent on every retry. A
+   * key-honouring server collapses the retry; a key-ignoring one may see at
+   * most one duplicate per write (docs/remote-store-contract.md).
+   *
+   * Decision C3: each entry is claimed before it is pushed, so two writers —
+   * two flushes, or a flush and learn()'s background push — never push it at
+   * once. Claims are released when the flush ends, also when it throws; the
+   * key is on the row, so nothing about the next retry depends on them.
+   *
+   * `skipped` counts entries not attempted because their host's circuit
+   * breaker is open; the reason is in `expired_warnings`.
+   *
+   * #1299: an entry whose last failure retrying cannot fix (`needs_action`:
+   * 401/403/404/422 or a write refusal) is re-dialled at most once per
+   * NEEDS_ACTION_RETRY_MS by this automatic path. Those skipped are counted in
+   * `held` and left exactly as they were. `force: true` — the explicit
+   * `plur outbox --flush` / `plur_outbox { flush: true }` — retries them
+   * anyway, for the user who has just fixed the cause. Nothing is ever
+   * dropped or rescoped for being `needs_action`.
    */
-  async flushOutbox(): Promise<{ flushed: number; failed: number; expired_warnings: string[] }> {
+  async flushOutbox(options: { timeoutMs?: number; force?: boolean } = {}): Promise<{
+    flushed: number; failed: number; deferred: number; skipped: number; held: number; expired_warnings: string[]
+  }> {
     this._assertWritable()
+    const budget = new AbortController()
+    let budgetTimer: NodeJS.Timeout | undefined
+    const startBudget = () => {
+      if (options.timeoutMs !== undefined && !budgetTimer) {
+        budgetTimer = setTimeout(() => budget.abort(), Math.max(0, options.timeoutMs))
+      }
+    }
+    /** Entries this flush holds a claim on. */
+    const claimed = new Set<string>()
+    try {
+      return await this._flushOutbox(budget.signal, startBudget, options.force === true, claimed)
+    } finally {
+      if (budgetTimer) clearTimeout(budgetTimer)
+      // Released however the flush ended — a thrown merge-back included. The
+      // idempotency key lives on the outbox row, so the retry does not need
+      // the claim to remember anything (decision C4).
+      for (const id of claimed) this._releaseOutboxClaim(id)
+    }
+  }
+
+  private async _flushOutbox(budget: AbortSignal, startBudget: () => void, force: boolean, claimed: Set<string>): Promise<{
+    flushed: number; failed: number; deferred: number; skipped: number; held: number; expired_warnings: string[]
+  }> {
+    // Stamped BEFORE the load, so the rows are at least as new as the stamp.
+    const rowsSeen = { stamp: this._engramsFileStamp(), keys: new Map<string, string | undefined>() }
     const engrams = await this._primaryStore.load()
+    rowsSeen.keys = queuedOutboxKeys(engrams)
+    // The network budget starts NOW, after the local load (review of #1277).
+    startBudget()
     // #766: skip retired engrams — a retired engram must not be pushed to the
     // remote and resurrected. The cancel-outbox path in forget() strips _outbox
     // on retirement; this guard is belt-and-suspenders for any path that retires
@@ -7828,7 +8555,13 @@ export class Plur {
     const pending = engrams.filter(e =>
       (e as any).structured_data?._outbox && e.status !== 'retired'
     )
-    if (pending.length === 0) return { flushed: 0, failed: 0, expired_warnings: [] }
+    if (pending.length === 0) return { flushed: 0, failed: 0, deferred: 0, skipped: 0, held: 0, expired_warnings: [] }
+
+    // Decision C4: every entry's idempotency key is ON ITS ROW before its first
+    // POST. Rows queued by clients that predate keys get one minted and
+    // persisted here, under the store lock, before anything is posted — so a
+    // merge-back that later throws cannot cost the retry its key.
+    await this._persistMissingOutboxKeys(pending)
 
     // #863: push supersedes TARGETS before the engrams that supersede them.
     //
@@ -7870,7 +8603,11 @@ export class Plur {
 
     let flushed = 0
     let failed = 0
+    let deferred = 0
+    let held = 0
     let skipped = 0
+    /** Outbox metadata changed without a delivery or a failure (a cut). */
+    let metadataDirty = false
     /** Warn once per host, not once per queued engram (#785). */
     const cooldownSkippedHosts = new Set<string>()
     /**
@@ -7884,14 +8621,54 @@ export class Plur {
      * not.
      */
     const demotedIds = new Set<string>()
+    /**
+     * Entries found already delivered (or re-queued) by another writer once
+     * claimed. Left out of the merge-back entirely: this flush's snapshot of
+     * them is stale and must not be written over the current row.
+     */
+    const leftToOthers = new Set<string>()
     const expired_warnings: string[] = []
     const now = new Date()
     const TTL_MS = 7 * 24 * 60 * 60 * 1000
 
     for (const engram of pending) {
+      // #1269: out of budget — leave the rest queued, untouched, for next time.
+      if (budget.aborted) { deferred++; continue }
       const outbox = (engram as any).structured_data._outbox as {
         target_url: string; target_scope: string; queued_at: string
         last_attempt: string; attempt_count: number; last_error: string
+        last_status?: number
+        /** Unique per logical write, stable across its retries (C4). */
+        idempotency_key?: string
+      }
+
+      // C4: never post without the key already on the row. Only a failed
+      // key write above leaves one keyless; it waits for the next flush.
+      if (!outbox.idempotency_key) {
+        expired_warnings.push(`${engram.id}: its idempotency key could not be saved — left for the next flush`)
+        deferred++
+        continue
+      }
+
+      // C3: claim the entry before touching the network — one pusher at a
+      // time (another flush, or learn()'s own background push).
+      const claim = this._claimOutboxEntry(engram.id, () => outbox.idempotency_key!)
+      if (claim.status === 'busy') {
+        expired_warnings.push(`${engram.id}: another writer is pushing it right now — left to that writer`)
+        deferred++
+        continue
+      }
+      claimed.add(engram.id)
+
+      // The claim guards the ROW, not this flush's snapshot of it (review of
+      // #1277). The snapshot was loaded before any network round-trip; since
+      // then another writer may have pushed this entry, removed its row and
+      // released its claim. Both removal paths delete the row BEFORE they
+      // release, so reading it now, under our claim, sees that. Gone, or
+      // re-queued under a different key: someone else owns it — leave it.
+      if (!(await this._outboxRowStillQueued(engram.id, outbox.idempotency_key, rowsSeen))) {
+        leftToOthers.add(engram.id)
+        continue
       }
 
       // Check TTL warning
@@ -7910,6 +8687,19 @@ export class Plur {
         expired_warnings.push(`${engram.id}: no matching remote store for scope ${outbox.target_scope}`)
         failed++
         continue
+      }
+      // #1299: back off an entry the store has already refused in a way a
+      // retry cannot fix. Nothing about it changes; it is only not dialled.
+      if (!force) {
+        const verdict = classifyOutboxFailure({
+          last_status: typeof outbox.last_status === 'number' ? outbox.last_status : undefined,
+          last_error: outbox.last_error,
+        })
+        const retryAt = verdict.state === 'needs_action' ? this._needsActionRetryAt(outbox) : undefined
+        if (retryAt !== undefined && retryAt > now.getTime()) {
+          held++
+          continue
+        }
       }
       // #785: consult the per-host breaker the RECALL leg maintains before
       // spending a full fetch timeout on a host already known to be down.
@@ -8041,7 +8831,8 @@ export class Plur {
       }
 
       try {
-        const pushed = await driver.appendAndGetServerId(cleanEngram)
+        // C4: the same key on every retry of this write.
+        const pushed = await driver.appendAndGetServerId(cleanEngram, { signal: budget, idempotencyKey: outbox.idempotency_key })
         // #863: remember the mapping so a later engram in this same flush can
         // point at the server id rather than the local one.
         if (pushed?.id) {
@@ -8063,12 +8854,41 @@ export class Plur {
         })
         this._maybeWriteProvenance(engram.id)
       } catch (err) {
+        // #1269: cut at the caller's budget. Not a failure of the remote, so
+        // the breaker is not fed. Recorded as an attempt so `plur outbox`
+        // shows it, and retried on the next flush with the same key (C4).
+        // A remote timeout or any other error takes the ordinary failure
+        // path below and is retried the same way.
+        if (err instanceof RemoteAbortedError) {
+          outbox.last_attempt = now.toISOString()
+          outbox.attempt_count += 1
+          outbox.last_error = 'cut at the flush time budget before the remote answered — retried on the next flush'
+          // #1299: this attempt got no status; an older 403 must not keep
+          // classifying the entry as needs_action.
+          delete outbox.last_status
+          metadataDirty = true
+          deferred++
+          logger.warning(`[plur:outbox] ${engram.id}: flush budget ran out mid-push — left queued for retry`)
+          continue
+        }
         outbox.last_attempt = now.toISOString()
         outbox.attempt_count += 1
         outbox.last_error = (err as Error).message
+        // #1299: the status when the remote gave one; cleared when it did not,
+        // so a stale 403 cannot outlive a later network failure.
+        if (err instanceof RemoteHttpError) outbox.last_status = err.status
+        else delete outbox.last_status
         // #785: and a write failure counts toward the same breaker, so a host
         // that only ever fails on writes still opens one.
-        recordWriteOutcome(storeEntry.url!, false, Date.now(), this.remoteHealthStatePath())
+        //
+        // #1308: except a refusal (401/403/404/422). The host answered; it
+        // said the REQUEST was wrong — no access to this scope, an unknown
+        // scope, an invalid engram. Counting it let a few refused writes to
+        // one scope open the breaker for every scope on the host. It neither
+        // counts nor resets: it says nothing about reachability either way.
+        // Network errors, timeouts and 5xx still count.
+        const refused = err instanceof RemoteHttpError && NEEDS_ACTION_STATUSES.has(err.status)
+        if (!refused) recordWriteOutcome(storeEntry.url!, false, Date.now(), this.remoteHealthStatePath())
         failed++
         logger.warning(`[plur:outbox] retry failed for ${engram.id}: ${(err as Error).message}`)
       }
@@ -8095,8 +8915,8 @@ export class Plur {
     // a pin, a local rescope. The flush only ever mutates outbox metadata, the
     // demotion marker, and (for a demotion) scope/visibility — so those are
     // what it writes back, and nothing else.
-    if (flushed > 0 || failed > 0) {
-      const consideredIds = new Set(pending.map(e => e.id))
+    if (flushed > 0 || failed > 0 || metadataDirty) {
+      const consideredIds = new Set(pending.map(e => e.id).filter(id => !leftToOthers.has(id)))
       const survivorsById = new Map(
         engrams.filter(e => consideredIds.has(e.id)).map(e => [e.id, e] as const),
       )
@@ -8139,7 +8959,90 @@ export class Plur {
     // the file on every no-op flush.
     if (idMapDirty) this._writeOutboxIdMap(persistedIdMap)
 
-    return { flushed, failed, expired_warnings }
+    return { flushed, failed, deferred, skipped, held, expired_warnings }
+  }
+
+  /**
+   * Identity of the YAML store file's current contents (inode, size, mtime in
+   * ns): any write changes it. `undefined` when the primary store is not the
+   * default YAML file, or it cannot be stat'ed — the caller then reads.
+   */
+  private _engramsFileStamp(): string | undefined {
+    if (!(this._primaryStore instanceof YamlPrimaryStore)) return undefined
+    try {
+      const st = fs.statSync(this._primaryStore.location, { bigint: true })
+      return `${st.ino}:${st.size}:${st.mtimeNs}`
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : undefined
+    }
+  }
+
+  /**
+   * Is this outbox row still queued, under this key, in the store as it is
+   * NOW? False when the row is gone (delivered and removed by another
+   * writer), retired, no longer queued, or queued under a different key (a
+   * different logical write). False also when the store cannot be read:
+   * skipping costs a flush, pushing blind can cost a duplicate.
+   *
+   * `seen` is the newest read this flush has made and the file stamp taken
+   * just before it. While the YAML file's stamp is unchanged nothing has been
+   * written since, so that read is current and the store is not loaded again:
+   * a large store is not re-parsed per entry inside the network budget
+   * (#1269). A store supplied by the embedder has no file to stamp and is
+   * read every time.
+   */
+  private async _outboxRowStillQueued(
+    id: string,
+    key: string,
+    seen: { stamp: string | undefined; keys: Map<string, string | undefined> },
+  ): Promise<boolean> {
+    try {
+      const stamp = this._engramsFileStamp()
+      if (stamp === undefined) {
+        const row = (await this._loadTargeted([id])).find(e => e.id === id)
+        return row !== undefined && queuedOutboxKeys([row]).get(id) === key
+      }
+      if (stamp !== seen.stamp) {
+        seen.stamp = stamp
+        seen.keys = queuedOutboxKeys(await this._primaryStore.load())
+      }
+      return seen.keys.get(id) === key
+    } catch (err) {
+      logger.warning(`[plur:outbox] could not re-read ${id} before pushing it — left for the next flush: ${(err as Error).message}`)
+      return false
+    }
+  }
+
+  /**
+   * Mint and persist an idempotency key for every pending outbox row that has
+   * none (rows queued by clients that predate keys), BEFORE any is posted
+   * (decision C4). Under the store lock; a row another writer keyed in the
+   * meantime keeps that key. Updates `pending` in place. Never throws: a row
+   * whose key could not be saved stays keyless and is not posted this flush.
+   */
+  private async _persistMissingOutboxKeys(pending: Engram[]): Promise<void> {
+    const keyless = pending.filter(e => !(e as any).structured_data?._outbox?.idempotency_key)
+    if (keyless.length === 0) return
+    try {
+      await this._withStoreLock(this.paths.engrams, async () => {
+        const fresh = await this._loadTargeted(keyless.map(e => e.id))
+        const changed: Engram[] = []
+        for (const row of fresh) {
+          const ob = (row as any).structured_data?._outbox
+          const mine = keyless.find(e => e.id === row.id) as any
+          if (!ob || !mine) continue
+          if (!ob.idempotency_key) {
+            ob.idempotency_key = randomUUID()
+            changed.push(row)
+          }
+          mine.structured_data._outbox.idempotency_key = ob.idempotency_key
+        }
+        await this._updateEngrams(fresh, changed)
+      })
+    } catch (err) {
+      for (const e of keyless) delete (e as any).structured_data._outbox.idempotency_key
+      logger.warning(`[plur:outbox] could not save idempotency keys for ${keyless.length} queued write(s): ${(err as Error).message}`)
+    }
   }
 
   /**
@@ -8484,6 +9387,14 @@ Generate an improved version of the procedure that prevents this failure. Return
       tension_count: unresolvedTensions,
       versioned_engram_count: versionedCount,
       outbox_count: await readOrAsync('outbox', () => this.outboxCount(), 0),
+      ...(await (async () => {
+        const summary = await readOrAsync('outbox', () => this.outboxSummary(), undefined as OutboxSummary | undefined)
+        if (!summary) return {}
+        return {
+          outbox_needs_action: summary.needs_action,
+          ...(summary.needs_action > 0 ? { outbox_attention: summary.scopes } : {}),
+        }
+      })()),
       history_events: readOr('history', () => countInjectionEvents(this.paths.root), undefined as any),
       ...(this._lastIndexError ? { index_error: this._lastIndexError } : {}),
       ...(Object.keys(storeErrors).length > 0 ? { store_errors: storeErrors } : {}),
@@ -8982,6 +9893,75 @@ Generate an improved version of the procedure that prevents this failure. Return
   }
 
   /**
+   * Load config.yaml for in-memory use, dropping a LOCAL store entry only when
+   * it would load engrams that are already loaded (#1319), compared by
+   * canonical path:
+   *
+   *  - its file is the primary store: every primary engram would load a
+   *    second time under namespaced ids and be injected twice; or
+   *  - its file AND scope repeat an earlier entry: the same engrams again.
+   *
+   * One file registered under two DIFFERENT scopes keeps loading under both,
+   * as it always has: each scope admits different engrams, so dropping one
+   * would make that scope's engrams vanish from recall. It gets an
+   * informational warning instead.
+   *
+   * A dropped entry is only ignored here: config.yaml is not rewritten, and
+   * writebacks start from the raw file (addStore / persistScopeMetadata), so
+   * nothing is deleted from disk. `ignoredDuplicateStores()` reports it.
+   */
+  private _loadConfig(): PlurConfig {
+    const config = loadConfig(this.paths.config)
+    const stores = config.stores ?? []
+    if (!stores.some(s => s.path !== undefined && !s.url)) {
+      this._ignoredDuplicates = []
+      return config
+    }
+    const { kept, ignored, sharedFile } = classifyStoreDuplicates(stores, this.paths.engrams)
+    const warnOnce = (key: string, message: string): void => {
+      if (this._warnedDuplicateStores.has(key)) return
+      this._warnedDuplicateStores.add(key)
+      logger.warning(message)
+    }
+    for (const { entry: s, primary } of ignored) {
+      warnOnce(`${s.path}\0${s.scope}`, primary
+        ? `[plur:config] ignoring store "${s.scope}" (${s.path}): it is the primary store file, which is always loaded. ` +
+          `Loading it again would inject every engram in it twice. The entry is left in config.yaml; run \`plur stores prune\` to remove it.`
+        : `[plur:config] ignoring store "${s.scope}" (${s.path}): the same file is already registered under the same scope. ` +
+          `Loading it again would inject its engrams twice. The entry is left in config.yaml; remove it to silence this warning.`)
+    }
+    for (const { entry: s, firstScope } of sharedFile) {
+      warnOnce(`${s.path}\0${s.scope}`,
+        `[plur:config] store "${s.scope}" (${s.path}) is the same file as store "${firstScope}". Both are loaded: ` +
+        `each scope admits its own engrams, and engrams scoped "global" in that file appear under both.`)
+    }
+    this._ignoredDuplicates = ignored
+    return ignored.length ? { ...config, stores: kept } : config
+  }
+
+  /** Local store entries in config.yaml that are ignored because they name the
+   *  primary file, or repeat an earlier entry's file and scope (#1319). */
+  ignoredDuplicateStores(): StoreEntry[] {
+    return this._ignoredDuplicates.map(d => d.entry)
+  }
+
+  /**
+   * Remove the config.yaml store entries that name the primary engrams file
+   * (`plur stores prune`, #1356). They are already ignored at load; this stops
+   * the warning for good. Only those entries are removed and the rest of
+   * config.yaml is kept byte for byte — see {@link removePrimaryStoreEntries}.
+   * Returns the removed entries.
+   */
+  removeDuplicatePrimaryStores(): StoreEntry[] {
+    const removed = removePrimaryStoreEntries(this.paths.config, this.paths.engrams)
+    if (removed.length) {
+      this.config = this._loadConfig()
+      this.configMtimeMs = this.statConfigMtime()
+    }
+    return removed
+  }
+
+  /**
    * Reload this.config from disk if config.yaml changed since the last load (#307).
    *
    * The MCP server holds ONE long-lived Plur instance, so a store added by
@@ -8995,7 +9975,7 @@ Generate an improved version of the procedure that prevents this failure. Return
   private reloadConfigIfChanged(): boolean {
     const mtime = this.statConfigMtime()
     if (mtime === 0 || mtime === this.configMtimeMs) return false
-    this.config = loadConfig(this.paths.config)
+    this.config = this._loadConfig()
     this.configMtimeMs = mtime
     // Same `.partial()`-neutralised-default rule as the constructor
     // (evaluator audit M4): `config.index` is `undefined` on a default
@@ -9046,7 +10026,7 @@ Generate an improved version of the procedure that prevents this failure. Return
       // tmp + fsync + rename, so a crash leaves the previous complete config.
       atomicWrite(this.paths.config, yaml.dump(configData, { lineWidth: 120, noRefs: true }), { mode: CONFIG_FILE_MODE })
     })
-    this.config = loadConfig(this.paths.config)
+    this.config = this._loadConfig()
     this.configMtimeMs = this.statConfigMtime()
   }
 
@@ -9193,10 +10173,31 @@ Generate an improved version of the procedure that prevents this failure. Return
     // (RemoteStore.apiBase folds them at HTTP time), so an exact-string compare
     // here would happily register the same url+scope twice under two spellings.
     // Comparison-time only — the stored spelling is never rewritten.
-    const sameEntry = config.stores?.find(s =>
-      isRemote ? (s.url !== undefined && normalizeEndpointUrl(s.url) === normalizeEndpointUrl(options!.url!) && s.scope === scope)
-               : (s.path === storePath),
-    )
+    // Local identity is the CANONICAL path (#1319): the same file spelled two
+    // ways (a symlinked home, /var vs /private/var) is one store, and the
+    // primary engrams.yaml is never a secondary store under any spelling —
+    // registering it loads every primary engram twice.
+    const canonicalStorePath = isRemote ? '' : canonicalize(storePath)
+    if (!isRemote && canonicalStorePath === canonicalize(this.paths.engrams)) {
+      const ignoredHere = this._ignoredDuplicates
+        .filter(d => d.duplicateOf === 'the primary store')
+        .map(d => `"${d.entry.scope}" (${d.entry.path})`)
+      throw new Error(
+        `addStore: "${storePath}" is the primary store (${this.paths.engrams}); it is always loaded and cannot be registered again as "${scope}".` +
+        (ignoredHere.length
+          ? ` config.yaml already lists it as ${ignoredHere.join(', ')}; that entry is ignored at load. Run \`plur stores prune\` to remove it.`
+          : ''),
+      )
+    }
+    // Local stores answer from what is LOADED (this.config, which drops
+    // ignored duplicates), not the raw file: an entry that is ignored at load
+    // must never be reported as the registration that covers this path. Among
+    // loaded entries for the same file, one with the requested scope wins.
+    const localMatches = isRemote ? [] : (this.config.stores ?? []).filter(s =>
+      s.path !== undefined && !s.url && (s.path === storePath || canonicalize(s.path) === canonicalStorePath))
+    const sameEntry = isRemote
+      ? config.stores?.find(s => s.url !== undefined && normalizeEndpointUrl(s.url) === normalizeEndpointUrl(options!.url!) && s.scope === scope)
+      : (localMatches.find(s => s.scope === scope) ?? localMatches[0])
     if (sameEntry) {
       // Token rotation (#305): a matched remote endpoint with a NEW token means
       // the server-side token was rotated/expired and the caller is re-supplying
@@ -9448,12 +10449,18 @@ Generate an improved version of the procedure that prevents this failure. Return
     return _isDirectoryTrusted(dir, this.paths.root)
   }
 
-  /** Grant trust to `dir` (`plur trust`). Returns the canonicalized path recorded. */
-  trustDirectory(dir: string): string {
-    return _trustDirectory(dir, this.paths.root)
+  /**
+   * Grant trust to `dir` (`plur trust`). Returns the canonicalized path
+   * recorded. A `nonce` must be one issued for `dir` and `{ trusted: true }` (#1378).
+   */
+  trustDirectory(dir: string, options?: { nonce?: string }): string {
+    return _trustDirectory(dir, this.paths.root, options)
   }
 
-  /** Revoke trust from `dir` (`plur untrust`). Returns whether an entry was removed. */
+  /**
+   * Revoke trust from `dir` (`plur untrust`). Returns whether an entry was
+   * removed. Needs no nonce: a revocation only removes trust (#1477 review).
+   */
   untrustDirectory(dir: string): boolean {
     return _untrustDirectory(dir, this.paths.root)
   }
@@ -9503,9 +10510,13 @@ Generate an improved version of the procedure that prevents this failure. Return
     return _removeFolderEntry(this.paths.root, folder, undefined, options)
   }
 
-  /** Issue a single-use nonce naming `folder` for the ask flow of `sessionId`. */
-  issueFolderNonce(sessionId: string, folder: string): string {
-    return _issueFolderNonce(this.paths.root, sessionId, folder)
+  /**
+   * Issue a single-use nonce for the ask flow of `sessionId` that authorises
+   * exactly `answer` on exactly `folder` (#1378). The ask flow issues one per
+   * answer it offers; see folders.ts issueFolderNonce.
+   */
+  issueFolderNonce(sessionId: string, folder: string, answer: FolderAnswer): string {
+    return _issueFolderNonce(this.paths.root, sessionId, folder, answer)
   }
 
   /** Expire every folder nonce of `sessionId` (call at session end). */
@@ -9523,9 +10534,15 @@ Generate an improved version of the procedure that prevents this failure. Return
       return discovered
     }
 
-    const knownPaths = new Set((this.config.stores ?? []).map(s => s.path))
-    // Also exclude the primary store directory
-    const primaryDir = dirname(this.paths.engrams)
+    // Canonical paths (#1319): the walk sees kernel-canonical cwd spellings
+    // while PLUR_PATH / $HOME are taken verbatim, so a raw string compare
+    // missed the primary under a symlinked home and registered it as
+    // `project:<home>`. Compare canonical forms; the primary is excluded here
+    // and again in addStore.
+    const knownPaths = new Set(
+      (this.config.stores ?? []).filter(s => s.path !== undefined && !s.url).map(s => canonicalize(s.path!)),
+    )
+    const primaryStore = canonicalize(this.paths.engrams)
 
     let dir = startDir
     const visited = new Set<string>()
@@ -9534,13 +10551,15 @@ Generate an improved version of the procedure that prevents this failure. Return
       visited.add(dir)
       const candidate = join(dir, '.plur', 'engrams.yaml')
 
+      const candidateKey = canonicalize(candidate)
+
       // Skip primary store
-      if (join(dir, '.plur') === primaryDir) {
+      if (candidateKey === primaryStore) {
         dir = dirname(dir)
         continue
       }
 
-      if (fs.existsSync(candidate) && !knownPaths.has(candidate)) {
+      if (fs.existsSync(candidate) && !knownPaths.has(candidateKey)) {
         // Infer scope from directory name or git remote
         let scope = `project:${basename(dir)}`
         try {
@@ -9554,7 +10573,7 @@ Generate an improved version of the procedure that prevents this failure. Return
 
         this.addStore(candidate, scope, { shared: true, readonly: false })
         discovered.push({ path: candidate, scope })
-        knownPaths.add(candidate)
+        knownPaths.add(candidateKey)
         logger.info(`Auto-discovered project store: ${candidate} (${scope})`)
       }
 
@@ -10137,7 +11156,7 @@ Generate an improved version of the procedure that prevents this failure. Return
       // tmp + fsync + rename, so a crash leaves the previous complete config.
       atomicWrite(this.paths.config, yaml.dump(configData, { lineWidth: 120, noRefs: true }), { mode: CONFIG_FILE_MODE })
     })
-    this.config = loadConfig(this.paths.config)
+    this.config = this._loadConfig()
     this.configMtimeMs = this.statConfigMtime()
   }
 
@@ -10174,7 +11193,9 @@ Generate an improved version of the procedure that prevents this failure. Return
    * mergeStoresForWriteback's raw-forbid restore doesn't discard the update.
    */
   persistScopeMetadata(discoveries: RemoteScopeDiscovery[]): void {
-    const stores = this.config.stores ?? []
+    // Raw config, not this.config: the in-memory list drops ignored duplicate
+    // local entries (#1319), and writing it back would delete them from disk.
+    const stores = loadConfig(this.paths.config).stores ?? []
     if (!stores.length) return
 
     let changed = false
