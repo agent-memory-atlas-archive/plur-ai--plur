@@ -37,8 +37,8 @@ describe('formal WritePath — tension gate and readonly tension mutators (candi
   /** Learn the same statement across scopes until the next hit would lock it. */
   async function decidedEngram(plur: Plur) {
     const e = await plur.learn(STATEMENT, { scope: 'project:a', type: 'behavioral' })
-    await plur.learn(STATEMENT, { scope: 'project:b', type: 'behavioral' })
-    await plur.learn(STATEMENT, { scope: 'project:c', type: 'behavioral' })
+    await plur.learn(STATEMENT, { scope: 'user:b', type: 'behavioral' })
+    await plur.learn(STATEMENT, { scope: 'user:c', type: 'behavioral' })
     const row = (await plur.getById(e.id))!
     expect(row.commitment, 'fixture: two cross-scope hits should reach decided').toBe('decided')
     return e
@@ -48,7 +48,7 @@ describe('formal WritePath — tension gate and readonly tension mutators (candi
     const plur = new Plur({ path: dir })
     const e = await decidedEngram(plur)
     writeFileSync(tensionsPath(), yaml.dump([record(e.id, 'ENG-2026-09-23-999')]))
-    await plur.learn(STATEMENT, { scope: 'project:d', type: 'behavioral' })
+    await plur.learn(STATEMENT, { scope: 'user:d', type: 'behavioral' })
     expect((await plur.getById(e.id))!.commitment).toBe('decided')
   })
 
@@ -59,7 +59,7 @@ describe('formal WritePath — tension gate and readonly tension mutators (candi
     writeFileSync(tensionsPath(), `- id: T-2026-0923-001\n  engram_a: ${e.id}\n  engram_b: [unterminated\n`)
     expect(() => plur.listTensions()).toThrow()
     expect(plur.hasUnresolvedTension(e.id), 'unreadable tension file answered "no tension"').toBe(true)
-    await plur.learn(STATEMENT, { scope: 'project:d', type: 'behavioral' })
+    await plur.learn(STATEMENT, { scope: 'user:d', type: 'behavioral' })
     expect((await plur.getById(e.id))!.commitment, 'escalated to locked past an unreadable tension file').toBe('decided')
   })
 
@@ -67,7 +67,7 @@ describe('formal WritePath — tension gate and readonly tension mutators (candi
     const plur = new Plur({ path: dir })
     const e = await decidedEngram(plur)
     expect(plur.hasUnresolvedTension(e.id)).toBe(false)
-    await plur.learn(STATEMENT, { scope: 'project:d', type: 'behavioral' })
+    await plur.learn(STATEMENT, { scope: 'user:d', type: 'behavioral' })
     expect((await plur.getById(e.id))!.commitment).toBe('locked')
   })
 

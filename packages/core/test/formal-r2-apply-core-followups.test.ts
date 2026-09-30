@@ -157,10 +157,20 @@ describe('F3: in-file duplicates across scopes, dry run vs real run', () => {
     expect(actions(dry)).toEqual(actions(real))
   })
 
+  // Personal scopes for the absorbed copies: #1268 decision A1 never absorbs a
+  // team (project:*) save, so team records are the two-imports case below.
   it('YAML store: still scope-blind (cross-scope recurrence) in both modes', async () => {
+    const personal = [recs[0], { ...recs[1], scope: 'user:b' }, { ...recs[2], scope: 'user:b' }]
+    const real = await runImport(plurWith(), personal, { from: 'generic' })
+    const dry = await runImport(plurWith(), personal, { from: 'generic', dryRun: true })
+    expect(actions(real)).toEqual(['imported', 'skipped', 'skipped'])
+    expect(actions(dry)).toEqual(actions(real))
+  })
+
+  it('YAML store: team records in two scopes are two imports in both modes (A1 / F1)', async () => {
     const real = await runImport(plurWith(), recs, { from: 'generic' })
     const dry = await runImport(plurWith(), recs, { from: 'generic', dryRun: true })
-    expect(actions(real)).toEqual(['imported', 'skipped', 'skipped'])
+    expect(actions(real)).toEqual(['imported', 'imported', 'skipped'])
     expect(actions(dry)).toEqual(actions(real))
   })
 })

@@ -64,9 +64,10 @@ describe('importer dry run predicts the real run on every backend', () => {
     expect([dry.imported, dry.skipped]).toEqual([real.imported, real.skipped])
   })
 
+  // A personal scope: #1268 decision A1 never absorbs a team (project:*) save.
   it('YAML store: the same case is skipped in both (cross-scope recurrence)', async () => {
-    const dry = await runImport(await fresh(), records, { from: 'generic', dryRun: true, scope: 'project:b' })
-    const real = await runImport(await fresh(), records, { from: 'generic', scope: 'project:b' })
+    const dry = await runImport(await fresh(), records, { from: 'generic', dryRun: true, scope: 'user:b' })
+    const real = await runImport(await fresh(), records, { from: 'generic', scope: 'user:b' })
     expect(real.skipped).toBe(1)
     expect([dry.imported, dry.skipped]).toEqual([real.imported, real.skipped])
   })

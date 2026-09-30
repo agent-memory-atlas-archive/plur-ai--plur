@@ -32,6 +32,7 @@ import { computeContentHash, isHashable } from '../content-hash.js'
 import { detectSecrets } from '../secrets.js'
 import { learnContextContent } from '../content-fields.js'
 import { scopesOverlap, domainSegmentsOverlap, subjectsOverlap } from '../tensions.js'
+import { isSharedScope } from '../scope-util.js'
 import type { ImportRecord, ImportRecordResult, MigrationReport } from './types.js'
 
 export interface RunImportOptions {
@@ -63,9 +64,11 @@ export async function runImport(plur: Plur, records: ImportRecord[], opts: RunIm
   const knownIds = new Set(preExisting.map(e => e.id))
   // Dry run only: earlier records of this file, keyed both by hash and by
   // (hash, scope). The store half of the dedup question goes to
-  // `plur.wouldDeduplicate` (learn()'s own code). Which key a record is looked
-  // up by follows `plur.dedupScopeFor`: scope-blind where learn() dedups across
-  // scopes (YAML, #176), (hash, scope) where it does not (a delegating
+  // `plur.wouldDeduplicate` (learn()'s own code, which follows decision A1 /
+  // F1: a shared-scope record is never absorbed by another scope's engram).
+  // Which key a record is looked up by follows `plur.dedupScopeFor`:
+  // scope-blind where learn() dedups across scopes (YAML, #176, non-shared
+  // scopes), (hash, scope) where it does not (a shared scope, a delegating
   // Postgres/PGLite store, a writable-remote scope) — so two records of one
   // file in different scopes are predicted as the real run imports them.
   const hashToId = new Map<string, string>()

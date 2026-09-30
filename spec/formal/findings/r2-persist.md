@@ -539,3 +539,12 @@ only record. This is documented at `addRenameListener`.
 - Run: the targeted Postgres-backed files (formal-r2-apply-persist*, formal-r2-persist*, postgres*,
   primary-store, storage-adapter*): 22 files, 202 tests passed. `npx tsc --noEmit -p packages/core`:
   clean. `lake env lean PlurSpec/R2Persist.lean`: clean, 1472 lines.
+
+## Merge with #1354 (main, 2026-09-30)
+
+#1354 first reached the double-holder race of item 1 from the empty-lock side with one
+`<lock>.takeover` guard, the round-1 single guard this round replaced. Main then adopted this
+round's ladder for it (#1424, owner decisions C1 and C2), so this branch takes main's
+`takeOver` / `takeOverSync` unchanged, with this branch's heartbeat (decision P1) on top. The
+ladder here is keyed by the judged token as modelled; the inode and still-abandoned re-checks under
+the slot are main's.

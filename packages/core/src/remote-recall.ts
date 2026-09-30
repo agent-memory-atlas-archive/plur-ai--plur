@@ -671,6 +671,9 @@ function processHostRows(
       continue
     }
     const cloned = stampStoreRow(e, entry.scope) as any
+    // Served by a url store (see the same marker in `_loadSecondaryAndPacks`).
+    // Set after the stamp, which drops `_`-prefixed keys the row ships.
+    cloned._fromRemoteStore = true
     // The injection scorer iterates `tags` unguarded — a row without them
     // must not throw at scoring time.
     if (!Array.isArray(cloned.tags)) cloned.tags = []
