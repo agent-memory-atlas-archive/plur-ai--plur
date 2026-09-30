@@ -155,3 +155,65 @@ describe.skipIf(process.platform === 'win32')('legacy marker fallback when the s
     expect(readdirSync(evilFallback)).toEqual(['sid-sess-refused.marker'])
   }, 90_000)
 })
+
+/**
+ * #1396 review: a stale ppid-named marker must not make a NEW payload session
+ * look already started. Releases before #1278 wrote a ppid-keyed marker on
+ * every prompt and markers are never deleted, so `<digits>.marker` files pile
+ * up; under payload-first keying none of them can belong to the current
+ * session. With a payload session_id, only payload-derived legacy forms count.
+ */
+describe('stale ppid-keyed markers do not suppress a payload session\'s injection (#1396 review)', () => {
+  let home: string
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'plur-h1-ppid-'))
+    mkdirSync(join(home, 'tmp'), { recursive: true })
+    writeFileSync(join(home, '.mcp.json'), JSON.stringify({ mcpServers: { plur: { command: 'plur-mcp' } } }))
+  })
+  afterEach(() => rmSync(home, { recursive: true, force: true }))
+
+  function inject(input: object, extraEnv: Record<string, string> = {}) {
+    return runCli('node', [CLI, 'hook-inject'], {
+      input: JSON.stringify(input),
+      encoding: 'utf-8',
+      cwd: home,
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        TMPDIR: join(home, 'tmp'),
+        PLUR_PATH: join(home, '.plur'),
+        PLUR_DISABLE_EMBEDDINGS: '1',
+        CLAUDE_SESSION_ID: '',
+        ...extraEnv,
+      },
+    })
+  }
+
+  function plant(dir: string, key: string, sessionId: string) {
+    writeFileSync(join(dir, `${key}.marker`), JSON.stringify({ task: 'another session', sessionId }), { mode: 0o600 })
+  }
+
+  it('a new payload session still gets its session-start injection', () => {
+    inject({ prompt: 'warm', session_id: 'sess-warm' }) // creates the verified dir
+    const dir = join(home, 'tmp', 'plur-sessions')
+    // The spawned hook's ppid is this process (spawnSync, no shell); plant our
+    // own ppid too in case a runner interposes.
+    plant(dir, String(process.pid), 'S-STALE-PID')
+    plant(dir, String(process.ppid), 'S-STALE-PPID')
+    const r = inject({ prompt: 'brand new session', session_id: '2b1f0c9e-fresh-session' })
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('session started')
+    expect(r.stdout).not.toContain('S-STALE')
+    expect(existsSync(join(dir, '2b1f0c9e-fresh-session.marker'))).toBe(true)
+  }, 60_000)
+
+  it('without a payload session_id the env key still marks a started session (main\'s behaviour)', () => {
+    inject({ prompt: 'warm', session_id: 'sess-warm' })
+    const dir = join(home, 'tmp', 'plur-sessions')
+    plant(dir, 'env-session', 'S-ENV')
+    const r = inject({ prompt: 'next prompt' }, { CLAUDE_SESSION_ID: 'env-session' })
+    expect(r.status).toBe(0)
+    expect(r.stdout).not.toContain('session started')
+  }, 60_000)
+})
