@@ -27,6 +27,22 @@ plur remote        # show this folder's connection and check it
   grant is needed: the URL and token are yours, in your config.
 - The token can also come from `--token-env <VAR>` or stdin (`--token -`). It
   is never printed: not in text, not in `--json`, not in an error.
+- **It refuses `$HOME`, a filesystem root and any folder above `$HOME`**:
+  an entry there would connect every folder under it. The check runs before
+  the server is contacted and again when `folders.yaml` is written, under its
+  lock, on the path actually recorded (`Plur.setFolder`'s new
+  `refuseCoveringHome` option, error code `covers-home`). A folder replaced by
+  a symlink to `$HOME` while the server answers is therefore still refused;
+  the store stays registered in `config.yaml` and no folder is mapped.
+- **The current folder is recorded literally**, so a folder named `proj?` does
+  not also connect `projX`. A nonce for such a write is bound to the same key:
+  `issueFolderNonce` and `verifyFolderNonce` take the write's `literal` option.
+- **Text from outside this machine is printed only when it fits a grammar.**
+  Bare `plur remote` shows an untrusted `.plur.yaml`'s requested scope and
+  domain only when they are valid scope or domain names, and of its
+  `remote_url` only the host (`requested.remote_host`); anything else is shown
+  as `invalid`. A username returned by the server is shown only when it is a
+  plain user name, otherwise as `invalid`.
 - **`plur remote` with no flags** prints the folder's policy (`on`/`off`/`ask`,
   the scope, and where that came from) and checks each store serving the
   folder: the url stores for its scope, and a trusted `.plur.yaml` remote.
@@ -50,9 +66,11 @@ plur remote        # show this folder's connection and check it
 Trust is now granted by `plur folders set <dir> --trusted`, by the automatic
 import of `trust.yaml`, and, once the hooks read the folder map, by answering
 yes to the one-time question.
-Both commands keep working, with the same output and exit codes, so existing
-scripts and runbooks keep running. The trust check for a `.plur.yaml` that
-names its own remote is unchanged.
+Both commands keep working. In a terminal they give the same output and exit
+codes as before. Outside a terminal, `plur trust` now needs the nonce the ask
+flow issued for that answer, and `plur untrust` needs none (see "A folder
+nonce now authorises one answer" below). The trust check for a `.plur.yaml`
+that names its own remote is unchanged.
 
 ### Editors now rate the memory they inject, from the reply
 

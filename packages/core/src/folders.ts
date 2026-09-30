@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, rmSync, mkdirSync, lstatSync, realpathSync } from 'fs'
-import { basename, dirname, join, resolve, sep } from 'path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 import yaml from 'js-yaml'
@@ -486,7 +486,7 @@ export function resolveFolderPolicy(dir: string, opts: FolderPolicyOptions): Fol
 // Writes (CLI only): set / remove, with the nonce and shared-scope guards.
 // ---------------------------------------------------------------------------
 
-export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'nonce-answer' | 'scope-unconfigured' | 'invalid'
+export type FolderMapErrorCode = 'malformed' | 'nonce-required' | 'nonce-unknown' | 'nonce-expired' | 'nonce-folder' | 'nonce-answer' | 'scope-unconfigured' | 'invalid' | 'covers-home'
 
 export class FolderMapError extends Error {
   constructor(public readonly code: FolderMapErrorCode, message: string) {
@@ -546,6 +546,34 @@ export interface SetFolderOptions {
    * a path is stored as a glob, as `plur folders set` intends.
    */
   literal?: boolean
+  /**
+   * Refuse (FolderMapError 'covers-home', nothing written) when the path this
+   * write records is the home folder, a filesystem root or an ancestor of the
+   * home: such an entry would cover every folder under it. Checked under the
+   * folder-map lock on the key actually written, so a folder swapped for a
+   * symlink to the home after the caller's own check is still refused
+   * (#1415 review). `plur remote` sets it.
+   */
+  refuseCoveringHome?: boolean
+}
+
+/**
+ * True when `dir` is `home`, a filesystem root, or an ancestor of `home`.
+ * `dir` is compared as given (resolved) and canonicalised, against the home
+ * as given and canonicalised, so a symlink, `..` or another letter case does
+ * not hide it.
+ */
+export function coversHomeOrRoot(dir: string, home: string = homedir()): boolean {
+  const dirs = new Set([resolve(dir), canonicalize(dir)])
+  const homes = new Set([resolve(home), canonicalize(home)])
+  for (const d of dirs) {
+    if (dirname(d) === d) return true // a root: its parent is itself
+    for (const h of homes) {
+      const rel = relative(d, h)
+      if (rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return true
+    }
+  }
+  return false
 }
 
 function hasGlob(p: string): boolean {
@@ -677,8 +705,8 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   // Refuse a malformed map and check the nonce first, but CONSUME the nonce
   // only after the map is saved: a refused or failed write never burns it.
   const map = loadForWrite(root)
-  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, change, opts.now, home) : null
   const literal = opts.literal === true
+  const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, change, opts.now, home, literal) : null
   const key = folderEntryKey(folder, home, literal)
   const { applied, nameOnly } = findEntryIndex(map.folders, folder, home, literal)
   // Every entry for this folder merges into ONE, which keeps exactly what is
@@ -701,6 +729,18 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   // The merged path stays a literal folder (#1415) when it has `*`/`?` and
   // either this edit is literal or the applied entry it came from was.
   if (hasGlob(entry.path) && (literal || appliedEntries[0]?.e.literal === true)) entry.literal = true
+  // #1415 review: the refusal holds on the path this write records, computed
+  // here under the lock — not on a check the caller made before it.
+  if (opts.refuseCoveringHome) {
+    const written = new Set([key, entry.path].filter(p => literal || entry.literal === true || !hasGlob(p)).map(p => expandHome(p, home)))
+    for (const p of written) {
+      if (coversHomeOrRoot(p, home)) {
+        throw new FolderMapError('covers-home',
+          `${p} is your home folder, a filesystem root or a folder above your home, and an entry for it would cover ` +
+          'every folder under it; nothing was changed.')
+      }
+    }
+  }
   if (appliedEntries.some(c => c.e.trusted === true)) entry.trusted = true
   const scope = mostSpecific(appliedEntries.filter(c => c.e.scope !== undefined), home)?.scope
   if (scope !== undefined) entry.scope = scope
@@ -926,22 +966,27 @@ function writeNonceFile(file: string, data: NonceFile): void {
  * `{ trusted: false }` and `plur folders rm` is `{ remove: true }`. The folder
  * is recorded as the key a write of it records (folderEntryKey: `~` expanded,
  * canonicalised, a glob as typed), which is what verifyFolderNonce compares.
+ * `literal` must match the write's own `literal` option (#1415 review): a
+ * literal write of `sub?` records the canonical folder, a glob write `sub?`
+ * as typed, and the nonce is bound to the same key.
  */
 export function issueFolderNonce(
   root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number = Date.now(),
+  options: { home?: string; literal?: boolean } = {},
 ): string {
   if (answerKey(answer) === null) throw new FolderMapError('invalid', 'A folder nonce needs the answer it authorises.')
-  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, folder, answer, now))
+  const key = folderEntryKey(folder, options.home ?? homedir(), options.literal === true)
+  return locked(root, () => issueFolderNonceUnlocked(root, sessionId, key, answer, now))
 }
 
-function issueFolderNonceUnlocked(root: string, sessionId: string, folder: string, answer: FolderAnswer, now: number): string {
+function issueFolderNonceUnlocked(root: string, sessionId: string, key: string, answer: FolderAnswer, now: number): string {
   mkdirSync(nonceDir(root), { recursive: true, mode: 0o700 })
   const file = nonceFile(root, sessionId)
   const data = readNonceFile(file) ?? { session: safeSessionKey(sessionId), nonces: [] }
   const nonce = randomBytes(16).toString('hex')
   // The same key a write of this folder records (#1477 review): `~` expands
   // to the home, a literal folder is canonicalised, a glob is kept as typed.
-  data.nonces.push({ nonce, folder: folderEntryKey(folder), answer: cleanAnswer(answer), issued_at: now })
+  data.nonces.push({ nonce, folder: key, answer: cleanAnswer(answer), issued_at: now })
   writeNonceFile(file, data)
   return nonce
 }
@@ -964,8 +1009,11 @@ export function endFolderNonceSession(root: string, sessionId: string): void {
 /**
  * Verify and consume `nonce` for `answer` on `folder` in one step. See verifyFolderNonce.
  */
-export function consumeFolderNonce(root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now()): void {
-  locked(root, () => verifyFolderNonce(root, nonce, folder, answer, now)())
+export function consumeFolderNonce(
+  root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now(),
+  options: { home?: string; literal?: boolean } = {},
+): void {
+  locked(root, () => verifyFolderNonce(root, nonce, folder, answer, now, options.home ?? homedir(), options.literal === true)())
 }
 
 /**
@@ -979,11 +1027,14 @@ export function consumeFolderNonce(root: string, nonce: string, folder: string, 
  */
 export function verifyFolderNonce(
   root: string, nonce: string, folder: string, answer: FolderAnswer, now: number = Date.now(), home: string = homedir(),
+  literal = false,
 ): () => void {
   // Checked against exactly the key the write records (#1477 review). With
   // canonicalize(folder) alone, a quoted `~/x` was checked as `<cwd>/~/x`
   // but written as `$HOME/x`, so a nonce for one folder could write another.
-  const key = folderEntryKey(folder, home)
+  // `literal` is the write's own (#1415 review): a literal write of `sub?`
+  // records the canonical folder, so it is checked against that, not `sub?`.
+  const key = folderEntryKey(folder, home, literal)
   const dir = nonceDir(root)
   let files: string[] = []
   try { files = readdirSync(dir).filter(f => f.endsWith('.yaml')) } catch { /* no nonces issued */ }

@@ -125,6 +125,10 @@ export class StubServer {
   /** Delay before answering POST /engrams/:id/feedback, ms — to simulate a
    *  slow server a hook watchdog cuts off mid-way (#1318 review). */
   feedbackDelayMs = 0
+  /** When set, GET /api/v1/me answers only after this settles — a server
+   *  that holds the answer while the test changes the client's world (#1415
+   *  review: a folder swapped for a symlink to $HOME during the round trip). */
+  beforeMe: (() => void | Promise<void>) | null = null
 
   // --- POST /api/v1/recall (#776 server-authoritative recall envelope) ---
   /** Rows served in the envelope's `results` (top-level engram shape, each
@@ -262,6 +266,7 @@ export class StubServer {
     this.meCalls = 0
     this.getByIdCalls = 0
     this.feedbackDelayMs = 0
+    this.beforeMe = null
   }
 
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -279,6 +284,12 @@ export class StubServer {
     // GET /api/v1/me — resolved identity + authorized scopes (#292)
     if (method === 'GET' && path === '/api/v1/me') {
       this.meCalls++
+      const hook = this.beforeMe
+      if (hook) {
+        const me = this.me
+        Promise.resolve().then(() => hook()).then(() => this.json(res, 200, me), () => this.json(res, 500, { error: 'beforeMe failed' }))
+        return
+      }
       this.json(res, 200, this.me)
       return
     }

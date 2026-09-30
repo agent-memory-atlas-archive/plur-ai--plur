@@ -1,9 +1,9 @@
-import { join, relative, isAbsolute, sep } from 'path'
+import { join } from 'path'
 import { homedir } from 'os'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { shouldOutputJson, outputJson, outputText, outputInfo, exit } from '../output.js'
 import {
-  AddRemoteStoreError, FolderMapError, canonicalize, findProjectConfigPath, readProjectConfigFromPath,
+  AddRemoteStoreError, FolderMapError, canonicalize, coversHomeOrRoot, findProjectConfigPath, readProjectConfigFromPath,
   normalizeEndpointUrl, redactToken, redactTokenDeep, type FolderPolicy,
 } from '@plur-ai/core'
 
@@ -137,6 +137,61 @@ function legacyMovedMessage(path: string): string {
     `(config.yaml), so you can remove remote_token (and remote_url, remote_scopes) from ${path}. It was not changed.`
 }
 
+// Text from outside this machine — a repo's `.plur.yaml`, a server's `/me` —
+// reaches the agent reading this output, so only values that fit a narrow
+// grammar are printed; anything else is shown as "invalid" (#1415 review).
+const SCOPE_OR_DOMAIN = /^[A-Za-z0-9._@/:-]{1,256}$/
+const HOST = /^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$/
+const USERNAME = /^[\p{L}\p{N}._@+-]{1,128}$/u
+const INVALID = 'invalid'
+
+/** A scope or domain, when it fits the grammar; otherwise "invalid". */
+function safeScopeOrDomain(value: unknown): string {
+  return typeof value === 'string' && SCOPE_OR_DOMAIN.test(value) ? value : INVALID
+}
+
+/** Only the host (and port) of a URL, when it fits the grammar; otherwise "invalid". */
+function safeHost(url: unknown): string {
+  if (typeof url !== 'string') return INVALID
+  try {
+    const host = new URL(url).host
+    return host.length <= 261 && HOST.test(host) ? host : INVALID
+  } catch {
+    return INVALID
+  }
+}
+
+/** A server-supplied username, when it fits the grammar; otherwise "invalid". */
+function safeUsername(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined
+  return typeof value === 'string' && USERNAME.test(value) ? value : INVALID
+}
+
+/**
+ * What an untrusted `.plur.yaml` requests, reduced to grammar-checked values:
+ * scope and domain as written when valid, and only the host of remote_url.
+ */
+function safeRequested(r: FolderPolicy['requested']): { scope?: string; domain?: string; remote_host?: string } | undefined {
+  if (!r) return undefined
+  return {
+    ...(r.scope !== undefined ? { scope: safeScopeOrDomain(r.scope) } : {}),
+    ...(r.domain !== undefined ? { domain: safeScopeOrDomain(r.domain) } : {}),
+    ...(r.remote_url !== undefined ? { remote_host: safeHost(r.remote_url) } : {}),
+  }
+}
+
+/** The folder policy as printed: `requested` reduced by safeRequested. */
+function shownPolicy(policy: FolderPolicy): Omit<FolderPolicy, 'requested'> & { requested?: ReturnType<typeof safeRequested> } {
+  const { requested, ...rest } = policy
+  const safe = safeRequested(requested)
+  return safe ? { ...rest, requested: safe } : rest
+}
+
+function coversHomeMessage(folder: string): string {
+  return `Error: ${folder} is your home folder, a filesystem root or a folder above your home, and connecting it ` +
+    'would connect every folder under it. Run `plur remote` in a subfolder (a project folder) instead.'
+}
+
 function fail(json: boolean, message: string, extra: Record<string, unknown> = {}): never {
   if (json) outputJson({ success: false, error: message, ...extra })
   return exit(1, message)
@@ -190,11 +245,10 @@ async function connect(parsed: Parsed, flags: GlobalFlags): Promise<void> {
   // A folder entry covers everything below it, so connecting $HOME, a
   // filesystem root or an ancestor of $HOME would connect every folder under
   // it (the design keeps $HOME at ask). Refused before any server is dialled.
+  // This is the fast check; the write itself refuses again under the
+  // folder-map lock (refuseCoveringHome), on the path it actually records.
   const folder = canonicalize(process.cwd())
-  if (coversHome(folder)) {
-    return exit(1, `Error: ${folder} is your home folder, a filesystem root or a folder above your home, and connecting it ` +
-      'would connect every folder under it. Run `plur remote` in a subfolder (a project folder) instead. Nothing was written.')
-  }
+  if (coversHomeOrRoot(folder, homedir())) return exit(1, `${coversHomeMessage(folder)} Nothing was written.`)
 
   const plur = createPlur(flags)
   const refuse = (err: unknown, prefix: string): never => {
@@ -213,7 +267,7 @@ async function connect(parsed: Parsed, flags: GlobalFlags): Promise<void> {
   for (const scope of scopes) {
     try {
       const v = await plur.verifyRemoteStore({ url, token: tok, scope })
-      username = username ?? v.username
+      username = username ?? safeUsername(v.username)
     } catch (err) {
       return refuse(err, 'Not connected: ')
     }
@@ -233,9 +287,16 @@ async function connect(parsed: Parsed, flags: GlobalFlags): Promise<void> {
   let mapped: string
   try {
     // Literal: a folder really named `proj?` must not be stored as a glob that
-    // also covers its siblings.
-    mapped = plur.setFolder(folder, { scope: scopes[0] }, { literal: true }).path
+    // also covers its siblings. refuseCoveringHome: the $HOME/root refusal is
+    // made again on the key written, under the lock, so a folder swapped for
+    // a symlink to $HOME while /me was answering is still refused.
+    mapped = plur.setFolder(folder, { scope: scopes[0] }, { literal: true, refuseCoveringHome: true }).path
   } catch (err) {
+    if (err instanceof FolderMapError && err.code === 'covers-home') {
+      const stores = scopes.join(', ')
+      return exit(1, `${coversHomeMessage(canonicalize(folder))} The store (${stores}) is registered in config.yaml, ` +
+        'but no folder was mapped in folders.yaml.')
+    }
     return refuse(err, `The store is registered in config.yaml, but ${folder} could not be mapped in folders.yaml: `)
   }
 
@@ -262,13 +323,6 @@ async function connect(parsed: Parsed, flags: GlobalFlags): Promise<void> {
   if (legacy) outputText(scrubAll(legacyMovedMessage(legacy.path), [tok, legacy.remote_token]))
 }
 
-/** True when `dir` is $HOME, a filesystem root, or an ancestor of $HOME. */
-function coversHome(dir: string): boolean {
-  if (relative(dir, join(dir, '..')) === '') return true // a root: its parent is itself
-  const rel = relative(dir, canonicalize(homedir()))
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
-}
-
 interface ServedStore {
   url: string
   scope?: string
@@ -293,7 +347,8 @@ async function probeLegacy(url: string, token: string): Promise<Pick<ServedStore
     if (r.status === 401 || r.status === 403) return { ok: false, status: 'auth_expired', reason: `HTTP ${r.status}` }
     if (!r.ok) return { ok: false, status: 'unreachable', reason: `HTTP ${r.status}` }
     const data = await r.json().catch(() => ({})) as { username?: unknown }
-    return { ok: true, status: 'ok', ...(typeof data.username === 'string' && data.username ? { username: data.username } : {}) }
+    const username = safeUsername(data.username)
+    return { ok: true, status: 'ok', ...(username ? { username } : {}) }
   } catch (err) {
     return { ok: false, status: 'unreachable', reason: err instanceof Error ? err.message : String(err) }
   } finally {
@@ -325,7 +380,7 @@ async function show(flags: GlobalFlags): Promise<void> {
         if (!h.scopes.includes(policy.scope)) continue
         served.push({
           url: h.url, scope: policy.scope, source: 'config', ok: h.ok, status: h.status,
-          ...(h.username ? { username: h.username } : {}),
+          ...(safeUsername(h.username) ? { username: safeUsername(h.username) } : {}),
           ...(h.reason ? { reason: h.reason } : {}),
         })
       }
@@ -350,7 +405,7 @@ async function show(flags: GlobalFlags): Promise<void> {
   const code: 0 | 1 | 2 = served.length === 0 ? 1 : served.every(s => s.ok) ? 0 : 2
   if (json) {
     outputJson(scrubDeep({
-      success: code === 0, folder, policy, stores: served,
+      success: code === 0, folder, policy: shownPolicy(policy), stores: served,
       ...(legacy ? { legacy_plur_yaml: { path: legacy.path, message: legacyNote } } : {}),
     }, tokens))
     if (code !== 0) process.exit(code)

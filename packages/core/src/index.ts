@@ -146,6 +146,7 @@ export {
   setFolderEntry,
   removeFolderEntry,
   clearFolderTrust,
+  coversHomeOrRoot,
   findPlurMarker,
   folderPatternMatches,
   folderPatternSpecificity,
@@ -10605,7 +10606,10 @@ Generate an improved version of the procedure that prevents this failure. Return
    * name a store configured in config.yaml; a `nonce` (from the ask flow)
    * must be the one issued for this folder. Throws FolderMapError on refusal.
    */
-  setFolder(folder: string, change: FolderChange, options?: { nonce?: string; home?: string; literal?: boolean }): FolderEntry {
+  setFolder(
+    folder: string, change: FolderChange,
+    options?: { nonce?: string; home?: string; literal?: boolean; refuseCoveringHome?: boolean },
+  ): FolderEntry {
     this.reloadConfigIfChanged()
     const configuredScopes = (this.config.stores ?? []).map(s => s.scope)
     return _setFolderEntry(this.paths.root, folder, change, { configuredScopes, ...options })
@@ -10621,8 +10625,8 @@ Generate an improved version of the procedure that prevents this failure. Return
    * exactly `answer` on exactly `folder` (#1378). The ask flow issues one per
    * answer it offers; see folders.ts issueFolderNonce.
    */
-  issueFolderNonce(sessionId: string, folder: string, answer: FolderAnswer): string {
-    return _issueFolderNonce(this.paths.root, sessionId, folder, answer)
+  issueFolderNonce(sessionId: string, folder: string, answer: FolderAnswer, options?: { home?: string; literal?: boolean }): string {
+    return _issueFolderNonce(this.paths.root, sessionId, folder, answer, undefined, options)
   }
 
   /** Expire every folder nonce of `sessionId` (call at session end). */
