@@ -40,6 +40,13 @@ plus the feedback call if the server has it.
 - `PLUR_AUTO_RATE_WORKER_CEILING_MS` (default 15 min) moves the worker's
   guard against an immortal process.
 
+A store with no embedding cache misses the hybrid deadline on its first
+prompt, because the cache is saved only when a hybrid search finishes. The
+Claude Code hook then starts one background build of the cache
+(`hook-inject --warm-embeddings`, lowest CPU priority, marker
+`.embeddings-warming` in the store, stopped after `PLUR_WARM_CEILING_MS`), so
+the next session's first prompt takes the hybrid path.
+
 ## What actually consumes the budget
 
 A synchronous injection runs hybrid search first and falls back to BM25 on a
