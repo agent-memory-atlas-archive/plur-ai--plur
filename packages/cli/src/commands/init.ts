@@ -727,6 +727,9 @@ function findSettingsPath(_flags: GlobalFlags, args: string[]): string {
  *   entry, the user's own hooks and every other setting stay as they are.
  * - The map entry is `on` with no scope, so a `.plur.yaml` there stays the
  *   scope hint (applied when trusted, as for any folder).
+ * - A folder whose .plur.yaml requests a scope, domain or remote and is not
+ *   trusted gets no entry: `on` would count as a decision, skip the question
+ *   that offers to trust it, and drop its scope (#1469 review).
  * - A folder the map already has, and one the map turns `off`, keep their
  *   entry unchanged. If the map cannot be written, the repo file is left
  *   alone too, so the repo keeps its memory either way.
@@ -749,6 +752,14 @@ function migrateRepoHooks(flags: GlobalFlags, userPath: string): string | null {
     const policy = resolveFolderPolicy(folder, { root })
     if (policy.mode === 'off') {
       recorded = 'the folder map has it off, left as is'
+    } else if (policy.mode === 'ask' && policy.reason === 'untrusted-plur-yaml') {
+      // An `on` entry would count as a decision: the question that offers to
+      // trust the .plur.yaml (and so keep its scope) would never run, and
+      // memory would go to the default scope (#1469 review). Leave the map
+      // alone; the folder question asks on the next prompt.
+      const wanted = policy.requested?.scope ? ` for scope ${policy.requested.scope}` : ''
+      recorded = `not recorded in the folder map: its .plur.yaml asks${wanted} and is not trusted, ` +
+        'so the folder question asks on the next prompt and can trust it'
     } else if (loadFolderMap(root).folders.some(e => e.path === folder || canonicalize(e.path) === target)) {
       recorded = 'the folder map already has it, left as is'
     } else {
@@ -1566,7 +1577,14 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       writeSettings(enforcementPath, settings)
       // Only once user settings carry the hooks: a repo an older init set up
       // hands its PLUR hooks over, so none runs twice (#1467).
-      repoMigration = migrateRepoHooks(flags, enforcementPath)
+      // Contained like the other legs (#1469 review): a failure here (a
+      // read-only repo file) is reported, and init still does the rest.
+      try {
+        repoMigration = migrateRepoHooks(flags, enforcementPath)
+      } catch (err: unknown) {
+        repoMigration = `FAILED (${(err as Error)?.message ?? 'unknown error'}) — PLUR's hooks are still in ` +
+          `${join(process.cwd(), '.claude', 'settings.json')} as well as in user settings; fix it and re-run \`plur init\``
+      }
       const status = hooksStatusFor(before, after, hadHooks)
       injectionHooksStatus = status
       enforcementHooksStatus = status

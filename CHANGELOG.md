@@ -17,7 +17,9 @@ It moves PLUR's hooks out of the repo's `.claude/settings.json` into user
 settings and removes only PLUR's hooks from the repo file; the repo's MCP
 entry, your own hooks and every other setting stay. It records the repo as
 `on` in `folders.yaml`, with no scope, so the repo keeps working without being
-asked and its `.plur.yaml` stays the scope hint. No hook runs twice, and a
+asked and its `.plur.yaml` stays the scope hint. A repo whose `.plur.yaml`
+asks for a scope but is not trusted gets no entry, so the folder question
+asks once and can trust it, keeping the scope. No hook runs twice, and a
 second run changes nothing. A folder the map has `off` keeps that entry. After
 the upgrade, **other folders get the folder question** on their first prompt:
 answer it once per folder, or "never here" to silence one for good.

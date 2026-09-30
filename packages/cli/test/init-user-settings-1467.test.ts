@@ -16,13 +16,16 @@
  * temp directory, so the real ~/.plur and ~/.claude are never touched.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, realpathSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, realpathSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { load as loadYaml } from 'js-yaml'
+import { resolveFolderPolicy } from '@plur-ai/core'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
 
 const CLI = builtCliPath(join(__dirname, '..'))
+const MCP = join(__dirname, '..', '..', 'mcp', 'dist', 'index.js')
 
 interface Hook { command: string; timeout?: number }
 interface Entry { matcher?: string; hooks: Hook[] }
@@ -37,6 +40,11 @@ const repoFile = () => join(repo, '.claude', 'settings.json')
 const mapFile = () => join(home, '.plur', 'folders.yaml')
 const read = (p: string): Settings => JSON.parse(readFileSync(p, 'utf8'))
 const raw = (p: string): string => (existsSync(p) ? readFileSync(p, 'utf8') : '<absent>')
+/** The folder map's entries, parsed (a long path is folded by the YAML writer). */
+const mapEntries = (): Array<Record<string, unknown>> =>
+  existsSync(mapFile()) ? ((loadYaml(readFileSync(mapFile(), 'utf8')) as { folders?: Array<Record<string, unknown>> })?.folders ?? []) : []
+/** What PLUR does in the repo now, from the resolver the hooks use. */
+const policy = () => resolveFolderPolicy(repo, { root: join(home, '.plur'), home })
 
 function init(...args: string[]): string {
   const r = runCli('node', [CLI, 'init', '--no-desktop', '--no-prompt', '--no-codex', '--no-cursor', '--no-antigravity', ...args], {
@@ -138,19 +146,18 @@ describe('re-running plur init in a repo that holds PLUR prompt hooks (#1467 mig
   const mine = { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine >> /tmp/mine.log' }] }
 
   /** What an older `plur init` left in a repo, plus the user's own settings in the same file. */
-  function olderInstall(): void {
+  function olderInstall(plurYaml?: string): void {
     init('--project')
     const s = read(repoFile())
     s.permissions = { allow: ['Bash(ls:*)'] }
     s.hooks!.PreToolUse = [mine, ...s.hooks!.PreToolUse]
     writeFileSync(repoFile(), JSON.stringify(s, null, 2) + '\n')
-    writeFileSync(join(repo, '.plur.yaml'), 'scope: project:repo-hint\n')
+    if (plurYaml !== undefined) writeFileSync(join(repo, '.plur.yaml'), plurYaml)
   }
 
   it('moves the hooks to user settings, removes only PLUR\'s hooks from the repo, keeps its MCP entry, records the repo as on', () => {
     olderInstall()
     const before = read(repoFile())
-    const plurYaml = raw(join(repo, '.plur.yaml'))
     init()
 
     const project = read(repoFile())
@@ -169,11 +176,9 @@ describe('re-running plur init in a repo that holds PLUR prompt hooks (#1467 mig
     const cmds = plurCommands(user)
     expect(new Set(cmds).size).toBe(cmds.length)
 
-    const map = raw(mapFile())
-    expect(map).toContain(`path: ${repo}`)
-    expect(map).toMatch(/plur: '?on'?\n/)
-    expect(map).not.toContain('repo-hint') // the .plur.yaml stays the hint; no scope copied
-    expect(raw(join(repo, '.plur.yaml'))).toBe(plurYaml)
+    expect(mapEntries()).toEqual([{ path: repo, plur: 'on' }])
+    expect(policy()).toMatchObject({ mode: 'on' })
+    expect(policy().scope).toBeUndefined()
 
     // The repo keeps working: its first prompt injects instead of asking. A
     // folder nobody registered is asked, once.
@@ -229,5 +234,61 @@ describe('re-running plur init in a repo that holds PLUR prompt hooks (#1467 mig
     init()
     expect(raw(repoFile())).toBe(before)
     expect(raw(mapFile())).not.toContain(repo)
+  })
+
+  it('an untrusted .plur.yaml that asks for a scope: hooks move, no map entry, the folder question still offers the scope (#1469 review)', () => {
+    olderInstall('scope: project:repo-hint\n')
+    const plurYaml = raw(join(repo, '.plur.yaml'))
+    expect(policy()).toMatchObject({ mode: 'ask', reason: 'untrusted-plur-yaml', requested: { scope: 'project:repo-hint' } })
+    const out = init()
+    expect(plurCommands(read(repoFile()))).toEqual([])
+    expect(hasPrompt(read(userFile()))).toBe(true)
+    expect(mapEntries()).toEqual([])
+    expect(policy()).toMatchObject({ mode: 'ask', reason: 'untrusted-plur-yaml', requested: { scope: 'project:repo-hint' } })
+    expect(raw(join(repo, '.plur.yaml'))).toBe(plurYaml)
+    expect(out).toMatch(/not recorded in the folder map: its \.plur\.yaml asks for scope project:repo-hint/)
+  })
+
+  it('a trusted .plur.yaml: recorded on, and its scope still applies (#1469 review)', () => {
+    olderInstall('scope: project:repo-hint\n')
+    mkdirSync(join(home, '.plur'), { recursive: true })
+    const parent = join(home, 'code')
+    writeFileSync(mapFile(), `version: 1\nfolders:\n  - path: ${JSON.stringify(parent)}\n    trusted: true\n`)
+    expect(policy()).toMatchObject({ mode: 'on', scope: 'project:repo-hint' })
+    init()
+    expect(plurCommands(read(repoFile()))).toEqual([])
+    expect(mapEntries()).toEqual([{ path: parent, trusted: true }, { path: repo, plur: 'on' }])
+    expect(policy()).toMatchObject({ mode: 'on', scope: 'project:repo-hint' })
+  })
+
+  it('a read-only repo settings file: the migration is reported as failed and init does the rest (#1469 review)', () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return // chmod does not bind here
+    olderInstall()
+    const before = raw(repoFile())
+    chmodSync(repoFile(), 0o444)
+    try {
+      const out = init()
+      expect(out).toMatch(/This repo: +FAILED \(/)
+      expect(out).toContain(repoFile())
+      expect(raw(repoFile())).toBe(before)
+      // the steps after the migration still ran and reported
+      expect(out).toMatch(/Skills: /)
+      expect(out).toMatch(/CLAUDE\.md: +/)
+      expect(out).toMatch(/Claude Desktop: +skipped/)
+      expect(existsSync(join(home, '.claude', 'skills', 'plur-memory', 'SKILL.md'))).toBe(true)
+    } finally {
+      chmodSync(repoFile(), 0o644)
+    }
+  })
+
+  it('plur-mcp init after the migration puts no PLUR hooks back in the repo and adds no duplicates (#1469 review)', () => {
+    olderInstall()
+    init()
+    const user = raw(userFile())
+    const r = runCli('node', [MCP, 'init'], { encoding: 'utf-8', env, cwd: repo, input: '' })
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0)
+    expect(plurCommands(read(repoFile()))).toEqual([])
+    expect(r.stdout).toContain(`already installed in ${userFile()}`)
+    expect(raw(userFile())).toBe(user)
   })
 })
