@@ -5,21 +5,26 @@ Reported against Codex; the reasoning applies to every synchronous harness.
 
 ## Why these hooks are synchronous, and therefore bounded
 
-Claude Code's `hook-inject` is **async with a 90s timeout**, so it can absorb a
-slow first recall. That trade does not transfer to Codex or Antigravity: an
-async hook's `additionalContext` is delivered at the harness's "next safe point",
-which is **not the turn that triggered it** — and for a `codex exec` one-shot,
-never. So those hooks are synchronous, and a synchronous hook has a hard budget.
+An async hook's `additionalContext` is delivered at the harness's "next safe
+point", which is **not the turn that triggered it**: a first reply that uses no
+tools gets no memory, and a one-shot (`codex exec`, `claude -p`) never does. So
+every injection hook is synchronous, and a synchronous hook has a hard budget.
+Claude Code's `hook-inject` was async with a 90s timeout until #1313.
 
 | Harness | Hook | Budget |
 |---|---|---|
 | Codex | `SessionStart`, `UserPromptSubmit` | 25s |
 | Antigravity | pre-invocation | 20s |
 | Cursor | `sessionStart` | 10s |
-| Claude Code | `UserPromptSubmit` | 90s (async) |
+| Claude Code | `UserPromptSubmit`, `SessionStart` (matcher `compact`) | 20s; the hook exits itself at 15s (`PLUR_HOOK_CEILING_MS`) |
 
 Codex's own default is 600s. PLUR's are deliberately tight so a wedged hook
 cannot hang a turn.
+
+In Claude Code only the first prompt of a session and the rehydrate after
+compaction do the full injection. Later prompts check the session marker and
+exit: 68 to 101ms on a 10,000-engram store, against 34ms for a bare
+`node -e 0`. Re-run `plur init` to move an existing async registration to sync.
 
 ## What actually consumes the budget
 
