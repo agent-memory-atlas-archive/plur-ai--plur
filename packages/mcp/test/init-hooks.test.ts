@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
 import { buildPlurHooks, applyPlurHooks, type Settings } from '../src/index.js'
 // @plur-ai/mcp cannot depend on @plur-ai/cli, so the hook definitions are
 // mirrored. This import is test-only: it pins the mirror to the source.
@@ -20,7 +23,7 @@ describe('plur-mcp init hook definitions (#1279)', () => {
     expect(hooks.SessionStart).toEqual([
       {
         matcher: 'compact',
-        hooks: [{ type: 'command', command: `${CMD} hook-inject --rehydrate`, timeout: 90, async: true }],
+        hooks: [{ type: 'command', command: `${CMD} hook-inject --rehydrate`, timeout: 20 }],
       },
     ])
   })
@@ -251,3 +254,68 @@ describe('applyPlurHooks heal scope (#1300 review, second round)', () => {
 })
 
 type HookEntryT = NonNullable<Settings['hooks']>[string][number]
+
+/**
+ * #1270 merge: on Windows `plur init` writes Claude Code hooks in exec form
+ * (node + the CLI js entry recorded in ~/.plur/bin/plur-hook.meta.json +
+ * hook-*). `plur-mcp init` must see them as PLUR's (the spec-level check,
+ * isPlurHookSpec), so it neither adds a second set nor leaves a stale exec-form
+ * PostCompact rehydrate behind; a node hook running another script stays the
+ * user's.
+ */
+describe('applyPlurHooks recognises the exec form plur init writes on Windows (#1270)', () => {
+  const NODE = 'C:\\Program Files\\nodejs\\node.exe'
+  const ENTRY = 'C:\\Users\\U\\AppData\\Roaming\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js'
+  const exec = (sub: string, ...extra: string[]) => ({ type: 'command', command: NODE, args: [ENTRY, sub, ...extra], timeout: 15 })
+  const userNode = { type: 'command', command: NODE, args: ['C:\\scripts\\mine.js', 'hook-inject'] }
+  let home = ''
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'plur-mcp-exec-'))
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    mkdirSync(join(home, '.plur', 'bin'), { recursive: true })
+    writeFileSync(join(home, '.plur', 'bin', 'plur-hook.meta.json'), JSON.stringify({ entrypoints: [ENTRY] }))
+  })
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('an exec-form install counts as installed: nothing is added', () => {
+    const settings = {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [exec('hook-inject')] }],
+        SessionStart: [{ matcher: 'compact', hooks: [exec('hook-inject', '--rehydrate')] }],
+        Stop: [{ matcher: '*', hooks: [exec('hook-learn-check')] }],
+      },
+    } as unknown as Settings
+    const snapshot = JSON.parse(JSON.stringify(settings))
+    const { settings: next, status } = applyPlurHooks(settings, buildPlurHooks('C:\\Users\\U\\.plur\\bin\\plur-hook.cmd'))
+    expect(status).toBe('already')
+    expect(next).toEqual(snapshot)
+  })
+
+  it('a stale exec-form PostCompact rehydrate is healed; a user node hook beside it is kept', () => {
+    const hooks = buildPlurHooks('C:\\Users\\U\\.plur\\bin\\plur-hook.cmd')
+    const settings = {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [exec('hook-inject')] }],
+        PostCompact: [{ matcher: 'auto|manual', hooks: [exec('hook-inject', '--rehydrate'), userNode] }],
+      },
+    } as unknown as Settings
+    const { settings: next, status } = applyPlurHooks(settings, hooks)
+    expect(status).toBe('healed')
+    expect(next.hooks!.PostCompact).toEqual([{ matcher: 'auto|manual', hooks: [userNode] }])
+    expect(next.hooks!.SessionStart).toEqual(hooks.SessionStart)
+  })
+
+  it('a node hook running another script is not an install', () => {
+    const settings = { hooks: { UserPromptSubmit: [{ hooks: [userNode] }] } } as unknown as Settings
+    const { status } = applyPlurHooks(settings, buildPlurHooks('npx @plur-ai/cli'))
+    expect(status).toBe('installed')
+  })
+})
