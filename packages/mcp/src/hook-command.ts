@@ -23,9 +23,11 @@ const PLAIN = '[^\\s"\'`$&;|<>()]'
 
 /**
  * A PLUR hook subcommand — any `hook-*` (decision H2 "prefix"), so a new hook
- * needs no list update — then only plain arguments to the end.
+ * needs no list update — then only plain arguments to the end. Arguments are
+ * separated by spaces or tabs only: a newline or CR ends a shell command, so
+ * a hook chained on the next line is the user's.
  */
-const HOOK_TAIL = `\\s+hook-[a-z0-9][a-z0-9-]*(?:\\s+${PLAIN}+)*\\s*$`
+const HOOK_TAIL = `[ \\t]+hook-[a-z0-9][a-z0-9-]*(?:[ \\t]+${PLAIN}+)*[ \\t]*$`
 
 /**
  * The shim's file name: `plur-hook` or `plur-hook.cmd`, or its Windows 8.3
@@ -46,19 +48,21 @@ const SHIM_FILE = '(?:plur-hook(?:\\.cmd)?|(?<=/(?:\\.plur|plur~\\d+)/bin/)plur-
  *    the Antigravity fallback of decision H3. Only an absolute path ending in
  *    PLUR's own `.plur/bin/` directory, and never with a second absolute path
  *    after a space, so `echo <shim>` or `/usr/bin/env <shim>` never parses
- *    as a path.
+ *    as a path. The lookahead checks one whitespace character at each
+ *    position (not a `\s+` run), which keeps the match linear on a long run
+ *    of spaces; a newline or CR never belongs to the path.
  */
-const SPACED_CHAR = `(?:(?!\\s+(?:[a-z]:)?/)[^"'\`$&;|<>()])`
+const SPACED_CHAR = `(?:(?!\\s(?:[a-z]:)?/)[^"'\`$&;|<>()\\r\\n])`
 const SHIM_PATH = [
   `(?:${PLAIN}*/)?${SHIM_FILE}`,
   `"(?:[^"]*/)?${SHIM_FILE}"`,
   `(?:[a-z]:)?/${SPACED_CHAR}*/\\.plur/bin/${SHIM_FILE}`,
 ].join('|')
 
-const SHIM_FORM = new RegExp(`^(?:&\\s+)?(?:${SHIM_PATH})${HOOK_TAIL}`)
+const SHIM_FORM = new RegExp(`^(?:&[ \\t]+)?(?:${SHIM_PATH})${HOOK_TAIL}`)
 
 /** The `npx [-y] @plur-ai/cli[@version] hook-*` fallback, in every form init wrote. */
-const NPX_FORM = new RegExp(`^npx(?:\\s+-y)?\\s+@plur-ai/cli(?:@${PLAIN}+)?${HOOK_TAIL}`)
+const NPX_FORM = new RegExp(`^npx(?:[ \\t]+-y)?[ \\t]+@plur-ai/cli(?:@${PLAIN}+)?${HOOK_TAIL}`)
 
 /**
  * Is this hook command one PLUR wrote? The whole command must be PLUR's own

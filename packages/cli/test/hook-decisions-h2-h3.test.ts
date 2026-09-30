@@ -253,9 +253,37 @@ describe('F4: the PLUR-hook matcher is anchored', () => {
     ['sh -c "npx @plur-ai/cli hook-inject"'],
     ['npx @plur-ai/cli learn "session ended"'],
     ['./scripts/hook-inject.sh'],
+    // A newline or CR separates commands in a shell: a user hook chained after
+    // PLUR's on its own line is the user's (#1270 review).
+    [`${WIN_SHIM_F} hook-cursor-stop\n/home/me/bin/notify-slack.sh`],
+    [`${POSIX_SHIM_F} hook-cursor-stop\n/home/me/bin/notify-slack.sh`],
+    [`${POSIX_SHIM_F} hook-inject\r\n/home/me/bin/notify-slack.sh`],
+    [`${POSIX_SHIM_F} hook-inject\r/home/me/bin/notify-slack.sh`],
+    [`${POSIX_SHIM_F} hook-observe --post\nnotify-slack`],
+    [`${POSIX_SHIM_F}\nhook-inject`],
+    [`${POSIX_SHIM_F} hook-inject\n--post`],
+    ['npx @plur-ai/cli hook-inject\nnotify-slack'],
+    ['npx\n@plur-ai/cli hook-inject'],
+    ['npx -y\r@plur-ai/cli hook-inject'],
+    ['&\n"C:/Users/Test User/.plur/bin/plur-hook.cmd" hook-cursor-guard'],
+    ['C:/tools/run.cmd\nfoo/.plur/bin/plur-hook.cmd hook-inject'],
   ])('does not claim %s', (cmd) => {
     expect(isPlurHookCommand(cmd)).toBe(false)
     expect(mcpIsPlurHookCommand(cmd)).toBe(false)
+  })
+
+  it('still claims a PLUR hook with a trailing newline (the command is trimmed)', () => {
+    expect(isPlurHookCommand(`${POSIX_SHIM_F} hook-inject\n`)).toBe(true)
+    expect(mcpIsPlurHookCommand(`${POSIX_SHIM_F} hook-inject\r\n`)).toBe(true)
+  })
+
+  it('runs in linear time on a 1 MiB run of spaces (#1270 review)', () => {
+    const hostile = 'C:/' + ' '.repeat(1 << 20) + 'x'
+    for (const match of [isPlurHookCommand, mcpIsPlurHookCommand]) {
+      const start = performance.now()
+      expect(match(hostile)).toBe(false)
+      expect(performance.now() - start).toBeLessThan(200)
+    }
   })
 
   it('exec form: an index.js that merely ends in packages/cli/dist is not claimed', () => {
