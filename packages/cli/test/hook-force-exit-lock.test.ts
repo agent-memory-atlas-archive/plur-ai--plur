@@ -12,17 +12,19 @@ const SLOW_LOCK = join(__dirname, 'helpers', 'slow-store-lock.mjs')
  * #1343: every hook that force-exits must not leave the store lock behind.
  *
  * `process.exit()` does not wait for in-flight async work. When the process is
- * inside a store write at that moment, the lock file stays — and an EMPTY one
- * (the O_EXCL create landed, the token write had not) cannot be attributed to
- * anyone, so core waits out its 60s stale threshold on the next write. On the
- * Claude Code hook that cost every later first prompt its memory (#1313).
+ * inside a store write at that moment, the lock file stays. Before #1354 it was
+ * an EMPTY one (the O_EXCL create landed, the token write had not), which core
+ * waited out for its 60s stale threshold; on the Claude Code hook that cost
+ * every later first prompt its memory (#1313). Core now publishes the lock with
+ * its token by hard link, so what stays is a lock naming this (dead) pid — taken
+ * over at once on this host, but still 60s for a waiter that cannot probe it.
  *
  * The race is made deterministic with a preload (helpers/slow-store-lock.mjs)
  * that slows each lock acquisition. For the injection hooks the first
  * acquisition is the BM25 pass that serves the turn (hybrid is still loading
  * its embedder), held 6s; the abandoned hybrid search queues behind it in the
  * same process and takes the lock the moment BM25 releases — so the hook
- * exits while that second, empty lock is on disk. Its hold (1.5s) fits inside
+ * exits while that second lock is on disk. Its hold (1.5s) fits inside
  * the bounded wait the exit now does.
  *
  * Every test runs against a temp HOME / PLUR_PATH / TMPDIR — never ~/.plur.
@@ -44,9 +46,12 @@ function baseEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
   return { ...env, ...extra }
 }
 
+// The lock, and anything else the lock protocol leaves beside it: a private
+// publish file (#1354), a takeover claim or a guard slot. None should survive
+// an exit that waited for the store to go idle.
 function locksLeft(): string[] {
   if (!existsSync(store)) return []
-  return readdirSync(store).filter(f => f.endsWith('.lock'))
+  return readdirSync(store).filter(f => f.startsWith('engrams.yaml.lock'))
 }
 
 function runHook(hook: string, payload: Record<string, unknown>, extra: Record<string, string>) {
@@ -113,9 +118,9 @@ describe('force-exiting hooks leave no store lock behind (#1343)', () => {
 
   it('hook-codex-inject, exiting while its next lock acquisition is issued but not yet on disk', () => {
     // BM25 holds the lock 6s; the abandoned hybrid search queues behind it in
-    // this process and is handed the lock the moment BM25 releases. Its O_EXCL
-    // create is then in flight for 1.5s with NO file on disk — a disk-only
-    // check passes, and exiting there lands an empty lock. Only an in-process
+    // this process and is handed the lock the moment BM25 releases. Its lock
+    // publish (the hard link) is then in flight for 1.5s with NO file on disk —
+    // a disk-only check passes, and exiting there lands the lock. Only an in-process
     // count of lock operations can see it (core's pendingStoreLockOps).
     const r = runHook('hook-codex-inject',
       { session_id: 'codex-inject-inflight', hook_event_name: 'UserPromptSubmit', prompt: 'basalt-heron codeword' },
@@ -132,8 +137,8 @@ describe('force-exiting hooks leave no store lock behind (#1343)', () => {
 
   it('hook-inject, when its watchdog fires mid-write', () => {
     // BM25 only, so the one store write is the awaited injection counter —
-    // and the watchdog (1s) fires while its lock is still empty (1.8s — under the
-    // 2s after which an empty lock is presumed someone else's).
+    // and the watchdog (1s) fires while that acquisition is still in progress
+    // (1.8s after its lock lands).
     const r = runHook('hook-inject',
       { session_id: 'claude-watchdog-1', hook_event_name: 'UserPromptSubmit', prompt: 'basalt-heron codeword' },
       { PLUR_HOOK_HYBRID: '0', PLUR_HOOK_CEILING_MS: '1000', PLUR_TEST_LOCK_ACQUIRE_DELAYS_MS: '1800' })
