@@ -9,6 +9,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { execSync } from 'child_process'
 import { builtCliPath } from './helpers/built-cli.js'
+import { isolatedHomeEnv } from './helpers/isolated-env.js'
 import { buildCodexHooks, mergeCodexHooks } from '../src/codex-hooks.js'
 import { buildCursorHooks, mergeCursorHooks } from '../src/cursor-hooks.js'
 import { buildAgyHookSet } from '../src/antigravity-hooks.js'
@@ -23,7 +24,7 @@ describe('auto-rate hook registration (#1310)', () => {
 
   function runInit(): void {
     execSync(`node ${CLI} init --global --no-desktop`, {
-      encoding: 'utf-8', timeout: 15000, env: { ...process.env, HOME: home, USERPROFILE: home }, cwd: home,
+      encoding: 'utf-8', timeout: 15000, env: isolatedHomeEnv(home), cwd: home,
     })
   }
 

@@ -1,6 +1,7 @@
 import { shouldOutputJson, outputJson, setQuiet, exit } from './output.js'
 import { parseGlobalFlags, createPlur } from './plur.js'
 import { unknownFlagMessage } from './known-flags.js'
+import { exitWhenStoreIdle } from './lib/store-lock-exit.js'
 
 export type { GlobalFlags } from './plur.js'
 export { parseGlobalFlags, createPlur } from './plur.js'
@@ -9,6 +10,18 @@ import { CLI_VERSION as VERSION } from './version.js'
 
 // --- Main ---
 const argv = process.argv.slice(2)
+
+// Hook probe (decision H3's Windows CI job): with PLUR_HOOK_PROBE set to a
+// file path, a hook-* invocation appends its subcommand to that file and
+// exits 0 without running. The job runs every hook string `plur init`
+// generated through bash, pwsh and cmd, and this proves each one reached
+// the CLI with the right subcommand. Unset (always, outside that job), it
+// does nothing.
+if (process.env.PLUR_HOOK_PROBE && /^hook-/.test(argv[0] ?? '')) {
+  const { appendFileSync } = await import('fs')
+  appendFileSync(process.env.PLUR_HOOK_PROBE, `${argv[0]}\n`)
+  process.exit(0)
+}
 
 if (argv.includes('--version') || argv.includes('-v')) {
   console.log(VERSION)
@@ -54,7 +67,7 @@ Commands:
   stores add <path>       Add a knowledge store
   stores add --url <u>    Add a remote store (verified; --scope, --token-env)
   stores prune            Remove config.yaml store entries that name the primary store file (#1356)
-  trust [dir]             Trust a directory's .plur.yaml scope/domain (default: cwd) [--list]
+  trust [dir]             Trust a directory's .plur.yaml scope/domain (default: cwd) [--list] [--nonce <n>]
   untrust [dir]           Revoke a directory's trust grant (default: cwd)
   folders list            Your per-folder decisions (~/.plur/folders.yaml, #1347)
   folders set <folder>    --scope <s> | --on | --off | --ask  [--trusted|--no-trusted] [--nonce <n>]
@@ -232,6 +245,22 @@ try {
   // isn't, the fingerprint guard makes an unchanged YAML nearly free.
   await drainPendingIndexWork()
 } catch (err: any) {
+  // Hook commands never print errors to stdout (owner decision H1, formal
+  // field report cluster 5). An editor parses a hook's stdout as its result
+  // and shows a non-zero exit as a hook error, so an `{"error"}` document
+  // there — e.g. from an injection that threw after the watchdog had stopped
+  // the run — breaks the turn instead of failing open. Stderr, exit 0.
+  // Every other command keeps its error document and exit 1.
+  //
+  // The exit goes through exitWhenStoreIdle (#1349): the throw can arrive
+  // while a store write of this process is still in flight (the hybrid search
+  // a hook abandoned at its deadline records its injection under
+  // `engrams.yaml.lock`), and exiting there leaves that lock behind for every
+  // later writer. Bounded, and immediate when the store is idle.
+  if (command.startsWith('hook-')) {
+    process.stderr.write(`[plur] ${command} failed: ${err?.message ?? 'unknown error'}\n`)
+    await exitWhenStoreIdle()
+  }
   if (shouldOutputJson(flags)) {
     outputJson({ error: err.message })
   } else {
