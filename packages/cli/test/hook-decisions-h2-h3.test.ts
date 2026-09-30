@@ -27,8 +27,13 @@ import {
   parseClaudeVersion,
   nextRecordedEntries,
   RECORDED_ENTRIES_MAX,
+  matchesPlurHookLauncher,
+  MAX_HOOK_COMMAND_LENGTH,
 } from '../src/lib/hook-command.js'
-import { isPlurHookCommand as mcpIsPlurHookCommand } from '../../mcp/src/hook-command.js'
+import {
+  isPlurHookCommand as mcpIsPlurHookCommand,
+  matchesPlurHookLauncher as mcpMatchesPlurHookLauncher,
+} from '../../mcp/src/hook-command.js'
 import { buildCursorHooks, mergeCursorHooks } from '../src/cursor-hooks.js'
 import { buildCodexHooks, mergeCodexHooks } from '../src/codex-hooks.js'
 
@@ -36,6 +41,25 @@ const SHIM_POSIX = '/Users/a/.plur/bin/plur-hook'
 const SHIM_WIN = 'C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd'
 const NODE_WIN = 'C:\\Program Files\\nodejs\\node.exe'
 const CLI_WIN = 'C:\\Users\\Test User\\AppData\\Roaming\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js'
+
+/**
+ * Run `fn` with `os.homedir()` returning `home` (HOME on darwin/linux,
+ * USERPROFILE on Windows). The unquoted spaced shim path is claimed only
+ * when it is this home's shim.
+ */
+function withHome(home: string, fn: () => void): void {
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+  try {
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    fn()
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
 
 /** Run `fn` with a temp HOME whose plur-hook.meta.json records `entry` (none when null). */
 function withRecordedEntry(entry: string | null, fn: () => void): void {
@@ -66,7 +90,8 @@ describe('H2: any hook-* behind PLUR\'s launcher is PLUR\'s', () => {
     ['npx -y @plur-ai/cli@0.21.0 hook-auto-rate'],
     ['npx @plur-ai/cli hook-anything-new'],
   ])('claims %s', (cmd) => {
-    expect(isPlurHookCommand(cmd)).toBe(true)
+    // The unquoted spaced form is claimed as this home's own shim only.
+    withHome('C:\\Users\\Test User', () => expect(isPlurHookCommand(cmd)).toBe(true))
   })
 
   it.each([
@@ -222,14 +247,12 @@ describe('F4: the PLUR-hook matcher is anchored', () => {
     ['npx -y @plur-ai/cli@0.19.4 hook-inject'],
     ['npx -y @plur-ai/cli@0.9.1 hook-learn-check'],
     [`${POSIX_SHIM_F} hook-inject --event plan_mode`],
-    [`${SHIM_WIN} hook-inject --event plan_mode`],
     [`"${SHIM_WIN}" hook-observe --post`],
     ['"/Users/Test User/.plur/bin/plur-hook" hook-inject'],
     ['C:/Users/TESTUS~1/.plur/bin/plur-hook.cmd hook-codex-inject'],
     ['C:/Users/RUNNER~1/AppData/Local/Temp/TESTUS~1/PLUR~1/bin/PLUR-H~1.CMD hook-cursor-stop'],
     ['& "C:/Users/Test User/.plur/bin/plur-hook.cmd" hook-cursor-guard'],
     ['plur-hook hook-inject'],
-    ['/tmp/Test User-x/.plur/bin/plur-hook.cmd hook-agy-guard'],
   ])('still claims the layout %s', (cmd) => {
     expect(isPlurHookCommand(cmd)).toBe(true)
     expect(mcpIsPlurHookCommand(cmd)).toBe(true)
@@ -286,6 +309,45 @@ describe('F4: the PLUR-hook matcher is anchored', () => {
     }
   })
 
+  // The patterns themselves, without the length cap (which may be raised):
+  // 1 MiB inputs of every shape the matcher has been slow on, including the
+  // repeated path-end-plus-argument tail that took 84 s at 1 MiB (#1270
+  // review). The spaced shim form is exercised with a home that is the
+  // start of the hostile input.
+  const MiB = 1 << 20
+  const fill = (unit: string, bytes: number) => unit.repeat(Math.ceil(bytes / unit.length)).slice(0, bytes)
+  it.each([
+    ['repeated path end + argument tail', 'C:/a' + fill('/.plur/bin/plur-hook hook-x a', MiB) + ';'],
+    ['repeated quoted path end + argument tail', '"C:/a' + fill('/.plur/bin/plur-hook" hook-x a', MiB) + ';'],
+    ['run of spaces', 'C:/' + ' '.repeat(MiB) + 'x'],
+    ['run of backslashes', 'C:' + '\\'.repeat(MiB) + '.plur\\bin\\plur-hook hook-x;'],
+    ['alternating " /"', 'C:/a' + fill(' /', MiB) + '.plur/bin/plur-hook hook-x;'],
+    ['alternating " a"', 'C:/a' + fill(' a', MiB) + '/.plur/bin/plur-hook hook-x;'],
+    ['alternating " c:/"', 'C:/a' + fill(' c:/', MiB) + '.plur/bin/plur-hook hook-x;'],
+    ['npx with many arguments', 'npx -y @plur-ai/cli hook-x' + fill(' a', MiB) + ';'],
+    ['repeated npx', fill('npx -y @plur-ai/cli hook-x ', MiB) + ';'],
+    ['& then spaces', '& ' + ' '.repeat(MiB) + '"C:/a/.plur/bin/plur-hook" hook-x;'],
+    ['spaces and tabs between arguments', '/a/.plur/bin/plur-hook hook-x' + fill(' \t', MiB) + ';'],
+  ])('the patterns run in linear time on 1 MiB: %s', (_label, hostile) => {
+    for (const home of ['/nowhere', 'C:/a']) {
+      withHome(home, () => {
+        for (const match of [matchesPlurHookLauncher, mcpMatchesPlurHookLauncher]) {
+          const start = performance.now()
+          expect(match(hostile)).toBe(false)
+          expect(performance.now() - start).toBeLessThan(200)
+        }
+      })
+    }
+  })
+
+  it(`never claims a command longer than ${MAX_HOOK_COMMAND_LENGTH} characters`, () => {
+    const longArgs = `${POSIX_SHIM_F} hook-inject` + ' a'.repeat(MAX_HOOK_COMMAND_LENGTH)
+    expect(matchesPlurHookLauncher(longArgs)).toBe(true)
+    expect(isPlurHookCommand(longArgs)).toBe(false)
+    expect(mcpIsPlurHookCommand(longArgs)).toBe(false)
+    expect(isPlurHookCommand(`${POSIX_SHIM_F} hook-inject --rehydrate`)).toBe(true)
+  })
+
   it('exec form: an index.js that merely ends in packages/cli/dist is not claimed', () => {
     withRecordedEntry(CLI_WIN, () => {
       expect(isPlurHookSpec({ command: NODE_WIN, args: ['C:\\someone\\packages\\cli\\dist\\index.js', 'hook-inject'] })).toBe(false)
@@ -297,6 +359,86 @@ describe('F4: the PLUR-hook matcher is anchored', () => {
   it('exec form: nothing is claimed when no entry is recorded', () => {
     withRecordedEntry(null, () => {
       expect(isPlurHookSpec({ command: NODE_WIN, args: [CLI_WIN, 'hook-inject'] })).toBe(false)
+    })
+  })
+})
+
+/**
+ * #1270 review: an unquoted shim path with spaces cannot be told apart from
+ * another binary running the shim with arguments, so it is claimed only when
+ * it is this machine's own shim, `<homedir>/.plur/bin/plur-hook[.cmd]`. When
+ * in doubt the command is the user's: an unclaimed PLUR hook costs a
+ * duplicate entry at worst, a wrongly claimed user hook is deleted by init.
+ */
+describe('#1270 review: the unquoted spaced shim path is claimed only as this home\'s shim', () => {
+  const both = (cmd: string) => [isPlurHookCommand(cmd), mcpIsPlurHookCommand(cmd)]
+
+  it.each([
+    // [home, command]
+    ['C:\\Users\\John Smith', 'C:\\Users\\John Smith\\.plur\\bin\\plur-hook.cmd hook-inject'],
+    ['C:\\Users\\John Smith', 'c:/users/john smith/.plur/bin/PLUR-HOOK.CMD hook-inject --event plan_mode'],
+    ['C:\\Users\\Test User', `${SHIM_WIN} hook-inject --event plan_mode`],
+    ['C:/Program Files/Some Dir', 'C:/Program Files/Some Dir/.plur/bin/plur-hook hook-inject'],
+    ['/tmp/Test User-x', '/tmp/Test User-x/.plur/bin/plur-hook.cmd hook-agy-guard'],
+    ['/Users/Test User/', '/Users/Test User/.plur/bin/plur-hook hook-inject'],
+  ])('home %s: claims %s', (home, cmd) => {
+    withHome(home, () => expect(both(cmd)).toEqual([true, true]))
+  })
+
+  // Every legitimate form that does not depend on the home still counts,
+  // whatever the home is.
+  it.each([
+    ['/home/me/.plur/bin/plur-hook hook-inject'],
+    ['/Users/a/.plur/bin/plur-hook hook-session-remind'],
+    [`"${SHIM_WIN}" hook-inject`],
+    ['"/Users/Test User/.plur/bin/plur-hook" hook-inject'],
+    ['"C:\\Users\\John Smith\\.plur\\bin\\plur-hook.cmd" hook-inject'],
+    ['npx -y @plur-ai/cli@0.21.0 hook-inject'],
+    ['npx @plur-ai/cli hook-inject'],
+    ['& "C:/Users/Test User/.plur/bin/plur-hook.cmd" hook-cursor-guard'],
+    ['C:/Users/TESTUS~1/.plur/bin/plur-hook.cmd hook-codex-inject'],
+    ['C:/Users/RUNNER~1/AppData/Local/Temp/TESTUS~1/PLUR~1/bin/PLUR-H~1.CMD hook-cursor-stop'],
+  ])('with an unrelated home, still claims %s', (cmd) => {
+    withHome('/somewhere/else', () => expect(both(cmd)).toEqual([true, true]))
+  })
+
+  // Another binary running the shim: the user's, for every home, including
+  // the one whose shim they run.
+  it.each([
+    ['/usr/bin/time ~/.plur/bin/plur-hook hook-inject'],
+    ['/usr/bin/nice -n 5 ~/.plur/bin/plur-hook hook-inject'],
+    ['/usr/bin/nice ~/.plur/bin/plur-hook hook-inject'],
+    ['/usr/bin/env ~/.plur/bin/plur-hook hook-inject'],
+    ['/usr/bin/env FOO=1 ./.plur/bin/plur-hook hook-inject'],
+    ['/usr/bin/env -i /home/me/.plur/bin/plur-hook hook-inject'],
+    ['env ~/.plur/bin/plur-hook hook-inject'],
+    ['nice -n 5 /home/me/.plur/bin/plur-hook hook-inject'],
+    ['C:/Tools/log.exe %USERPROFILE%/.plur/bin/plur-hook.cmd hook-inject'],
+    ['C:\\Tools\\log.exe %USERPROFILE%\\.plur\\bin\\plur-hook.cmd hook-inject'],
+    ['C:/Tools/log.exe C:/Users/John Smith/.plur/bin/plur-hook.cmd hook-inject'],
+    ['C:/Tools/log.exe x/.plur/bin/plur-hook.cmd hook-inject'],
+    ['/home/me/bin/notify-slack.sh --then ./.plur/bin/plur-hook hook-inject'],
+    ['C:/evil.exe -x=c:/x/.plur/bin/plur-hook hook-inject'],
+    ['C:/Users/John Smith/bin/wrap.exe C:/Users/John Smith/.plur/bin/plur-hook.cmd hook-inject'],
+  ])('does not claim %s', (cmd) => {
+    for (const home of ['/home/me', 'C:\\Users\\John Smith', 'C:/Users/me', '/nowhere']) {
+      withHome(home, () => expect(both(cmd)).toEqual([false, false]))
+    }
+  })
+
+  it('does not claim a spaced shim path of another home (a duplicate at worst)', () => {
+    withHome('C:\\Users\\someone', () => {
+      expect(both(`${SHIM_WIN} hook-inject`)).toEqual([false, false])
+    })
+  })
+
+  it('this home\'s spaced shim followed by a chained command is still the user\'s', () => {
+    withHome('C:\\Users\\John Smith', () => {
+      for (const tail of [' && x', '; x', ' | x', '\nx', ' $(x)', ' `x`', ' > out']) {
+        expect(both(`C:/Users/John Smith/.plur/bin/plur-hook.cmd hook-inject${tail}`)).toEqual([false, false])
+      }
+      expect(both('C:/Users/John Smith/.plur/bin/plur-hook.cmd status')).toEqual([false, false])
+      expect(both('C:/Users/John Smith/.plur/bin/plur-hook.cmd.bak hook-inject')).toEqual([false, false])
     })
   })
 })

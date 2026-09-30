@@ -21,6 +21,24 @@ function setPlatform(p: NodeJS.Platform): void {
   Object.defineProperty(process, 'platform', { value: p })
 }
 
+/**
+ * Make `os.homedir()` the home WIN_SHIM lives in. The unquoted spaced shim
+ * path is claimed only when it is this home's own shim (#1270 review).
+ */
+function pinWinHome(): void {
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+  beforeEach(() => {
+    process.env.HOME = 'C:\\Users\\Test User'
+    process.env.USERPROFILE = 'C:\\Users\\Test User'
+  })
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+}
+
 // darwin/linux only since decision H3: Windows hooks never use a quoted
 // prefix (see windowsHookCommand / claudeHookSpec, hook-decisions-h2-h3.test.ts).
 describe('hookCommandPrefix (#1267)', () => {
@@ -35,6 +53,7 @@ describe('hookCommandPrefix (#1267)', () => {
 })
 
 describe('isPlurHookCommand (#1267)', () => {
+  pinWinHome()
   it.each([
     ['/home/a/.plur/bin/plur-hook hook-inject'],
     ['"/Users/Test User/.plur/bin/plur-hook" hook-inject'],
@@ -84,6 +103,7 @@ describe('isPlurHookCommand (#1267)', () => {
 })
 
 describe('Cursor and Codex hook merges on Windows (#1267)', () => {
+  pinWinHome()
   it('Cursor: re-init over an older unquoted backslash set leaves one set', () => {
     const oldSet = buildCursorHooks(WIN_SHIM)
     const doubled = {

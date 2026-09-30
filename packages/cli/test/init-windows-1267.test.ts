@@ -130,8 +130,10 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
   })
 
   it('cleans up the unquoted backslash hooks an older version wrote, keeping user hooks', () => {
-    // What older inits wrote on Windows — twice, since each re-run duplicated.
-    const old = 'C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd'
+    // What older inits wrote on Windows — twice, since each re-run duplicated:
+    // this home's shim, unquoted, with backslashes.
+    const winHome = home.replace(/\//g, '\\')
+    const old = `${winHome}\\.plur\\bin\\plur-hook.cmd`
     const legacy = (sub: string) => ({ hooks: [{ type: 'command', command: `${old} ${sub}`, timeout: 90 }] })
     const userHook = { hooks: [{ type: 'command', command: 'C:\\tools\\my-own-hook.exe', timeout: 5 }] }
     mkdirSync(join(home, '.claude'), { recursive: true })
@@ -146,7 +148,7 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     runInit()
     const settings = readSettings()
     const commands = allCommands(settings)
-    expect(commands.some((c) => c.includes('C:\\Users'))).toBe(false)
+    expect(commands.some((c) => c.includes(winHome))).toBe(false)
     expect(settings.hooks?.UserPromptSubmit?.filter((e) => e.hooks[0].args?.[1] === 'hook-inject')).toHaveLength(1)
     expect(settings.hooks?.SessionStart).toHaveLength(1)
     expect(settings.hooks?.Stop).toHaveLength(1)
@@ -156,7 +158,7 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
 
   it('removes only PLUR hooks from an entry and keeps hooks PLUR did not write', () => {
     // The #1267 review reproduced all three deletions under the first matcher.
-    const legacy = 'C:\\Users\\Test User\\.plur\\bin\\plur-hook.cmd hook-inject'
+    const legacy = `${home.replace(/\//g, '\\')}\\.plur\\bin\\plur-hook.cmd hook-inject`
     const backup = 'C:\\Users\\Me\\.plur\\bin\\plur-hook-backup.ps1'
     const logger = 'C:\\Users\\Me\\.PLUR\\BIN\\Plur-Hook-logger.bat'
     const audit = 'C:\\tools\\my-audit.exe'
@@ -234,7 +236,10 @@ describe('plur doctor sees Windows hooks (#1267)', { timeout: 60000 }, () => {
       command: 'C:\\Program Files\\nodejs\\node.exe',
       args: ['C:\\npm\\node_modules\\@plur-ai\\cli\\dist\\index.js', 'hook-inject'],
     }],
-  ])('reports hooksInstalled for a %s hook', (_label, spec) => {
+  ])('reports hooksInstalled for a %s hook', (_label, fixture) => {
+    // An older init wrote this home's own shim path (#1270 review: the
+    // unquoted spaced form is claimed only as this home's shim).
+    const spec = { ...fixture, command: fixture.command.replace('C:\\Users\\Test User', home.replace(/\//g, '\\')) }
     // Decision F4: an exec-form hook is PLUR's only when its js entry is the
     // one init recorded next to the shim.
     mkdirSync(join(home, '.plur', 'bin'), { recursive: true })
