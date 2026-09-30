@@ -238,6 +238,33 @@ describe('hook-auto-rate (#1310)', { timeout: 120_000 }, () => {
     }, 120_000)
   })
 
+  it('the watchdog ceiling counts from process start, so a slow start stays inside the 10s budget (#1318 review)', () => {
+    const id = seed(e)
+    const rateDir = join(e.root, 'tmp', 'plur-auto-rate')
+    mkdirSync(rateDir, { recursive: true, mode: 0o700 })
+    writeFileSync(join(rateDir, 'claude-slow-1.injected'), `${id}\n`, { mode: 0o600 })
+    // Another live writer holds the store, so the inline path blocks until the watchdog.
+    const lock = join(e.plurPath, 'engrams.yaml.lock')
+    writeFileSync(lock, `${hostname()}:${process.pid}:${Date.now()}:0`)
+    const preload = join(__dirname, 'helpers', 'slow-start-no-spawn.mjs')
+    const t0 = Date.now()
+    const r = runCli(process.execPath, ['--import', preload, CLI, 'hook-auto-rate', 'claude'], {
+      input: JSON.stringify({ hook_event_name: 'Stop', session_id: 'slow-1', cwd: e.project, last_assistant_message: QUOTING_REPLY }),
+      encoding: 'utf-8', timeout: 60_000, cwd: e.project,
+      env: { ...e.env, PLUR_AUTO_RATE_CEILING_MS: '2000', PLUR_TEST_SLOW_START_MS: '3000' },
+    })
+    const elapsed = Date.now() - t0
+    rmSync(lock, { force: true })
+    expect(r.status).toBe(0)
+    expect(r.stdout ?? '').toBe('')
+    // Counted from process start: ~3s start + 0.8s store-idle wait. Counted
+    // from arming, it would be 3s + 2s + 0.8s.
+    expect(elapsed).toBeLessThan(4_800)
+    // And the watchdog path really ran: the inline run waited on the held lock
+    // (~0.8s past the 3s start) instead of exiting right after a worker spawn.
+    expect(elapsed).toBeGreaterThanOrEqual(3_600)
+  }, 60_000)
+
   describe('pending window (#1318 review)', () => {
     const MISS = 'Done. The build is green and nothing else changed.'
     const stopWith = (sid: string, reply: string) =>

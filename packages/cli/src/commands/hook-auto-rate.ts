@@ -1,6 +1,7 @@
 import { type GlobalFlags } from '../plur.js'
 import { hookFolderOn, payloadDir } from '../lib/folder-gate.js'
 import { readStdinJson, runCodexHook, codexSessionId } from '../lib/codex-hook-io.js'
+import { exitWhenStoreIdle, EXIT_LOCK_WAIT_MS } from '../lib/store-lock-exit.js'
 import { enqueueTurn, hasLeftoverBatches, spawnWorker, runWorker, agyReplySinceLastUser, type AutoRateEditor } from '../lib/auto-rate.js'
 
 /**
@@ -45,9 +46,17 @@ const CEILING_MS = parseInt(process.env.PLUR_AUTO_RATE_CEILING_MS ?? '', 10) || 
 
 /**
  * The worker's own ceiling: only an immortal-process guard (#504), far above
- * any real run. It is checked between turns, never inside a store write.
+ * any real run. When it fires, the exit waits (bounded) until no store write
+ * is in flight (exitWhenStoreIdle, #1343).
  */
 const WORKER_CEILING_MS = parseInt(process.env.PLUR_AUTO_RATE_WORKER_CEILING_MS ?? '', 10) || 15 * 60_000
+
+/**
+ * How long the watchdog waits for an in-flight store write. The watchdog is
+ * armed relative to process start (see below), so Node startup + CEILING_MS
+ * + this wait stays under the 10s budget on a slow machine too.
+ */
+const WATCHDOG_LOCK_WAIT_MS = 800
 
 interface Turn {
   sessionId: string
@@ -94,13 +103,19 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     const editor = args[1] as AutoRateEditor
     const sessionId = args[2] ?? ''
     if (!EDITORS.includes(editor) || !sessionId) return
-    const guard = setTimeout(() => process.exit(0), WORKER_CEILING_MS)
+    // #1343: never exit inside a store write — wait (bounded) for the store to go idle.
+    const guard = setTimeout(() => { void exitWhenStoreIdle(EXIT_LOCK_WAIT_MS) }, WORKER_CEILING_MS)
     guard.unref()
     await runCodexHook('auto-rate worker', async () => { await runWorker(editor, sessionId, flags) })
     return
   }
 
-  const watchdog = setTimeout(() => process.exit(0), CEILING_MS)
+  // #1343: the inline fallback below opens the store, so the watchdog waits
+  // (bounded, inside the editor's 10s budget) for no store write in flight.
+  // The ceiling counts from process start, not from here: module import and
+  // Node startup (slow on Windows) are part of the editor's budget.
+  const elapsedMs = Math.round(process.uptime() * 1000)
+  const watchdog = setTimeout(() => { void exitWhenStoreIdle(WATCHDOG_LOCK_WAIT_MS) }, Math.max(0, CEILING_MS - elapsedMs))
   watchdog.unref()
 
   await runCodexHook('auto-rate', async () => {

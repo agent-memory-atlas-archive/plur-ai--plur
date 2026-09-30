@@ -1,5 +1,5 @@
 import { createPlur, type GlobalFlags } from '../plur.js'
-import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce } from '../lib/folder-gate.js'
+import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce, createAskPlur } from '../lib/folder-gate.js'
 import { readStdinJson, runCodexHook, codexSessionId, markSessionStarted, emitContext, injectWithFallback } from '../lib/codex-hook-io.js'
 import { resolveProjectRemote, projectRemoteRefusalNotice } from '../lib/project-remote.js'
 import { recordInjected } from '../lib/auto-rate.js'
@@ -36,9 +36,8 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
     const policy = hookFolderPolicy(dir, flags)
     if (policy.mode === 'off') return
     if (policy.mode === 'ask') {
-      let askPlur = null
-      try { askPlur = createPlur(flags, { readonly: true }) } catch { /* the question works without the ranker */ }
-      const ask = folderAskOnce({ dir, policy, sessionId, flags, plur: askPlur, prompt })
+      // No store discovery: asking must not register this folder's .plur store.
+      const ask = folderAskOnce({ dir, policy, sessionId, flags, plur: createAskPlur(flags), prompt })
       if (ask) emitContext('UserPromptSubmit', ask)
       return
     }

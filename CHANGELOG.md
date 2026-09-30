@@ -42,7 +42,9 @@ what you decided about the folder:
   for **yes** (`plur folders set <folder> --scope <s> --nonce <n>`, or `--on`),
   **not now** (nothing) and **never here** (`--off --nonce <n>`). For an
   untrusted `.plur.yaml` it also offers `--trusted`, names the host the repo
-  wants to send memories to, and never shows its token. What that file
+  wants to send memories to (only a plain host name or IP address with an
+  optional port; anything else is shown as "an invalid remote URL"), and
+  never shows its token. What that file
   requests is shown on its own line, marked as quoted repository text, and
   only as values that fit the scope or domain grammar and the parsed host of
   a URL; anything else is named ("an invalid scope"), never copied, so the
@@ -83,6 +85,31 @@ what you decided about the folder:
   older install. Codex's existing SessionStart hook handles `resume` itself.
   Cursor and Antigravity send no resume signal and delete no nonces at session
   end, so a resumed conversation there keeps its unexpired question.
+- **Some folders cannot be answered from the question.** A folder rule reads
+  `*` and `?` as a pattern, so a "yes" for a folder named `x*` would also
+  cover its sibling `xyz` (#1493). A path with `*`, `?` or `[`, a control or
+  line-break character, or a bidi or zero-width character (U+200B–U+200F,
+  U+202A–U+202E, U+2066–U+2069, U+FEFF) gets a short notice instead, and so
+  does a path with `$`, a backtick, `%`, `!`, `"` or a curly double quote
+  (U+201C, U+201D, U+201E) on Windows, where the offered command
+  double-quotes the folder and bash, PowerShell or cmd would still expand
+  them (PowerShell ends a double-quoted string at a curly double quote). The
+  path is shown JSON-escaped as quoted data (`$`, backticks, `'` and curly
+  quotes escaped too), and no command or nonce is offered. The
+  folder stays undecided and is asked about once per session. Set it by hand.
+- Outside the commands, the question prints the folder only in that
+  JSON-escaped form, and no line of it holds an apostrophe, so no printed
+  line runs a command named in the folder (`x&touch CANARY`, `x$(...)`) when
+  pasted into bash or PowerShell. The untrusted header now reads "the repo
+  .plur.yaml is not trusted", and the trust answer "Yes, and trust the
+  .plur.yaml in this repo". The values an untrusted `.plur.yaml` requests
+  are printed the same escaped way. On Windows a folder whose path ends in
+  a backslash (a drive or UNC root) also gets the notice: the backslash
+  would escape the closing quote of the offered command.
+- Asking changes nothing. The question no longer registers the folder's own
+  `.plur/engrams.yaml` as a project store in config.yaml (the hooks build
+  their scope ranker with store discovery off), so that store never reaches
+  another folder's session and is never offered as a scope.
 
 Not changed yet: the opencode plugin and the MCP server's `plur_session_start`
 do not read the map.

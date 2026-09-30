@@ -4,7 +4,7 @@ import { homedir, hostname, setPriority } from 'os'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
 import { createPlur, type GlobalFlags } from '../plur.js'
-import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce } from '../lib/folder-gate.js'
+import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce, createAskPlur } from '../lib/folder-gate.js'
 import type { FolderPolicy } from '@plur-ai/core'
 import { safeSessionKey } from '../lib/session-key.js'
 import { injectWithFallback, hybridEnabled, type Injectable, type InjectOutcome } from '../lib/codex-hook-io.js'
@@ -799,8 +799,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
 async function askFolder(input: Record<string, unknown>, dir: string, policy: FolderPolicy, flags: GlobalFlags): Promise<void> {
   if (claudeHookEventName(input, { rehydrate: false, event: null }) !== 'UserPromptSubmit') return
   const id = (typeof input.session_id === 'string' && input.session_id) || process.env.CLAUDE_SESSION_ID || ''
-  let plur: Plur | null = null
-  try { plur = createPlur(flags, { readonly: true }) } catch { /* the question still works without the ranker */ }
+  // No store discovery: asking must not register this folder's .plur store.
+  const plur = createAskPlur(flags)
   const ask = folderAskOnce({
     dir, policy, sessionId: id, flags, plur,
     prompt: typeof input.prompt === 'string' ? input.prompt : '',
@@ -932,10 +932,10 @@ async function injectSession(
   // hybrid failure, BM25 (local-only by design — inject() never dials)
   // serves the turn.
   const { result, mode, hybrid } = await injectForHook(plur, task, injectOpts)
+  recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
   // A missed deadline leaves the hybrid search running; it must not hold
   // the process (and so the prompt) open until the watchdog.
   abandonedHybrid = mode === 'bm25' && hybridEnabled() ? hybrid : null
-  recordInjected('claude', input.session_id, result.injected_ids) // #1310 auto-rate
   storeRoot = plur.storageRoot
   if (result.count > 0) {
     const parts: string[] = []

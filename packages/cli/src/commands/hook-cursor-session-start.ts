@@ -1,6 +1,6 @@
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
-import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce, isFolderAskText } from '../lib/folder-gate.js'
+import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce, isFolderAskText, createAskPlur } from '../lib/folder-gate.js'
 import { cursorContextRulePath } from '../mcp-config.js'
 import { readStdinJson, cursorConversationId, markSessionStarted, writeContextRule } from '../lib/cursor-hook-io.js'
 import { resolveProjectRemote, projectRemoteRefusalNotice } from '../lib/project-remote.js'
@@ -64,9 +64,8 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   if (!conversationId) return // can't track this session — stay silent rather than guess
 
   if (policy.mode === 'ask') {
-    let askPlur = null
-    try { askPlur = createPlur(flags, { readonly: true }) } catch { /* the question works without the ranker */ }
-    const ask = folderAskOnce({ dir, policy, sessionId: conversationId, flags, plur: askPlur })
+    // No store discovery: asking must not register this folder's .plur store.
+    const ask = folderAskOnce({ dir, policy, sessionId: conversationId, flags, plur: createAskPlur(flags) })
     if (!ask) return
     writeContextRule(ask, rulePath)
     process.stdout.write(JSON.stringify({ additional_context: ask }))

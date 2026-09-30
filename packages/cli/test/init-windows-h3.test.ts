@@ -81,11 +81,10 @@ describe('decision H3: string editors on win32', { timeout: 60000 }, () => {
     const shim = join(home, '.plur', 'bin', 'plur-hook.cmd').replace(/\\/g, '/')
     const files = hookFiles()
     for (const c of collectCommands(JSON.parse(readFileSync(files.Codex, 'utf-8')))) {
-      // hook-codex-* plus #1310's auto-rate (merged in with #1418).
+      // #1310: the auto-rate Stop hook is Codex's too (`hook-auto-rate codex`).
       expect(c.startsWith(`& "${shim}" hook-codex-`) || c === `& "${shim}" hook-auto-rate codex`, c).toBe(true)
     }
     for (const c of collectCommands(JSON.parse(readFileSync(files.Antigravity, 'utf-8')))) {
-      // hook-agy-* plus #1310's auto-rate (merged in with #1418).
       expect(c.startsWith(`${shim} hook-agy-`) || c === `${shim} hook-auto-rate agy`, c).toBe(true)
     }
     const report = JSON.parse(run(['doctor', '--no-handshake', '--json']))
