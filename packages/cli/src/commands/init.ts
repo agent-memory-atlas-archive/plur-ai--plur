@@ -255,7 +255,7 @@ function installMcpBinary(): { shimPath: string; status: string } {
 // Installed into global ~/.claude/settings.json unconditionally (issue #95) so
 // they fire from any subdirectory project. Each hook silent-passes when
 // isPlurConfigured() is false, so projects without plur are unaffected.
-function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
+export function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
   return {
     SessionStart: [
       {
@@ -302,7 +302,7 @@ function buildEnforcementHooks(cmd: string): Record<string, HookEntry[]> {
 // Injection hooks pull relevant engrams into the conversation context. Installed
 // at the path chosen by --global/--project (default project) because per-project
 // domain/scope tuning may matter for what gets injected.
-function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
+export function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
   return {
     // First message: inject engrams based on the prompt.
     // Subsequent messages: periodic reminder to call plur_learn (~1ms skip).
@@ -323,9 +323,12 @@ function buildInjectionHooks(cmd: string): Record<string, HookEntry[]> {
     ],
 
     // Re-inject after context compaction so engrams survive long conversations.
-    PostCompact: [
+    // SessionStart with matcher "compact" fires right after compaction and can
+    // carry context; PostCompact cannot (#1274). Re-running init strips the
+    // old PostCompact entry with the rest of the plur hooks.
+    SessionStart: [
       {
-        matcher: 'auto|manual',
+        matcher: 'compact',
         hooks: [
           { type: 'command', command: `${cmd} hook-inject --rehydrate`, timeout: 90, async: true },
         ],
@@ -1494,7 +1497,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo('', flags)
   outputInfo(`Injection hooks (9): ${injectionHooksStatus}`, flags)
   outputInfo('  UserPromptSubmit  — inject engrams + auto-start session', flags)
-  outputInfo('  PostCompact       — re-inject engrams after context compaction', flags)
+  outputInfo('  SessionStart      — re-inject engrams after context compaction', flags)
   outputInfo('  PreToolUse        — contextual injection (plan mode, skills, agents)', flags)
   outputInfo('  PreToolUse        — observation capture for pattern learning', flags)
   outputInfo('  PostToolUse       — observation results capture', flags)
