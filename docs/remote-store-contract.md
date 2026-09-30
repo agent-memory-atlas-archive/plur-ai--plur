@@ -1,32 +1,55 @@
 # Remote store: retried writes
 
-How the client retries a queued write (the outbox), and what a server can do
-to make those retries safe. Everything here is additive: a server that
-ignores it keeps working.
+How the client retries a write to a team store, and what a server does to make
+those retries safe. Everything here is additive: a server that ignores it keeps
+working, at the cost of at most one duplicate per write (below).
 
-## `Idempotency-Key` on `POST /api/v1/engrams`
+## The idempotency key
 
-Every create carries an `Idempotency-Key` header whose value is the client's
-**local engram id** (for example `ENG-2026-09-29-001`). It is the same on
-every retry of the same queued write, and different for different writes.
+Every `POST /api/v1/engrams` from the client carries a key:
 
-A server that honours it should, for a key it has already accepted from the
-same token, return the original response (status and `id`) instead of
-creating a second engram. A server that ignores the header is still safe,
-because the client also checks before retrying, as described next.
+- as the `Idempotency-Key` request header, and
+- as `idempotency_key` in the JSON body.
 
-## Retry after a cut request
+The key is exactly this:
 
-A client that gives up on a create before the server answers cannot tell
-whether the server stored it. This happens when a hook's time budget runs out.
-The client marks such a write as *in doubt*. Before posting it again, the
-client pages `GET /api/v1/engrams?scope=<scope>` and looks for an active
-engram with exactly the same `statement`:
+- **Unique per logical write.** It is a random UUID (version 4), minted once
+  when the write is created. Two different writes never share a key, not even
+  from two machines using the same token, or two writes of the same statement.
+  It is never derived from an engram id, a statement or a timestamp.
+- **Persisted before the first POST.** It is stored on the queued write's
+  outbox row before that write is first posted. A row queued by an older
+  client that has no key gets one minted and stored before it is posted.
+- **Stable across retries.** Every retry of *that* write sends the same key,
+  including a retry after the client failed to record an earlier outcome.
 
-- **Found:** the write is treated as delivered and the server's `id` is used.
-  Nothing is posted.
-- **Absent after a complete listing:** the write is posted again.
-- **Anything else** (timeout, 5xx, incomplete paging): nothing is posted. The
-  write stays queued for a later flush.
+## Retries
 
-A server therefore needs only the list endpoint it already has for this check.
+A push that timed out, was cut short by a time budget, or failed with an
+error is not treated as "maybe delivered". It stays queued and is **retried**
+on the next flush, **with the same key**. The client does not look for the
+write on the server before retrying.
+
+Two local writers never push the same queued write at once. Before pushing,
+the client takes a claim on the write: a file created atomically. A claim made
+on this machine is held for as long as its process is alive, however long the
+push takes (a hard cap of 15 minutes guards against a recycled process id); a
+claim from another machine sharing the store directory is held for a 60-second
+lease. A stale claim is taken over by renaming a new claim file over it, so the
+claim is never absent during a takeover.
+
+## What the server does with the key
+
+1. **A key-honouring server must deduplicate by key.** For a key it has already
+   accepted from the same token, it returns the original response (status and
+   `id`) instead of creating a second engram. The window must be at least as
+   long as the client keeps retrying a queued write: 7 days. On such a server
+   every write is stored exactly once, however many times it is retried.
+2. **A key-ignoring server may see at most one duplicate per write.** A retry
+   that follows an attempt the server stored but the client never heard back
+   from creates a second row. The client never deletes its queued copy before
+   a push is confirmed, so writes are never lost this way, only possibly
+   duplicated once.
+3. **Recommended:** record the key with the engram and return it as
+   `data.idempotency_key` in list responses, so an operator can find and merge
+   such duplicates.

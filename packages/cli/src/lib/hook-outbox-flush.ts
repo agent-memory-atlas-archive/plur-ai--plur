@@ -68,7 +68,11 @@ function throttleMarker(root: string, hook: string): string {
 /** True when a flush from this hook ran less than `minIntervalMs` ago. */
 function recentlyFlushed(root: string, hook: string, minIntervalMs: number): boolean {
   try {
-    return Date.now() - statSync(throttleMarker(root, hook)).mtimeMs < minIntervalMs
+    const age = Date.now() - statSync(throttleMarker(root, hook)).mtimeMs
+    // A marker dated in the future (clock skew, a restored backup) would
+    // otherwise suppress the flush until the clock caught up: treat it as
+    // expired (2026-09-29 audit).
+    return age >= 0 && age < minIntervalMs
   } catch {
     return false
   }
@@ -82,7 +86,10 @@ function markFlushed(root: string, hook: string): void {
 }
 
 function storeRoot(flags: GlobalFlags): string {
-  return flags.path ?? process.env.PLUR_PATH ?? join(homedir(), '.plur')
+  // `||`, not `??`: an empty PLUR_PATH (or --path "") means unset, as it does
+  // for createPlur and the other hook readers (#1395). With `??` it resolved
+  // `./engrams.yaml` in the current directory.
+  return flags.path || process.env.PLUR_PATH || join(homedir(), '.plur')
 }
 
 /**

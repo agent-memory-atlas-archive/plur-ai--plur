@@ -10,9 +10,9 @@
  * "the hook exits promptly" is measured on the wall clock the harness sees.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, utimesSync, readFileSync } from 'fs'
 import { join } from 'path'
-import { tmpdir } from 'os'
+import { tmpdir, hostname } from 'os'
 import { spawn } from 'child_process'
 import { Plur } from '@plur-ai/core'
 import { StubServer } from '../../core/test/helpers/stub-server.js'
@@ -174,6 +174,62 @@ describe('outbox flush from hooks and plur sync (#1269)', () => {
     const end = await runCli(HOOKS[0].args, { cwd: project, env, input: HOOKS[0].input })
     expect(end.code, end.stderr).toBe(0)
     expect(await pending()).toBe(0)
+  })
+
+  it('a throttle marker dated in the future (clock skew) does not block the Cursor stop flush', async () => {
+    await queue(1)
+    const marker = join(store, 'cache', 'hook-cursor-stop.outbox-flush')
+    mkdirSync(join(store, 'cache'), { recursive: true })
+    writeFileSync(marker, 'from a clock two days ahead')
+    const future = new Date(Date.now() + 2 * 86_400_000)
+    utimesSync(marker, future, future)
+
+    const r = await runCli(HOOKS[2].args, { cwd: project, env, input: HOOKS[2].input })
+    expect(r.code, r.stderr).toBe(0)
+    expect(await pending()).toBe(0)
+  })
+
+  // Decision C4 changed this test: the next flush simply retries (no lookup),
+  // with the key persisted on the row before the first POST — so a
+  // key-honouring server keeps exactly one row.
+  it('a hook abandoned after its POST landed is retried with the same key; a key-honouring server keeps one row', async () => {
+    server.honourIdempotency = true
+    await queue(1)
+    // Another writer holds the store lock, so the flush's merge-back waits and
+    // the Codex hook's outer timer gives up and force-exits — after the POST
+    // already reached the server.
+    const lock = join(store, 'engrams.yaml.lock')
+    writeFileSync(lock, `${hostname()}:${process.pid}:${Date.now()}:0`)
+    try {
+      const r = await runCli(HOOKS[1].args, { cwd: project, env, input: HOOKS[1].input })
+      expect(r.code, r.stderr).toBe(0)
+      expect(server.engramCount).toBe(1)
+    } finally {
+      rmSync(lock, { force: true })
+    }
+
+    // Next flush: re-posts with the same key; the server collapses it.
+    const result = await new Plur({ path: store }).flushOutbox()
+    expect(result.flushed).toBe(1)
+    expect(server.engramCount).toBe(1)
+    expect(new Set(server.appendKeys.filter(Boolean)).size).toBe(1)
+    expect(await pending()).toBe(0)
+  })
+
+  it('an empty PLUR_PATH counts as unset: the hook flushes ~/.plur, not a store in the current directory', async () => {
+    // The store under the (temp) HOME, where an unset PLUR_PATH points.
+    const homeStore = join(env.HOME, '.plur')
+    mkdirSync(homeStore, { recursive: true })
+    writeFileSync(join(homeStore, 'config.yaml'), readFileSync(join(store, 'config.yaml'), 'utf8'))
+    const plur = new Plur({ path: homeStore })
+    server.appendErrorResponse = { status: 503, body: 'down for the test' }
+    await plur.learnRouted('queued under the home store', { scope: SCOPE, type: 'behavioral' })
+    server.appendErrorResponse = null
+    expect(await plur.outboxCount()).toBe(1)
+
+    const r = await runCli(HOOKS[0].args, { cwd: project, env: { ...env, PLUR_PATH: '' }, input: HOOKS[0].input })
+    expect(r.code, r.stderr).toBe(0)
+    expect(await new Plur({ path: homeStore }).outboxCount()).toBe(0)
   })
 
   it('the kill-switch turns the hook flush off', async () => {

@@ -91,6 +91,12 @@ export class StubServer {
   appendDropWhileDelayed = false
   /** `Idempotency-Key` header of the most recent POST /engrams. */
   lastAppendIdempotencyKey: string | null = null
+  /** Every `Idempotency-Key` received on an accepted POST /engrams, in order. */
+  appendKeys: Array<string | null> = []
+  /** Model a server that follows docs/remote-store-contract.md on POST: a key
+   *  already accepted from the same token replays the original response. */
+  honourIdempotency = false
+  private idempotencyReplies = new Map<string, { id: string; scope: string; status: string; data: Record<string, unknown> }>()
   /** When set, PATCH /engrams/:id still applies the update server-side but
    *  echoes this value as the {engram: ...} body — to simulate a server whose
    *  echoed row fails RemoteRowSchema validation (#327). */
@@ -195,6 +201,9 @@ export class StubServer {
     this.appendCalls = 0
     this.appendDropWhileDelayed = false
     this.lastAppendIdempotencyKey = null
+    this.appendKeys = []
+    this.honourIdempotency = false
+    this.idempotencyReplies.clear()
     this.badPatchEcho = null
     this.recallRows = []
     this.recallStatus = null
@@ -293,6 +302,13 @@ export class StubServer {
       this.lastAppendIdempotencyKey = typeof idemKey === 'string' ? idemKey : null
       this.readBody(req, (body) => {
         this.lastAppendBody = body
+        const key = typeof idemKey === 'string' ? idemKey : null
+        this.appendKeys.push(key)
+        const replayKey = key ? `${req.headers.authorization}\0${key}` : null
+        if (this.honourIdempotency && replayKey && this.idempotencyReplies.has(replayKey)) {
+          this.json(res, 201, this.idempotencyReplies.get(replayKey))
+          return
+        }
         const { statement, scope, domain, type, source } = body
         const refusal = typeof scope === 'string' ? this.appendErrorByScope[scope] : undefined
         if (refusal) {
@@ -300,6 +316,8 @@ export class StubServer {
           res.end(refusal.body)
           return
         }
+        // Recorded with the row, as docs/remote-store-contract.md recommends.
+        const idempotency_key = body.idempotency_key
         const id = `ENG-SRV-${String(++this.idCounter).padStart(3, '0')}`
         const now = new Date().toISOString()
         const engram: StoredEngram = {
@@ -310,11 +328,18 @@ export class StubServer {
           status: 'active',
           // `source` carries rescope provenance over the wire (#676) — keep it
           // so tests can assert the pushed shape.
-          data: { statement, domain, type, ...(source !== undefined ? { source } : {}) },
+          data: {
+            statement, domain, type,
+            ...(source !== undefined ? { source } : {}),
+            ...(idempotency_key !== undefined ? { idempotency_key } : {}),
+          },
           created_at: now,
           updated_at: now,
         }
-        const store = () => this.engrams.set(id, engram)
+        const store = () => {
+          this.engrams.set(id, engram)
+          if (replayKey) this.idempotencyReplies.set(replayKey, { id, scope: engram.scope, status: engram.status, data: engram.data })
+        }
         if (!(this.appendDelayMs > 0 && this.appendDropWhileDelayed)) store()
         // Normally the server returns the real assigned id; badAppendId lets a
         // test make it return a malformed one (#404).

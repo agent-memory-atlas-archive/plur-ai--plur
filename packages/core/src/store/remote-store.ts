@@ -667,7 +667,10 @@ export class RemoteStore {
    * placeholder will fail — the engram only exists on the server with
    * the server's ID.
    */
-  async appendAndGetServerId(engram: Engram, opts?: { signal?: AbortSignal }): Promise<{ id: string }> {
+  async appendAndGetServerId(
+    engram: Engram,
+    opts?: { signal?: AbortSignal; idempotencyKey?: string },
+  ): Promise<{ id: string }> {
     // #768: transmit the full engram, not just the core four — pinned,
     // rationale, tags, commitment, validity windows and supersedes were
     // silently dropped, so team-scope pins never round-tripped. Optional
@@ -692,7 +695,11 @@ export class RemoteStore {
     // an engram written by an older path, or replayed from an outbox predating
     // this, sends nothing rather than claiming `explicit` it cannot vouch for.
     const scope_source = e.structured_data?._scopeSource as string | undefined
+    const idempotencyKey = opts?.idempotencyKey
     const body = JSON.stringify({
+      // docs/remote-store-contract.md: the key is also recorded with the row,
+      // so a retry can find what an earlier, cut attempt stored.
+      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
       statement: e.statement,
       scope:     engram.scope,
       domain:    e.domain,
@@ -746,10 +753,15 @@ export class RemoteStore {
     })
     const r = await this.fetchBounded(`${this.apiBase}/engrams`, {
       method: 'POST',
-      // Stable across retries of the same local engram, so a server that
-      // honours it can collapse a retried POST into the original
-      // (docs/remote-store-contract.md). Servers that do not ignore it.
-      headers: this.headers({ 'Content-Type': 'application/json', 'Idempotency-Key': engram.id }),
+      // Unique per LOGICAL write and stable across that write's retries — a
+      // random UUID the caller mints once and persists (docs/remote-store-
+      // contract.md). NEVER derived from the engram id: that is `__pending__`
+      // on every direct write and a per-day sequence that collides across
+      // machines (2026-09-29 audits). No key, no header.
+      headers: this.headers({
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      }),
       body,
     }, RemoteStore.readBounded, opts?.signal)
     if (!r.ok) throw new RemoteHttpError(r.status, `Remote store append failed: ${r.status} ${r.text}`)
@@ -786,39 +798,6 @@ export class RemoteStore {
    */
   async save(_engrams: Engram[]): Promise<void> {
     throw new Error('Remote store does not support bulk save() — use append()/remove() per engram')
-  }
-
-  /**
-   * Is an engram with exactly this statement stored in this scope?
-   *
-   * Used by the outbox flush before re-posting a push that was cut mid-flight
-   * (review of #1277): the server may have stored it, and the server-assigned
-   * id never reached us. Pages the ordinary list endpoint, uncached, under
-   * `signal`. Never throws: anything short of a complete answer is `unknown`,
-   * and the caller must not post on `unknown`.
-   */
-  async findByStatement(
-    statement: string,
-    opts?: { signal?: AbortSignal },
-  ): Promise<{ status: 'found'; id: string } | { status: 'absent' } | { status: 'unknown' }> {
-    const limit = 200
-    try {
-      for (let page = 0, offset = 0; page < 50; page++, offset += limit) {
-        const u = `${this.apiBase}/engrams?scope=${encodeURIComponent(this.scope)}&limit=${limit}&offset=${offset}`
-        const r = await this.fetchBounded(u, { headers: this.headers() }, RemoteStore.readBounded, opts?.signal)
-        if (!r.ok) return r.status === 403 || r.status === 404 ? { status: 'absent' } : { status: 'unknown' }
-        const body = r.json as { rows?: unknown[]; total_count?: number } | undefined
-        if (!body || !Array.isArray(body.rows)) return { status: 'unknown' }
-        for (const row of body.rows) {
-          const e = this.reshape(row as any)
-          if (e && e.statement === statement && e.status !== 'retired') return { status: 'found', id: e.id }
-        }
-        if (body.rows.length < limit || offset + body.rows.length >= (body.total_count ?? 0)) return { status: 'absent' }
-      }
-      return { status: 'unknown' } // page cap reached without a full answer
-    } catch {
-      return { status: 'unknown' }
-    }
   }
 
   async getById(id: string): Promise<Engram | null> {

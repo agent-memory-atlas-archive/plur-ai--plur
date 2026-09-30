@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+### A folder map records your per-folder decisions, and `trust.yaml` folds into it
+
+**First half of #1347: core and CLI only. No hook reads the map yet.** A new
+file, `~/.plur/folders.yaml`, holds your own decisions about folders: `on`,
+`off` or `ask`, a default write `scope`, and `trusted`. `trusted` is the grant
+that used to live in `trust.yaml`. `.plur.yaml` is unchanged and stays the
+repo's request. Only the CLI writes the map.
+
+- **`resolveFolderPolicy(dir)`** (core, and `Plur.resolveFolderPolicy`) returns
+  `{ mode, scope?, remoteAllowed, source }`, resolved in this order:
+  1. Any matching `off` entry wins.
+  2. A `.plur.yaml` means on. A map `scope` beats its scope hint, and its remote
+     is allowed only under a `trusted` entry.
+  3. A project MCP config means on.
+  4. Otherwise the most specific matching entry decides.
+  5. Otherwise the answer is `ask`, and that includes `$HOME`.
+
+  Paths may be globs (`*`, `**`, `?`) and may start with `~`. A plain folder
+  also covers everything below it.
+- **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
+  `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
+  `--no-trusted`.
+  - **Outside an interactive terminal, `set` and `rm` need `--nonce <n>`.** That
+    is how the ask flow calls them, and it stops an agent from writing any
+    folder, `--trusted` included, by leaving `--nonce` out. A person at a
+    terminal needs no nonce. `plur trust` is the explicit alias for a person
+    and still works in scripts.
+  - A nonce names one folder and works once. It is used up only after the map
+    is saved, so a failed write does not burn it. It expires when its session
+    ends, after 24 hours at most.
+  - `set` refuses a team scope (`group:`, `org:`, `team:`, `space:`, `public`)
+    that no store in `config.yaml` serves. `project:` scopes live in the local
+    store and need none.
+  - Neither command writes to a folders.yaml it cannot read; it is never
+    overwritten.
+- **Upgrade needs no steps.** The first read of a missing `folders.yaml` imports
+  the `trust.yaml` entries as `trusted: true` entries. Nothing is ever added to
+  `trust.yaml`. `plur untrust` removes the grant from both files, so neither a
+  downgrade (an older version reading `trust.yaml`) nor a fresh import brings a
+  revoked grant back.
+- **`plur trust`, `plur untrust` and `plur init-remote`** now set and clear
+  `trusted` in the map. Their output and exit codes are unchanged, with one
+  exception: `plur trust` and `plur untrust` exit 1 on a folders.yaml they
+  cannot read, rather than overwrite it. `plur init-remote` still writes
+  `.plur.yaml` and exits 0, but warns that it could not record trust and leaves
+  remote memory off until you run `plur trust`. It fails safe.
+- A folders.yaml that cannot be read counts as empty and logs one warning. It
+  never throws.
+- **Trust matching is now in one place, the map, and it fails closed.** A
+  stored entry is compared exactly as written with the checked folder's
+  canonical path. It is never resolved on disk, and neither is its parent. So a
+  trusted folder, or its parent, later replaced by a symlink does not pass its
+  trust on to wherever the link points.
+  - An entry imported from `trust.yaml` keeps its spelling. If an older version
+    stored an entry under a symlinked parent for a folder that did not exist
+    yet, run `plur trust` again once that folder exists.
+  - `plur untrust` also removes an entry stored under the plain spelling of
+    the folder you give it.
+  - A `~` in the map expands to your home as written and to its canonical path.
+
 ### A refused write to one scope no longer pauses writes to the whole server
 
 **A few refused writes to one scope could stop queued writes to every other
@@ -80,7 +140,9 @@ it did.
 `SessionEnd`, Codex `SessionEnd`, and Cursor `stop`. Each flush has a budget
 that fits inside its hook's timeout (2.5s, 1.2s, 1.2s), and with nothing
 queued it is skipped after a single file read; Cursor's `stop`, which fires
-on every turn, retries at most once every five minutes. When the budget runs out the
+on every turn, retries at most once every five minutes. A throttle timestamp
+dated in the future, from clock skew, counts as expired instead of blocking
+the flush until the clock catches up. When the budget runs out the
 in-flight push is cut and the rest stays queued, unchanged; a failing remote
 leaves entries queued with the failure recorded, as before. The hook itself
 never fails over it. `PLUR_HOOK_OUTBOX_FLUSH=0` turns it off and
@@ -97,13 +159,51 @@ The result has two new counts: `deferred` (entries it did not get to) and
 reports skipped writes and the breaker's reason; before, it said nothing
 about them. A cut is not counted as a failure against the host.
 
-**A push cut mid-flight is not delivered twice.** The server may have stored
-it before the budget ran out, and the client cannot know. So the cut is
-recorded as an attempt, which `plur outbox` shows, and the write is marked in
-doubt. Before posting it again, the client looks for it on the server and
-treats a match as delivered. Every create now also carries an
-`Idempotency-Key` (the local engram id) for servers that honour one. See
-`docs/remote-store-contract.md`.
+**A push that is cut, times out or throws is retried, with the same key.**
+The server may have stored it before the answer arrived, and the client cannot
+know. The owner decided this is not a "maybe delivered" state: the write stays
+queued, the attempt is recorded (`plur outbox` shows it), and the next flush
+posts it again. What makes that safe is the idempotency key.
+
+**Idempotency keys are unique per write, and on the row before the first
+POST.** An earlier version of this change derived the key from the engram id.
+On a direct team write that id is the placeholder `__pending__`, and on queued
+writes it is a per-day number that two machines share. A server following the
+contract would have kept only the first write and reported the rest as
+delivered. Now:
+
+- every write gets a random UUID when it is created. It is stored on the
+  queued write's outbox row before that write is first posted, and reused on
+  every retry. A row queued by an older client gets a key minted and stored
+  before it is posted, so a flush whose local write-back fails afterwards
+  still retries with the same key;
+- each queued write is *claimed* before it is pushed: a small file created
+  atomically. So a flush and `learn()`'s own background push, or two flushes,
+  never push the same write at once. Before, this race gave two server copies
+  in half of the audit's runs. A claim is held while the process that made it
+  is alive, however long its push runs, so a POST held open by a slow server
+  cannot be re-pushed by a second flusher (a 15-minute cap covers a recycled
+  process id). A stale claim is taken over by renaming a new claim over it, so
+  there is never a moment with no claim for a second writer to slip into;
+- on a key-honouring server every write is stored once. A server that
+  ignores the key may see at most one duplicate per write, and no write is
+  ever dropped.
+
+`docs/remote-store-contract.md` states this exactly: unique per logical write,
+persisted before the first POST, stable across retries, deduplicated by a
+key-honouring server within a 7-day window.
+
+**A recall refused with 422 no longer trips the host breaker.** Like 401, 403
+and 404 before it, and like the write leg (#1308), a 422 answer to a recall
+neither counts toward the per-host breaker nor resets it. Three refused
+recalls used to open a 5-minute cooldown that also parked queued writes to
+every scope on the host.
+
+**An empty `PLUR_PATH` no longer hides queued writes from the hook flush.**
+The hooks' "is anything queued?" check treated `PLUR_PATH=""` as a path and
+looked for `./engrams.yaml` in the current directory, so it skipped a store
+under `~/.plur` that had queued writes. An empty value now counts as unset,
+as it does everywhere else (#1395).
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
