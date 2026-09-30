@@ -112,8 +112,6 @@ export class StubServer {
    *  the client actually transmits on the wire (#768: optional fields like
    *  pinned/rationale/tags were silently never sent). */
   lastAppendBody: Record<string, unknown> | null = null
-  /** Number of POST /engrams requests received (including rejected ones). */
-  appendCalls = 0
   /** Number of DELETE /engrams/:id requests received. */
   deleteCalls = 0
   /** When set, awaited before a POST /engrams is handled, with the 1-based call
