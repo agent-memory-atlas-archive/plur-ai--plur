@@ -93,6 +93,7 @@ Commands:
   hook-session-end        (internal) SessionEnd hook — auto-close memory lifecycle
   hook-session-mark       (internal) Hook handler for session sentinel
   hook-session-remind     (internal) Hook handler for session start reminder
+  hook-session-resume     (internal) SessionStart(resume) hook: re-ask the folder question
   hook-correction-detect  (internal) UserPromptSubmit hook — detect corrections
   hook-revert-detect      (internal) PostToolUse hook — detect revert operations
   hook-cursor-session-start (internal) Cursor sessionStart hook handler
@@ -185,6 +186,7 @@ const COMMANDS: Record<string, string> = {
   'hook-session-end': './commands/hook-session-end.js',
   'hook-session-mark': './commands/hook-session-mark.js',
   'hook-session-remind': './commands/hook-session-remind.js',
+  'hook-session-resume': './commands/hook-session-resume.js',
   'hook-correction-detect': './commands/hook-correction-detect.js',
   'hook-revert-detect': './commands/hook-revert-detect.js',
   'hook-cursor-session-start': './commands/hook-cursor-session-start.js',
