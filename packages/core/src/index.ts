@@ -9492,7 +9492,7 @@ Generate an improved version of the procedure that prevents this failure. Return
    * name a store configured in config.yaml; a `nonce` (from the ask flow)
    * must be the one issued for this folder. Throws FolderMapError on refusal.
    */
-  setFolder(folder: string, change: FolderChange, options?: { nonce?: string; home?: string }): FolderEntry {
+  setFolder(folder: string, change: FolderChange, options?: { nonce?: string; home?: string; literal?: boolean }): FolderEntry {
     this.reloadConfigIfChanged()
     const configuredScopes = (this.config.stores ?? []).map(s => s.scope)
     return _setFolderEntry(this.paths.root, folder, change, { configuredScopes, ...options })

@@ -1,4 +1,5 @@
-import { join } from 'path'
+import { join, relative, isAbsolute, sep } from 'path'
+import { homedir } from 'os'
 import { createPlur, type GlobalFlags } from '../plur.js'
 import { shouldOutputJson, outputJson, outputText, outputInfo, exit } from '../output.js'
 import {
@@ -186,6 +187,15 @@ async function connect(parsed: Parsed, flags: GlobalFlags): Promise<void> {
     return exit(1, 'Error: pass --scope <scope> (or --scopes <a,b>) — the team scope this folder should use. Nothing was written.')
   }
 
+  // A folder entry covers everything below it, so connecting $HOME, a
+  // filesystem root or an ancestor of $HOME would connect every folder under
+  // it (the design keeps $HOME at ask). Refused before any server is dialled.
+  const folder = canonicalize(process.cwd())
+  if (coversHome(folder)) {
+    return exit(1, `Error: ${folder} is your home folder, a filesystem root or a folder above your home, and connecting it ` +
+      'would connect every folder under it. Run `plur remote` in a subfolder (a project folder) instead. Nothing was written.')
+  }
+
   const plur = createPlur(flags)
   const refuse = (err: unknown, prefix: string): never => {
     const raw = err instanceof Error ? err.message : String(err)
@@ -220,10 +230,11 @@ async function connect(parsed: Parsed, flags: GlobalFlags): Promise<void> {
     }
   }
 
-  const folder = process.cwd()
   let mapped: string
   try {
-    mapped = plur.setFolder(folder, { scope: scopes[0] }).path
+    // Literal: a folder really named `proj?` must not be stored as a glob that
+    // also covers its siblings.
+    mapped = plur.setFolder(folder, { scope: scopes[0] }, { literal: true }).path
   } catch (err) {
     return refuse(err, `The store is registered in config.yaml, but ${folder} could not be mapped in folders.yaml: `)
   }
@@ -249,6 +260,13 @@ async function connect(parsed: Parsed, flags: GlobalFlags): Promise<void> {
   for (const l of lines) outputInfo(scrubAll(l, [tok, legacy?.remote_token]), flags)
   // Not suppressed by --quiet: it says a file of yours still holds a token.
   if (legacy) outputText(scrubAll(legacyMovedMessage(legacy.path), [tok, legacy.remote_token]))
+}
+
+/** True when `dir` is $HOME, a filesystem root, or an ancestor of $HOME. */
+function coversHome(dir: string): boolean {
+  if (relative(dir, join(dir, '..')) === '') return true // a root: its parent is itself
+  const rel = relative(dir, canonicalize(homedir()))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
 interface ServedStore {

@@ -41,6 +41,11 @@ export interface FolderEntry {
   plur?: FolderMode
   scope?: string
   trusted?: boolean
+  /**
+   * The path is a literal folder even though it contains `*` or `?` (a folder
+   * really named `proj?`): it is never read as a glob (#1415 review).
+   */
+  literal?: boolean
 }
 
 export interface FolderMap {
@@ -73,6 +78,7 @@ const FolderEntrySchema = z.object({
   plur: z.enum(['on', 'off', 'ask']).optional(),
   scope: z.string().min(1).optional(),
   trusted: z.boolean().optional(),
+  literal: z.boolean().optional(),
 }).passthrough()
 
 const FolderMapSchema = z.object({
@@ -132,10 +138,10 @@ function globToRegex(pattern: string): RegExp {
  * expanded. A literal directory covers itself and everything below it; a glob
  * covers any path it matches and everything below a match.
  */
-export function folderPatternMatches(pattern: string, target: string, platform: Platform = process.platform): boolean {
+export function folderPatternMatches(pattern: string, target: string, platform: Platform = process.platform, literal = false): boolean {
   const p = norm(pattern, platform)
   const t = norm(target, platform)
-  if (firstGlobIndex(p) === -1) {
+  if (literal || firstGlobIndex(p) === -1) {
     if (t === p) return true
     return t.startsWith(p.endsWith('/') ? p : p + '/')
   }
@@ -153,9 +159,9 @@ export function folderPatternMatches(pattern: string, target: string, platform: 
 }
 
 /** Specificity: literal prefix length, then segment count (design r2 §Resolution 4). */
-export function folderPatternSpecificity(pattern: string, platform: Platform = process.platform): [number, number] {
+export function folderPatternSpecificity(pattern: string, platform: Platform = process.platform, literal = false): [number, number] {
   const p = norm(pattern, platform)
-  const g = firstGlobIndex(p)
+  const g = literal ? -1 : firstGlobIndex(p)
   return [g === -1 ? p.length : g, p.split('/').filter(Boolean).length]
 }
 
@@ -188,14 +194,14 @@ export function expandHome(p: string, home: string): string {
  * `lax` (used only for `off`, where matching MORE is the safe direction) also
  * accepts the entry with its parent, or all of it, canonicalised.
  */
-function entryForms(entryPath: string, home: string, lax: boolean): string[] {
+function entryForms(entryPath: string, home: string, lax: boolean, literalPath = false): string[] {
   const homes = entryPath === '~' || entryPath.startsWith('~/') || entryPath.startsWith('~\\')
     ? [...new Set([home, canonicalize(home)])]
     : [home]
   const forms = new Set<string>()
   for (const h of homes) {
     const expanded = expandHome(entryPath, h)
-    const g = firstGlobIndex(expanded)
+    const g = literalPath ? -1 : firstGlobIndex(expanded)
     let literal: string
     let tail: string
     if (g === -1) {
@@ -218,14 +224,21 @@ function entryForms(entryPath: string, home: string, lax: boolean): string[] {
 }
 
 function entryCovers(entry: FolderEntry, targets: string[], home: string, lax: boolean): boolean {
-  const forms = entryForms(entry.path, home, lax)
-  return forms.some(f => targets.some(t => folderPatternMatches(f, t)))
+  const lit = entry.literal === true
+  const forms = entryForms(entry.path, home, lax, lit)
+  return forms.some(f => targets.some(t => folderPatternMatches(f, t, process.platform, lit)))
+}
+
+/** True when the entry's path is read as a glob. */
+function entryIsGlob(e: FolderEntry): boolean {
+  return e.literal !== true && hasGlob(e.path)
 }
 
 function mostSpecific(entries: Array<{ e: FolderEntry; i: number }>, home: string): FolderEntry | undefined {
   let best: { e: FolderEntry; i: number; s: [number, number] } | undefined
   for (const c of entries) {
-    const s = folderPatternSpecificity(entryForms(c.e.path, home, false)[0])
+    const lit = c.e.literal === true
+    const s = folderPatternSpecificity(entryForms(c.e.path, home, false, lit)[0], process.platform, lit)
     if (!best || s[0] > best.s[0] || (s[0] === best.s[0] && s[1] > best.s[1]) ||
         (s[0] === best.s[0] && s[1] === best.s[1] && c.i > best.i)) {
       best = { ...c, s }
@@ -338,7 +351,7 @@ export function saveFolderMap(root: string, map: FolderMap): void {
 
 function cleanEntry(e: FolderEntry): FolderEntry {
   const out: FolderEntry = { ...e }
-  for (const k of ['plur', 'scope', 'trusted'] as const) if (out[k] === undefined) delete out[k]
+  for (const k of ['plur', 'scope', 'trusted', 'literal'] as const) if (out[k] === undefined) delete out[k]
   return out
 }
 
@@ -494,6 +507,12 @@ export interface SetFolderOptions {
   nonce?: string
   home?: string
   now?: number
+  /**
+   * Record `folder` as a literal folder even when its name contains `*` or
+   * `?` (`plur remote` records the current folder this way). Without it such
+   * a path is stored as a glob, as `plur folders set` intends.
+   */
+  literal?: boolean
 }
 
 function hasGlob(p: string): boolean {
@@ -501,17 +520,17 @@ function hasGlob(p: string): boolean {
 }
 
 /** The path a CLI write records: literal folders are canonicalised, globs kept as typed. */
-export function folderEntryKey(folder: string, home: string = homedir()): string {
-  return hasGlob(folder) ? folder : canonicalize(expandHome(folder, home))
+export function folderEntryKey(folder: string, home: string = homedir(), literal = false): string {
+  return !literal && hasGlob(folder) ? folder : canonicalize(expandHome(folder, home))
 }
 
-function findEntryIndex(entries: FolderEntry[], folder: string, home: string): number {
-  if (hasGlob(folder)) return entries.findIndex(e => e.path === folder)
+function findEntryIndex(entries: FolderEntry[], folder: string, home: string, literal = false): number {
+  if (!literal && hasGlob(folder)) return entries.findIndex(e => e.path === folder)
   const raw = resolve(expandHome(folder, home))
   const target = canonicalize(raw)
   return entries.findIndex(e =>
-    e.path === folder ||
-    (!hasGlob(e.path) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false).includes(target))),
+    (e.path === folder && !entryIsGlob(e)) ||
+    (!entryIsGlob(e) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false, e.literal === true).includes(target))),
   )
 }
 
@@ -554,9 +573,10 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   // only after the map is saved: a refused or failed write never burns it.
   const map = loadForWrite(root)
   const consume = opts.nonce !== undefined ? verifyFolderNonce(root, opts.nonce, folder, opts.now) : null
-  const key = folderEntryKey(folder, home)
-  const idx = findEntryIndex(map.folders, folder, home)
-  const entry: FolderEntry = idx >= 0 ? { ...map.folders[idx] } : { path: key }
+  const literal = opts.literal === true
+  const key = folderEntryKey(folder, home, literal)
+  const idx = findEntryIndex(map.folders, folder, home, literal)
+  const entry: FolderEntry = idx >= 0 ? { ...map.folders[idx] } : { path: key, ...(literal && hasGlob(key) ? { literal: true } : {}) }
   if (change.scope !== undefined) {
     entry.scope = change.scope
     if (change.mode === undefined) delete entry.plur
@@ -574,7 +594,7 @@ function setFolderEntryUnlocked(root: string, folder: string, change: FolderChan
   consume?.()
   // Dual-write (see addLegacyTrustEntry): keep trust.yaml in step for
   // adapters on the previous core.
-  if (change.trusted === true && !hasGlob(entry.path)) addLegacyTrustEntryUnlocked(root, entry.path)
+  if (change.trusted === true && !entryIsGlob(entry)) addLegacyTrustEntryUnlocked(root, entry.path)
   if (change.trusted === false) removeLegacyTrustEntryUnlocked(root, folder, home)
   return cleanEntry(entry)
 }
@@ -621,7 +641,7 @@ function clearFolderTrustUnlocked(root: string, folder: string, home: string): b
   const target = canonicalize(raw)
   map.folders = map.folders.filter(e => {
     const hit = e.trusted === true && (e.path === folder ||
-      (!hasGlob(e.path) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false).includes(target))))
+      (!entryIsGlob(e) && (resolve(expandHome(e.path, home)) === raw || entryForms(e.path, home, false, e.literal === true).includes(target))))
     if (!hit) return true
     changed = true
     delete e.trusted

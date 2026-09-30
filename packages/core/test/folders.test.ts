@@ -311,6 +311,40 @@ describe('win32 paths (pure matcher)', () => {
   })
 })
 
+// #1415 review: `plur remote` records the current folder, and a folder really
+// named `proj?` must not become a glob covering its siblings. `?` is not a
+// legal file name character on Windows.
+describe.skipIf(process.platform === 'win32')('writes: the literal option', () => {
+  it('records a folder named proj? literally, so its siblings stay unmapped', () => {
+    const q = mk('w/proj?')
+    const x = mk('w/projX')
+    const deep = mk('w/projY/deep')
+    const sub = mk('w/proj?/sub')
+    expect(setFolderEntry(root, q, { mode: 'off' }, { configuredScopes: [], home, literal: true }))
+      .toEqual({ path: realpathSync(q), plur: 'off', literal: true })
+    expect(policy(q).mode).toBe('off')
+    expect(policy(sub).mode).toBe('off')
+    expect(policy(x).mode).not.toBe('off')
+    expect(policy(deep).mode).not.toBe('off')
+    // A second literal write updates the same entry.
+    setFolderEntry(root, q, { mode: 'on' }, { configuredScopes: [], home, literal: true })
+    expect(loadFolderMap(root).folders).toEqual([{ path: realpathSync(q), plur: 'on', literal: true }])
+  })
+
+  it('without it, a path with ? is still stored as a glob (plur folders set)', () => {
+    mk('w/projX')
+    const glob = join(home, 'w', 'proj?')
+    expect(setFolderEntry(root, glob, { mode: 'off' }, { configuredScopes: [], home })).toEqual({ path: glob, plur: 'off' })
+    expect(policy(join(home, 'w', 'projX')).mode).toBe('off')
+  })
+
+  it('a literal folder without glob characters is stored exactly as before', () => {
+    const d = mk('plain')
+    expect(setFolderEntry(root, d, { mode: 'on' }, { configuredScopes: [], home, literal: true }))
+      .toEqual({ path: realpathSync(d), plur: 'on' })
+  })
+})
+
 describe('writes: nonce and shared-scope guards', () => {
   it('a hand-run set without a nonce is accepted', () => {
     const d = mk('hand')

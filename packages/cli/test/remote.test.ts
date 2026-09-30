@@ -144,6 +144,54 @@ describe('plur remote (#1413)', () => {
     expect(existsSync(join(work, '.gitignore'))).toBe(false)
   }, TEST_TIMEOUT_MS)
 
+  // #1415 review: a folder name with `?` or `*` was stored as a glob, so its
+  // siblings were connected to the team scope too. `?` is not a legal file
+  // name character on Windows.
+  it.skipIf(process.platform === 'win32')('records a folder named proj? literally: its sibling projX stays unconnected', async () => {
+    const w = join(root, 'w')
+    for (const d of [join('proj?', 'sub'), 'projX', join('projY', 'deep')]) mkdirSync(join(w, d), { recursive: true })
+    const r = await cli(['remote', '--url', baseUrl, '--token', TOKEN, '--scope', SCOPE, '--json'], { cwd: join(w, 'proj?') })
+    expect(r.status, r.stderr).toBe(0)
+    const { resolveFolderPolicy } = await import('../../core/src/folders.js')
+    const policy = (dir: string) => resolveFolderPolicy(dir, { root: plurDir, home })
+    expect(policy(join(w, 'proj?'))).toMatchObject({ mode: 'on', scope: SCOPE })
+    expect(policy(join(w, 'proj?', 'sub'))).toMatchObject({ mode: 'on', scope: SCOPE })
+    expect(policy(join(w, 'projX')).mode).not.toBe('on')
+    expect(policy(join(w, 'projY', 'deep')).mode).not.toBe('on')
+    expect(policy(join(w, 'projX')).scope).toBeUndefined()
+    // Re-running finds the same literal entry instead of adding a second one.
+    const again = await cli(['remote', '--url', baseUrl, '--token', TOKEN, '--scope', SCOPE, '--json'], { cwd: join(w, 'proj?') })
+    expect(again.status, again.stderr).toBe(0)
+    expect(folders()).toHaveLength(1)
+  }, TEST_TIMEOUT_MS)
+
+  // #1415 review: `plur remote` in $HOME, a filesystem root or an ancestor of
+  // $HOME would connect every folder under it. Refused before anything is
+  // written or any server is dialled.
+  describe('refuses a folder that would connect everything under it', () => {
+    const cases: Array<[string, () => string]> = [
+      ['$HOME', () => home],
+      ['an ancestor of $HOME', () => root],
+      ['the filesystem root', () => '/'],
+    ]
+    it.skipIf(process.platform === 'win32').each(cases)('refuses %s', async (_label, dir) => {
+      const before = configText()
+      const r = await cli(['remote', '--url', baseUrl, '--token', TOKEN, '--scope', SCOPE], { cwd: dir() })
+      expect(r.status).not.toBe(0)
+      expect(r.stdout + r.stderr).toMatch(/subfolder/i)
+      expect(configText()).toBe(before)
+      expect(foldersText()).toBeNull()
+    }, TEST_TIMEOUT_MS)
+
+    it('still connects a subfolder of $HOME', async () => {
+      const proj = join(home, 'proj')
+      mkdirSync(proj, { recursive: true })
+      const r = await cli(['remote', '--url', baseUrl, '--token', TOKEN, '--scope', SCOPE, '--json'], { cwd: proj })
+      expect(r.status, r.stderr).toBe(0)
+      expect(folders()).toEqual([{ path: realpathSync(proj), scope: SCOPE }])
+    }, TEST_TIMEOUT_MS)
+  })
+
   it('--scopes registers each scope and maps the folder to the first', async () => {
     const r = await cli(['remote', '--url', baseUrl, '--token', TOKEN, '--scopes', `${SCOPE},${SCOPE2}`, '--json'])
     expect(r.status, r.stderr).toBe(0)
