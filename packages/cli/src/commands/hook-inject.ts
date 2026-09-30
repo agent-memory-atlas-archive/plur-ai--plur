@@ -133,12 +133,8 @@ const NO_CONTEXT_EVENTS = new Set(['PostCompact'])
  * for callers that send no session id at all.
  */
 function sessionKey(input: Record<string, unknown>): string {
-  const id = input.session_id
-  const raw =
-    (typeof id === 'string' && id) ||
-    process.env.CLAUDE_SESSION_ID ||
-    String(process.ppid || 'unknown')
-  return safeSessionKey(raw)
+  // Owner decision H1 ("payload", 2026-09-29): the one shared helper.
+  return hookSessionKey(input.session_id)
 }
 
 // Set when the watchdog fires (#1343). The watchdog then waits, bounded, for
@@ -189,6 +185,7 @@ const REMINDER_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 // ignored .plur.yaml because the reader lived in this CLI-only file).
 import { readProjectConfig, claimHookDegradationLines, type Plur } from '@plur-ai/core'
 import { resolveProjectRemote, projectRemoteRefusalNotice, type ProjectRemote } from '../lib/project-remote.js'
+import { hookSessionKey } from '../lib/session-key.js' // decision H1
 
 /**
  * #776: the former `tryRemoteInject` remote-first POST /api/v1/inject path
@@ -236,6 +233,53 @@ function sessionStatePath(key: string, ext: string): string | null {
 
 function sessionMarkerPath(key: string): string | null {
   return sessionStatePath(key, 'marker')
+}
+
+/**
+ * The keys an older hook-inject wrote this session's MARKER under — not the
+ * checkpoint/counter forms, which `legacyHookSessionKeys` also returns for
+ * their own readers (#1396 review).
+ *
+ * With a payload session_id, only forms derived from that id: #1228's `sid-`
+ * key and the uncapped `safeSessionKey(payload)` main wrote before the 64-char
+ * cap. Never the env/ppid forms: under payload-first keying a ppid marker can
+ * never belong to this session (the ppid changes on every prompt), and stale
+ * `<pid>.marker` files from releases before #1278 would otherwise make a new
+ * session look already started and skip its injection.
+ *
+ * Without a payload session_id, main's own marker key: the uncapped
+ * `safeSessionKey(env || ppid)`. Main never read the stripped checkpoint form
+ * for markers, so neither does this.
+ */
+function legacyMarkerKeys(key: string, input: Record<string, unknown>): string[] {
+  const id = input.session_id
+  const payload = typeof id === 'string' && id ? id : ''
+  const forms = payload
+    ? [`sid-${safeSessionKey(payload)}`, safeSessionKey(payload)]
+    : [safeSessionKey(process.env.CLAUDE_SESSION_ID || String(process.ppid || 'unknown'))]
+  return [...new Set(forms.filter(k => k !== key))]
+}
+
+/**
+ * The marker to READ for this session: the current key's, or — when it does
+ * not exist — one an older writer left under a legacy key (H1 upgrade path:
+ * #1228's `sid-` prefix or the uncapped form; see legacyMarkerKeys), so a session that
+ * started before the upgrade is not injected twice. Writers use `key` only.
+ *
+ * #1395: null when the state dir is refused — read nothing, persist nothing.
+ * The dir is resolved once and every legacy candidate is joined onto that
+ * same verified dir, never onto an unverified one.
+ */
+function readableMarkerPath(key: string, input: Record<string, unknown>): string | null {
+  const dir = sessionDir()
+  if (!dir) return null
+  const current = join(dir, `${key}.marker`)
+  if (existsSync(current)) return current
+  for (const legacy of legacyMarkerKeys(key, input)) {
+    const p = join(dir, `${legacy}.marker`)
+    if (existsSync(p)) return p
+  }
+  return current
 }
 
 function lastReminderPath(key: string): string | null {
@@ -503,7 +547,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // `session_id`. Reading stdin is a single synchronous read.
   const input = readStdinSync()
   const key = sessionKey(input)
-  const marker = sessionMarkerPath(key)
+  const marker = readableMarkerPath(key, input)
 
   // Contextual injection for specific events (plan_mode, skill, agent, subagent)
   if (event) {
