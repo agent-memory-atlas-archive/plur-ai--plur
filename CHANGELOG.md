@@ -2,6 +2,124 @@
 
 ## Unreleased
 
+### The primary store is no longer registered a second time as a project store
+
+**On some installs every engram was injected twice, under two ids** (#1319).
+Store auto-discovery walks up from the working directory looking for
+`.plur/engrams.yaml`, and skipped the primary store by comparing path strings.
+When the primary path and the walk spelled the same directory differently —
+a symlinked home, or `/var` versus `/private/var` — the check missed, and the
+primary `engrams.yaml` was written into `config.yaml` as `project:<home>`. It
+was then loaded once as the primary and once as a secondary with namespaced
+ids, costing injection budget and splitting feedback between the two copies.
+
+Now:
+
+- Discovery and `addStore` compare canonical paths. `addStore` refuses the
+  primary file under any spelling. If `config.yaml` already lists the primary
+  file as a store, the error says that entry is ignored and can be removed.
+  A second spelling of an already-registered local store returns
+  `already_registered` with the scope of an entry that is actually loaded,
+  preferring the scope you asked for.
+- A `config.yaml` that already holds such an entry needs no edit. At load, a
+  local store entry is ignored, with one warning, when its file is the
+  primary file, or when both its file and its scope repeat an earlier entry.
+  The entry stays in `config.yaml`, and writebacks start from the file on
+  disk, so nothing is removed.
+- `plur doctor` lists the store entries that are ignored at load (also in
+  `--json`, as `ignoredDuplicateStores`), and the new `plur stores prune`
+  removes the ones that name the primary store file, which stops the
+  warning (#1356). It removes only those entries, leaves every other byte of
+  `config.yaml` as it was (comments included), and writes atomically. If the
+  `stores:` list is not in plain block style it changes nothing and says so.
+  An entry that repeats another store's file and scope is still left for you
+  to remove by hand.
+- One file registered under two different scopes keeps loading under both,
+  as before, because each scope admits different engrams. A warning says the
+  two entries share a file, and that engrams scoped `global` in it appear
+  under both scopes.
+- Path comparison also holds for files that do not exist yet, such as a fresh
+  install's `engrams.yaml`. `canonicalize` used to fall back to the path as
+  written when it could not be resolved. It now resolves the deepest existing
+  folder above it and re-appends the rest, so `/var/…/missing` and
+  `/private/var/…/missing` compare equal. How directory trust matches
+  symlinked and not-yet-existing folders is settled separately, in #1348.
+- Path comparison also folds letter case on a case-insensitive filesystem
+  (macOS, Windows) (#1357). `canonicalize` returns the on-disk case, so
+  `~/Store/engrams.yaml` and `~/store/engrams.yaml` are one store. The CLI's
+  copy of `canonicalize` now matches core's. In the folder map, a checked
+  folder is compared in its on-disk case; an `off` entry still matches every
+  spelling it matched before, and a `trusted` entry recorded in the on-disk
+  case (as `plur trust` records it) now also covers other case spellings.
+  `plur folders set`, `plur folders rm` and `plur untrust` find every entry
+  recorded for a folder, including one that spells it differently: as
+  typed, through a symlink, as `~/dup` beside its absolute path (both kept
+  by the `trust.yaml` import), or in another letter case when the
+  filesystem shows that spelling is the same folder (a sibling `pROJ` or
+  `Ⓟ` on a case-sensitive disk is never taken for `Proj` or `ⓟ`). `rm`
+  removes all of them, and `untrust` clears all their grants. `set` merges
+  them into one entry and keeps what was in effect: a trust grant and a
+  scope come only from entries that applied to the folder, and the scope
+  kept is the one the resolver was using. An entry that matched only by
+  its spelling never applied its grant or scope (only an `off` applies
+  that loosely), so it can only make the mode more restrictive: its `off`
+  or `ask` counts, its `on` does not. The most restrictive mode is kept
+  unless you set one. `--scope` without a mode
+  means `on`, also when it replaces a merged `off`.
+
+### The secret guard now recognises GitHub, GitLab, Slack, npm, Stripe and AWS temporary keys
+
+**A memory holding a GitHub token was stored, and could sync to a team
+store** (#1317). `detectSecrets` had no pattern for vendor-prefixed tokens, so a
+classic `ghp_…` token and a fine-grained `github_pat_…` token both scanned
+clean.
+
+Now flagged, each by the vendor's documented prefix, charset and length:
+
+- GitHub `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` (`github_token`) and
+  `github_pat_` (`github_pat`).
+- GitLab `glpat-`, `gloas-`, `gldt-`, `glrt-`, `glrtr-`, `glcbt-`, `glptt-`,
+  `glft-`, `glimt-`, `glagent-`, `glwt-`, `glsoat-`, `glffct-`
+  (`gitlab_token`). GitLab bodies may legitimately contain `-` and `_`, so
+  the body must also look random (mixed case or digits); a hyphenated slug
+  after the prefix, as in a GitLab docs URL, stays clean.
+- Slack `xoxb-`, `xoxp-`, `xoxs-` (with their 8+ digit workspace id),
+  `xoxa-`, `xoxr-`, app-level `xapp-` and the token-rotation formats `xoxe-`,
+  `xoxe.xoxp-`, `xoxe.xoxb-` (`slack_token`); a prefix followed by a short
+  number and hyphenated words stays clean.
+- npm `npm_` (`npm_token`).
+- Stripe `sk_live_` and `rk_live_` (`stripe_live_key`).
+- AWS temporary access key ids, `ASIA…`, under the existing `aws_access_key`.
+  Because `ASIA` begins ordinary uppercase words, this branch needs exactly
+  20 characters with nothing alphanumeric on either side and at least one
+  digit, so region-like prose ("ASIAPACIFIC…") stays clean. The `AKIA` branch
+  is unchanged.
+
+Credentials are also matched against a percent-decoded copy of the text, so a
+token inside an encoded URL or query string (`access_token%3D` then the token,
+or an encoded `_` in the prefix) is found, and against a copy with JSON
+backslash escapes unfolded, so a token after a literal `\n`, `\t` or `\r` in
+JSON-escaped text or a pasted log is found (#1372). A token glued after a
+digit is found too.
+
+A credential finding no longer echoes the first 20 characters of the match,
+which for a GitHub or npm token was the prefix plus 16 of its 36 secret
+characters. It now shows the prefix (or the keyword of an assignment) and the
+last four characters, such as `ghp_...WXYZ`; a value shorter than 16
+characters after the prefix, such as a password, is not shown at all (#1373).
+This is the text pack-scan issue details carry.
+
+The `jwt` pattern no longer takes quadratic time on repeated `eyJ` input
+(#1397). As a regex it took about six minutes on 1 MiB, the size packs and
+engrams are scanned up to, so a crafted pack or engram could stall pack
+install, preview or `learn`; every added scan view made it worse. It is now
+matched in linear time, with the same results and no cap on segment length.
+
+The same patterns apply to the pack scanner, so a pack carrying one of these
+refuses to install (`docs/pack-scan-surface.md`). Text that only names a prefix,
+such as "use a `ghp_` token", stays clean. No existing pattern changed except
+`aws_access_key`, which now also accepts `ASIA`.
+
 ### A folder map records your per-folder decisions, and `trust.yaml` folds into it
 
 **First half of #1347: core and CLI only. No hook reads the map yet.** A new
@@ -13,14 +131,26 @@ repo's request. Only the CLI writes the map.
 - **`resolveFolderPolicy(dir)`** (core, and `Plur.resolveFolderPolicy`) returns
   `{ mode, scope?, remoteAllowed, source }`, resolved in this order:
   1. Any matching `off` entry wins.
-  2. A `.plur.yaml` means on. A map `scope` beats its scope hint, and its remote
-     is allowed only under a `trusted` entry.
+  2. A **trusted** `.plur.yaml`, or one that requests nothing, means on, exactly
+     as before. A map `scope` beats its scope hint, and its remote is allowed
+     only under a `trusted` entry. An **untrusted** `.plur.yaml` that requests a
+     scope, domain or remote has those requests ignored. A map decision for the
+     folder applies if there is one; otherwise the answer is `ask`, with
+     `reason: 'untrusted-plur-yaml'` and what the repo `requested`.
   3. A project MCP config means on.
   4. Otherwise the most specific matching entry decides.
   5. Otherwise the answer is `ask`, and that includes `$HOME`.
 
   Paths may be globs (`*`, `**`, `?`) and may start with `~`. A plain folder
   also covers everything below it.
+
+  **This changes behaviour for anyone whose `.plur.yaml` is not trusted**
+  (owner decision D1, "ignore-ask"). A cloned repo can no longer choose where
+  your saves go. Once the hooks use this resolver (the next PR), such a repo
+  stops applying its scope hint and asks you once instead. Answering yes records
+  `trusted: true` (plus a scope if you choose one), and the repo then works as
+  it does today. Until that PR lands, the hooks behave exactly as before. To
+  keep a repo working without being asked, run `plur trust <repo>` now.
 - **`plur folders list | set <folder> | rm <folder>`.** `set` takes one of
   `--scope <s>`, `--on`, `--off` or `--ask`, plus optional `--trusted` or
   `--no-trusted`.
@@ -38,10 +168,33 @@ repo's request. Only the CLI writes the map.
   - Neither command writes to a folders.yaml it cannot read; it is never
     overwritten.
 - **Upgrade needs no steps.** The first read of a missing `folders.yaml` imports
-  the `trust.yaml` entries as `trusted: true` entries. Nothing is ever added to
-  `trust.yaml`. `plur untrust` removes the grant from both files, so neither a
-  downgrade (an older version reading `trust.yaml`) nor a fresh import brings a
-  revoked grant back.
+  the `trust.yaml` entries as `trusted: true` entries.
+- **Trust is written to both files, for now.** The published opencode plugin
+  still reads only `trust.yaml`. So until every adapter is on this core, each
+  grant and each revocation updates both `folders.yaml` and `trust.yaml`. This
+  covers `plur trust`, `plur untrust`, `plur folders set --trusted` and
+  `--no-trusted`.
+  - A revocation lands in both files, so neither an older reader, a downgrade
+    nor a fresh import brings it back. This applies to `plur untrust`, to
+    `--no-trusted`, and to `plur folders rm` of a trusted entry (owner decision
+    F2). A `trust.yaml` line counts as the same folder under the map's own
+    matching, so a `~/…` spelling, or a differently-cased spelling on a
+    case-insensitive disk, is removed too. When a revocation matches several
+    entries for the folder, the line of every entry that held a grant is
+    removed. On a case-sensitive disk, the line of a sibling folder whose name
+    differs only in letter case is kept. A revocation never adds anything to
+    `trust.yaml`.
+  - The one-time code is used up as soon as `folders.yaml` is saved, before
+    `trust.yaml` is written (owner decision F3). If the `trust.yaml` write
+    fails, the command reports the error, and the code cannot be used again;
+    the next attempt needs a fresh ask.
+  - Glob grants are recorded only in the map, because the old reader cannot
+    express them.
+  - A grant that an older core adds to `trust.yaml` after the import is not
+    seen by this core until you run `plur trust` again.
+- **Writes are serialised.** Every change to `folders.yaml`, `trust.yaml` and
+  the nonce files is made under one lock. Before this, 12 parallel
+  `plur folders set` runs all reported success but only 5 entries were saved.
 - **`plur trust`, `plur untrust` and `plur init-remote`** now set and clear
   `trusted` in the map. Their output and exit codes are unchanged, with one
   exception: `plur trust` and `plur untrust` exit 1 on a folders.yaml they
@@ -138,6 +291,178 @@ shares an entry with a PLUR hook, are left in place. Installs that use the
 local shim, including the backslash and quoted Windows paths, now count as
 installed too, so re-running no longer adds a second set (#1303, on Windows
 as well).
+
+### A killed writer no longer stalls the store for a minute
+
+**A process killed while taking the store lock left an empty
+`engrams.yaml.lock` that blocked every other writer for the full 60s stale
+threshold** (#1354). The lock was created first and its owner token written
+second; a process killed in between (SIGKILL, a hook killed at its harness
+budget) left a file with no pid in it, so the liveness check that recovers
+from a dead holder at once had nothing to check. Hooks, the MCP server and the
+CLI all waited it out.
+
+Now:
+
+- Core publishes the lock complete. The token is written to a private file and
+  hard-linked into place, which fails on an existing lock exactly as the
+  exclusive create did. A kill at any point leaves either no lock or a lock
+  naming a dead pid, which is taken over at once. Measured: an observer
+  process polling the lock during 3,000 acquisitions saw an empty lock 4,115
+  times before this change and never after it.
+- An empty lock older than 10s is treated as abandoned and taken over. Empty
+  locks can still come from older clients sharing the store and from
+  filesystems without hard links. The 10s comes from measurement: over 20,000
+  create-then-write cycles the gap was at most 0.73s, p99 10–117ms depending
+  on event-loop load.
+- Takeovers are serialized by a short-lived guard file
+  (`engrams.yaml.lock.takeover`), and each one re-inspects the lock after
+  taking the guard. This closes an older race that applies to every takeover,
+  including the immediate one for a dead holder. Two waiters that judged the
+  same abandoned lock could both act on it. The second one moved the first
+  one's fresh, live lock aside, and while it was putting that lock back, a
+  third process could acquire it. A test that pauses a takeover at that point
+  shows two holders without the guard and none with it. The claim also checks
+  that the file it moved is the one it inspected, not just that the contents
+  match, and it puts a live owner's lock back by hard link, so the lock is
+  never briefly empty.
+- A lock carrying a token is unchanged. A live owner is never stolen from,
+  however old the lock. A token that cannot be checked, such as one from
+  another host, still gets the full 60s.
+
+This applies to the YAML store, and to PGLite, which keeps YAML as its source
+of truth and takes the same lock. A Postgres primary store serializes writers
+with a Postgres advisory lock and does not use this lock file.
+
+### A team save is no longer swallowed by a personal note with the same text (#1268)
+
+**A shared-scope write whose text matched a personal engram was never
+written.** Cross-scope recurrence (#176) matched any active engram with the same
+content hash in a different scope, and on a match it updates that engram
+*instead* of writing a new one. So a `group:` or `project:` learn identical to
+something in `global`, `local`, `user:` or `agent:` bumped the personal note's
+recurrence count and nothing reached the team scope. Found while triaging an
+enterprise deployment's report of team saves that never reached the team store.
+
+**A shared-scope save now always writes its team copy.** It is never absorbed
+into another engram — not a personal or `global` one (including one the
+recurrence ladder graduated, or one you moved to `global` yourself with
+`rescope`), and not another team's engram either: a save to `group:a/ops` whose
+text matches an engram in `group:a/eng` now reaches the ops store instead of
+vanishing into the eng engram. The matching engram is still credited: the team
+save is recorded on it as a recurrence (counted, with a source marked
+`validated_by` the team scope, and commitment escalated by the usual ladder).
+You may end up with several engrams with the same text — your own and each
+team's — and that is intended. `plur import` follows the same rule: a record for
+a shared scope whose text exists elsewhere is imported into its own scope, and
+`--dry-run` now predicts that instead of reporting it as a duplicate.
+
+**What is in a team store stays there.** When the ladder would broaden a
+team-bound engram to `global` — one served by, queued for, or in the scope of
+any team store, a url store or a `shared: true` file-path store — it now leaves
+that engram exactly as it is and creates, once, a `global` copy in your local
+store instead. The copy points back at the team engram (`derived_from`), its
+first source records `promoted_from` the team scope, its commitment escalates
+as the ladder would, and it is never queued for or pushed to a team store.
+Later recurrences credit the same copy. A team engram still queued for its
+store also records the recurrence on itself (count and source; its scope and
+queue entry are kept). The copy keeps the
+team engram's validity window, knowledge anchors and dual coding; it does not
+take its pin (a pin spends your own injection budget) or its relations (they
+name team-store ids). When a `global` engram with the same text already exists,
+the ladder credits that one rather than creating a second. Before, the team
+engram could be rewritten to `global` in the team's own file, or rewritten
+locally and then pushed to the team store as `scope: global`. Non-shared
+file-path stores still broaden in place.
+
+Personal→personal recurrence, and a personal save recurring onto a shared
+engram, behave as before.
+
+**How far the ladder may escalate is now a setting.** `recurrence.max_commitment`
+in `config.yaml` caps the commitment the cross-scope ladder can reach — team
+validation and the promoted `global` copy included:
+
+```yaml
+recurrence:
+  max_commitment: locked   # default: the ladder may lock a rule
+  # max_commitment: decided  # stop one step below; only an explicit act locks
+```
+
+A config without the key behaves as `locked`, which is what the ladder has
+always done. An unresolved tension still blocks the step into `locked` either
+way — on the engram itself, on the promoted `global` copy, and on an existing
+`global` engram the ladder credits instead. The ladder only moves the four rungs
+`exploring → leaning → decided → locked`; a `draft` engram (pending approval)
+or any other value is never advanced.
+
+### A team save that stays on this machine now says so (#1264)
+
+**A write to a shared scope with no store registered for it never left the
+machine, and nothing said so.** An enterprise deployment reported engrams that
+were created and never reached the team. A `learn` to `group:`/`project:`/`org:`…
+with no writable url store for exactly that scope falls through to the local
+store — deliberately, since nothing is auto-routed into a shared store — but
+`plur_learn` answered `decision: "ADD"` and `plur learn` printed nothing else.
+
+Every learn result now carries `delivery`: `remote` (a store accepted it),
+`outbox` (saved here and queued for a store — the push is deferred or failed and
+will be retried) or `local` (on this machine only). A shared scope that lands
+`local` also carries a warning naming the scope and how to register a store for
+it. `plur_learn` returns both (`delivery`, `delivery_warning`); `plur learn
+--json` does too, and plain `plur learn` prints the warning even with `--quiet`.
+Core exposes the same answer as `plur.deliveryOf(engram, requestedScope?)`.
+
+When a save to a shared scope comes back as an engram in a *different* scope —
+recorded as a recurrence on another team's engram, or on a `global` one — the
+result is `local` and the warning names the scope you asked for and says nothing
+was written there. Before, the warning named the other team's scope (the one
+you did not write to), or there was no warning at all.
+
+A save that matched an existing row is classified by the store that actually
+holds that row. With a url store and a local path store registered for the same
+scope, a match on the path store's row is reported `local`, not `remote` —
+nothing was sent anywhere.
+
+Nothing about where engrams are written changes. The field is additive.
+
+### `plur stores add` can register a remote store, and checks the token first (#1265)
+
+**An installer script can now connect a machine to a team store without MCP**
+(#1265). An enterprise deployment reported that its installer had no way to do
+this: `plur stores add` took only `<path> <scope>`, the one command that could
+add a url store was the MCP tool `plur_stores_add`, and the advice printed by
+`plur stores discover` and `plur login` pointed at a command that could not do
+it.
+
+```
+plur stores add --url https://plur.example.test --scope group:example/eng --token-env PLUR_TOKEN
+```
+
+The token can also come from `--token <t>` or from stdin with `--token -`, so it
+need not sit in shell history.
+
+**Nothing is written until the server agrees.** The command asks the server's
+`/me` first. A rejected token, an unreachable server, or a scope the token is
+not authorised for exits 1 and leaves `config.yaml` as it was; the scope refusal
+lists the scopes the token can reach. Running the same command twice exits 0
+and says "already registered" without touching the file. The same url and scope
+with a *different* token replaces the stored token, but only after the new one
+verifies — a token the server rejects never overwrites a working one.
+
+**A scope that already belongs to another store is never taken silently.** The
+command refuses, changes nothing, and says to re-run with `--overwrite-scope`.
+With that flag the scope is reassigned to the url store, and only after the
+token has passed `/me`.
+
+The token is never printed: not in text output, not in `--json`, and not in an
+error, including an error that echoes the server's reply. That covers the token
+raw, percent-encoded, JSON-escaped and base64-encoded, and a scope or username
+in the server's `/me` answer that carries the token (such scopes are left out
+of the listed authorised scopes, and the message says how many were withheld).
+A fragment of the token, or its base64 buried inside a larger blob, has no
+fixed form and is not caught. `plur stores add
+<path> <scope>` is unchanged. The core method is `Plur.addRemoteStore()`, which
+throws `AddRemoteStoreError` with a stable `code`.
 
 ### The end-of-response learning nudge now reaches the model in Claude Code
 
@@ -2112,7 +2437,7 @@ PLUR's engram leak guard, scope isolation, pack/sync distribution, and remote-st
 
 `detectSensitive()` truncated its input to the first 64 KB before scanning, then silently passed the rest. The infra-topology detectors (`public_ipv4`, `public_ipv6`, `basic_auth_url`, `fqdn_port`, `ipv4_port`, `internal_host`) exist only in `detectSensitive`, so an engram whose first 64 KB was benign filler but which carried a public IP / basic-auth URL / internal host **after** byte 64 KB passed the write guard un-demoted and was written to a shared/remote store (and slipped past `filterPublishable`).
 
-- The scan window is raised from 64 KB to **1 MiB** — far above any realistic engram. The detector regexes are bounded/linear; a benign full-window pass is ~7ms/64KB but adversarial regex-dense input measured ~300–420 ms for a full 1 MiB pass (#386 review). Total scan work is capped at 1 MiB regardless of input size (bounded, linear — a per-write CPU cost on >64KB engrams, not a DoS).
+- The scan window is raised from 64 KB to **1 MiB** — far above any realistic engram. The detector regexes were described here as bounded/linear; that was wrong for `jwt`, which was quadratic on repeated `eyJ` (1 MiB took about six minutes) until #1397 replaced it with a linear matcher. A benign full-window pass is ~7ms/64KB but adversarial regex-dense input measured ~300–420 ms for a full 1 MiB pass (#386 review). Total scan work is capped at 1 MiB regardless of input size (bounded, linear — a per-write CPU cost on >64KB engrams, not a DoS).
 - Input larger than the ceiling is now **fail-closed**: `detectSensitive` appends a synthetic `scan_truncated` hit so `_guardSensitiveScope` demotes the write and `filterPublishable` excludes the engram — the unscanned tail can no longer be assumed clean. The `scan_truncated` signal is always offending regardless of a scope's `sensitivity` policy.
 - **Packs export inherits this** (via #389): `scanPrivacy` now routes through `detectSensitive` + `truncateToScanLimit`, so the raised window, the infra-family detectors, and the `scan_truncated` fail-closed all apply to `exportPack`/`installPack` too — the "...and packs" half of #386, delivered by the #389 packs-scan change rather than here.
 
