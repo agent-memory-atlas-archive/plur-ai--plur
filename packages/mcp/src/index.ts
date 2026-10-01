@@ -368,7 +368,7 @@ function stripPlurHooks(entries: HookEntry[]): HookEntry[] {
  *   carry context (#1274), one hook at a time, dropping an entry only when
  *   it has no hooks left. If a PLUR rehydrate was among them, add the
  *   SessionStart(compact) entry unless one is there ('healed'). A file with
- *   PLUR hooks but no rehydrate (the global file `plur init` writes) gets
+ *   PLUR hooks but no rehydrate (the global file `plur init --project` writes) gets
  *   none added. Nothing else changes, so a fuller
  *   `plur init` install is not replaced by this smaller set.
  * - Otherwise 'already', and the settings come back unchanged.
@@ -399,9 +399,9 @@ export function applyPlurHooks(
     changed = true
   }
   // Add SessionStart(compact) only in place of a PostCompact rehydrate just
-  // removed from THIS file. `plur init` keeps the global file to enforcement
-  // hooks and puts rehydrate in the project file; adding one to the global
-  // file would run rehydrate twice per compaction there.
+  // removed from THIS file. `plur init --project` keeps the global file to
+  // enforcement hooks and puts rehydrate in the project file; adding one to
+  // the global file would run rehydrate twice per compaction there.
   if (movedRehydrate && !(hooks.SessionStart ?? []).some(isPlurRehydrate)) {
     hooks.SessionStart = [...(hooks.SessionStart ?? []), ...(hooksMap.SessionStart ?? []).filter(e => !isResumeEntry(e))]
     changed = true
@@ -422,12 +422,16 @@ export function applyPlurHooks(
     : { settings, status: 'already' }
 }
 
+/**
+ * Hooks go to user settings (~/.claude/settings.json), from any folder, as
+ * `plur init` does since #1467: the folder map gates every hook, so a
+ * user-level hook is safe everywhere. Writing to <cwd>/.claude/settings.json
+ * whenever that folder existed put a second PLUR set back into a repo that
+ * `plur init` had just migrated (#1469 review). plur-mcp init has no
+ * `--project`; use `plur init --project` for a per-repo placement.
+ */
 function installHooks(): string {
-  const projectSettings = join(process.cwd(), '.claude', 'settings.json')
-  const globalSettings = join(homedir(), '.claude', 'settings.json')
-  const settingsPath = existsSync(join(process.cwd(), '.claude'))
-    ? projectSettings
-    : globalSettings
+  const settingsPath = join(homedir(), '.claude', 'settings.json')
 
   const settingsRead = readJsonObjectForWrite(settingsPath)
   if (!settingsRead.ok) {
