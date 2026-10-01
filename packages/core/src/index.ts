@@ -2372,10 +2372,25 @@ export class Plur {
    * Never throws — provenance is a description, and failing to write one must
    * not fail the learn that prompted it.
    */
+  /**
+   * Run fire-and-forget work only once the store has committed (#1178, F16).
+   *
+   * A transactional store runs a protected write inside one connection and one
+   * ownership context. Background work started inside that context would
+   * inherit it, then fail once the transaction ends, or run against state that
+   * a later rollback discards. Stores without transactions run it immediately.
+   */
+  private _afterStoreCommit(callback: () => void): void {
+    if (this._primaryStore.afterCommit) this._primaryStore.afterCommit(callback)
+    else callback()
+  }
+
   private _maybeWriteProvenance(engramId: string): void {
     if (provenanceMode(this.config) !== 'always') return
-    void this.writeProvenance(engramId).catch(err => {
-      logger.warning(`[plur:provenance] could not write a record for ${engramId}: ${(err as Error).message}`)
+    this._afterStoreCommit(() => {
+      void this.writeProvenance(engramId).catch(err => {
+        logger.warning(`[plur:provenance] could not write a record for ${engramId}: ${(err as Error).message}`)
+      })
     })
   }
 
@@ -3995,112 +4010,118 @@ export class Plur {
         // with nothing attached — an unhandled rejection, which terminates the
         // process on modern Node. A background task must not be able to take
         // the host down.
-        this._outboxInFlight.add(engram.id)
-        void (async () => {
-          // One pusher per entry (2026-09-29 panel, M6): a flush that started
-          // between the local write and this push must not POST it too.
-          if (this._claimOutboxEntry(engram.id, () => pushKey).status === 'busy') return
-          let pushed = false
-          // Decision D1: keep the id the server assigned — if a forget/rescope
-          // cancels the delivery while this POST is on the wire, the accepted
-          // remote copy is queued for retirement by that id.
-          let serverId: string | undefined
-          try {
-            ;({ id: serverId } = await remoteDriver.appendAndGetServerId(engram, { idempotencyKey: pushKey }))
-            pushed = true
-          } catch (err) {
-            // The POST did not land. The in-flight claim is still held, and is
-            // released only by the `finally` below, AFTER this bookkeeping
-            // write (review of #1231): released before it, another writer could
-            // take the row in the gap and put its own POST on the wire.
-            // Already saved locally with outbox metadata — will be retried.
-            logger.warning(`[plur:outbox] immediate push failed for ${engram.id}, queued for retry: ${(err as Error).message}`)
-            await this._withStoreLock(this.paths.engrams, async () => {
-              // Targeted read (#827): only this engram's outbox bookkeeping.
-              const fresh = await this._loadTargeted([engram.id])
-              const target = fresh.find(e => e.id === engram.id) as any
-              if (target?.structured_data?._outbox) {
-                target.structured_data._outbox.last_error = (err as Error).message
-                target.structured_data._outbox.attempt_count = 1
-                // #1299: the status, when the remote gave one — it is what
-                // tells a refusal from a blip.
-                if (err instanceof RemoteHttpError) target.structured_data._outbox.last_status = err.status
-              }
-              if (target?.structured_data?._outbox) {
-                // Incremental write (#740): only the outbox bookkeeping changed.
-                await this._updateEngrams(fresh, [target as Engram])
-              }
-            })
-            this._releaseOutboxClaim(engram.id)
-            return
-          }
+        // Started only once the local write has committed (#1178, F16). A
+        // transactional primary store would otherwise hand this task the
+        // write's own connection, which is gone by the time it runs. A
+        // rolled-back write never launches it, so nothing is marked in flight.
+        this._afterStoreCommit(() => {
+          this._outboxInFlight.add(engram.id)
+          void (async () => {
+            // One pusher per entry (2026-09-29 panel, M6): a flush that started
+            // between the local write and this push must not POST it too.
+            if (this._claimOutboxEntry(engram.id, () => pushKey).status === 'busy') return
+            let pushed = false
+            // Decision D1: keep the id the server assigned — if a forget/rescope
+            // cancels the delivery while this POST is on the wire, the accepted
+            // remote copy is queued for retirement by that id.
+            let serverId: string | undefined
+            try {
+              ;({ id: serverId } = await remoteDriver.appendAndGetServerId(engram, { idempotencyKey: pushKey }))
+              pushed = true
+            } catch (err) {
+              // The POST did not land. The in-flight claim is still held, and is
+              // released only by the `finally` below, AFTER this bookkeeping
+              // write (review of #1231): released before it, another writer could
+              // take the row in the gap and put its own POST on the wire.
+              // Already saved locally with outbox metadata — will be retried.
+              logger.warning(`[plur:outbox] immediate push failed for ${engram.id}, queued for retry: ${(err as Error).message}`)
+              await this._withStoreLock(this.paths.engrams, async () => {
+                // Targeted read (#827): only this engram's outbox bookkeeping.
+                const fresh = await this._loadTargeted([engram.id])
+                const target = fresh.find(e => e.id === engram.id) as any
+                if (target?.structured_data?._outbox) {
+                  target.structured_data._outbox.last_error = (err as Error).message
+                  target.structured_data._outbox.attempt_count = 1
+                  // #1299: the status, when the remote gave one — it is what
+                  // tells a refusal from a blip.
+                  if (err instanceof RemoteHttpError) target.structured_data._outbox.last_status = err.status
+                }
+                if (target?.structured_data?._outbox) {
+                  // Incremental write (#740): only the outbox bookkeeping changed.
+                  await this._updateEngrams(fresh, [target as Engram])
+                }
+              })
+              this._releaseOutboxClaim(engram.id)
+              return
+            }
 
-          if (!pushed) return
-          // Remote has it. Remove the local copy — and if this fails, say so
-          // rather than re-queueing something already accepted.
-          try {
-            await this._withStoreLock(this.paths.engrams, async () => {
-              // NOT `_loadTargeted` (#827): this REMOVES a row, and the only
-              // removal primitive `PrimaryStore` has is a whole-corpus save of
-              // the array without it. A one-row targeted read here would be a
-              // full replace by an empty array — the corpus, deleted. It stays
-              // a full load until there is a `remove`/`deleteMany` seam.
-              const fresh = await this._primaryStore.load()
-              const idx = fresh.findIndex(e => e.id === engram.id)
-              // Hand off only a row that is STILL queued FOR THIS STORE. A
-              // forget() or a local rescope that landed while the POST was in
-              // flight cancelled the delivery (#766, #848); a D4 update or a
-              // rescope to another store RETARGETED it (audit of #1228,
-              // finding 1) — the row still carries `_outbox`, but for a store
-              // that has not received it. Deleting the row in either case
-              // loses a decision; keep it and say so.
-              const pushedTarget = storeEntry ? { url: storeEntry.url!, scope } : undefined
-              if (idx !== -1 && !Plur._stillQueuedFor(fresh[idx], pushedTarget)) {
-                const retargeted = Plur._stillQueued(fresh[idx])
-                // Decision D1: queue a durable "retire on remote" entry for the
-                // copy the remote just accepted; flushOutbox() retries it (and,
-                // for a retargeted row, before it delivers to the new store).
-                const queuedRetire = serverId
-                  ? Plur._queueRetireRemote(fresh[idx], {
-                      target_url: pushedTarget?.url ?? '',
-                      target_scope: scope,
-                      server_id: serverId,
-                    }, new Date().toISOString())
-                  : false
-                if (queuedRetire) await this._updateEngrams(fresh, [fresh[idx]])
-                logger.warning(
-                  `[plur:outbox] ${engram.id} reached the remote${serverId ? ` as ${serverId}` : ''} after its delivery `
-                  + (retargeted
-                    ? `was retargeted to another store during the push. The local record stays queued for the new store`
-                    : `was cancelled locally (forget/rescope during the push). The local record is kept`)
-                  + (queuedRetire
-                    ? `; the old copy is queued for retirement and the next flush retires it.`
-                    : `; the remote copy must be retired there.`),
-                )
-                return
-              }
-              if (idx !== -1) {
-                fresh.splice(idx, 1)
-                // Deliberate removal: the remote accepted this engram, so the
-                // local copy is redundant by design (audit #794 shrink guard).
-                await this._writeEngrams(this.paths.engrams, fresh, { allowShrink: true })
-                await this._syncIndex()
-              }
-            })
-          } catch (err) {
-            // Retried by the next flush with the same key (decision C4): a
-            // key-honouring server collapses it; one that ignores keys may
-            // hold one duplicate.
-            logger.warning(
-              `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
-              + `${(err as Error).message}. The next flush will retry it with the same idempotency key.`,
-            )
-          } finally {
-            this._releaseOutboxClaim(engram.id)
-          }
-        })().catch(err => {
-          logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
-        }).finally(() => { this._outboxInFlight.delete(engram.id) })
+            if (!pushed) return
+            // Remote has it. Remove the local copy — and if this fails, say so
+            // rather than re-queueing something already accepted.
+            try {
+              await this._withStoreLock(this.paths.engrams, async () => {
+                // NOT `_loadTargeted` (#827): this REMOVES a row, and the only
+                // removal primitive `PrimaryStore` has is a whole-corpus save of
+                // the array without it. A one-row targeted read here would be a
+                // full replace by an empty array — the corpus, deleted. It stays
+                // a full load until there is a `remove`/`deleteMany` seam.
+                const fresh = await this._primaryStore.load()
+                const idx = fresh.findIndex(e => e.id === engram.id)
+                // Hand off only a row that is STILL queued FOR THIS STORE. A
+                // forget() or a local rescope that landed while the POST was in
+                // flight cancelled the delivery (#766, #848); a D4 update or a
+                // rescope to another store RETARGETED it (audit of #1228,
+                // finding 1) — the row still carries `_outbox`, but for a store
+                // that has not received it. Deleting the row in either case
+                // loses a decision; keep it and say so.
+                const pushedTarget = storeEntry ? { url: storeEntry.url!, scope } : undefined
+                if (idx !== -1 && !Plur._stillQueuedFor(fresh[idx], pushedTarget)) {
+                  const retargeted = Plur._stillQueued(fresh[idx])
+                  // Decision D1: queue a durable "retire on remote" entry for the
+                  // copy the remote just accepted; flushOutbox() retries it (and,
+                  // for a retargeted row, before it delivers to the new store).
+                  const queuedRetire = serverId
+                    ? Plur._queueRetireRemote(fresh[idx], {
+                        target_url: pushedTarget?.url ?? '',
+                        target_scope: scope,
+                        server_id: serverId,
+                      }, new Date().toISOString())
+                    : false
+                  if (queuedRetire) await this._updateEngrams(fresh, [fresh[idx]])
+                  logger.warning(
+                    `[plur:outbox] ${engram.id} reached the remote${serverId ? ` as ${serverId}` : ''} after its delivery `
+                    + (retargeted
+                      ? `was retargeted to another store during the push. The local record stays queued for the new store`
+                      : `was cancelled locally (forget/rescope during the push). The local record is kept`)
+                    + (queuedRetire
+                      ? `; the old copy is queued for retirement and the next flush retires it.`
+                      : `; the remote copy must be retired there.`),
+                  )
+                  return
+                }
+                if (idx !== -1) {
+                  fresh.splice(idx, 1)
+                  // Deliberate removal: the remote accepted this engram, so the
+                  // local copy is redundant by design (audit #794 shrink guard).
+                  await this._writeEngrams(this.paths.engrams, fresh, { allowShrink: true })
+                  await this._syncIndex()
+                }
+              })
+            } catch (err) {
+              // Retried by the next flush with the same key (decision C4): a
+              // key-honouring server collapses it; one that ignores keys may
+              // hold one duplicate.
+              logger.warning(
+                `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
+                + `${(err as Error).message}. The next flush will retry it with the same idempotency key.`,
+              )
+            } finally {
+              this._releaseOutboxClaim(engram.id)
+            }
+          })().catch(err => {
+            logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
+          }).finally(() => { this._outboxInFlight.delete(engram.id) })
+        })
 
         this._appendHistory({
           event: 'engram_created',
@@ -5375,7 +5396,7 @@ export class Plur {
       if (typeof adapter.listEngramsMissingEmbeddings === 'function') {
         const gap = await adapter.listEngramsMissingEmbeddings(1)
         if (gap.length > 0) {
-          this._kickPrimaryAutoEmbed(adapter)
+          this._afterStoreCommit(() => this._kickPrimaryAutoEmbed(adapter))
           return fallback()
         }
       }
@@ -9146,7 +9167,7 @@ export class Plur {
     const primary = this._primaryQueryAdapter()
     if (primary && typeof primary.listEngramsMissingEmbeddings === 'function') {
       this._lastIndexError = null // new pass — stale failures cleared on success
-      this._kickPrimaryAutoEmbed(primary)
+      this._afterStoreCommit(() => this._kickPrimaryAutoEmbed(primary))
       return
     }
     if (this.indexedStorage) {
