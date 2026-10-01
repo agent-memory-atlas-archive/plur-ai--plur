@@ -678,18 +678,20 @@ counterexamples kept.
 - **Conflict J (decision recorded 2026-09-30):** The owner decided
   (2026-09-30): the untrusted-scope notice and its tests are removed together,
   by whichever of #1228 and #1418 lands second, since the folder-map question
-  replaces the notice. Until then the gate and its tests stay.
+  replaces the notice. #1418 landed first, so #1228 carries the removal at the
+  merge of main that brought it in (2026-10-01).
 
-  So this branch keeps the 8 end-to-end hook replays in
-  packages/cli/test/formal-apply-surface-trust.test.ts ("CLI hooks ignore an
-  untrusted .plur.yaml scope": hook-inject, hook-codex-inject,
-  hook-cursor-session-start and hook-agy-pre-invocation, each untrusted and
-  trusted). An earlier commit on this branch (0d607fde) dropped them before
-  the decision was recorded; they are restored. The notice assertions in
-  formal-gaps-codex-session-start.test.ts and formal-audit-1228c.test.ts stay
-  for the same reason. The 3 `trustedProjectScope` helper tests stay, and
-  §9's model is unchanged: it describes the helper's decision, which still
-  holds for as long as the helper is called.
+  Applied: `trustedProjectScope` and its 3 helper tests are deleted, and
+  the hooks take main's folder-gate code. The 8 end-to-end replays in
+  packages/cli/test/formal-apply-surface-trust.test.ts stay: untrusted still
+  never adopts the scope, and now also shows the folder-map question (a
+  positive assertion, so the replay cannot pass on empty output); trusted
+  still adopts it. formal-gaps-codex-session-start.test.ts and
+  formal-audit-1228c.test.ts assert the question instead of the notice: its
+  once-per-session rule (1228-c #6), and its commands naming a non-default
+  store with `--path` (1228-c #1, carried into folder-gate.ts). §9's
+  adoption model is unchanged (untrusted is never adopted); its notice is now
+  the folder-map question, which the Lean model does not describe.
 - **8b init-remote:** packages/cli/test/formal-adapters-init-remote.test.ts
   (4) is deleted. `plur remote` (#1415) replaces the `init-remote` rewrite.
   §8b's theorems still check; they describe the rewrite in the code that is

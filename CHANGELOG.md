@@ -181,10 +181,12 @@ Only the opencode plugin checked.
 
 Every adapter now follows the opencode rule. A `.plur.yaml` scope or domain is
 used only from a directory you have trusted with `plur trust <dir>` (trusting a
-repository root covers everything below it). Otherwise it is ignored, the
-default scope applies, and a warning names the file and the command to run.
-`plur_session_start` returns it as `project_config_warning` and puts it at the
-top of `guide`. Trusted directories behave as before. The DeepSeek Harness
+repository root covers everything below it). Otherwise it is ignored and the
+default scope applies. In the Claude Code, Codex, Cursor and Antigravity hooks,
+the folder-map question (#1418) asks once whether to trust it; its commands
+name the store when the hook uses one other than `~/.plur`. `plur_session_start`
+returns a warning as `project_config_warning` and puts it at the top of `guide`.
+Trusted directories behave as before. The DeepSeek Harness
 plugin also never adopts `scope: global` from a workspace file.
 
 **If your own projects use `.plur.yaml`**, run `plur trust <repo root>` once

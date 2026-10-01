@@ -64,27 +64,25 @@ describe('CLI hooks, custom store (1228-c #1, end to end)', () => {
   }
   const hook = () => {
     const r = runCli('node', [CLI, 'hook-inject'], {
-      input: JSON.stringify({ prompt: 'how do we deploy' }), encoding: 'utf-8', timeout: 60_000, env: env(true), cwd: repo,
+      input: JSON.stringify({ session_id: 's-1228c', prompt: 'how do we deploy' }), encoding: 'utf-8', timeout: 60_000, env: env(true), cwd: repo,
     })
     return (r.stdout ?? '') + (r.stderr ?? '')
   }
 
-  it('the printed command, run from a shell without PLUR_PATH, makes the hook honour the directory', { timeout: 120_000 }, () => {
+  it('the offered command, run from a shell without PLUR_PATH, makes the hook honour the directory', { timeout: 120_000 }, () => {
+    // Decision J: since #1418 the folder-map question replaces the notice.
+    // Its commands must name the hook's store, or a shell without PLUR_PATH
+    // writes a grant the hook never reads.
     const out = hook()
-    const m = /run: plur ((?:--path \S+ )?trust \S+?)(?=\\n|"|\s|$)/.exec(out)
+    const m = /Yes, and trust the \.plur\.yaml in this repo: plur ((?:--path \S+ )?folders set \S+ --trusted --nonce [0-9a-f]+)/.exec(out)
     expect(m, out).not.toBeNull()
-    expect(m![1]).toBe(`--path ${store} trust ${repo}`)
-    // Outside a terminal `plur trust` needs a nonce bound to this folder and
-    // answer (#1378, owner decision). The printed command is for a person at a
-    // terminal, so the test adds the nonce that a terminal would make unneeded.
-    const nonce = issueFolderNonce(store, 'session-1228c', repo, { trusted: true })
-    const t = runCli('node', [CLI, ...m![1].split(' '), '--nonce', nonce], { encoding: 'utf-8', timeout: 60_000, env: env(false), cwd: dir })
+    expect(m![1].startsWith(`--path ${store} folders set ${repo} --trusted --nonce `)).toBe(true)
+    const t = runCli('node', [CLI, ...m![1].split(' ')], { encoding: 'utf-8', timeout: 60_000, env: env(false), cwd: dir })
     expect(t.status, t.stderr).toBe(0)
-    expect(listTrustedDirectories(store)).toContain(repo)
-    // The next session start is a fresh hook run: a fresh TMPDIR, no marker.
+    // The next session is a fresh hook run: a fresh TMPDIR, no marker.
     tmp = join(dir, 'tmp2'); mkdirSync(tmp)
     const again = hook()
-    expect(again).not.toMatch(/Ignored the scope/)
+    expect(again).not.toContain('requests project settings')
     expect(again).toContain('Project scope: group:acme/eng')
   })
 })
@@ -134,7 +132,7 @@ describe('`--` for every command with positional arguments (1228-c #3)', () => {
   })
 })
 
-describe('hook-codex-inject: notices once per session (1228-c #6)', () => {
+describe('hook-codex-inject: asks once per session (1228-c #6)', () => {
   let dir: string
   let repo: string
   let tmp: string
@@ -157,13 +155,11 @@ describe('hook-codex-inject: notices once per session (1228-c #6)', () => {
     return (r.stdout ?? '') + (r.stderr ?? '')
   }
 
-  it('after SessionStart said it, prompts do not repeat it', { timeout: 180_000 }, () => {
-    expect(run('hook-codex-session-start', { session_id: 's1' })).toMatch(/Ignored the scope/)
-    expect(run('hook-codex-inject', { session_id: 's1', prompt: 'how do we deploy' })).not.toMatch(/Ignored the scope/)
-  })
-
-  it('with no SessionStart (a resumed session), the first prompt says it and the second does not', { timeout: 180_000 }, () => {
-    expect(run('hook-codex-inject', { session_id: 's2', prompt: 'how do we deploy' })).toMatch(/Ignored the scope/)
-    expect(run('hook-codex-inject', { session_id: 's2', prompt: 'and how do we roll back' })).not.toMatch(/Ignored the scope/)
+  // Decision J: the notice is gone; the folder-map question that replaces it
+  // keeps the once-per-session rule this block pinned.
+  it('SessionStart says nothing; the first prompt asks and the second does not', { timeout: 180_000 }, () => {
+    expect(run('hook-codex-session-start', { session_id: 's1' })).not.toContain('requests project settings')
+    expect(run('hook-codex-inject', { session_id: 's1', prompt: 'how do we deploy' })).toContain('requests project settings')
+    expect(run('hook-codex-inject', { session_id: 's1', prompt: 'and how do we roll back' })).not.toContain('requests project settings')
   })
 })

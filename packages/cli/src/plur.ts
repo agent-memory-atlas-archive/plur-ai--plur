@@ -182,52 +182,6 @@ export function trustCommand(dir: string | null, storageRoot?: string): string {
   return `plur --path ${shellWord(storageRoot)} trust ${target}`
 }
 
-/** What a hook may adopt from `.plur.yaml`, and what to tell the user when it may not. */
-export interface TrustedProjectScope {
-  scope?: string
-  domain?: string
-  /** Set when a scope/domain was IGNORED: names the file and the trust command. */
-  notice?: string
-}
-
-/**
- * Adopt a `.plur.yaml` `scope`/`domain` only from a directory the user trusted
- * (decision E3, 2026-09-26): the rule @plur-ai/opencode's `resolveTrustedScope`
- * already followed, now shared by every CLI hook adapter.
- *
- * A cloned repository's `scope: group:acme/eng` was adopted as "a local filter
- * that needs no gate" — and it is not only a filter: the hooks tell the model
- * to learn under it, so a repo could pick the (possibly remote, team) scope an
- * unscoped write lands in. Trust is checked against the directory the FILE
- * lives in (`configDir`, from `resolveProjectRemote`'s single read), and it is
- * hierarchical, so trusting the repo root once covers it. Fails closed: no
- * directory, or a throwing check, means untrusted.
- */
-export function trustedProjectScope(
-  trust: ScopeTrustCheck,
-  config: Pick<ProjectConfig, 'scope' | 'domain'>,
-  configDir: string | null,
-): TrustedProjectScope {
-  if (!config.scope && !config.domain) return {}
-  let trusted = false
-  try {
-    trusted = configDir !== null && trust.isDirectoryTrusted(configDir)
-  } catch {
-    trusted = false
-  }
-  if (trusted) return { scope: config.scope, domain: config.domain }
-  const file = configDir ? join(configDir, '.plur.yaml') : '.plur.yaml'
-  const declared = [
-    config.scope ? `scope "${config.scope}"` : null,
-    config.domain ? `domain "${config.domain}"` : null,
-  ].filter(Boolean).join(' / ')
-  return {
-    notice:
-      `[PLUR] Ignored the ${declared} in ${file} — ${configDir ?? 'its directory'} is not a trusted directory, ` +
-      `so the local default scope is used instead. If this project is yours, run: ${trustCommand(configDir, trust.storageRoot)}`,
-  }
-}
-
 /**
  * A trust check against the store `flags` select, without constructing a Plur
  * (the hook reminder path runs on every prompt and builds none). Same answer

@@ -18,42 +18,16 @@ import { trustDirectory } from '@plur-ai/core'
 import { runCli } from './helpers/spawn.js'
 import { builtCliPath } from './helpers/built-cli.js'
 
-// Imported lazily so the hook replays below still run (and fail on their own
-// assertions) against a plur.ts that does not export the helper yet.
-const helper = async () => (await import('../src/plur.js') as any).trustedProjectScope as
-  (t: { isDirectoryTrusted(d: string): boolean }, c: { scope?: string; domain?: string }, dir: string | null) =>
-    { scope?: string; domain?: string; notice?: string }
-
 const CLI = builtCliPath(join(__dirname, '..'))
 
 // `printsScope`: the hook tells the model "Project scope: …" when it adopts one
 // (codex inject prints no scope line, so only the refusal side is visible).
 const HOOKS: Array<{ name: string; hook: string; printsScope: boolean; input: (repo: string) => object }> = [
-  { name: 'hook-inject', hook: 'hook-inject', printsScope: true, input: () => ({ prompt: 'how do we deploy' }) },
+  { name: 'hook-inject', hook: 'hook-inject', printsScope: true, input: () => ({ session_id: 's1', prompt: 'how do we deploy' }) },
   { name: 'codex inject', hook: 'hook-codex-inject', printsScope: false, input: () => ({ session_id: 's1', prompt: 'how do we deploy' }) },
   { name: 'cursor session-start', hook: 'hook-cursor-session-start', printsScope: true, input: () => ({ conversation_id: 'c1' }) },
   { name: 'antigravity', hook: 'hook-agy-pre-invocation', printsScope: true, input: (repo) => ({ conversationId: 'c1', invocationNum: 0, workspacePaths: [repo] }) },
 ]
-
-describe('trustedProjectScope (E3)', () => {
-  const cfg = { scope: 'group:acme/eng', domain: 'acme.eng' }
-  it('ignores scope/domain from an untrusted directory and names the file', async () => {
-    const r = (await helper())({ isDirectoryTrusted: () => false }, cfg, '/repo')
-    expect(r.scope).toBeUndefined()
-    expect(r.domain).toBeUndefined()
-    expect(r.notice).toContain('/repo/.plur.yaml')
-    expect(r.notice).toContain('plur trust /repo')
-  })
-  it('adopts them from a trusted directory (good case)', async () => {
-    const r = (await helper())({ isDirectoryTrusted: () => true }, cfg, '/repo')
-    expect(r).toMatchObject({ scope: 'group:acme/eng', domain: 'acme.eng' })
-    expect(r.notice).toBeUndefined()
-  })
-  it('fails closed when the trust check throws', async () => {
-    const r = (await helper())({ isDirectoryTrusted: () => { throw new Error('x') } }, cfg, '/repo')
-    expect(r.scope).toBeUndefined()
-  })
-})
 
 describe('CLI hooks ignore an untrusted .plur.yaml scope (E3)', () => {
   let dir: string
@@ -84,19 +58,19 @@ describe('CLI hooks ignore an untrusted .plur.yaml scope (E3)', () => {
   }
 
   for (const h of HOOKS) {
-    it(`${h.name}: untrusted → scope not adopted, notice names the file and \`plur trust\``, { timeout: 90_000 }, () => {
+    it(`${h.name}: untrusted → scope not adopted; the folder question asks instead (decision J)`, { timeout: 90_000 }, () => {
       const out = run(h.hook, h.input(repo))
       expect(out).not.toContain('Project scope: group:acme/eng')
-      expect(out).toContain('.plur.yaml')
-      expect(out).toMatch(/Ignored the scope/)
-      expect(out).toContain('plur trust ')
+      // The folder-map question (#1418) replaces the old notice. Asserting it
+      // keeps this replay from passing on empty output.
+      expect(out).toContain('requests project settings')
     })
 
     it(`${h.name}: trusted → scope adopted as before`, { timeout: 90_000 }, () => {
       trustDirectory(repo, join(dir, '.plur'))
       const out = run(h.hook, h.input(repo))
       if (h.printsScope) expect(out).toContain('Project scope: group:acme/eng')
-      expect(out).not.toMatch(/Ignored the scope/)
+      expect(out).not.toContain('requests project settings')
     })
   }
 })
