@@ -229,7 +229,7 @@ github.com/plur-ai/plur/releases/tag/v$VERSION"
 
   REPLY="Manual update:
 
-Claude Code / Cursor / OpenCode:
+Claude Code / Cursor / OpenCode / Codex:
 npm update -g @plur-ai/mcp @plur-ai/cli
 
 OpenClaw:
