@@ -276,6 +276,9 @@ function hasAnyPlurHook(config: Record<string, unknown>): boolean {
   return false
 }
 
+/** Test seam (formal apply S4.2). */
+export const _hasAnyPlurHook = hasAnyPlurHook
+
 /** Every string under a `command` key, anywhere in a parsed hooks file. */
 function collectHookCommands(value: unknown, out: string[] = []): string[] {
   if (Array.isArray(value)) for (const v of value) collectHookCommands(v, out)
@@ -960,6 +963,25 @@ async function buildOpencodeReport(skipNetworkCheck: boolean): Promise<OpencodeR
   }
 }
 
+/**
+ * Which harnesses actually carry PLUR hooks, named by the config file's label
+ * ("Claude Code (global)" → "Claude Code"). Formal r2, cli#10: the healthy
+ * verdict said "ready to use in Claude Code" whenever ANY harness had hooks —
+ * `hooksInstalled` is a `.some()` over the Cursor, Codex and Antigravity
+ * files too — so a Codex-only machine was told Claude Code was ready.
+ */
+export function hookHarnesses(configs: Array<{ label: string; hasPlurHooks: boolean }>): string[] {
+  const names = configs.filter(c => c.hasPlurHooks).map(c => c.label.replace(/\s*\(.*$/, ''))
+  return [...new Set(names)]
+}
+
+/** The healthy verdict, naming only harnesses whose hooks are installed. */
+export function readyLine(harnesses: string[]): string {
+  if (harnesses.includes('Claude Code')) return '✓ Healthy. plur is ready to use in Claude Code.'
+  const where = harnesses.length ? harnesses.join(', ') : 'no harness'
+  return `✓ Healthy. plur is ready to use in ${where}. Claude Code has no plur hooks — run \`plur init\` to add them.`
+}
+
 function buildReport(skipHandshake: boolean, flags: GlobalFlags): Promise<DoctorReport> {
   const configs = inspectConfigs()
   const hooksInstalled = configs.some((c) => c.hasPlurHooks)
@@ -1461,7 +1483,7 @@ export function printText(report: DoctorReport, flags?: GlobalFlags): void {
 
   outputText('')
   if (report.overall === 'ok') {
-    outputText('✓ Healthy. plur is ready to use in Claude Code.')
+    outputText(readyLine(hookHarnesses(report.configs)))
   } else {
     outputText('✗ Issues detected.')
     if (!report.hooksInstalled || !report.mcpRegistered) {

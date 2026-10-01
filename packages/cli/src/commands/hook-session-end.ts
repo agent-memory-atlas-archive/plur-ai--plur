@@ -66,7 +66,9 @@ function sessionKeys(payloadSessionId?: string): string[] {
 }
 
 function plurPath(flags: GlobalFlags): string {
-  return flags.path || process.env.PLUR_PATH || join(homedir(), '.plur') // `||`: empty means unset (H3)
+  // `||`, as createPlur and the checkpoint writer resolve it (cli#6, H3): an
+  // empty PLUR_PATH means "unset" everywhere, not "the current directory".
+  return flags.path || process.env.PLUR_PATH || join(homedir(), '.plur')
 }
 
 function readStdinRaw(): string {

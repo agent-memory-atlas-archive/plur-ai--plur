@@ -114,6 +114,12 @@ export class StubServer {
    *  the client actually transmits on the wire (#768: optional fields like
    *  pinned/rationale/tags were silently never sent). */
   lastAppendBody: Record<string, unknown> | null = null
+  /** Number of DELETE /engrams/:id requests received. */
+  deleteCalls = 0
+  /** When set, awaited before a POST /engrams is handled, with the 1-based call
+   *  number — lets a test hold one write on the wire while another client runs
+   *  (deterministic interleaving across two clients). */
+  appendHook: ((n: number) => Promise<void>) | null = null
   /** Every POST /engrams/:id/feedback body received, in order (#1310: assert
    *  whether `source` was sent). */
   feedbackBodies: Array<Record<string, unknown>> = []
@@ -349,7 +355,8 @@ export class StubServer {
 
     // POST /api/v1/engrams — create
     if (method === 'POST' && path === '/api/v1/engrams') {
-      this.appendCalls++
+      const n = ++this.appendCalls
+      const handleAppend = (): void => {
       if (this.appendErrorResponse !== null) {
         const { status, body } = this.appendErrorResponse
         res.writeHead(status, { 'Content-Type': 'text/plain' })
@@ -416,6 +423,9 @@ export class StubServer {
         } else if (this.appendDelayMs > 0) setTimeout(respond, this.appendDelayMs).unref()
         else respond()
       })
+      }
+      if (this.appendHook) void this.appendHook(n).then(handleAppend)
+      else handleAppend()
       return
     }
 
@@ -435,6 +445,7 @@ export class StubServer {
 
     // DELETE /api/v1/engrams/:id — retire
     if (method === 'DELETE' && idMatch) {
+      this.deleteCalls++
       const id = decodeURIComponent(idMatch[1])
       const engram = this.engrams.get(id)
       if (!engram) {

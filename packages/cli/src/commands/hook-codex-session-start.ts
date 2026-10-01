@@ -73,7 +73,7 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
       // Never silent (#1198): if the project declared remote settings we
       // refused, say so here — this is the only model-visible surface.
       const refusal = projectRemote.refusedFrom
-        ? `${projectRemoteRefusalNotice(projectRemote.refusedFrom)}\n\n`
+        ? `${projectRemoteRefusalNotice(projectRemote.refusedFrom, plur.storageRoot)}\n\n`
         : ''
       context = refusal + (body ? `${header}\n\n${body}` : header)
     } catch (err: unknown) {

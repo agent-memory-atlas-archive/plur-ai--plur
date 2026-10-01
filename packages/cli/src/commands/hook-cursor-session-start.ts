@@ -115,9 +115,9 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
     // A refused .plur.yaml is still worth saying: the user's scope routing is
     // unaffected, but they should know the remote settings were not honoured —
     // for the trust reason here, and for #1200 regardless.
-    const refusal = projectRemote.refusedFrom
-      ? `${projectRemoteRefusalNotice(projectRemote.refusedFrom)}\n\n`
-      : ''
+    const refusal = [
+      projectRemote.refusedFrom ? projectRemoteRefusalNotice(projectRemote.refusedFrom, plur.storageRoot) : null,
+    ].filter(Boolean).map(n => `${n}\n\n`).join('')
     fullContext = refusal + (context ? `${header}\n\n${context}` : header)
   } catch (err: unknown) {
     // Audit fix (evaluator review — user lens, iteration 4, 2026-07-09):

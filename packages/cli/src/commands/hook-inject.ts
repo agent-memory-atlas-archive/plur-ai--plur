@@ -1,9 +1,11 @@
-import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync } from 'fs'
+import { existsSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, readSync, statSync, readdirSync, unlinkSync, renameSync, openSync, closeSync, linkSync, writeSync, fstatSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { homedir, hostname, setPriority } from 'os'
 import { spawn } from 'child_process'
-import { randomUUID } from 'crypto'
+import { randomUUID, randomBytes } from 'crypto'
 import { createPlur, type GlobalFlags } from '../plur.js'
+import { cleanupStaleSessionFiles } from '../lib/codex-hook-io.js'
+import { checkpointRoot } from './hook-learn-check.js'
 import { hookFolderPolicy, payloadDir, sessionSettings, folderAskOnce, createAskPlur } from '../lib/folder-gate.js'
 import type { FolderPolicy } from '@plur-ai/core'
 import { safeSessionKey } from '../lib/session-key.js'
@@ -229,6 +231,17 @@ function sessionDir(): string | null {
   return hookSessionDir()
 }
 
+/**
+ * #1228's former hook-inject key: `sid-` + the payload id, else ppid (formal
+ * r2, cli#7). Nothing writes under it since main's payload-first
+ * {@link sessionKey} (#1278, decision H1) keys the marker, reminder and lock;
+ * it is kept as the legacy form readers may still meet (see #1401).
+ */
+export function injectSessionKey(input: Record<string, unknown>, ppid: number | string = process.ppid || 'unknown'): string {
+  const sid = typeof input.session_id === 'string' ? input.session_id : ''
+  return sid ? `sid-${safeSessionKey(sid)}` : String(ppid)
+}
+
 function sessionStatePath(key: string, ext: string): string | null {
   const dir = sessionDir()
   return dir ? join(dir, `${key}.${ext}`) : null
@@ -325,7 +338,116 @@ function touchReminder(key: string): void {
   // Fail-open: a state-dir write failing (unwritable $TMPDIR) must never crash
   // the prompt. The reminder timer is best-effort bookkeeping.
   const path = lastReminderPath(key)
-  if (path) try { writeFileSync(path, String(Date.now())) } catch { /* fail-open */ }
+  if (path) try { writeFileSync(path, String(Date.now()), { mode: 0o600 }) } catch { /* fail-open */ }
+}
+
+/**
+ * What a hook holds after taking the inject lock: the file's inode and the
+ * token written into it. `releaseInjectLock` deletes the lock only when the
+ * file at `path` still has both — see there.
+ */
+export interface InjectLockHold { path: string; ino: number; token: string }
+
+/**
+ * Take the per-session inject lock (#519) with O_EXCL (formal r2, cli#7).
+ *
+ * The previous stat-then-write let two hooks that fired together both see
+ * "no lock" and both write one — exactly the concurrent BGE loads the lock
+ * exists to prevent. `wx` makes creation the test. A lock older than
+ * LOCK_STALE_MS belongs to a crashed run and is taken over (one retry).
+ *
+ *   'acquired'    — ours; the caller MUST release it (in a finally) with
+ *                   `releaseInjectLock(hold)`
+ *   'busy'        — a live run holds it; bail
+ *   'unavailable' — cannot lock at all (no trustworthy dir, I/O error);
+ *                   proceed unlocked, the pre-#519 behaviour (fail open)
+ */
+export function takeInjectLock(
+  path: string | null,
+  opts: {
+    staleMs?: number
+    now?: () => number
+    /** Test seam: runs between the staleness check and the takeover. */
+    _beforeTakeover?: () => void
+    /** Test seam: runs after the takeover moved the lock aside, before the put-back. */
+    _afterMoveAside?: () => void
+  } = {},
+): { status: 'acquired' | 'busy' | 'unavailable'; hold?: InjectLockHold } {
+  const staleMs = opts.staleMs ?? LOCK_STALE_MS
+  const now = opts.now ?? Date.now
+  if (!path) return { status: 'unavailable' }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd: number
+    try {
+      fd = openSync(path, 'wx', 0o600)
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') return { status: 'unavailable' }
+      try {
+        const seen = statSync(path)
+        if (now() - seen.mtimeMs < staleMs) return { status: 'busy' }
+        opts._beforeTakeover?.()
+        // Stale: the holder crashed — take it over. A plain unlink here let two
+        // hooks that both saw it stale delete each other's fresh lock and both
+        // inject (formal verification, R2-CLI item 3). Move whatever is at
+        // `path` aside atomically, then check it is the stale file we judged
+        // (inode AND mtime, so a filesystem that reuses inode numbers cannot
+        // pass a fresh lock off as the stale one).
+        const aside = `${path}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
+        renameSync(path, aside)
+        opts._afterMoveAside?.()
+        const moved = statSync(aside)
+        if (moved.ino === seen.ino && moved.mtimeMs === seen.mtimeMs) {
+          unlinkSync(aside)
+        } else {
+          // A live lock arrived in between: put it back (link fails if yet
+          // another holder already exists — either way someone holds it). If
+          // the put-back fails, the moved lock's owner no longer holds `path`;
+          // `releaseInjectLock` checks ownership, so it will not delete the
+          // newer holder's lock (#1238).
+          try { linkSync(aside, path) } catch { /* a newer holder exists */ }
+          unlinkSync(aside)
+          return { status: 'busy' }
+        }
+      } catch { /* vanished between open and stat — retry */ }
+      continue
+    }
+    // Ours. Record what makes it ours: its inode and a token in its body.
+    const token = `${process.pid}-${randomBytes(8).toString('hex')}`
+    let written = token
+    try { writeSync(fd, token) } catch { written = '' /* the inode still identifies it */ }
+    let ino = -1
+    try { ino = fstatSync(fd).ino } catch { /* ino -1: release then leaves it to go stale */ }
+    try { closeSync(fd) } catch { /* ignore */ }
+    return { status: 'acquired', hold: { path, ino, token: written } }
+  }
+  return { status: 'busy' }
+}
+
+/** `takeInjectLock` without the hold — the status only. */
+export function acquireInjectLock(
+  path: string | null,
+  staleMs: number = LOCK_STALE_MS,
+  now: () => number = Date.now,
+  /** Test seam: runs between the staleness check and the takeover. */
+  _beforeTakeover?: () => void,
+): 'acquired' | 'busy' | 'unavailable' {
+  return takeInjectLock(path, { staleMs, now, _beforeTakeover }).status
+}
+
+/**
+ * Release an inject lock this hook took — only if it is still this hook's
+ * lock (#1238). A takeover that raced a third hook can leave `path` holding
+ * ANOTHER hook's live lock; an unconditional unlink here deleted it, and a
+ * fourth hook could then inject beside the third. The file is deleted only
+ * when it has the inode and the token recorded at acquire time.
+ */
+export function releaseInjectLock(hold: InjectLockHold | undefined): void {
+  if (!hold) return
+  try {
+    if (statSync(hold.path).ino !== hold.ino) return
+    if (readFileSync(hold.path, 'utf8') !== hold.token) return
+    unlinkSync(hold.path)
+  } catch { /* already gone */ }
 }
 
 function extractEventTask(input: Record<string, unknown>, event: string): string {
@@ -362,25 +484,50 @@ function extractEventTask(input: Record<string, unknown>, event: string): string
   }
 }
 
+/** Is a process with this pid alive? EPERM means alive but not ours. */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false
+  try { process.kill(pid, 0); return true } catch (err: unknown) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM'
+  }
+}
+
 /**
- * Deferred wrap-up (#216): detect orphaned sessions from previous runs.
+ * Deferred wrap-up (#216): recover sessions that ended without wrap-up.
  *
- * Scans ~/.plur/sessions/ for checkpoint files without a matching
- * session_end episode. If found, generates a brief recovery notice
- * and cleans up the checkpoint. Returns a notice string or null.
+ * Scans <store>/sessions/ for checkpoint files left behind (plur_session_end
+ * and hook-session-end both remove theirs). Formal r2, cli#6 — the property
+ * is: A CHECKPOINT IS REMOVED ONLY AFTER A DURABLE CAPTURE
+ * (PlurSpec/R2CLI.lean §2, `removed_only_after_capture`). Before:
+ *   - a valid orphan produced a one-off notice in THIS session's context and
+ *     was unlinked — nothing durable, so the previous session's only record
+ *     was gone after a transient string (hook-session-end had been fixed for
+ *     exactly this in #217; this path never was);
+ *   - an unparseable checkpoint was unlinked outright;
+ *   - "idle > 5 min" was the only orphan test, so a session still running in
+ *     another terminal, between checkpoints (one every 10 responses), was
+ *     declared dead and its checkpoint destroyed;
+ *   - the scan read PLUR_PATH only, while the store and hook-session-end
+ *     honour --path.
+ * Now: an orphan is captured as an episode FIRST and unlinked only if that
+ * succeeded; a corrupt checkpoint is renamed aside (kept, never rescanned);
+ * a checkpoint whose key is a pid that is still alive is left alone (the
+ * writer keys by ppid when CLAUDE_SESSION_ID is unset — the common case).
  *
  * Conservative: only reports metadata (stop count, duration, cwd).
- * Does not attempt LLM-quality summaries — that context is gone.
  */
-function processDeferredWrapups(): string | null {
-  const plurDir = process.env.PLUR_PATH || join(homedir(), '.plur') // `||`: empty means unset (H3)
-  const sessionsDir = join(plurDir, 'sessions')
+export function processDeferredWrapups(
+  plur: Pick<Plur, 'capture'>,
+  root: string,
+  now: number = Date.now(),
+  isAlive: (pid: number) => boolean = pidAlive,
+): string | null {
+  const sessionsDir = join(root, 'sessions')
   if (!existsSync(sessionsDir)) return null
 
   const notices: string[] = []
   try {
     const files = readdirSync(sessionsDir).filter(f => f.endsWith('.checkpoint.json'))
-    const now = Date.now()
     // Skip checkpoints touched within the stale threshold — that session may
     // still be active in another terminal. Default 5 min; override via
     // PLUR_CHECKPOINT_STALE_MIN (minutes) for slower-cadence users.
@@ -389,33 +536,54 @@ function processDeferredWrapups(): string | null {
 
     for (const file of files) {
       const path = join(sessionsDir, file)
+      const key = file.slice(0, -'.checkpoint.json'.length)
+      let checkpoint: any
+      let lastCheckpoint: number
       try {
-        const checkpoint = JSON.parse(readFileSync(path, 'utf8'))
-        const lastCheckpoint = new Date(checkpoint.last_checkpoint).getTime()
-
-        // Skip if checkpoint is too recent (session may still be active elsewhere)
-        if (now - lastCheckpoint < STALE_THRESHOLD_MS) continue
-
-        // Calculate session duration
-        const started = new Date(checkpoint.started_at)
-        const ended = new Date(checkpoint.last_checkpoint)
-        const durationMin = Math.round((ended.getTime() - started.getTime()) / 60000)
-        const durationStr = durationMin >= 60
-          ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}m`
-          : `${durationMin}m`
-
-        notices.push(
-          `Previous session (${durationStr}, ${checkpoint.stop_count} responses` +
-          `${checkpoint.cwd ? ', ' + checkpoint.cwd.split('/').slice(-2).join('/') : ''}) ` +
-          `ended without wrap-up.`,
-        )
-
-        // Clean up the checkpoint
-        unlinkSync(path)
+        checkpoint = JSON.parse(readFileSync(path, 'utf8'))
+        lastCheckpoint = new Date(checkpoint.last_checkpoint).getTime()
+        if (!checkpoint || typeof checkpoint !== 'object' || Number.isNaN(lastCheckpoint)) throw new Error('corrupt')
       } catch {
-        // Corrupt checkpoint — remove it
-        try { unlinkSync(path) } catch {}
+        // Unparseable: keep the bytes (they are the session's only record),
+        // move them out of the scan so they are not re-reported forever.
+        try { renameSync(path, `${path}.corrupt`) } catch { /* leave it */ }
+        continue
       }
+
+      // Too recent — the session may still be active elsewhere.
+      if (now - lastCheckpoint < STALE_THRESHOLD_MS) continue
+      // A pid-keyed checkpoint whose process is alive is a LIVE session that
+      // simply has not reached its next checkpoint. (PID reuse can only make
+      // this skip a dead session — the safe direction; it is retried later.)
+      if (/^\d+$/.test(key) && isAlive(Number(key))) continue
+
+      // Calculate session duration
+      const started = new Date(checkpoint.started_at)
+      const durationMin = Math.max(0, Math.round((lastCheckpoint - started.getTime()) / 60000))
+      const durationStr = Number.isNaN(durationMin) ? '?m' : durationMin >= 60
+        ? `${Math.floor(durationMin / 60)}h ${durationMin % 60}m`
+        : `${durationMin}m`
+      const where = typeof checkpoint.cwd === 'string' && checkpoint.cwd
+        ? ', ' + checkpoint.cwd.split('/').slice(-2).join('/') : ''
+      const facts = `${durationStr}, ${checkpoint.stop_count ?? 0} responses${where}`
+
+      // Durable FIRST. Only a successful capture licenses the unlink.
+      try {
+        plur.capture(
+          `Session ended without wrap-up (${facts}); recovered at the next session start.`,
+          {
+            channel: 'hook',
+            agent: 'claude-code',
+            session_id: typeof checkpoint.session_id === 'string' ? checkpoint.session_id : key,
+            tags: ['session-end', 'deferred-wrapup'],
+          },
+        )
+      } catch (err: unknown) {
+        process.stderr.write(`[plur] deferred wrap-up: capture failed, keeping ${file}: ${(err as Error)?.message ?? err}\n`)
+        continue
+      }
+      try { unlinkSync(path) } catch { /* captured; a leftover is re-captured at worst */ }
+      notices.push(`Previous session (${facts}) ended without wrap-up.`)
     }
   } catch {
     return null
@@ -596,7 +764,7 @@ const LOCK_STALE_MS =
 // The inject lock this run holds, if any. The watchdog removes it before its
 // process.exit(): exit skips every `finally`, and a lock left behind would make
 // every prompt for the next LOCK_STALE_MS bail silently (#1278 review).
-let heldInjectLock: string | null = null
+let heldInjectLock: InjectLockHold | null = null
 
 // Full first-message injections allowed per session before the hook stops
 // trying (#1278 review). Each attempt that does not finish — it threw, the
@@ -655,7 +823,8 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // there leaves the lock behind. Wait (bounded) until the store is idle first.
   const watchdog = setTimeout(() => {
     stopping = true
-    if (heldInjectLock) try { unlinkSync(heldInjectLock) } catch { /* fail-open */ }
+    // Through the ownership check (#1238): never a lock another run has taken over since.
+    if (heldInjectLock) releaseInjectLock(heldInjectLock)
     // A hybrid search still running at the ceiling is embedding a cold store:
     // same as a missed deadline, the cache would stay cold (#1313 audit). The
     // check runs at the exit itself, after the store-idle wait (#1343).
@@ -734,20 +903,14 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // Multiple rapid async firings (datacore#33) otherwise pile up at ~160 MB
   // RSS each and trigger an OOM cascade. Lock is stale after HOOK_CEILING_MS
   // so a crashed process never permanently blocks subsequent invocations.
-  const injectLock = sessionStatePath(key, 'injecting')
-  let injectLockAcquired = false
-  if (injectLock) {
-    try {
-      const s = statSync(injectLock)
-      if (Date.now() - s.mtimeMs < LOCK_STALE_MS) return
-    } catch { /* no lock file — proceed */ }
-    try { writeFileSync(injectLock, ''); injectLockAcquired = true } catch { /* fail-open */ }
-    if (injectLockAcquired) heldInjectLock = injectLock
-  }
+  const lock = takeInjectLock(sessionStatePath(key, 'injecting'))
+  if (lock.status === 'busy') return
+  heldInjectLock = lock.hold ?? null
 
   // Release the lock on every exit, including a throw from the injection —
   // a lock left behind would make the retry on the next prompt bail silently
-  // until it goes stale (#1278).
+  // until it goes stale (#1278). Only a lock this hook still owns is removed
+  // (#1238).
   try {
     if (!isRehydrate) {
       const attempts = readAttempts(key)
@@ -762,7 +925,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     }
     await injectSession(input, key, marker, isRehydrate, flags, dir, policy)
   } finally {
-    if (injectLockAcquired && injectLock) try { unlinkSync(injectLock) } catch {}
+    releaseInjectLock(lock.hold)
     heldInjectLock = null
   }
   // #1313: the output (if any) has been flushed — emitContextConfirmed waits
@@ -849,8 +1012,9 @@ async function injectSession(
   const hookEventName = claudeHookEventName(input, { rehydrate: isRehydrate, event: null })
   if (NO_CONTEXT_EVENTS.has(hookEventName)) return
   // Project remote routing is resolved with the Plur instance, below — see
-  // lib/project-remote.ts. `scope`/`domain` are read here because they are
-  // local filters and need no gate.
+  // lib/project-remote.ts. `scope`/`domain` are gated on directory trust too
+  // (decision E3): they are not only a read filter — the header tells the
+  // model to learn under the scope — so a cloned repo must not choose it.
   let projectRemote: ProjectRemote | null = null
 
   // Get task description from hook input
@@ -884,6 +1048,10 @@ async function injectSession(
     pendingMarker = JSON.stringify({ task, sessionId: newSessionId })
     writeSessionTask(input.session_id, task)
     touchReminder(key) // Reset reminder timer on first message
+    // Keyed by session id, so markers accumulate one per session: sweep
+    // week-old state like every other hook family does (vetted dir only).
+    const stateDir = sessionDir()
+    if (stateDir) cleanupStaleSessionFiles(Date.now(), stateDir)
   }
 
   // Inject engrams (with project scope if configured). Read the session marker
@@ -966,7 +1134,7 @@ async function injectSession(
     if (projectConfig.scope) parts.push(`Project scope: ${projectConfig.scope} — use this scope for plur_learn calls`)
 
     // Deferred wrap-up: notify about orphaned previous sessions (#216)
-    const deferredNotice = processDeferredWrapups()
+    const deferredNotice = processDeferredWrapups(plur, checkpointRoot(flags))
     if (deferredNotice) parts.push('', deferredNotice)
   }
 
@@ -976,7 +1144,8 @@ async function injectSession(
   // #1196: say so. A remote leg that silently stops working is the regression
   // this gate could otherwise introduce — the user must be able to tell
   // "refused, here is the one command" from "quietly broken".
-  if (remoteRefusedFrom) parts.push(projectRemoteRefusalNotice(remoteRefusedFrom))
+  if (remoteRefusedFrom) parts.push(projectRemoteRefusalNotice(remoteRefusedFrom, plur.storageRoot))
+  // E3: an ignored scope/domain is said too, naming the file and `plur trust`.
 
   if (context) {
     parts.push('')
@@ -991,5 +1160,5 @@ async function injectSession(
 
   const delivered = await emitContextConfirmed(hookEventName, parts.join('\n'))
   // Fail-open: an unwritable state dir just means the next prompt re-injects.
-  if (delivered && pendingMarker && marker) try { writeFileSync(marker, pendingMarker) } catch { /* fail-open */ }
+  if (delivered && pendingMarker && marker) try { writeFileSync(marker, pendingMarker, { mode: 0o600 }) } catch { /* fail-open */ }
 }

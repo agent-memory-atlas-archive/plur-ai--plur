@@ -352,7 +352,9 @@ export function buildEnforcementHooks(launch: HookLaunch | string): Record<strin
     PostToolUse: [
       // Session sentinel — creates marker file after plur_session_start succeeds
       {
-        matcher: 'mcp__plur__plur_session_start',
+        // Same rule as the guard's exemption (any `mcp__<server>__plur_session_start`),
+        // so a plugin-named server still marks the session started.
+        matcher: 'mcp__.*__plur_session_start',
         hooks: [
           { type: 'command', ...mk('hook-session-mark'), timeout: 3 },
         ],
@@ -831,13 +833,13 @@ function settingsRefusal(path: string): string {
 function isPlurHook(entry: HookEntry): boolean {
   // PLUR's launcher (shim, npx fallback, or the Windows exec form) plus any
   // hook-* (decisions H2, H3) — see isPlurHookSpec.
-  return (entry.hooks ?? []).some(isPlurHookSpec)
+  return (entry?.hooks ?? []).some(isPlurHookSpec)
 }
 
 function hasPlurHooks(settings: Settings): boolean {
   const hooks = settings.hooks ?? {}
   for (const entries of Object.values(hooks)) {
-    if (entries.some(isPlurHook)) return true
+    if ((entries ?? []).some(isPlurHook)) return true
   }
   return false
 }
@@ -852,10 +854,10 @@ function stripPlurHooks(settings: Settings): Settings {
   const hooks = { ...(settings.hooks ?? {}) }
   for (const [event, entries] of Object.entries(hooks)) {
     const kept: HookEntry[] = []
-    for (const e of entries) {
+    for (const e of entries ?? []) {
       if (!isPlurHook(e)) { kept.push(e); continue }
-      const own = e.hooks.filter((h) => !isPlurHookSpec(h))
-      if (own.length > 0) kept.push({ ...e, hooks: own })
+      const specs = (e.hooks ?? []).filter((h) => !isPlurHookSpec(h))
+      if (specs.length > 0) kept.push({ ...e, hooks: specs })
     }
     if (kept.length > 0) {
       hooks[event] = kept
@@ -1826,3 +1828,9 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
     // Never fail `init` over this. Staying unidentified is a working state.
   }
 }
+
+/** Test seams (formal Adapters #3). */
+export { mergeHooks as _mergeClaudeHooks }
+export { isPlurHookSpec as _isPlurClaudeHookSpec }
+
+export { buildEnforcementHooks as _buildEnforcementHooks }

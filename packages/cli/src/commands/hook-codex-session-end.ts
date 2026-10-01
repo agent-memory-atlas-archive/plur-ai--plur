@@ -10,6 +10,8 @@ import {
   sentinelPath,
   counterPath,
   cleanupStaleSessionFiles,
+  sessionDirSafeToSweep,
+  sessionDir,
 } from '../lib/codex-hook-io.js'
 
 /**
@@ -42,7 +44,9 @@ export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
     // Otherwise silent unless the folder map says on (#1347).
     if (!hookFolderOn(payloadDir(input), flags)) return
     const sessionId = codexSessionId(input)
-    if (sessionId) {
+    if (sessionId && sessionDirSafeToSweep(sessionDir())) {
+      // Never unlink through a symlinked or foreign directory (cli#8) — the
+      // same rule the stale sweep already follows.
       for (const p of [
         sentinelPath(sessionId),
         counterPath(sessionId, 'guard-count'),
