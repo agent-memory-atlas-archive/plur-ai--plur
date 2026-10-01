@@ -754,6 +754,17 @@ export function trustCommand(dir: string | null, storageRoot?: string): string {
   return `plur --path ${_shellWord(storageRoot)} trust ${target}`
 }
 
+/** Same grammar as the folder question's (cli folder-gate.ts): bounded, no spaces or controls. */
+const UNTRUSTED_SCOPE_GRAMMAR = /^(?:global|[a-z][a-z0-9-]*:[A-Za-z0-9][A-Za-z0-9._@/:-]{0,199})$/
+const UNTRUSTED_DOMAIN_GRAMMAR = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/
+/** Characters that break a line, reorder text or hide in a path printed to the model. */
+const _UNSAFE_PATH_CHARS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/
+/** JSON-quote untrusted text and escape what JSON.stringify leaves raw (line separators, bidi, zero-width). */
+function _escapedText(s: string): string {
+  return JSON.stringify(s.length > 1024 ? s.slice(0, 1024) + '…' : s)
+    .replace(/[\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
+}
+
 export function readTrustedProjectConfig(
   trust: { isDirectoryTrusted(dir: string): boolean; readonly storageRoot?: string },
 ): { scope?: string; domain?: string; warning?: string } {
@@ -768,14 +779,22 @@ export function readTrustedProjectConfig(
     trusted = false
   }
   if (trusted) return { scope: raw.scope, domain: raw.domain }
+  // The file is untrusted, so its values and its path are data from the
+  // repository: grammar-checked, quoted and escaped, never copied as free
+  // text into the model's context (the rule #1418 applies to the folder
+  // question).
   const declared = [
-    raw.scope ? `scope "${raw.scope}"` : null,
-    raw.domain ? `domain "${raw.domain}"` : null,
+    raw.scope ? (UNTRUSTED_SCOPE_GRAMMAR.test(raw.scope) ? `scope ${_escapedText(raw.scope)}` : 'an invalid scope') : null,
+    raw.domain ? (UNTRUSTED_DOMAIN_GRAMMAR.test(raw.domain) ? `domain ${_escapedText(raw.domain)}` : 'an invalid domain') : null,
   ].filter(Boolean).join(' / ')
+  const safeDir = configDir !== null && !_UNSAFE_PATH_CHARS.test(configDir)
   const warning =
-    `${configPath ?? '.plur.yaml'} declares ${declared}, but ${configDir ?? 'its directory'} is not a trusted ` +
-    `directory — ignoring it and using the local default scope instead. If this project is yours, run: ` +
-    trustCommand(configDir, trust.storageRoot)
+    `${configPath ? _escapedText(configPath) : '.plur.yaml'} declares ${declared}, but ` +
+    `${configDir ? _escapedText(configDir) : 'its directory'} is not a trusted ` +
+    `directory — ignoring it and using the local default scope instead. If this project is yours, ` +
+    (safeDir || configDir === null
+      ? `run: ${trustCommand(configDir, trust.storageRoot)}`
+      : 'run `plur trust` for that directory from a terminal.')
   if (configPath && !_warnedUntrustedConfigs.has(configPath)) {
     _warnedUntrustedConfigs.add(configPath)
     try { process.stderr.write(`[plur] ${warning}\n`) } catch { /* never fail a tool over a log line */ }
