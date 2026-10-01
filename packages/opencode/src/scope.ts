@@ -1,5 +1,6 @@
-import { dirname } from 'node:path'
-import type { ProjectConfig } from '@plur-ai/core'
+import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { projectRemoteRefusalNotice as coreRefusalNotice, type ProjectConfig } from '@plur-ai/core'
 
 /**
  * Which path this session's memory is scoped by.
@@ -18,6 +19,47 @@ export function resolveScopeRoot(ctx: { directory?: string; worktree?: string })
 /** The subset of `Plur` this module needs — narrow so tests can stub it cheaply. */
 export interface TrustCheck {
   isDirectoryTrusted(dir: string): boolean
+  /** The store whose `trust.yaml` answers (`Plur.storageRoot`). */
+  readonly storageRoot?: string
+}
+
+/**
+ * One argument of a printed command, or null when it cannot be quoted safely
+ * (#1228 review; the rule of #1418's folder question): POSIX single quotes;
+ * Windows double quotes, refused for $, backtick, %, ! and the curly double
+ * quotes, which PowerShell and cmd expand; never a line-breaking, bidi or
+ * zero-width character.
+ */
+function shellWord(s: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(s)) return null
+  if (/^[A-Za-z0-9_@+=:,./~-]+$/.test(s)) return s
+  if (platform === 'win32') {
+    if (/[$`%!"\u201c\u201d\u201e]/.test(s) || s.endsWith('\\')) return null
+    return `"${s}"`
+  }
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * The trust command that reaches the store this plugin checks (audit 1228-c
+ * #1). The plugin opens `PLUR_PATH` when opencode's environment sets it; a bare
+ * `plur trust <dir>` in a shell without it writes `~/.plur/trust.yaml`, which
+ * this plugin never reads — so a non-default store is named with `--path`.
+ */
+export function trustCommand(dir: string, storageRoot?: string, platform: NodeJS.Platform = process.platform): string {
+  const target = shellWord(dir, platform)
+  const custom = storageRoot && resolve(storageRoot) !== resolve(join(homedir(), '.plur'))
+  const store = custom ? shellWord(resolve(storageRoot!), platform) : ''
+  if (target === null || store === null) return '`plur trust` for that directory, from a terminal (its path cannot be printed as a safe command)'
+  return custom ? `plur --path ${store} trust ${target}` : `plur trust ${target}`
+}
+
+/** Core's remote-refusal line, closing with {@link trustCommand} for this store. */
+export function projectRemoteRefusalNotice(refusedFrom: string, storageRoot?: string): string {
+  const line = coreRefusalNotice(refusedFrom)
+  const bare = `plur trust ${refusedFrom}`
+  if (!line.endsWith(bare)) return line
+  return line.slice(0, -bare.length) + trustCommand(refusedFrom, storageRoot)
 }
 
 /** The only fields this plugin ever adopts from a `.plur.yaml`. */
@@ -85,7 +127,7 @@ export function resolveTrustedScope(
     `${configPath} declares scope "${projectConfig.scope ?? '(none)'}"` +
     `${projectConfig.domain ? ` / domain "${projectConfig.domain}"` : ''}, but ${configDir} is not trusted — ` +
     `ignoring it and using the local default scope instead. If you cloned this repo yourself and want its ` +
-    `scope honored, run: plur trust ${configDir}`,
+    `scope honored, run: ${trustCommand(configDir, plur.storageRoot)}`,
   )
   return {}
 }

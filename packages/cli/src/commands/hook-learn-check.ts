@@ -1,8 +1,11 @@
-import { readSync, readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, statSync, renameSync, unlinkSync } from 'fs'
+import { readSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs'
 import { join } from 'path'
-import { tmpdir, homedir } from 'os'
+import { homedir } from 'os'
 import { type GlobalFlags } from '../plur.js'
-import { isPlurConfigured } from '../lib/plur-configured.js'
+import { ensureSessionDir, ticketCounter } from '../lib/codex-hook-io.js'
+import { hookFolderOn, payloadDir, parsePayload } from '../lib/folder-gate.js'
+import { hookSessionKey } from '../lib/session-key.js'
+import { hookSessionDir } from '../lib/session-task.js'
 
 /**
  * plur hook-learn-check — Stop hook that prompts learning reflection
@@ -16,62 +19,94 @@ import { isPlurConfigured } from '../lib/plur-configured.js'
  * calling plur_session_end, the next session_start detects the orphaned
  * checkpoint and processes observations retroactively.
  *
- * The counter persists via a temp file keyed to the session ID.
+ * The counter persists via a temp file keyed to the payload `session_id`
+ * (#1266). Claude Code does not export CLAUDE_SESSION_ID to hooks, and each
+ * Stop runs in a fresh shell, so the old ppid fallback gave every Stop its own
+ * counter and the nudge never fired.
+ *
+ * Directories (decision H3): the counter lives in the hook state dir
+ * (`hookSessionDir()`), and the checkpoint in `<PLUR root>/sessions`. Each is
+ * written only if its directory passes the ownership check. When no trusted
+ * directory exists, the hook persists nothing and prints nothing.
+ *
+ * Delivery (#1266, verified against a real Claude Code session): a Stop
+ * hook's TOP-LEVEL `additionalContext` is ignored — recorded as plain hook
+ * stdout, never shown to the model. Only
+ * `{hookSpecificOutput: {hookEventName: "Stop", additionalContext}}` reaches
+ * the model, and it does so by forcing ONE continuation turn. That turn ends
+ * in another Stop carrying `stop_hook_active: true`; nudging there would loop
+ * (observed: ~10 empty turns per prompt), so this hook stays silent on it.
  *
  * Input: JSON on stdin (Claude Code Stop hook format)
- * Output: JSON on stdout with additionalContext (or passthrough)
+ * Output: the hookSpecificOutput nudge on every LEARN_INTERVAL-th Stop,
+ *         otherwise nothing. The input payload is never echoed back: a Stop
+ *         hook's stdout is parsed as hook OUTPUT, so an echo was at best
+ *         ignored and at worst misread.
  */
 
 const LEARN_INTERVAL = 3 // Learning nudge every N stops
 const CHECKPOINT_INTERVAL = parseInt(process.env.PLUR_CHECKPOINT_INTERVAL || '10', 10)
 
-function sessionKey(): string {
-  const raw = process.env.CLAUDE_SESSION_ID || String(process.ppid || 'unknown')
-  return raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default'
+/**
+ * Owner decision H1 ("payload", 2026-09-29): the one shared helper —
+ * payload `session_id`, then CLAUDE_SESSION_ID, then ppid — so the checkpoint
+ * writer and every reader (hook-session-end, plur_session_end, the deferred
+ * wrap-up) agree. Readers also try the env-first stripped key this function
+ * used before (legacyHookSessionKeys). The stop counter is not migrated: an
+ * orphaned counter delays one nudge at most.
+ */
+function sessionKey(payloadSessionId?: unknown): string {
+  // Owner decision H1 ("payload", 2026-09-29): the one shared helper, so the
+  // counter/checkpoint writer and every reader agree. The stop counter is not
+  // migrated from legacy keys: an orphaned counter delays one nudge at most.
+  return hookSessionKey(payloadSessionId)
 }
 
-function counterPath(): string {
-  const dir = join(tmpdir(), 'plur-sessions')
-  mkdirSync(dir, { recursive: true })
-  return join(dir, `${sessionKey()}.stop-count`)
+// Decision H3: the counter lives in the hook state dir and follows its proved
+// rule (lib/session-task.ts hookSessionDir): the shared dir if it passes the
+// ownership check, else the private fallback if it passes, else null — and
+// null means persist nothing (formal conflict H).
+function counterPath(key: string): string | null {
+  const dir = hookSessionDir()
+  return dir ? join(dir, `${key}.stop-count`) : null
 }
 
 /**
- * Atomic counter via append-only file size, not read-int/increment/write
- * (audit fix, 2026-07-09 — cross-referenced from the feat/cursor-integration
- * branch's evaluator review: this file's own docstring at the top is what
- * hook-cursor-stop.ts cited as "the same mechanism" it mirrors, and an
- * identical audit there found and fixed this exact race — every Stop hook
- * invocation is a fresh, independent process, so a plain
- * read-then-write can lose an increment if two fire close together,
- * silently shifting/skipping the LEARN_INTERVAL nudge and
- * CHECKPOINT_INTERVAL gate below). Appending one byte is atomic on POSIX
- * filesystems even under concurrent writers; counting file size instead of
- * parsing decimal content can't lose an increment the way read-then-write
- * can.
+ * Per-session Stop counter. It used to be "atomic" append-a-byte-then-stat:
+ * the append is atomic, the pair is not — `A-append, B-append, A-stat,
+ * B-stat` handed both hooks 2, so one LEARN_INTERVAL/CHECKPOINT_INTERVAL
+ * multiple fired twice and the next was skipped (formal r2, cli#11). Each
+ * caller now gets the position of its own appended line: distinct values,
+ * exactly 1..n after n calls (PlurSpec/R2CLI.lean §4).
  */
 function incrementCounter(path: string): number {
-  appendFileSync(path, '.')
-  try {
-    return statSync(path).size
-  } catch {
-    return 1
-  }
+  return ticketCounter(path)
 }
 
-function plurPath(): string {
-  return process.env.PLUR_PATH ?? join(homedir(), '.plur')
+/**
+ * The store root — resolved exactly as createPlur resolves it (`--path`, then
+ * PLUR_PATH, then ~/.plur). The writer used to read PLUR_PATH only while
+ * hook-session-end honoured `--path`, so with `--path` the closer looked in a
+ * directory the writer never wrote (formal r2, cli#6). `||`, not `??`: an
+ * empty PLUR_PATH means unset, never "the cwd" (H3).
+ */
+export function checkpointRoot(flags: GlobalFlags): string {
+  return flags.path || process.env.PLUR_PATH || join(homedir(), '.plur')
 }
 
-function checkpointDir(): string {
-  const dir = join(plurPath(), 'sessions')
-  mkdirSync(dir, { recursive: true })
-  return dir
+// The checkpoint stays where its readers look (hook-session-end,
+// plur_session_end, hook-inject's deferred wrap-up) but is written only when
+// that directory passes the same check (H3): a planted symlink or a directory
+// someone else owns is refused, and the checkpoint is skipped.
+function checkpointDir(flags: GlobalFlags): string | null {
+  const dir = join(checkpointRoot(flags), 'sessions')
+  return ensureSessionDir(dir) ? dir : null
 }
 
-function writeCheckpoint(count: number, cwd: string): void {
-  const id = sessionKey()
-  const dir = checkpointDir()
+function writeCheckpoint(id: string, count: number, cwd: string, flags: GlobalFlags): void {
+  // id: hookSessionKey of this Stop payload (H1)
+  const dir = checkpointDir(flags)
+  if (!dir) return
   const path = join(dir, `${id}.checkpoint.json`)
 
   const now = new Date().toISOString()
@@ -128,49 +163,54 @@ function readStdinRaw(): string {
   }
 }
 
-const LEARN_PROMPT = `[PLUR] Did you discover, learn, or get corrected on something in your last response? If yes — call plur_learn now before moving on. If no — continue.`
+// Delivered as a one-turn instruction: Claude Code gives the model exactly one
+// continuation turn to act on it. Keep it short and give the "nothing" path an
+// explicit, near-silent answer so that turn costs as little as possible.
+export const LEARN_PROMPT = `[PLUR] Memory check: if your last response involved a correction, a stated preference, or a reusable discovery, call plur_learn for it now. Otherwise reply with just "ok". Do not repeat or continue your previous answer.`
 
-export async function run(_args: string[], _flags: GlobalFlags): Promise<void> {
+export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   const raw = readStdinRaw()
 
-  // Silent pass-through for projects without plur configured (#247).
-  // Lets hooks be installed globally without affecting non-plur projects.
-  if (!isPlurConfigured()) {
-    process.stdout.write(raw)
-    return
-  }
+  // Silent unless the folder map says on (#1347; was #247's project gate).
+  if (!hookFolderOn(payloadDir(parsePayload(raw)), flags)) return
 
-  // Parse stdin for cwd (provided by Claude Code hook payload)
+  // Parse stdin for cwd, session_id and stop_hook_active (Claude Code payload)
   let cwd = process.cwd()
+  let data: { cwd?: unknown; session_id?: unknown; stop_hook_active?: unknown } = {}
   try {
-    const data = JSON.parse(raw)
-    if (data.cwd) cwd = data.cwd
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') data = parsed
+    if (typeof data.cwd === 'string' && data.cwd) cwd = data.cwd
   } catch { /* use process.cwd fallback */ }
+
+  // A continuation Stop — the turn our own nudge forced. Never nudge here
+  // (that is the loop), and do not count it: the interval is per response.
+  if (data.stop_hook_active === true) return
+
+  const key = sessionKey(data.session_id)
 
   // Increment persistent counter (atomic append — see incrementCounter's docstring).
   // Fail-open: if the state dir is unwritable (read-only $TMPDIR, full disk),
-  // a Stop hook MUST NOT crash the response — pass the payload through untouched.
+  // a Stop hook MUST NOT crash the response — print nothing and exit 0.
   // counterPath() creates the dir and incrementCounter() appends; either can
   // throw on an unwritable filesystem, so wrap both.
+  const counter = counterPath(key)
+  if (!counter) return // no trusted state dir: persist nothing, stay silent (H3)
   let count: number
   try {
-    count = incrementCounter(counterPath())
+    count = incrementCounter(counter)
   } catch {
-    process.stdout.write(raw)
     return
   }
 
   // Write session checkpoint periodically (#215)
   if (count % CHECKPOINT_INTERVAL === 0) {
-    try { writeCheckpoint(count, cwd) } catch { /* never block on checkpoint failure */ }
+    try { writeCheckpoint(key, count, cwd, flags) } catch { /* never block on checkpoint failure */ }
   }
 
   // Learning nudge every Nth stop
-  if (count % LEARN_INTERVAL !== 0) {
-    process.stdout.write(raw)
-    return
-  }
+  if (count % LEARN_INTERVAL !== 0) return
 
-  const output = { additionalContext: LEARN_PROMPT }
+  const output = { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: LEARN_PROMPT } }
   process.stdout.write(JSON.stringify(output))
 }
