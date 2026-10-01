@@ -232,10 +232,20 @@ function sessionDir(): string | null {
 }
 
 /**
- * #1228's former hook-inject key: `sid-` + the payload id, else ppid (formal
- * r2, cli#7). Nothing writes under it since main's payload-first
- * {@link sessionKey} (#1278, decision H1) keys the marker, reminder and lock;
- * it is kept as the legacy form readers may still meet (see #1401).
+ * Which Claude Code session is this? (formal r2, cli#7)
+ *
+ * Every Claude Code hook payload carries `session_id`. The marker used to be
+ * keyed by `process.ppid` alone, while the session guard keys by session_id:
+ * `/clear` starts a new session in the SAME process, and a recycled PID is a
+ * new process with an old number — both found the previous session's marker
+ * and skipped injection entirely. The payload id is the identity; ppid is the
+ * fallback for payloads without one (and keeps those paths byte-identical to
+ * before). The `sid-` prefix keeps the two key spaces disjoint.
+ *
+ * LEGACY since owner decision H1 ("payload", 2026-09-29): the hook keys its
+ * state with `hookSessionKey` (lib/session-key.ts). This is the key a pre-H1
+ * writer used — `legacyHookSessionKeys` produces it for readers — kept for
+ * its unit tests. Nothing writes under it.
  */
 export function injectSessionKey(input: Record<string, unknown>, ppid: number | string = process.ppid || 'unknown'): string {
   const sid = typeof input.session_id === 'string' ? input.session_id : ''

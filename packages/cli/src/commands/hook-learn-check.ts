@@ -48,8 +48,12 @@ const LEARN_INTERVAL = 3 // Learning nudge every N stops
 const CHECKPOINT_INTERVAL = parseInt(process.env.PLUR_CHECKPOINT_INTERVAL || '10', 10)
 
 /**
- * Payload `session_id` first, then CLAUDE_SESSION_ID, then ppid — the same
- * precedence the checkpoint readers (hook-session-end, plur_session_end) use.
+ * Owner decision H1 ("payload", 2026-09-29): the one shared helper —
+ * payload `session_id`, then CLAUDE_SESSION_ID, then ppid — so the checkpoint
+ * writer and every reader (hook-session-end, plur_session_end, the deferred
+ * wrap-up) agree. Readers also try the env-first stripped key this function
+ * used before (legacyHookSessionKeys). The stop counter is not migrated: an
+ * orphaned counter delays one nudge at most.
  */
 function sessionKey(payloadSessionId?: unknown): string {
   // Owner decision H1 ("payload", 2026-09-29): the one shared helper, so the
@@ -100,6 +104,7 @@ function checkpointDir(flags: GlobalFlags): string | null {
 }
 
 function writeCheckpoint(id: string, count: number, cwd: string, flags: GlobalFlags): void {
+  // id: hookSessionKey of this Stop payload (H1)
   const dir = checkpointDir(flags)
   if (!dir) return
   const path = join(dir, `${id}.checkpoint.json`)
