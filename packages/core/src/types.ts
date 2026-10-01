@@ -55,6 +55,19 @@ export interface LearnContext {
   /** Always-load flag — bypass keyword-relevance gate during injection. */
   pinned?: boolean
   /**
+   * Tier within the pinned budget (pinned two-tier model). "hard": a sub-cap
+   * inside the pinned quota (`injection.pinned_hard_ratio` of it, default 0.5);
+   * the write is rejected if it would grow the hard tier past that cap.
+   * "soft": gets what the hard tier leaves. Default: "soft".
+   */
+  pin_tier?: 'hard' | 'soft'
+  /**
+   * Soft-tier priority, an integer 1–100 (default 50); anything else is
+   * rejected. Higher is selected first within an origin. Ignored for
+   * pin_tier="hard".
+   */
+  pinned_priority?: number
+  /**
    * Start of the knowledge's validity window (ISO YYYY-MM-DD, #347). Stored in
    * `temporal.valid_from`; inject/recall skip the engram before this date.
    */
@@ -355,7 +368,7 @@ export interface InjectionResult {
    *
    * Absent when nothing was omitted.
    */
-  omitted_pinned?: Array<{ id: string; cost: number; reason: 'pinned-sub-budget' | 'total-budget' }>
+  omitted_pinned?: Array<{ id: string; cost: number; reason: 'pinned-sub-budget' | 'total-budget' | 'hard-tier-cap' | 'soft-tier-budget' }>
 }
 
 export interface CaptureContext {

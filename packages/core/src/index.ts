@@ -14,7 +14,7 @@ import { generateEngramId, engramIdDatePrefix, loadAllPacks, storePrefix, namesp
 import { maybeDailyBackup } from './backup.js'
 import { logger } from './logger.js'
 import { searchEngrams, ftsTokenize, extendCorpusStats, searchTextFrom } from './fts.js'
-import { selectAndSpread, scoreEngramsPublic, formatWithLayer, assignLayer, estimateTokens } from './inject.js'
+import { selectAndSpread, scoreEngramsPublic, formatWithLayer, assignLayer, estimateTokens, pinnedHardCap, isHardPinned, DEFAULT_PINNED_HARD_RATIO } from './inject.js'
 import { reactivate } from './decay.js'
 import { captureEpisode, queryTimeline } from './episodes.js'
 import { agenticSearch } from './agentic-search.js'
@@ -32,7 +32,7 @@ import { embedderStatus, resetEmbedder, setEmbeddingsEnabled, type EmbedderStatu
 import { expandedSearch } from './query-expansion.js'
 import { recallAuto, type AutoSearchResult } from './search-orchestrator.js'
 import { autoSummary } from './summary.js'
-import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack, containsEmail } from './packs.js'
+import { installPack, uninstallPack, listPacks, exportPack, scanPrivacy, computePackHash, previewPack, containsEmail, migratePackIntegrity } from './packs.js'
 import type { ExportOptions } from './packs.js'
 import { learnContextContent, engramContentFields } from './content-fields.js'
 export { LEARN_CONTEXT_FIELD_ROLES, LEARN_CONTENT_FIELDS, learnContextContent, engramContentFields } from './content-fields.js'
@@ -343,7 +343,8 @@ export type { Engram, PreviousVersionRef } from './schemas/engram.js'
 export { ExtractionProvenanceSchema, getExtractionProvenance, type ExtractionProvenance } from './schemas/engram.js'
 export type { Episode } from './schemas/episode.js'
 export type { PackManifest } from './schemas/pack.js'
-export type { PreviewResult, RegistryEntry, PrivacyScanResult, PrivacyIssue, PackProvenanceView, InstallResult, NeutralizedCounts } from './packs.js'
+export { shortPackIntegrity, isTransientPackDir } from './packs.js'
+export type { PreviewResult, RegistryEntry, PrivacyScanResult, PrivacyIssue, PackProvenanceView, InstallResult, NeutralizedCounts, PackIntegrityMigrationReport } from './packs.js'
 export type { PlurConfig, StoreEntry, ScopeRoutingConfig } from './schemas/config.js'
 export type { ManifestSummary, PayloadDescriptor, Producer, Signer, CapsuleHeader, CapsulePreamble } from './schemas/capsule.js'
 export {
@@ -2371,10 +2372,25 @@ export class Plur {
    * Never throws — provenance is a description, and failing to write one must
    * not fail the learn that prompted it.
    */
+  /**
+   * Run fire-and-forget work only once the store has committed (#1178, F16).
+   *
+   * A transactional store runs a protected write inside one connection and one
+   * ownership context. Background work started inside that context would
+   * inherit it, then fail once the transaction ends, or run against state that
+   * a later rollback discards. Stores without transactions run it immediately.
+   */
+  private _afterStoreCommit(callback: () => void): void {
+    if (this._primaryStore.afterCommit) this._primaryStore.afterCommit(callback)
+    else callback()
+  }
+
   private _maybeWriteProvenance(engramId: string): void {
     if (provenanceMode(this.config) !== 'always') return
-    void this.writeProvenance(engramId).catch(err => {
-      logger.warning(`[plur:provenance] could not write a record for ${engramId}: ${(err as Error).message}`)
+    this._afterStoreCommit(() => {
+      void this.writeProvenance(engramId).catch(err => {
+        logger.warning(`[plur:provenance] could not write a record for ${engramId}: ${(err as Error).message}`)
+      })
     })
   }
 
@@ -3512,6 +3528,18 @@ export class Plur {
         `plur.${fn}: invalid type '${context.type}'. Must be one of: behavioral, terminological, procedural, architectural`
       )
     }
+    // Pinned two-tier fields. Nothing Zod-validates an engram before save, so
+    // an out-of-range priority written here would be stored verbatim — and a
+    // 9999 sorts ahead of every legitimately prioritised pin.
+    if (context?.pin_tier !== undefined && context.pin_tier !== 'hard' && context.pin_tier !== 'soft') {
+      throw new TypeError(`plur.${fn}: invalid pin_tier '${String(context.pin_tier)}'. Must be "hard" or "soft"`)
+    }
+    if (context?.pinned_priority !== undefined) {
+      const p = context.pinned_priority
+      if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 100) {
+        throw new TypeError(`plur.${fn}: pinned_priority must be an integer from 1 to 100, got ${String(p)}`)
+      }
+    }
     if (!this.config.allow_secrets) {
       // Scan the statement AND every caller-supplied content field (#381,
       // #389, #1002 review). The field set comes from ONE table,
@@ -3763,6 +3791,7 @@ export class Plur {
     // valid_from/valid_until fail fast — even when the write would dedup
     // into an existing engram below.
     const validity = resolveValidity(statement, context)
+
     return await this._withStoreLock(this.paths.engrams, async () => {
       const scope = guarded.scope
       const ps = this._primaryStore
@@ -3861,6 +3890,10 @@ export class Plur {
         ...this._buildEngramShape(statement, scope, context, now, validity, id => this._ancestorsOf(engrams, id), guarded.scopeSource),
         id,
       }
+      // Hard-tier cap: AFTER dedup (a re-learn that folds into an existing
+      // engram creates no row and must not be charged), on the engram as it
+      // will be committed, and inside the lock the write commits under.
+      await this._assertHardTierFits(engram)
 
       // #240: supersedes is a graph edge, not a temporality enum — write the
       // reverse superseded_by edge on each target found in the local primary
@@ -3977,112 +4010,118 @@ export class Plur {
         // with nothing attached — an unhandled rejection, which terminates the
         // process on modern Node. A background task must not be able to take
         // the host down.
-        this._outboxInFlight.add(engram.id)
-        void (async () => {
-          // One pusher per entry (2026-09-29 panel, M6): a flush that started
-          // between the local write and this push must not POST it too.
-          if (this._claimOutboxEntry(engram.id, () => pushKey).status === 'busy') return
-          let pushed = false
-          // Decision D1: keep the id the server assigned — if a forget/rescope
-          // cancels the delivery while this POST is on the wire, the accepted
-          // remote copy is queued for retirement by that id.
-          let serverId: string | undefined
-          try {
-            ;({ id: serverId } = await remoteDriver.appendAndGetServerId(engram, { idempotencyKey: pushKey }))
-            pushed = true
-          } catch (err) {
-            // The POST did not land. The in-flight claim is still held, and is
-            // released only by the `finally` below, AFTER this bookkeeping
-            // write (review of #1231): released before it, another writer could
-            // take the row in the gap and put its own POST on the wire.
-            // Already saved locally with outbox metadata — will be retried.
-            logger.warning(`[plur:outbox] immediate push failed for ${engram.id}, queued for retry: ${(err as Error).message}`)
-            await this._withStoreLock(this.paths.engrams, async () => {
-              // Targeted read (#827): only this engram's outbox bookkeeping.
-              const fresh = await this._loadTargeted([engram.id])
-              const target = fresh.find(e => e.id === engram.id) as any
-              if (target?.structured_data?._outbox) {
-                target.structured_data._outbox.last_error = (err as Error).message
-                target.structured_data._outbox.attempt_count = 1
-                // #1299: the status, when the remote gave one — it is what
-                // tells a refusal from a blip.
-                if (err instanceof RemoteHttpError) target.structured_data._outbox.last_status = err.status
-              }
-              if (target?.structured_data?._outbox) {
-                // Incremental write (#740): only the outbox bookkeeping changed.
-                await this._updateEngrams(fresh, [target as Engram])
-              }
-            })
-            this._releaseOutboxClaim(engram.id)
-            return
-          }
+        // Started only once the local write has committed (#1178, F16). A
+        // transactional primary store would otherwise hand this task the
+        // write's own connection, which is gone by the time it runs. A
+        // rolled-back write never launches it, so nothing is marked in flight.
+        this._afterStoreCommit(() => {
+          this._outboxInFlight.add(engram.id)
+          void (async () => {
+            // One pusher per entry (2026-09-29 panel, M6): a flush that started
+            // between the local write and this push must not POST it too.
+            if (this._claimOutboxEntry(engram.id, () => pushKey).status === 'busy') return
+            let pushed = false
+            // Decision D1: keep the id the server assigned — if a forget/rescope
+            // cancels the delivery while this POST is on the wire, the accepted
+            // remote copy is queued for retirement by that id.
+            let serverId: string | undefined
+            try {
+              ;({ id: serverId } = await remoteDriver.appendAndGetServerId(engram, { idempotencyKey: pushKey }))
+              pushed = true
+            } catch (err) {
+              // The POST did not land. The in-flight claim is still held, and is
+              // released only by the `finally` below, AFTER this bookkeeping
+              // write (review of #1231): released before it, another writer could
+              // take the row in the gap and put its own POST on the wire.
+              // Already saved locally with outbox metadata — will be retried.
+              logger.warning(`[plur:outbox] immediate push failed for ${engram.id}, queued for retry: ${(err as Error).message}`)
+              await this._withStoreLock(this.paths.engrams, async () => {
+                // Targeted read (#827): only this engram's outbox bookkeeping.
+                const fresh = await this._loadTargeted([engram.id])
+                const target = fresh.find(e => e.id === engram.id) as any
+                if (target?.structured_data?._outbox) {
+                  target.structured_data._outbox.last_error = (err as Error).message
+                  target.structured_data._outbox.attempt_count = 1
+                  // #1299: the status, when the remote gave one — it is what
+                  // tells a refusal from a blip.
+                  if (err instanceof RemoteHttpError) target.structured_data._outbox.last_status = err.status
+                }
+                if (target?.structured_data?._outbox) {
+                  // Incremental write (#740): only the outbox bookkeeping changed.
+                  await this._updateEngrams(fresh, [target as Engram])
+                }
+              })
+              this._releaseOutboxClaim(engram.id)
+              return
+            }
 
-          if (!pushed) return
-          // Remote has it. Remove the local copy — and if this fails, say so
-          // rather than re-queueing something already accepted.
-          try {
-            await this._withStoreLock(this.paths.engrams, async () => {
-              // NOT `_loadTargeted` (#827): this REMOVES a row, and the only
-              // removal primitive `PrimaryStore` has is a whole-corpus save of
-              // the array without it. A one-row targeted read here would be a
-              // full replace by an empty array — the corpus, deleted. It stays
-              // a full load until there is a `remove`/`deleteMany` seam.
-              const fresh = await this._primaryStore.load()
-              const idx = fresh.findIndex(e => e.id === engram.id)
-              // Hand off only a row that is STILL queued FOR THIS STORE. A
-              // forget() or a local rescope that landed while the POST was in
-              // flight cancelled the delivery (#766, #848); a D4 update or a
-              // rescope to another store RETARGETED it (audit of #1228,
-              // finding 1) — the row still carries `_outbox`, but for a store
-              // that has not received it. Deleting the row in either case
-              // loses a decision; keep it and say so.
-              const pushedTarget = storeEntry ? { url: storeEntry.url!, scope } : undefined
-              if (idx !== -1 && !Plur._stillQueuedFor(fresh[idx], pushedTarget)) {
-                const retargeted = Plur._stillQueued(fresh[idx])
-                // Decision D1: queue a durable "retire on remote" entry for the
-                // copy the remote just accepted; flushOutbox() retries it (and,
-                // for a retargeted row, before it delivers to the new store).
-                const queuedRetire = serverId
-                  ? Plur._queueRetireRemote(fresh[idx], {
-                      target_url: pushedTarget?.url ?? '',
-                      target_scope: scope,
-                      server_id: serverId,
-                    }, new Date().toISOString())
-                  : false
-                if (queuedRetire) await this._updateEngrams(fresh, [fresh[idx]])
-                logger.warning(
-                  `[plur:outbox] ${engram.id} reached the remote${serverId ? ` as ${serverId}` : ''} after its delivery `
-                  + (retargeted
-                    ? `was retargeted to another store during the push. The local record stays queued for the new store`
-                    : `was cancelled locally (forget/rescope during the push). The local record is kept`)
-                  + (queuedRetire
-                    ? `; the old copy is queued for retirement and the next flush retires it.`
-                    : `; the remote copy must be retired there.`),
-                )
-                return
-              }
-              if (idx !== -1) {
-                fresh.splice(idx, 1)
-                // Deliberate removal: the remote accepted this engram, so the
-                // local copy is redundant by design (audit #794 shrink guard).
-                await this._writeEngrams(this.paths.engrams, fresh, { allowShrink: true })
-                await this._syncIndex()
-              }
-            })
-          } catch (err) {
-            // Retried by the next flush with the same key (decision C4): a
-            // key-honouring server collapses it; one that ignores keys may
-            // hold one duplicate.
-            logger.warning(
-              `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
-              + `${(err as Error).message}. The next flush will retry it with the same idempotency key.`,
-            )
-          } finally {
-            this._releaseOutboxClaim(engram.id)
-          }
-        })().catch(err => {
-          logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
-        }).finally(() => { this._outboxInFlight.delete(engram.id) })
+            if (!pushed) return
+            // Remote has it. Remove the local copy — and if this fails, say so
+            // rather than re-queueing something already accepted.
+            try {
+              await this._withStoreLock(this.paths.engrams, async () => {
+                // NOT `_loadTargeted` (#827): this REMOVES a row, and the only
+                // removal primitive `PrimaryStore` has is a whole-corpus save of
+                // the array without it. A one-row targeted read here would be a
+                // full replace by an empty array — the corpus, deleted. It stays
+                // a full load until there is a `remove`/`deleteMany` seam.
+                const fresh = await this._primaryStore.load()
+                const idx = fresh.findIndex(e => e.id === engram.id)
+                // Hand off only a row that is STILL queued FOR THIS STORE. A
+                // forget() or a local rescope that landed while the POST was in
+                // flight cancelled the delivery (#766, #848); a D4 update or a
+                // rescope to another store RETARGETED it (audit of #1228,
+                // finding 1) — the row still carries `_outbox`, but for a store
+                // that has not received it. Deleting the row in either case
+                // loses a decision; keep it and say so.
+                const pushedTarget = storeEntry ? { url: storeEntry.url!, scope } : undefined
+                if (idx !== -1 && !Plur._stillQueuedFor(fresh[idx], pushedTarget)) {
+                  const retargeted = Plur._stillQueued(fresh[idx])
+                  // Decision D1: queue a durable "retire on remote" entry for the
+                  // copy the remote just accepted; flushOutbox() retries it (and,
+                  // for a retargeted row, before it delivers to the new store).
+                  const queuedRetire = serverId
+                    ? Plur._queueRetireRemote(fresh[idx], {
+                        target_url: pushedTarget?.url ?? '',
+                        target_scope: scope,
+                        server_id: serverId,
+                      }, new Date().toISOString())
+                    : false
+                  if (queuedRetire) await this._updateEngrams(fresh, [fresh[idx]])
+                  logger.warning(
+                    `[plur:outbox] ${engram.id} reached the remote${serverId ? ` as ${serverId}` : ''} after its delivery `
+                    + (retargeted
+                      ? `was retargeted to another store during the push. The local record stays queued for the new store`
+                      : `was cancelled locally (forget/rescope during the push). The local record is kept`)
+                    + (queuedRetire
+                      ? `; the old copy is queued for retirement and the next flush retires it.`
+                      : `; the remote copy must be retired there.`),
+                  )
+                  return
+                }
+                if (idx !== -1) {
+                  fresh.splice(idx, 1)
+                  // Deliberate removal: the remote accepted this engram, so the
+                  // local copy is redundant by design (audit #794 shrink guard).
+                  await this._writeEngrams(this.paths.engrams, fresh, { allowShrink: true })
+                  await this._syncIndex()
+                }
+              })
+            } catch (err) {
+              // Retried by the next flush with the same key (decision C4): a
+              // key-honouring server collapses it; one that ignores keys may
+              // hold one duplicate.
+              logger.warning(
+                `[plur:outbox] ${engram.id} was accepted by the remote but its local copy could not be removed: `
+                + `${(err as Error).message}. The next flush will retry it with the same idempotency key.`,
+              )
+            } finally {
+              this._releaseOutboxClaim(engram.id)
+            }
+          })().catch(err => {
+            logger.warning(`[plur:outbox] background push for ${engram.id} failed unexpectedly: ${(err as Error).message}`)
+          }).finally(() => { this._outboxInFlight.delete(engram.id) })
+        })
 
         this._appendHistory({
           event: 'engram_created',
@@ -4325,6 +4364,39 @@ export class Plur {
         _routeRefused: guarded.refusedShared,
       }
     }
+    // Hard-tier cap on the remote route. The engram is built here and POSTed,
+    // so this is a write path that produces a hard-tier engram exactly like
+    // learn() — and so is the local fallback below. Both run under ONE hold of
+    // the store lock, taken only for a hard-tier write so ordinary remote
+    // writes keep their lock-free POST. The cost is estimated with an id of
+    // the longest shape either outcome can carry (the server's id, or a local
+    // one), since neither is known until after the POST.
+    if (isHardPinned(localPlaceholder as never)) {
+      return await this._withStoreLock(this.paths.engrams, async () => {
+        await this._assertHardTierFits({ ...localPlaceholder, id: 'ENG-XXXXXX-0000-00-00-000' })
+        return await this._commitRemoteRouted(localPlaceholder, remoteDriver, scope, now, allEngrams, unpersistableHit, true)
+      })
+    }
+    return await this._commitRemoteRouted(localPlaceholder, remoteDriver, scope, now, allEngrams, unpersistableHit, false)
+  }
+
+  /**
+   * The commit half of `learnRouted`'s remote route: POST, or on failure save
+   * locally with an outbox marker. `lockHeld` says whether the caller already
+   * holds the primary store lock (a hard-tier write does, so its admission
+   * check and its fallback save observe one state); the lock is not reentrant,
+   * so the fallback takes it only when the caller does not.
+   */
+  private async _commitRemoteRouted(
+    localPlaceholder: Engram,
+    remoteDriver: RemoteStore,
+    scope: string,
+    now: string,
+    allEngrams: Engram[],
+    /** Decision A: a same-scope match held only in a pack or readonly store, noted in history. */
+    unpersistableHit: Engram | null,
+    lockHeld: boolean,
+  ): Promise<Engram> {
     let serverEngram: Engram
     // Idempotency key for this write (2026-09-29 audits). The placeholder's id
     // is `__pending__` on EVERY direct write, so it can never be the key: a
@@ -4340,7 +4412,7 @@ export class Plur {
       // matches the scope (e.g. readonly remote), we still save the local
       // engram but omit the outbox marker — the retry path will skip it.
       const storeEntry = (this.config.stores ?? []).find(s => s.url && s.scope === scope && !s.readonly)
-      return await this._withStoreLock(this.paths.engrams, async () => {
+      const saveFallback = async () => {
         const engrams = await this._primaryStore.load()
         // Replace placeholder ID with a real local ID
         localPlaceholder.id = generateEngramId([...engrams, ...allEngrams], this._mintedTodayIds())
@@ -4384,7 +4456,8 @@ export class Plur {
         this._maybeWriteProvenance(localPlaceholder.id)
         logger.warning(`[plur:outbox] remote write failed for ${localPlaceholder.id}, queued for retry: ${(err as Error).message}`)
         return localPlaceholder
-      })
+      }
+      return lockHeld ? await saveFallback() : await this._withStoreLock(this.paths.engrams, saveFallback)
     }
 
     // History is appended OUTSIDE the try that guards the remote write (#813,
@@ -4610,6 +4683,8 @@ export class Plur {
         supersedes: context!.supersedes!, superseded_by: [],
       } : undefined,
       pinned: context?.pinned === true ? true : undefined,
+      pinned_tier: context?.pin_tier,
+      pinned_priority: context?.pinned_priority,
       // #869: measurement context — present only when the caller supplies it.
       measured_under: this._validatedMeasuredUnder(context),
     }
@@ -5321,7 +5396,7 @@ export class Plur {
       if (typeof adapter.listEngramsMissingEmbeddings === 'function') {
         const gap = await adapter.listEngramsMissingEmbeddings(1)
         if (gap.length > 0) {
-          this._kickPrimaryAutoEmbed(adapter)
+          this._afterStoreCommit(() => this._kickPrimaryAutoEmbed(adapter))
           return fallback()
         }
       }
@@ -6678,6 +6753,8 @@ export class Plur {
         spread_cap: this.config.injection?.spread_cap,
         spread_budget: this.config.injection?.spread_budget,
         expiry: this.config.expiry,
+        pinned_hard_ratio: this.config.injection?.pinned_hard_ratio,
+        pinned_ratio: this.config.injection?.pinned_ratio,
       },
       embeddingBoosts,
     )
@@ -7317,11 +7394,15 @@ export class Plur {
       const existingIds = new Set(engrams.map(e => e.id))
       let saved = 0
       let skipped = 0
+      // Hard-tier tokens accepted earlier in this batch; listPinned cannot see
+      // them until the batch is written.
+      let pendingHard = 0
       for (const meta of metas) {
         if (existingIds.has(meta.id)) {
           skipped++
           continue
         }
+        pendingHard += await this._assertHardTierFits(meta, pendingHard)
         // LOW-1: guard each meta on the FULL content (statement + context
         // fields) at its scope before persist. Do NOT call _guardExplicitUpdate
         // (its warning text is the EXPLICIT-update path); inline the demotion
@@ -7412,6 +7493,10 @@ export class Plur {
       // statement, scope, commitment, relations and retirement as the tracked
       // mutations, and this is where four of the five actually happen.
       const toWrite = { ...(demote ? { ...updated, ...demote } : updated), updated_at: new Date().toISOString() }
+      // A whole-engram update can set `pinned` and `pinned_tier` — a write path
+      // that can produce a hard-tier engram, so it passes the same cap. Checked
+      // before the queued-scope reconcile so a refused update has no side effects.
+      await this._assertHardTierFits(toWrite)
       this._reconcileQueuedScope(engrams[idx], toWrite)
       const retiresNow = engrams[idx].status !== 'retired' && toWrite.status === 'retired'
       engrams[idx] = toWrite
@@ -7600,6 +7685,17 @@ export class Plur {
         pinned: pinned === true ? true : undefined,
         updated_at: new Date().toISOString(),
       }
+      // Pinned two-tier model: an unpin clears the tier and the priority with
+      // the flag. They describe a pin; left behind, a later re-pin would
+      // silently restore hard-tier membership without the cap ever being
+      // consulted.
+      if (pinned !== true) {
+        delete (updated as { pinned_tier?: unknown }).pinned_tier
+        delete (updated as { pinned_priority?: unknown }).pinned_priority
+      }
+      // A re-pin of an engram that still carries `pinned_tier: 'hard'` (written
+      // before unpin cleared it, or by another path) is a hard-tier write.
+      await this._assertHardTierFits(updated)
       engrams[idx] = updated
       // Incremental write (#740): only the (un)pinned engram row changed.
       await this._updateEngrams(engrams, [updated])
@@ -7608,6 +7704,11 @@ export class Plur {
     })
     if (localResult) return localResult
 
+    let remotePatched: {
+      patched: Engram; driver: RemoteStore; serverId: string; scope: string
+      /** Whether the engram was pinned BEFORE this call; null when unknown. */
+      priorPinned: boolean | null
+    } | null = null
     // Remote routing (closes #86 pin remainder). Strip the namespace prefix
     // before sending the server the unprefixed ID it knows about. Same
     // refusal rule as `_updateEngramReturning`: a namespaced id names ONE
@@ -7646,14 +7747,65 @@ export class Plur {
         // unpin the user was told had worked had not happened on any other
         // machine — and with the pinned set now quota-enforced at pin time,
         // it also held budget nobody could reclaim.
+        // Record the prior pin state BEFORE the PATCH, so a refused hard-tier
+        // pin can be reverted to what it was rather than to a forced unpin —
+        // and so re-pinning an engram that was already pinned (which cannot
+        // grow the tier) is never refused. Read from the driver's cache when
+        // it holds the row, else one GET; only for a pin, never an unpin.
+        let priorPinned: boolean | null = null
+        if (pinned === true) {
+          const cachedRow = ((driver as unknown as { cache?: { engrams?: Engram[] } | null }).cache?.engrams ?? [])
+            .find(e => e.id === serverId)
+          const prior = cachedRow ?? (typeof driver.getById === 'function' ? await driver.getById(serverId) : null)
+          priorPinned = prior ? (prior as { pinned?: boolean }).pinned === true : null
+        }
         const patched = await driver.patch(serverId, { pinned })
-        if (patched) return patched
+        if (!patched) continue
+        remotePatched = { patched, driver, serverId, scope: entry.scope, priorPinned }
+        break
       } catch (err) {
         if (serverId !== id) throw err
         continue
       }
     }
-    return null
+    if (!remotePatched) return null
+    // Pinned two-tier model: a remote re-pin can restore a hard tier the
+    // engram still carries (a partial PATCH cannot clear it on unpin). Only
+    // the server's answer says which tier the engram is in, so the cap is
+    // checked on it — under the store lock, like every other hard-tier write
+    // — and a pin that would overrun the cap is reverted to the state recorded
+    // before the PATCH and refused. There is a window between the PATCH and
+    // the revert. An engram that was already pinned is not checked: re-pinning
+    // it cannot grow the tier. When the prior state is unknown (no cached row,
+    // GET failed) the engram is treated as previously unpinned.
+    const { patched, driver, serverId, scope, priorPinned } = remotePatched
+    if (pinned === true && priorPinned !== true && isHardPinned(patched as never)) {
+      try {
+        await this._withStoreLock(this.paths.engrams, async () => {
+          await this._assertHardTierFits({ ...patched, id: namespaceEngramId(serverId, scope) })
+        })
+      } catch (err) {
+        // Surface a failed revert: swallowing it would report "refused" while
+        // the engram stays pinned over the cap on the server.
+        let revertError: string | null = null
+        try {
+          // Back to the recorded prior state. It is "not pinned" here: an
+          // engram that was pinned before the call never reaches this check.
+          const reverted = await driver.patch(serverId, { pinned: false })
+          if (!reverted) revertError = 'the server no longer holds the engram (404)'
+        } catch (e) {
+          revertError = (e as Error).message
+        }
+        if (revertError) {
+          throw new Error(
+            `${(err as Error).message} The pin was applied on the remote store and could NOT be reverted ` +
+            `(${revertError}); the engram ${serverId} is still pinned there. Unpin it explicitly.`,
+          )
+        }
+        throw err
+      }
+    }
+    return patched
   }
 
   /**
@@ -7669,6 +7821,80 @@ export class Plur {
   async listPinned(): Promise<Engram[]> {
     const all = await this._loadAllEngrams()
     return all.filter(e => (e as any).pinned === true && e.status === 'active')
+  }
+
+  /**
+   * Token cap of the HARD pinned tier at write time (pinned two-tier model):
+   * `injection.pinned_hard_ratio` of the same quota {@link pinnedQuota}
+   * enforces. The ratio is bounded to [0, 1], so the hard tier can never
+   * exceed the pinned quota. Default: 0.5 × 1000 = 500 tokens.
+   */
+  hardTierCap(): number {
+    return pinnedHardCap(
+      this.config.injection_budget ?? 2000,
+      this.config.injection?.pinned_hard_ratio ?? DEFAULT_PINNED_HARD_RATIO,
+      this.config.injection?.pinned_ratio ?? 0.5,
+    )
+  }
+
+  /**
+   * Refuse a write that would grow the hard pinned tier past
+   * {@link hardTierCap}. The ONE check every write path that can produce a
+   * hard-tier engram goes through: `learn()`, both halves of `learnRouted()`'s
+   * remote route, `setPinned()`, `updateEngram()` and `saveMetaEngrams()`.
+   *
+   * MUST be called while holding the primary store lock. A cap is a
+   * read-modify-write on a shared total: checked outside the lock, N
+   * concurrent hard-tier writes each read the same total, each conclude they
+   * fit, and all commit. `listPinned` takes no lock of its own, so calling it
+   * here does not re-enter.
+   *
+   * Cost is `estimateTokens` — the function injection charges the budget
+   * with — over the engram AS IT WILL BE COMMITTED, so admission, accounting
+   * and injection agree. It counts only what is rendered into the prompt; an
+   * unrendered field (`abstract`, `structured_data`, `tags`, …) costs nothing
+   * because it reaches no model.
+   *
+   * What the total counts: every hard-tier engram this client can see —
+   * the primary store, file-backed stores, and remote stores as far as their
+   * read cache holds them (`_loadRemoteCached` is a synchronous peek and may be
+   * cold). A remote store's hard tier can also be written by other clients,
+   * which no local check can serialise against. That is why injection enforces
+   * the same cap again (`fillTokenBudget`) and reports any overflow in
+   * `omitted_pinned` as `hard-tier-cap`: this check keeps the local tier honest,
+   * the injection-time cap is the one that cannot be bypassed.
+   *
+   * A write that does not GROW the tier is always allowed — an unrelated update
+   * to a hard-tier engram must not fail because the tier is (already) full.
+   *
+   * @param pendingTokens hard-tier tokens accepted earlier in the same locked
+   *   batch that `listPinned` cannot see yet.
+   * @returns the candidate's cost if it counts toward the tier, else 0.
+   */
+  private async _assertHardTierFits(candidate: Engram, pendingTokens = 0): Promise<number> {
+    if (!isHardPinned(candidate as never)) return 0
+    // A retired (or otherwise non-active) engram is not injected, so it is
+    // outside the tier: editing or retiring it must never be refused because
+    // the tier is full. listPinned() already excludes such rows from the total.
+    if (candidate.status !== undefined && candidate.status !== 'active') return 0
+    const cost = estimateTokens(candidate as never)
+    const hard = (await this.listPinned()).filter(e => isHardPinned(e as never))
+    const previous = hard.find(e => e.id === candidate.id)
+    if (previous && cost <= estimateTokens(previous as never)) return cost
+    const others = hard.filter(e => e.id !== candidate.id)
+    const current = others.reduce((n, e) => n + estimateTokens(e as never), 0) + pendingTokens
+    const cap = this.hardTierCap()
+    if (current + cost > cap) {
+      const list = others.map(e => `${e.id} (${estimateTokens(e as never)} tokens)`).join(', ')
+      throw new Error(
+        `Hard-tier pinned cap exceeded: the hard tier holds ${current} tokens, ` +
+        `this engram costs ${cost}, and the cap is ${cap} ` +
+        `(injection.pinned_hard_ratio of the pinned quota). ` +
+        `Existing hard-tier engrams: [${list}]. ` +
+        `Pin it in the soft tier instead, or unpin a hard-tier engram first.`,
+      )
+    }
+    return cost
   }
 
   /**
@@ -8941,7 +9167,7 @@ export class Plur {
     const primary = this._primaryQueryAdapter()
     if (primary && typeof primary.listEngramsMissingEmbeddings === 'function') {
       this._lastIndexError = null // new pass — stale failures cleared on success
-      this._kickPrimaryAutoEmbed(primary)
+      this._afterStoreCommit(() => this._kickPrimaryAutoEmbed(primary))
       return
     }
     if (this.indexedStorage) {
@@ -9105,6 +9331,15 @@ export class Plur {
   /** List all installed packs (with integrity hashes). */
   listPacks(): ReturnType<typeof listPacks> {
     return listPacks(this.paths.packs)
+  }
+
+  /**
+   * Re-baseline installed packs' registry integrity from v1 to `sha256:v2:`
+   * (ENGRAM-STANDARD-v1 §5.5), only for packs that still verify clean under v1.
+   * `dryRun: true` reports without writing. See `migratePackIntegrity`.
+   */
+  migratePackIntegrity(opts: { dryRun?: boolean } = {}): ReturnType<typeof migratePackIntegrity> {
+    return migratePackIntegrity(this.paths.packs, opts)
   }
 
   // SP5 methods (deferred — vault-export, registry not yet merged)

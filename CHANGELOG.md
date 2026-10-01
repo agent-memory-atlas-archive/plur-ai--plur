@@ -26,6 +26,104 @@ uses, let an out-of-scope engram back in whenever its embedding similarity was
 high, and spreading activation could reach one through a co-access link. Both
 now respect the scope; global and personal engrams still pass as before.
 
+### Pack integrity values are now `sha256:v2:`, and a v1 value still verifies
+
+**The v1 pack hash could not tell some different packs apart** (ENGRAM-STANDARD-v1
+§5.5; found by the formal verification run in #1228). It was
+`SHA256(SKILL.md ‖ engrams.yaml)` with nothing between the two files, so bytes
+moved across the boundary kept the same hash — a trailing line of SKILL.md could
+move into engrams.yaml and the pack still reported `ok`. A missing SKILL.md
+hashed the same as an empty one, and a deprecated `manifest.yaml` was not
+covered at all.
+
+**New packs carry `sha256:v2:<hex>`**: SHA-256 over `SKILL.md`, `manifest.yaml`
+and `engrams.yaml`, each framed as its name, its byte length and its bytes, with
+a missing file spelled differently from an empty one. Export writes it, install
+records it, and `plur packs list` reports it.
+
+**Nothing you already have breaks.** A pack that shipped a v1 `INTEGRITY` value,
+and a registry row written by an earlier install, are checked in the form they
+were recorded in, exactly as before.
+
+**To move installed packs to v2**, run `plur packs migrate-integrity`. It is a
+dry run until you add `--yes`, and the dry run writes nothing and takes no lock.
+A pack that no longer matches its v1 value keeps it and keeps reporting
+`modified`. For a pack that does still match, remember what v1 cannot see: a
+v1 match is not proof the pack is unchanged. So:
+
+- if the directory the pack was installed from is still on disk, the installed
+  pack is re-checked against what installing that source produces today, and
+  moves to v2 only if the two agree. If they differ it stays on v1 and is
+  reported `skipped-modified`;
+- otherwise the v2 value is **carried over from v1**, and marked as such.
+  Re-baselining this way carries v1's trust forward; it does not certify the
+  pack. `plur packs list` keeps saying `ok` for it but adds "baseline carried
+  from v1", and the JSON and `plur_packs_list` output carry
+  `baseline: "carried-from-v1"`. It will catch any change from now on, not an
+  edit v1 could not see before the migration. Reinstall such a pack from a
+  trusted source to get a verified baseline.
+
+Running it twice changes nothing the second time. It never touches a pack's
+shipped `INTEGRITY` file. It ignores the temporary directories an install leaves
+while it runs (or after a crash), and an install finishing mid-run no longer
+aborts it.
+
+**Going back to an older PLUR after migrating** (or after installing anything
+with this version): older versions only understand v1, so every registry row
+written as v2 shows as `modified` in their `packs list`, and they refuse a pack
+that ships a v2 `INTEGRITY` unless forced. Nothing is damaged — return to this
+version and the rows verify again — but do not "fix" those packs from the older
+version.
+
+`plur packs list` now shows the form prefix plus 12 hex digits of a v2 value
+(`sha256:v2:1a2b3c4d5e6f`), where it used to cut it to six.
+
+The standard moves to 1.8. Producers SHOULD write v2, and receivers MUST accept
+both forms. A consumer that only understands v1 will refuse v2 packs, so it
+needs updating before its producers switch. Four conformance vectors were added
+(`with-integrity-v2`, `boundary-shift-v2`, and `manifest-yaml-only-v2` and
+`no-engrams-v2` for an absent `SKILL.md` and an absent `engrams.yaml`), and every
+vector now declares its v2 value as well.
+
+### Two packs with the same manifest name no longer share an integrity baseline
+
+**The pack registry was keyed by manifest name, while installed packs live in
+directories named after their source** (found by the formal verification run in
+#1228). Two directories whose manifests shared a name shared one registry row,
+which caused two failures:
+
+- the second install overwrote the first's baseline, so `plur packs list`
+  reported the untouched first pack as `modified`;
+- uninstalling either pack removed the row by name, leaving the other one
+  `unverified`. Tamper detection was lost without any message.
+
+**Registry rows now record the install directory in a new `dir` field**, and
+install, uninstall and list all look rows up by it. Uninstalling one pack never
+removes another pack's row.
+
+**Older registry files still load unchanged.** A row without `dir` is matched by
+manifest name, as before, and reinstalling that pack upgrades the row in place —
+including when a newer pack with the same manifest name has been installed
+beside it since. On a case-insensitive filesystem the row follows the
+directory's real name, so `plur packs uninstall PACK-ONE` removes `pack-one`'s
+row along with the directory.
+
+**If you were hit by the original bug** — two installed packs with the same
+manifest name — your registry may hold one row that both packs could own.
+Nothing records which pack it belongs to, so `plur packs list` now reports both
+as `UNVERIFIED` (it used to report one of them as `modified` when it was not),
+`plur packs migrate-integrity` skips both as `skipped-ambiguous-legacy-row`, and
+uninstalling one never removes the row. The pack left behind after such an
+uninstall stays `UNVERIFIED`: the row is marked `ambiguous: true`, so it is not
+checked against a value that may be the removed pack's. **Reinstall each
+affected pack from a trusted source**; each then gets its own row.
+
+**Do not share a packs directory between this version and an older one.** An
+older PLUR matches rows by manifest name only: installing there replaces a
+same-name pack's row (dropping its `dir`), and uninstalling there removes every
+row with that name. If that has happened, run `plur packs list` with this
+version and reinstall any pack it reports as `UNVERIFIED`.
+
 ## 0.21.0
 
 Team memory you can trust, in every editor.
@@ -1663,6 +1761,44 @@ That is why the leak above could not be answered on the server side. Every propo
 Writes now carry `scope_source`: `explicit` (named on the call), `session` (a session or `.plur.yaml` scope was in effect), `default` (nothing named it) or `routed` (the router chose it). It is produced by the one constructor both write paths share, so the shape a server receives and the shape written locally cannot drift, and it is omitted when absent so an older outbox entry sends nothing rather than claiming something it cannot vouch for.
 
 Nothing about routing changes. The decision was always made; it was simply not legible to the other side of the wire.
+
+### Pinned engrams can be marked hard or soft
+
+**A pin can now say how much it matters** (#1082, #1203). `learn()` takes
+`pin_tier: "hard" | "soft"` and `pinned_priority` (an integer from 1 to 100),
+stored on the engram as `pinned_tier` and `pinned_priority`.
+
+The tiers live inside the pinned budget you already have, not beside it.
+The hard tier is a sub-cap of the pinned quota — `injection.pinned_hard_ratio`
+of it, default 0.5, so 500 tokens at the default `injection_budget` of 2000 —
+and the soft tier gets whatever the hard tier leaves. Within each origin
+(your primary store, then `stores:`/remote, then packs) hard pins are selected
+first, then soft pins by priority, then by relevance score. Origin stays the
+outer key, so a tier can never lift a pack pin above one of your own.
+
+**If you never set a tier, pinning behaves as before**: the same quota, the same share,
+the same order and the same `omitted_pinned` reasons (the one estimate correction below aside).
+
+A write that would grow the hard tier past its cap is refused, and every write
+path that can produce a hard-tier engram is checked under the store lock:
+`learn()`, both halves of `learnRouted()`'s remote route, re-pinning through
+`setPinned()`, `updateEngram()` and `saveMetaEngrams()`. The check charges the
+same cost injection charges — the rendered text — so admission and injection
+cannot disagree. Unpinning clears the tier and priority; packs cannot carry
+either. Anything that does not fit at injection is reported in `omitted_pinned`
+as `hard-tier-cap` or `soft-tier-budget` rather than dropped silently.
+
+The tier is not yet sent to remote stores: a tiered write to a remote scope
+lands there as an ordinary pin until the server accepts the two fields.
+
+**`injection.pinned_ratio` now sets the pinned share at injection too.** It
+already set the quota enforced when pinning, but injection used a fixed 0.5, so
+with any other value the two disagreed. With the default of 0.5 nothing changes.
+
+**The injection cost estimate now counts `claim_class`.** It is rendered as
+`Kind: …` in the meta line and was not charged, which let a rendered field
+carry unbudgeted text into the prompt. Engrams with a `claim_class` cost a few
+tokens more.
 
 ## 0.20.1
 
