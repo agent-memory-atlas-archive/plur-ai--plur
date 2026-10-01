@@ -2,7 +2,8 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
 import * as os from 'os'
-import { execFileSync } from 'child_process'
+import { gunzipSync } from 'zlib'
+import * as tar from 'tar'
 import yaml from 'js-yaml'
 import { loadPack, loadEngrams, saveEngrams, isTransientPackDir } from './engrams.js'
 import { atomicWrite, fsyncDir, withLock } from './sync.js'
@@ -46,66 +47,100 @@ export function isPackUrl(source: string): boolean {
  * No auth headers are added: signed-URL delivery means the URL is the
  * credential and no Authorization header is needed.
  */
+export const MAX_PACK_DOWNLOAD_BYTES = 32 * 1024 * 1024
+export const MAX_PACK_ARCHIVE_BYTES = 64 * 1024 * 1024
+export const PACK_DOWNLOAD_TIMEOUT_MS = 30_000
+
 export async function downloadAndExtractPack(url: string): Promise<{ packDir: string; tmpRoot: string }> {
-  // Create a unique temp root for this download
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'plur-pack-dl-'))
-
-  // Download
-  let response: Response
+  const controller = new AbortController()
+  // A TOTAL deadline for the request and the body, not an idle timeout.
+  // Extraction below is synchronous and runs after the body is in memory.
+  const timeout = setTimeout(() => controller.abort(), PACK_DOWNLOAD_TIMEOUT_MS)
+  // Signed URLs carry credentials in their path/query; errors must not echo them.
   try {
-    response = await fetch(url)
-  } catch (err: unknown) {
-    fs.rmSync(tmpRoot, { recursive: true, force: true })
-    const msg = err instanceof Error ? err.message : String(err)
-    throw new Error(`Failed to fetch pack from ${url}: ${msg}`)
-  }
-
-  if (!response.ok) {
-    fs.rmSync(tmpRoot, { recursive: true, force: true })
-    throw new Error(`Failed to fetch pack from ${url}: HTTP ${response.status} ${response.statusText}`)
-  }
-
-  // Save the response body to a .tar.gz file
-  const archivePath = path.join(tmpRoot, 'pack.tar.gz')
-  const buffer = await response.arrayBuffer()
-  fs.writeFileSync(archivePath, Buffer.from(buffer))
-
-  // Extract the archive
-  const extractDir = path.join(tmpRoot, FLAT_ARCHIVE_DIRNAME)
-  fs.mkdirSync(extractDir)
-  try {
-    execFileSync('tar', ['-xzf', archivePath, '-C', extractDir], { stdio: 'pipe' })
-  } catch (err: unknown) {
-    fs.rmSync(tmpRoot, { recursive: true, force: true })
-    const msg = err instanceof Error ? (err as NodeJS.ErrnoException).message : String(err)
-    throw new Error(`Failed to extract pack archive from ${url}: ${msg}`)
-  }
-
-  // Find the pack directory: either a single top-level subdirectory, or the
-  // extraction root itself (for flat archives).
-  // `lstat`: a tar entry that is a symbolic link to a directory must not be
-  // taken for the pack directory, or the preview would walk wherever it points.
-  const entries = fs.readdirSync(extractDir)
-  const subdirs = entries.filter(e => fs.lstatSync(path.join(extractDir, e)).isDirectory())
-
-  let packDir: string
-  if (subdirs.length === 1) {
-    // Standard layout: archive contains a single top-level directory
-    packDir = path.join(extractDir, subdirs[0])
-  } else {
-    // Flat layout: SKILL.md / engrams.yaml at archive root
-    const hasPackFiles = entries.some(e => e === 'SKILL.md' || e === 'engrams.yaml' || e === 'manifest.yaml')
-    if (hasPackFiles) {
-      packDir = extractDir
-    } else {
-      fs.rmSync(tmpRoot, { recursive: true, force: true })
-      throw new Error(
-        `Pack archive from ${url} has an unexpected layout — expected a single top-level directory or pack files at the root (SKILL.md / engrams.yaml).`,
-      )
+    let response: Response
+    try {
+      response = await fetch(url, { signal: controller.signal })
+    } catch {
+      // fetch() quotes the URL in its own messages ("Failed to parse URL
+      // from <url>", "…includes credentials: <url>"). Never pass them on.
+      throw new Error(controller.signal.aborted ? 'download timed out' : 'request failed before a response')
     }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const declared = Number(response.headers.get('content-length'))
+    if (declared > MAX_PACK_DOWNLOAD_BYTES) {
+      await response.body?.cancel()
+      throw new Error('pack download exceeds size limit')
+    }
+    if (!response.body) throw new Error('empty pack response')
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    try {
+      for (;;) {
+        let next: Awaited<ReturnType<typeof reader.read>>
+        try { next = await reader.read() } catch {
+          throw new Error(controller.signal.aborted ? 'download timed out' : 'connection failed while downloading')
+        }
+        const { done, value } = next
+        if (done) break
+        total += value.byteLength
+        if (total > MAX_PACK_DOWNLOAD_BYTES) throw new Error('pack download exceeds size limit')
+        chunks.push(value)
+      }
+    } finally {
+      await reader.cancel().catch(() => {})
+      reader.releaseLock()
+    }
+    // Bound expansion BEFORE extracting even the first archive entry. This
+    // also bounds tar metadata, padding and sparse-file payloads.
+    const archive = gunzipSync(Buffer.concat(chunks), { maxOutputLength: MAX_PACK_ARCHIVE_BYTES })
+    const archivePath = path.join(tmpRoot, 'pack.tar')
+    fs.writeFileSync(archivePath, archive, { mode: 0o600 })
+    let entries = 0
+    tar.list({ file: archivePath, sync: true, strict: true, onReadEntry(entry) {
+      if (++entries > MAX_PACK_ENTRIES) throw new Error('pack archive exceeds entry limit')
+      if (entry.type !== 'File' && entry.type !== 'OldFile' && entry.type !== 'Directory') {
+        throw new Error('pack archive contains a symbolic link, hard link, or special file')
+      }
+      const name = entry.path
+      if (name.startsWith('/') || /^[a-z]:/i.test(name) || name.includes('\\') || name.split('/').some(unsafeSegment)) {
+        throw new Error('pack archive path escapes extraction directory')
+      }
+      if (name.split('/').length > 64 || entry.size > MAX_PACK_FILE_BYTES) {
+        throw new Error('pack archive entry exceeds size or depth limit')
+      }
+    } })
+    const extractDir = path.join(tmpRoot, FLAT_ARCHIVE_DIRNAME)
+    fs.mkdirSync(extractDir)
+    tar.extract({ file: archivePath, cwd: extractDir, sync: true, strict: true,
+      preservePaths: false, preserveOwner: false, noChmod: true, maxDepth: 64 })
+    const names = fs.readdirSync(extractDir)
+    const subdirs = names.filter(e => fs.lstatSync(path.join(extractDir, e)).isDirectory())
+    const hasPackFiles = names.some(e => ['SKILL.md', 'engrams.yaml', 'manifest.yaml'].includes(e))
+    const packDir = hasPackFiles ? extractDir
+      : subdirs.length === 1 ? path.join(extractDir, subdirs[0]) : undefined
+    if (!packDir) throw new Error('unexpected archive layout — expected a pack directory or pack files at root')
+    return { packDir, tmpRoot }
+  } catch (err) {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+    const reason = controller.signal.aborted ? 'download timed out' : (err instanceof Error ? err.message : 'invalid archive')
+    throw new Error(`Failed to fetch or extract pack: ${reason}`)
+  } finally {
+    clearTimeout(timeout)
   }
+}
 
-  return { packDir, tmpRoot }
+/**
+ * A path segment that is, or on some platform becomes, a parent reference.
+ * Windows strips trailing dots and spaces, so `.. `, `...` and `name.` are
+ * not what they look like. A lone `.` is a no-op (`tar -czf p.tgz .` writes
+ * `./SKILL.md`) and stays allowed.
+ */
+function unsafeSegment(segment: string): boolean {
+  if (segment === '.') return false
+  return /^\.+\s*$/.test(segment) || /[. ]$/.test(segment)
 }
 
 /** Remove the temp directory created by downloadAndExtractPack. Safe to call even if the path no longer exists. */
