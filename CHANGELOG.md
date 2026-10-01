@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.21.0
+
+Team memory you can trust, in every editor.
+
+- Team writes never vanish silently
+- Per-folder memory decisions
+- Windows setup fixed
+- Faster first prompt
 
 ### A corrected memory stops being injected, and a project's memories stay in that project (#1232)
 
@@ -26,7 +33,7 @@ uses, let an out-of-scope engram back in whenever its embedding similarity was
 high, and spreading activation could reach one through a co-access link. Both
 now respect the scope; global and personal engrams still pass as before.
 
-### Pack integrity values are now `sha256:v2:`, and a v1 value still verifies
+### Pack integrity values are now `sha256:v2:`, and a v1 value still verifies (#1229)
 
 **The v1 pack hash could not tell some different packs apart** (ENGRAM-STANDARD-v1
 §5.5; found by the formal verification run in #1228). It was
@@ -85,7 +92,7 @@ needs updating before its producers switch. Four conformance vectors were added
 `no-engrams-v2` for an absent `SKILL.md` and an absent `engrams.yaml`), and every
 vector now declares its v2 value as well.
 
-### Two packs with the same manifest name no longer share an integrity baseline
+### Two packs with the same manifest name no longer share an integrity baseline (#1229)
 
 **The pack registry was keyed by manifest name, while installed packs live in
 directories named after their source** (found by the formal verification run in
@@ -124,14 +131,44 @@ same-name pack's row (dropping its `dir`), and uninstalling there removes every
 row with that name. If that has happened, run `plur packs list` with this
 version and reinstall any pack it reports as `UNVERIFIED`.
 
-## 0.21.0
+### A downloaded pack is bounded and checked before anything is extracted (#1251)
 
-Team memory you can trust, in every editor.
+**Installing a pack from a URL no longer trusts the archive.** Before, the whole
+download was buffered with no size limit and handed to the system `tar`, so an
+untrusted archive could cause unbounded download and decompression work, and
+links or unusual file names reached the extractor unchecked. Now the download
+stops after 30 seconds or 32 MiB, decompression stops at 64 MiB, and the
+archive is listed before anything is written: symbolic and hard links, special
+files, absolute or `..` paths, more than 10,000 entries, an entry over 16 MiB
+and paths deeper than 64 folders are refused. Extraction runs in-process with
+no shell, the temporary folder is removed on any failure, and errors never echo
+the signed download URL.
 
-- Team writes never vanish silently
-- Per-folder memory decisions
-- Windows setup fixed
-- Faster first prompt
+### Migrations, backups and PostgreSQL writes no longer lose newer data (#1252)
+
+**A failed migration could erase records written after its backup.** It
+restored a version backup that could predate later writes. A failed migration
+now leaves the live store untouched. If the process dies between writing the
+migrated store and recording the new schema version, a recovery journal lets
+the next start finish recording the version without running the migrations
+again, and it refuses if other writes happened in between. A schema-version
+write that fails while the process is still running puts the old store back
+and keeps the old version. A malformed `config.yaml` is now refused instead of
+being read as version 0, which would have re-run every migration over an
+already-migrated store.
+
+**Backups restore exactly the bytes they verified.** Validation, checksum and
+snapshot share one read of the store. Two restores in the same millisecond no
+longer overwrite each other's safety copy. A corrupt same-day snapshot is moved
+aside and replaced with a fresh one, where before the day ended with no usable
+backup.
+
+**PostgreSQL: one write owner at a time.** The lock, the reads and the writes
+run on one connection in one transaction, so losing the connection ends
+ownership and aborts the writes together, and the lock cannot be left held. A
+write from a stale session is refused, a rolled-back transaction is no longer
+reported as committed, and background work (provenance, auto-embedding, the
+push after a team write) starts only after the commit.
 
 ### The first prompt of a session no longer waits on a cold embedding cache (#1414)
 
@@ -1408,7 +1445,7 @@ looked for `./engrams.yaml` in the current directory, so it skipped a store
 under `~/.plur` that had queued writes. An empty value now counts as unset,
 as it does everywhere else (#1395).
 
-### Claude Code: one full injection per session, and the reminder fires (#1396)
+### Claude Code: one full injection per session, and the reminder fires (#1396, #1401)
 
 **Every prompt in a Claude Code session re-ran the full "session started"
 injection, and the 10-minute memory reminder never fired** (#1278). The
