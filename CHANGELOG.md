@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### `plur init` puts the prompt hooks in user settings, so every folder is asked
+
+**#1467.** Run anywhere but `$HOME`, `plur init` used to write the prompt
+hooks (`hook-inject`, the compact rehydrate and the rest) and the MCP entry to
+`<cwd>/.claude/settings.json`, so every folder outside that repo never got the
+folder question and never got memory. Now that the folder map gates every
+hook, a user-level hook is safe everywhere, and user settings
+(`~/.claude/settings.json`) are the default from any folder. `--global` does
+the same as the default. `plur init --project` keeps the old placement.
+
+**`plur-mcp init` writes its hooks to user settings too.** It used to write
+them to the project's `.claude/settings.json` whenever the folder had a
+`.claude/` folder, which put a second set of PLUR hooks back into a repo that
+`plur init` had just migrated. Now it always writes them to
+`~/.claude/settings.json`, and a re-run adds no duplicates. Where it registers
+the MCP server is unchanged. `plur-mcp init` has no `--project` option: for a
+per-repo placement, use `plur init --project`.
+
+**Upgrading, if you ran `plur init` inside a repo:** re-run `plur init` there.
+It moves PLUR's hooks out of the repo's `.claude/settings.json` into user
+settings and removes only PLUR's hooks from the repo file; the repo's MCP
+entry, your own hooks and every other setting stay. It records the repo as
+`on` in `folders.yaml`, with no scope, so the repo keeps working without being
+asked and its `.plur.yaml` stays the scope hint. A repo whose `.plur.yaml`
+asks for a scope but is not trusted gets no entry, so the folder question
+asks once and can trust it, keeping the scope. `plur init --scope X` (or
+`--domain`) in such a repo writes the new `.plur.yaml` first and decides on
+it, as in a fresh repo: untrusted, it is asked about; in a trusted folder, the
+new scope applies. If the migration fails, init reports `FAILED (…)`, says
+whether the folder was already recorded in `folders.yaml`, and does the rest.
+No hook runs twice, and a
+second run changes nothing. A folder the map has `off` keeps that entry. After
+the upgrade, **other folders get the folder question** on their first prompt:
+answer it once per folder, or "never here" to silence one for good.
+
 ### `plur init-remote` is now `plur remote`, and the token stays out of the repo (#1413)
 
 **One command connects a folder to a team store** (folder-map design r3).

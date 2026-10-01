@@ -8,6 +8,8 @@ import { createPlur, type GlobalFlags } from '../plur.js'
 import { outputInfo } from '../output.js'
 import { CLI_VERSION } from '../version.js'
 import { CLAUDE_INJECT_TIMEOUT_S } from '../lib/claude-inject-budget.js'
+import { plurRoot } from '../lib/folder-gate.js'
+import { resolveFolderPolicy, loadFolderMap, setFolderEntry, folderMapPath, canonicalize } from '@plur-ai/core'
 import {
   hookCommandPrefix,
   isPlurHookSpec,
@@ -86,9 +88,9 @@ import {
  *      created to avoid npx overhead and race conditions (#178).
  *
  * Usage:
- *   plur init                 # default: creates .claude/settings.json in current directory
- *   plur init --global        # force global ~/.claude/settings.json
- *   plur init --project       # force project .claude/settings.json (same as default)
+ *   plur init                 # default: user settings ~/.claude/settings.json, from any folder (#1467)
+ *   plur init --global        # same as the default
+ *   plur init --project       # prompt hooks + MCP in ./.claude/settings.json (the pre-#1467 placement)
  *   plur init --desktop / --no-desktop        # force / skip Claude Desktop registration
  *   plur init --cursor / --no-cursor          # force / skip Cursor (auto: .cursor/ exists)
  *   plur init --codex / --no-codex            # force / skip Codex (auto: ~/.codex exists)
@@ -103,7 +105,10 @@ import {
  *   cd ~/projects/my-app
  *   plur init --domain myapp.core --scope project:my-app
  *
- * This creates .claude/settings.json (hooks + MCP) and .plur.yaml (scoping).
+ * This writes the hooks + MCP to user settings and .plur.yaml (scoping) in
+ * the folder. Run inside a repo an older init set up, it moves PLUR's hooks
+ * out of the repo's .claude/settings.json and records the repo as `on` in the
+ * folder map (#1467).
  */
 
 interface Settings {
@@ -697,31 +702,96 @@ function installSkills(settingsPath: string): string {
   return `Skills: ${parts.join('; ')} in ${destRoot}`
 }
 
+/**
+ * Where the prompt hooks and the MCP entry go (#1467). User settings by
+ * default, from any folder, and with `--global`: the folder map gates every
+ * hook, so a user-level hook is safe everywhere, and every folder can be
+ * asked. `--project` keeps the old placement in `<cwd>/.claude/settings.json`.
+ *
+ * Before #1467 a run anywhere but `$HOME` wrote to the project file (#19),
+ * so every folder outside that repo never got the question or memory.
+ */
 function findSettingsPath(_flags: GlobalFlags, args: string[]): string {
-  const forceGlobal = args.includes('--global')
-  const forceProject = args.includes('--project')
+  if (args.includes('--project')) return join(process.cwd(), '.claude', 'settings.json')
+  return join(homedir(), '.claude', 'settings.json')
+}
 
-  if (forceGlobal) {
-    return join(homedir(), '.claude', 'settings.json')
+/**
+ * Re-running `plur init` in a repo that an older init set up (#1467): move
+ * PLUR's hooks out of `<cwd>/.claude/settings.json` (user settings now carry
+ * them) so no hook runs twice, and record the repo as `on` in folders.yaml
+ * through the folder-map writer, so the repo keeps working without being
+ * asked. Returns a status line, or null when there is nothing to migrate.
+ *
+ * - Only PLUR's hooks are removed from the repo file, hook by hook; its MCP
+ *   entry, the user's own hooks and every other setting stay as they are.
+ * - The map entry is `on` with no scope, so a `.plur.yaml` there stays the
+ *   scope hint (applied when trusted, as for any folder).
+ * - A folder whose .plur.yaml requests a scope, domain or remote and is not
+ *   trusted gets no entry: `on` would count as a decision, skip the question
+ *   that offers to trust it, and drop its scope (#1469 review).
+ * - A folder the map already has, and one the map turns `off`, keep their
+ *   entry unchanged. If the map cannot be written, the repo file is left
+ *   alone too, so the repo keeps its memory either way.
+ * - The policy is read after this run's `.plur.yaml` is written (run() calls
+ *   installProjectConfig first), so `plur init --scope X` in such a repo is
+ *   decided on the `.plur.yaml` it will have, as in a fresh repo (#1469
+ *   review).
+ * - A failure is reported as `FAILED (…)`, and says whether the folder map
+ *   was already written when the repo file could not be.
+ */
+function migrateRepoHooks(flags: GlobalFlags, userPath: string): string | null {
+  const folder = process.cwd()
+  const repoPath = join(folder, '.claude', 'settings.json')
+  // The same file under another spelling (a symlinked tmp or home, e.g.
+  // /var vs /private/var on macOS) is user settings, never a repo to migrate.
+  if (!existsSync(repoPath) || repoPath === userPath ||
+      canonicalize(repoPath) === canonicalize(userPath)) return null
+  const { settings, ok } = loadSettingsForWrite(repoPath)
+  if (!ok) return `left ${repoPath} alone: it is not a JSON object`
+  if (!hasPlurHooks(settings)) return null
+
+  const root = plurRoot(flags)
+  const stillThere = `PLUR's hooks are still in ${repoPath} as well as in user settings`
+  let recorded: string
+  let mapWritten = false
+  try {
+    const target = canonicalize(folder)
+    const policy = resolveFolderPolicy(folder, { root })
+    if (policy.mode === 'off') {
+      recorded = 'the folder map has it off, left as is'
+    } else if (policy.mode === 'ask' && policy.reason === 'untrusted-plur-yaml') {
+      // An `on` entry would count as a decision: the question that offers to
+      // trust the .plur.yaml (and so keep its scope) would never run, and
+      // memory would go to the default scope (#1469 review). Leave the map
+      // alone; the folder question asks on the next prompt.
+      const wanted = policy.requested?.scope ? ` for scope ${policy.requested.scope}` : ''
+      recorded = `not recorded in the folder map: its .plur.yaml asks${wanted} and is not trusted, ` +
+        'so the folder question asks on the next prompt and can trust it'
+    } else if (loadFolderMap(root).folders.some(e => e.path === folder || canonicalize(e.path) === target)) {
+      recorded = 'the folder map already has it, left as is'
+    } else {
+      setFolderEntry(root, folder, { mode: 'on' }, { configuredScopes: [] })
+      mapWritten = true
+      recorded = `recorded as on in ${folderMapPath(root)}`
+    }
+  } catch (err: unknown) {
+    return `FAILED (could not record the folder in the folder map: ${(err as Error)?.message ?? err}) — ` +
+      `${stillThere}; fix it and re-run \`plur init\``
   }
 
-  // Check for project-level .claude/ directory
-  const projectSettings = join(process.cwd(), '.claude', 'settings.json')
-  const projectDir = join(process.cwd(), '.claude')
-
-  // --project flag forces project-level config, regardless of whether .claude/ exists
-  if (forceProject) {
-    return projectSettings
+  const stripped = stripPlurHooks(settings)
+  if (stripped.hooks && Object.keys(stripped.hooks).length === 0) delete stripped.hooks
+  try {
+    writeSettings(repoPath, stripped)
+  } catch (err: unknown) {
+    const map = mapWritten
+      ? `the folder was already recorded as on in ${folderMapPath(root)}, so re-running only moves the hooks`
+      : 'the folder map was not changed'
+    return `FAILED (${(err as Error)?.message ?? 'unknown error'}) — ${stillThere}; ${map}; ` +
+      'fix it and re-run `plur init`'
   }
-
-  // Auto-detect: prefer project if .claude/ already exists
-  if (existsSync(projectDir)) {
-    return projectSettings
-  }
-
-  // Default: create project-level config (Issue #19)
-  // PLUR works best with project-scoped hooks for multi-project setups
-  return projectSettings
+  return `moved PLUR's hooks from ${repoPath} to user settings (its MCP entry and other settings kept); ${recorded}`
 }
 
 function loadSettings(path: string): Settings {
@@ -1486,6 +1556,13 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   const PLUR_HOOKS_ENFORCEMENT = buildEnforcementHooks(hookLaunch)
   const PLUR_HOOKS_INJECTION = buildInjectionHooks(hookLaunch)
 
+  // Write project config if --domain or --scope provided. Before the settings
+  // legs: the repo migration below decides on the policy this folder will
+  // have after this run, so a new --scope in a repo an older init set up is
+  // asked about, as in a fresh repo, instead of being hidden behind an `on`
+  // entry recorded from the old state (#1469 review).
+  const projectConfigPath = installProjectConfig(args)
+
   const injectionPath = findSettingsPath(flags, args)
   const enforcementPath = join(homedir(), '.claude', 'settings.json')
   const samePath = injectionPath === enforcementPath
@@ -1493,6 +1570,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   let injectionHooksStatus: string
   let enforcementHooksStatus: string
   let mcpStatus: string
+  let repoMigration: string | null = null
 
   if (samePath) {
     // Single file — combined enforcement + injection hooks
@@ -1521,6 +1599,16 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
       }
 
       writeSettings(enforcementPath, settings)
+      // Only once user settings carry the hooks: a repo an older init set up
+      // hands its PLUR hooks over, so none runs twice (#1467).
+      // Contained like the other legs (#1469 review): a failure here (a
+      // read-only repo file) is reported, and init still does the rest.
+      try {
+        repoMigration = migrateRepoHooks(flags, enforcementPath)
+      } catch (err: unknown) {
+        repoMigration = `FAILED (${(err as Error)?.message ?? 'unknown error'}) — PLUR's hooks are still in ` +
+          `${join(process.cwd(), '.claude', 'settings.json')} as well as in user settings; fix it and re-run \`plur init\``
+      }
       const status = hooksStatusFor(before, after, hadHooks)
       injectionHooksStatus = status
       enforcementHooksStatus = status
@@ -1605,9 +1693,6 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   // the hooks and MCP registration that are the point of `plur init`.
   const skillsStatus = containLeg('Skills', () => installSkills(injectionPath))
 
-  // Write project config if --domain or --scope provided
-  const projectConfigPath = installProjectConfig(args)
-
   const entry = buildMcpServerEntry()
 
   outputInfo('PLUR installed for Claude Code.', flags)
@@ -1620,7 +1705,9 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   }
   outputInfo(`MCP binary:  ${mcpShim.status}${mcpShim.shimPath ? ` (${mcpShim.shimPath})` : ''}`, flags)
   outputInfo('', flags)
-  outputInfo('Architecture: One global engram store (~/.plur/), enforcement hooks global, injection hooks project-scoped.', flags)
+  outputInfo(samePath
+    ? 'Architecture: One global engram store (~/.plur/); all hooks in user settings, gated per folder by the folder map.'
+    : 'Architecture: One global engram store (~/.plur/), enforcement hooks global, injection hooks project-scoped (--project).', flags)
   outputInfo('Multi-project scoping via domain/scope fields on engrams, not separate installs.', flags)
   outputInfo('', flags)
   outputInfo(skillsStatus, flags)
@@ -1645,6 +1732,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo('', flags)
   outputInfo(`Enforcement file: ${enforcementPath}`, flags)
   if (!samePath) outputInfo(`Injection file:   ${injectionPath}`, flags)
+  if (repoMigration) outputInfo(`This repo:        ${repoMigration}`, flags)
   outputInfo(`Claude Desktop:   ${desktopStatus}`, flags)
   outputInfo(codexStatus, flags)
   outputInfo(agyStatus, flags)
