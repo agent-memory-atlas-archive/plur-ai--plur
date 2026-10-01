@@ -447,6 +447,50 @@ function isSupersededEngram(engram: ScoredEngram): boolean {
   return (engram.relations?.superseded_by?.length ?? 0) > 0
 }
 
+/**
+ * Replaced by an engram that this session could deliver. Such an engram is not
+ * current: the correction that replaced it is, so it is not injected (outside
+ * a historical prompt). When no replacement is deliverable here — retired,
+ * living only in a remote store, a draft awaiting approval (#1141), expired,
+ * or in an on_request pack — dropping the old engram would leave the session
+ * with neither, so the ×0.3 re-rank still applies instead.
+ *
+ * A supersede loop is not a replacement. Self-supersession, and a replacement
+ * whose own superseded_by chain leads back to this engram (A → B → A), would
+ * otherwise make every member of the loop disappear; each member keeps the
+ * ×0.3 re-rank instead, as before #1232.
+ *
+ * Only DIRECT superseded_by edges count. On a chain A → B → C where B is not
+ * deliverable and C is, A is not suppressed: it keeps the ×0.3 re-rank and is
+ * injected beside C, as before #1232.
+ */
+function isReplacedByDeliverable(
+  engram: Engram,
+  deliverableIds: ReadonlySet<string>,
+  supersededBy: ReadonlyMap<string, readonly string[]>,
+): boolean {
+  return (engram.relations?.superseded_by ?? []).some(id =>
+    deliverableIds.has(id) && !leadsBackTo(id, engram.id, supersededBy))
+}
+
+/** Does following superseded_by edges from `start` reach `target`? A self-edge reaches at once. */
+function leadsBackTo(
+  start: string,
+  target: string,
+  supersededBy: ReadonlyMap<string, readonly string[]>,
+): boolean {
+  const seen = new Set<string>()
+  const stack = [start]
+  while (stack.length > 0) {
+    const id = stack.pop()!
+    if (id === target) return true
+    if (seen.has(id)) continue
+    seen.add(id)
+    for (const next of supersededBy.get(id) ?? []) stack.push(next)
+  }
+  return false
+}
+
 // --- Strip pipeline ---
 
 function stripAssociations(engram: ScoredEngram): AgentEngram {
@@ -857,20 +901,31 @@ export function selectAndSpread(
   // "retired" nor "unresolvable" — it is simply not part of this view — so it
   // is skipped without feeding spread_drops.
   const scopeExcludedIds = new Set<string>()
+  // Every engram this session could deliver, in scope or not, for the
+  // "replaced by a deliverable engram" test: active, approved, valid, and not
+  // in an on_request pack. A correction stored in another scope still replaces
+  // (whether it should is #1237). Filled by the scoring loops below.
+  const deliverableIds = new Set<string>()
+  // superseded_by edges of every engram the loops see, for loop detection.
+  const supersededBy = new Map<string, readonly string[]>()
+  const historical = hasHistoricalIntent(ctx.prompt)
 
   // Step 1-2: Score all active engrams
   const scored: ScoredEngram[] = []
 
   for (const engram of personalEngrams) {
+    if (engram.relations?.superseded_by?.length) supersededBy.set(engram.id, engram.relations.superseded_by)
     if (engram.status !== 'active') { nonActiveIds.add(engram.id); continue }
     // NOT added to nonActiveIds: a draft is active, it is simply ungated for
     // delivery (#1141). That set feeds spread_drops accounting for retired or
     // unresolvable targets, and a pending-review engram is neither.
-    if (skipForApproval(engram)) continue
-    if (skipForValidity(engram, nowMs, expiryMode, graceDays)) continue
+    const deliverable = !skipForApproval(engram)
+      && !skipForValidity(engram, nowMs, expiryMode, graceDays)
+    if (deliverable) deliverableIds.add(engram.id)
     // Visibility BEFORE the map and the score (see isInjectVisible): nothing
     // below — pinned exemption, embedding boost, spreading — may revive it.
     if (!isInjectVisible(engram.scope, ctx.scope, ctx.grantedScopes)) { scopeExcludedIds.add(engram.id); continue }
+    if (!deliverable) continue
     engramMap.set(engram.id, engram)
     let raw = scoreEngram(engram, promptLower, promptWords, [], ctx.scope, false, ctx.grantedScopes)
     // Embedding boost: semantically similar engrams with zero keyword hits still get scored.
@@ -908,10 +963,13 @@ export function selectAndSpread(
     if (packMeta.injection_policy === 'on_request') continue
     const matchTerms = packMeta.match_terms
     for (const engram of pack.engrams) {
+      if (engram.relations?.superseded_by?.length) supersededBy.set(engram.id, engram.relations.superseded_by)
       if (engram.status !== 'active') continue
-      if (skipForApproval(engram)) continue
-      if (skipForValidity(engram, nowMs, expiryMode, graceDays)) continue
+      const deliverable = !skipForApproval(engram)
+        && !skipForValidity(engram, nowMs, expiryMode, graceDays)
+      if (deliverable) deliverableIds.add(engram.id)
       if (!isInjectVisible(engram.scope, ctx.scope, ctx.grantedScopes)) { scopeExcludedIds.add(engram.id); continue }
+      if (!deliverable) continue
       engramMap.set(engram.id, engram)
       let raw = scoreEngram(engram, promptLower, promptWords, matchTerms, ctx.scope, true, ctx.grantedScopes)
       const embBoost = embeddingBoosts?.get(engram.id) ?? 0
@@ -953,13 +1011,20 @@ export function selectAndSpread(
   // pinning. Without this exemption, a session with strong personal-engram
   // matches normalizes pinned scores below DEFAULT_MIN_RELEVANCE (0.3) and
   // the pinned engram is silently dropped before fillTokenBudget sees it.
-  const filtered = scored.filter(s => (s as any).pinned === true || s.score >= minRelevance)
+  // A superseded engram whose replacement is deliverable is not current, so it is
+  // not a candidate at all — not in directives, constraints or consider.
+  // A historical prompt ("previously", "used to") still reaches it.
+  const filtered = scored.filter(s =>
+    ((s as any).pinned === true || s.score >= minRelevance)
+    && (historical || !isReplacedByDeliverable(s, deliverableIds, supersededBy)))
 
   // Sort by score descending
   filtered.sort((a, b) => b.score - a.score)
 
-  // Supersedes chain preference: under budget pressure, tip beats older members
-  if (!hasHistoricalIntent(ctx.prompt)) {
+  // Supersedes chain preference: under budget pressure, tip beats older members.
+  // Only a superseded engram with no deliverable replacement here (or one in a
+  // supersede loop) reaches this.
+  if (!historical) {
     for (const e of filtered) {
       if (isSupersededEngram(e)) {
         e.score *= 0.3
@@ -1117,6 +1182,7 @@ export function selectAndSpread(
         continue
       }
       if (target.status !== 'active') { droppedRetired++; continue }
+      if (!historical && isReplacedByDeliverable(target, deliverableIds, supersededBy)) continue
 
       // Apply decay to co_accessed associations at read time
       const effectiveStrength = assoc.type === 'co_accessed' && assoc.updated_at
