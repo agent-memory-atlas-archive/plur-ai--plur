@@ -2,12 +2,12 @@
 
 ## 0.21.0
 
-Team memory you can trust, in every editor.
+More control over what your agents remember, and where.
 
-- Team writes never vanish silently
-- Per-folder memory decisions
-- Windows setup fixed
-- Faster first prompt
+- A memory map per folder
+- plur remote for team stores
+- Hard and soft pins
+- Smarter, self-correcting memory
 
 ### A corrected memory stops being injected, and a project's memories stay in that project (#1232)
 
@@ -469,7 +469,7 @@ Changed in this fix round:
 - **`plur_admin` no longer doubles a tool-name prefix** on errors: you now get `plur_session_scope: no session is open…`, not `plur_session_scope: plur_session_scope: …`.
 - **dsh with a `@plur-ai/core` that cannot check trust** still ignores the workspace scope (fails closed). The warning now tells you to upgrade core instead of suggesting a `plur trust` that core would never read. If the engine did not load at all, the warning offers no trust command.
 
-### `plur init` puts the prompt hooks in user settings, so every folder is asked
+### `plur init` puts the prompt hooks in user settings, so every folder is asked (#1467)
 
 **#1467.** Run anywhere but `$HOME`, `plur init` used to write the prompt
 hooks (`hook-inject`, the compact rehydrate and the rest) and the MCP entry to
@@ -576,7 +576,7 @@ flow issued for that answer, and `plur untrust` needs none (see "A folder
 nonce now authorises one answer" below). The trust check for a `.plur.yaml`
 that names its own remote is unchanged.
 
-### Every editor's hooks follow the folder map, and a folder with no decision asks once
+### Every editor's hooks follow the folder map, and a folder with no decision asks once (#1347)
 
 **Second half of #1347.** The Claude Code, Codex, Cursor and Antigravity hooks
 no longer gate on a project marker. They ask the folder map
@@ -1195,7 +1195,7 @@ refuses to install (`docs/pack-scan-surface.md`). Text that only names a prefix,
 such as "use a `ghp_` token", stays clean. No existing pattern changed except
 `aws_access_key`, which now also accepts `ASIA`.
 
-### A folder map records your per-folder decisions, and `trust.yaml` folds into it
+### A folder map records your per-folder decisions, and `trust.yaml` folds into it (#1347)
 
 **First half of #1347: core and CLI only. No hook reads the map yet.** A new
 file, `~/.plur/folders.yaml`, holds your own decisions about folders: `on`,
@@ -1355,7 +1355,7 @@ first, then the stripped form older writers used. `plur_session_end` got the
 same fix earlier (#1301). Real Claude Code session ids are UUIDs, which both
 forms leave unchanged, so only unusual ids were affected.
 
-### Queued team writes now leave the laptop when a session ends
+### Queued team writes now leave the laptop when a session ends (#1277)
 
 **An enterprise deployment reported engrams that stayed on laptops** (#1269).
 A team-scoped write that cannot reach its store is queued locally (the
@@ -1485,7 +1485,7 @@ Stop hook writes. That hook replaces unsafe characters with `_`, while this
 reader stripped them, so a session id with such characters left its checkpoint
 behind, and the next session reported it as orphaned.
 
-### Claude Code now actually receives injected memory
+### Claude Code now actually receives injected memory (#1303)
 
 **In Claude Code, automatic memory never reached the model** (#1274). An
 enterprise deployment reported that most folders had no automatic memory.
