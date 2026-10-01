@@ -613,7 +613,9 @@ ignore the values.
 | `previous_version_ref` | object | `{event_id, changed_at}` | Pointer to prior content version. |
 | `episode_ids` | string[] | default `[]` | Source episode IDs. |
 | `summary` | string | ≤80 chars | Injection-friendly short form. |
-| `pinned` | boolean | | Always-load flag; bypasses keyword gating. Use sparingly. |
+| `pinned` | boolean | | Always-load flag; bypasses keyword gating. Tier is controlled by `pinned_tier`. Use sparingly. |
+| `pinned_tier` | `"hard"` \| `"soft"` | default `"soft"` | Tier within the pinned budget; meaningful only with `pinned: true` and cleared on unpin. `"hard"`: a sub-cap inside the pinned quota (`injection.pinned_hard_ratio` of it, default 0.5), filled first within each origin; a write that would grow the hard tier past its cap is rejected, and any hard-tier engram that does not fit at injection is reported. `"soft"`: gets what the hard tier leaves of the pinned share. Pins never outrank the origin order (primary store, then stores/remote, then packs). |
+| `pinned_priority` | integer | 1–100, default 50 | Soft-tier priority. Higher is selected first within an origin; ties fall back to relevance score. Ignored for `pinned_tier="hard"`. Cleared on unpin. |
 | `measured_under` | object | `model?`, `source_type?`, `hardware?`, `dataset?`, `date?` (ISO date) | Measurement conditions for numeric/benchmark engrams — which model, environment type, hardware tier, dataset, and date the value was recorded under. Allows tension-aware retrieval to treat differently-measured values as refinements rather than contradictions (#869). |
 
 #### 4.12.1 `content_hash` detects corruption, not tampering

@@ -1638,6 +1638,44 @@ Writes now carry `scope_source`: `explicit` (named on the call), `session` (a se
 
 Nothing about routing changes. The decision was always made; it was simply not legible to the other side of the wire.
 
+### Pinned engrams can be marked hard or soft
+
+**A pin can now say how much it matters** (#1082, #1203). `learn()` takes
+`pin_tier: "hard" | "soft"` and `pinned_priority` (an integer from 1 to 100),
+stored on the engram as `pinned_tier` and `pinned_priority`.
+
+The tiers live inside the pinned budget you already have, not beside it.
+The hard tier is a sub-cap of the pinned quota — `injection.pinned_hard_ratio`
+of it, default 0.5, so 500 tokens at the default `injection_budget` of 2000 —
+and the soft tier gets whatever the hard tier leaves. Within each origin
+(your primary store, then `stores:`/remote, then packs) hard pins are selected
+first, then soft pins by priority, then by relevance score. Origin stays the
+outer key, so a tier can never lift a pack pin above one of your own.
+
+**If you never set a tier, pinning behaves as before**: the same quota, the same share,
+the same order and the same `omitted_pinned` reasons (the one estimate correction below aside).
+
+A write that would grow the hard tier past its cap is refused, and every write
+path that can produce a hard-tier engram is checked under the store lock:
+`learn()`, both halves of `learnRouted()`'s remote route, re-pinning through
+`setPinned()`, `updateEngram()` and `saveMetaEngrams()`. The check charges the
+same cost injection charges — the rendered text — so admission and injection
+cannot disagree. Unpinning clears the tier and priority; packs cannot carry
+either. Anything that does not fit at injection is reported in `omitted_pinned`
+as `hard-tier-cap` or `soft-tier-budget` rather than dropped silently.
+
+The tier is not yet sent to remote stores: a tiered write to a remote scope
+lands there as an ordinary pin until the server accepts the two fields.
+
+**`injection.pinned_ratio` now sets the pinned share at injection too.** It
+already set the quota enforced when pinning, but injection used a fixed 0.5, so
+with any other value the two disagreed. With the default of 0.5 nothing changes.
+
+**The injection cost estimate now counts `claim_class`.** It is rendered as
+`Kind: …` in the meta line and was not charged, which let a rendered field
+carry unbudgeted text into the prompt. Engrams with a `claim_class` cost a few
+tokens more.
+
 ## 0.20.1
 
 ### opencode reaches PLUR Enterprise
