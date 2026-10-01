@@ -161,9 +161,22 @@ export interface ScopeTrustCheck {
   readonly storageRoot?: string
 }
 
-/** Quote a shell word only when it needs it, so the common case stays readable. */
-function shellWord(s: string): string {
-  return /^[A-Za-z0-9_@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+/**
+ * One argument of a command printed for the user or the agent to run, or null
+ * when it cannot be quoted safely (#1228 review, the same rule as #1418's
+ * folder question). POSIX: single quotes. Windows: double quotes, which
+ * PowerShell and cmd still expand for $, backtick, %, ! and the curly double
+ * quotes, so a path holding one gets no command. A line break, bidi or
+ * zero-width character never gets one.
+ */
+function shellWord(s: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(s)) return null
+  if (/^[A-Za-z0-9_@+=:,./~-]+$/.test(s)) return s
+  if (platform === 'win32') {
+    if (/[$`%!"\u201c\u201d\u201e]/.test(s) || s.endsWith('\\')) return null
+    return `"${s}"`
+  }
+  return `'${s.replace(/'/g, `'\\''`)}'`
 }
 
 /**
@@ -176,10 +189,12 @@ function shellWord(s: string): string {
  * bare command wrote a grant the adapter never read, and the notice repeated.
  * So when the store is not the default one, the command names it.
  */
-export function trustCommand(dir: string | null, storageRoot?: string): string {
-  const target = dir === null ? '<dir>' : shellWord(dir)
+export function trustCommand(dir: string | null, storageRoot?: string, platform: NodeJS.Platform = process.platform): string | null {
+  const target = dir === null ? '<dir>' : shellWord(dir, platform)
+  if (target === null) return null
   if (!storageRoot || resolve(storageRoot) === resolve(join(homedir(), '.plur'))) return `plur trust ${target}`
-  return `plur --path ${shellWord(storageRoot)} trust ${target}`
+  const store = shellWord(resolve(storageRoot), platform)
+  return store === null ? null : `plur --path ${store} trust ${target}`
 }
 
 /**

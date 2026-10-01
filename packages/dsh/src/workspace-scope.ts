@@ -130,9 +130,21 @@ export function trustedWorkspaceScope(
   }
 }
 
-/** Quote a shell word only when it needs it. */
-function shellWord(s: string): string {
-  return /^[A-Za-z0-9_@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+/**
+ * One argument of a printed command, or null when it cannot be quoted safely
+ * (#1228 review; the rule of #1418's folder question): POSIX single quotes;
+ * Windows double quotes, refused for $, backtick, %, ! and the curly double
+ * quotes, which PowerShell and cmd expand; never a line-breaking, bidi or
+ * zero-width character.
+ */
+function shellWord(s: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(s)) return null
+  if (/^[A-Za-z0-9_@+=:,./~-]+$/.test(s)) return s
+  if (platform === 'win32') {
+    if (/[$`%!"\u201c\u201d\u201e]/.test(s) || s.endsWith('\\')) return null
+    return `"${s}"`
+  }
+  return `'${s.replace(/'/g, `'\\''`)}'`
 }
 
 /**
@@ -140,9 +152,12 @@ function shellWord(s: string): string {
  * a store configured with `path` (or the plugin's `PLUR_PATH`) is not the one a
  * bare `plur trust <dir>` in the user's shell writes, so it is named.
  */
-export function trustCommand(dir: string, storageRoot?: string): string {
-  if (!storageRoot || resolve(storageRoot) === resolve(join(homedir(), '.plur'))) return `plur trust ${shellWord(dir)}`
-  return `plur --path ${shellWord(storageRoot)} trust ${shellWord(dir)}`
+export function trustCommand(dir: string, storageRoot?: string, platform: NodeJS.Platform = process.platform): string {
+  const target = shellWord(dir, platform)
+  const custom = storageRoot && resolve(storageRoot) !== resolve(join(homedir(), '.plur'))
+  const store = custom ? shellWord(resolve(storageRoot!), platform) : ''
+  if (target === null || store === null) return '`plur trust` for that directory, from a terminal (its path cannot be printed as a safe command)'
+  return custom ? `plur --path ${store} trust ${target}` : `plur trust ${target}`
 }
 
 /** What the engine can do about trust — decides which remedy is honest. */

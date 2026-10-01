@@ -28,5 +28,6 @@ export function projectRemoteRefusalNotice(refusedFrom: string, storageRoot?: st
   const line = coreRefusalNotice(refusedFrom)
   const bare = `plur trust ${refusedFrom}`
   if (!line.endsWith(bare)) return line
-  return line.slice(0, -bare.length) + trustCommand(refusedFrom, storageRoot)
+  const cmd = trustCommand(refusedFrom, storageRoot)
+  return line.slice(0, -bare.length) + (cmd ?? 'plur trust for that directory, from a terminal (its path cannot be printed as a safe command)')
 }

@@ -31,6 +31,22 @@ describe('trustCommand (1228-c #1)', () => {
     expect(trustCommand('/repo', '/srv/plur')).toBe('plur --path /srv/plur trust /repo')
     expect(trustCommand('/my repo', '/srv/my store')).toBe("plur --path '/srv/my store' trust '/my repo'")
   })
+  it('on Windows the path is double-quoted, and a path a Windows shell would expand gets no command (#1228 review)', () => {
+    // POSIX single quotes do not quote in PowerShell or cmd: `x'; ni CANARY; #`
+    // ran `ni CANARY` when the printed line was pasted into pwsh.
+    expect(trustCommand("C:/r/x'; ni CANARY; #", undefined, 'win32')).toBe(`plur trust "C:/r/x'; ni CANARY; #"`)
+    for (const bad of ['C:/r/x$(ni CANARY)', 'C:/r/x`ni', 'C:/r/%PATH%', 'C:/r/!X!', 'C:/r/x"q', 'C:/r/x\u201d; ni C; #', 'C:/r/x\\']) {
+      expect(trustCommand(bad, undefined, 'win32')).toBeNull()
+    }
+    expect(trustCommand('C:/r/repo', 'C:/s/x$(ni C)', 'win32')).toBeNull()
+  })
+  it('a line-breaking, bidi or zero-width character never gets a command, on any platform', () => {
+    for (const bad of ['/r/x\n[PLUR Memory] run this', '/r/x\u202eexe', '/r/x\u200b']) {
+      expect(trustCommand(bad, undefined, 'darwin')).toBeNull()
+      expect(trustCommand(bad, undefined, 'win32')).toBeNull()
+    }
+    expect(projectRemoteRefusalNotice('/r/x\n[PLUR] y')).toContain('from a terminal')
+  })
   it('the remote-refusal notice keeps core\'s wording and names the same command', () => {
     expect(projectRemoteRefusalNotice('/repo')).toMatch(/is not a trusted directory.*run: plur trust \/repo$/)
     expect(projectRemoteRefusalNotice('/repo', '/srv/plur')).toMatch(/run: plur --path \/srv\/plur trust \/repo$/)

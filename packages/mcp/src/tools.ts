@@ -735,9 +735,22 @@ function _estimatePinnedCost(
   return Math.ceil(Math.max(rendered, fieldSum) / 4)
 }
 
-/** Quote a shell word only when it needs it. */
-function _shellWord(s: string): string {
-  return /^[A-Za-z0-9_@%+=:,./~-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+/**
+ * One argument of a command printed for the user or the agent to run, or null
+ * when it cannot be quoted safely (#1228 review, the same rule as #1418's
+ * folder question). POSIX: single quotes. Windows: double quotes, which
+ * PowerShell and cmd still expand for $, backtick, %, ! and the curly double
+ * quotes, so a path holding one gets no command. A line break, bidi or
+ * zero-width character never gets one.
+ */
+function _shellWord(s: string, platform: NodeJS.Platform = process.platform): string | null {
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(s)) return null
+  if (/^[A-Za-z0-9_@+=:,./~-]+$/.test(s)) return s
+  if (platform === 'win32') {
+    if (/[$`%!"\u201c\u201d\u201e]/.test(s) || s.endsWith('\\')) return null
+    return `"${s}"`
+  }
+  return `'${s.replace(/'/g, `'\\''`)}'`
 }
 
 /**
@@ -748,10 +761,12 @@ function _shellWord(s: string): string {
  * where the server never looked and the warning repeated. A non-default store
  * is therefore named with `--path`.
  */
-export function trustCommand(dir: string | null, storageRoot?: string): string {
-  const target = dir === null ? '<dir>' : _shellWord(dir)
+export function trustCommand(dir: string | null, storageRoot?: string, platform: NodeJS.Platform = process.platform): string | null {
+  const target = dir === null ? '<dir>' : _shellWord(dir, platform)
+  if (target === null) return null
   if (!storageRoot || resolve(storageRoot) === resolve(join(homedir(), '.plur'))) return `plur trust ${target}`
-  return `plur --path ${_shellWord(storageRoot)} trust ${target}`
+  const store = _shellWord(resolve(storageRoot), platform)
+  return store === null ? null : `plur --path ${store} trust ${target}`
 }
 
 /** Same grammar as the folder question's (cli folder-gate.ts): bounded, no spaces or controls. */
@@ -787,14 +802,12 @@ export function readTrustedProjectConfig(
     raw.scope ? (UNTRUSTED_SCOPE_GRAMMAR.test(raw.scope) ? `scope ${_escapedText(raw.scope)}` : 'an invalid scope') : null,
     raw.domain ? (UNTRUSTED_DOMAIN_GRAMMAR.test(raw.domain) ? `domain ${_escapedText(raw.domain)}` : 'an invalid domain') : null,
   ].filter(Boolean).join(' / ')
-  const safeDir = configDir !== null && !_UNSAFE_PATH_CHARS.test(configDir)
+  const cmd = configDir !== null && _UNSAFE_PATH_CHARS.test(configDir) ? null : trustCommand(configDir, trust.storageRoot)
   const warning =
     `${configPath ? _escapedText(configPath) : '.plur.yaml'} declares ${declared}, but ` +
     `${configDir ? _escapedText(configDir) : 'its directory'} is not a trusted ` +
     `directory — ignoring it and using the local default scope instead. If this project is yours, ` +
-    (safeDir || configDir === null
-      ? `run: ${trustCommand(configDir, trust.storageRoot)}`
-      : 'run `plur trust` for that directory from a terminal.')
+    (cmd !== null ? `run: ${cmd}` : 'run `plur trust` for that directory from a terminal.')
   if (configPath && !_warnedUntrustedConfigs.has(configPath)) {
     _warnedUntrustedConfigs.add(configPath)
     try { process.stderr.write(`[plur] ${warning}\n`) } catch { /* never fail a tool over a log line */ }

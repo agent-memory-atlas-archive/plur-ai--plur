@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, realpathSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { Plur } from '@plur-ai/core'
-import { getToolDefinitions, _resetSessionTelemetry } from '../src/tools.js'
+import { getToolDefinitions, _resetSessionTelemetry, trustCommand } from '../src/tools.js'
 
 describe('MCP .plur.yaml scope/domain needs directory trust (E3)', () => {
   let root: string
@@ -71,6 +71,14 @@ describe('MCP .plur.yaml scope/domain needs directory trust (E3)', () => {
       expect(text).not.toContain('\u202e')
     }
     expect(warning).not.toContain('\n')
+  })
+
+  it('trustCommand quotes per platform and prints no command for a path a shell would expand (#1228 review)', () => {
+    expect(trustCommand("C:/r/x'; ni CANARY; #", undefined, 'win32')).toBe(`plur trust "C:/r/x'; ni CANARY; #"`)
+    expect(trustCommand('C:/r/x$(ni CANARY)', undefined, 'win32')).toBeNull()
+    expect(trustCommand('C:/r/%PATH%', undefined, 'win32')).toBeNull()
+    expect(trustCommand("/r/x'; touch CANARY; #", undefined, 'darwin')).toBe(`plur trust '/r/x'\\''; touch CANARY; #'`)
+    expect(trustCommand('/r/x\u2028y', undefined, 'darwin')).toBeNull()
   })
 
   it('untrusted: a 1 MiB scope is reported as invalid, not echoed', async () => {
