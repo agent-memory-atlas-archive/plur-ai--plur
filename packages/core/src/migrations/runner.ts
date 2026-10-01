@@ -2,7 +2,8 @@ import * as fs from 'fs'
 import { createHash, randomUUID } from 'node:crypto'
 import * as yaml from 'js-yaml'
 import { join } from 'path'
-import { loadEngrams, saveEngrams } from '../engrams.js'
+import { loadEngrams, saveEngrams, engramStoreEntries } from '../engrams.js'
+import { recordLastWritten } from '../backup.js'
 import { atomicWrite, withLock, fsyncDir, CONFIG_FILE_MODE } from '../sync.js'
 import { logger } from '../logger.js'
 import type { Migration } from './types.js'
@@ -148,9 +149,31 @@ function recoverMigration(engramsPath: string, configPath: string): void {
   fsyncDir(join(engramsPath, '..'))
 }
 
+/*
+ * There is deliberately no "restore from backup" on failure (formal-verification
+ * finding, spec/formal/findings/persistence.md candidate 2). `up()`/`down()` run
+ * on an in-memory copy and nothing is written until every one has succeeded, so
+ * when one throws the live engrams.yaml is still exactly what it was. The backup,
+ * by contrast, is never refreshed (the no-clobber rule above keeps the FIRST copy
+ * taken for a version), so copying it back replaced the live store with an older
+ * one — measured: 3 engrams -> 1 after a rollback and a failing re-run. The backup
+ * stays on disk for manual recovery; the failure path simply writes nothing.
+ */
+
 /** Stage/validate exact bytes, persist intent, replace corpus, stamp config.
- * A retry can finish stamping after a crash at any commit boundary. */
-function commitMigration(engramsPath: string, configPath: string, engrams: ReturnType<typeof loadEngrams>, version: number): void {
+ * A retry can finish stamping after a crash at any commit boundary.
+ *
+ * A stamp that THROWS (formal round 2, findings/r2-persist.md item 4: config
+ * lock held by another process, EACCES, a full disk) puts the corpus back, so
+ * both files are left as they were, like every other failure of a run. Only a
+ * crash between the two writes splits them, and the journal recovers that. */
+function commitMigration(
+  engramsPath: string,
+  configPath: string,
+  engrams: ReturnType<typeof loadEngrams>,
+  fromVersion: number,
+  version: number,
+): void {
   const staged = `${engramsPath}.${randomUUID()}.migration-stage`
   let bytes: Buffer
   try {
@@ -163,12 +186,49 @@ function commitMigration(engramsPath: string, configPath: string, engrams: Retur
   } finally {
     try { fs.unlinkSync(staged) } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err }
   }
+  const before = fs.existsSync(engramsPath) ? fs.readFileSync(engramsPath) : null
   const journalPath = `${engramsPath}.migration.json`
-  atomicWrite(journalPath, JSON.stringify({ config: configPath, before: corpusHash(engramsPath), after: digest(bytes), version }))
+  atomicWrite(journalPath, JSON.stringify({ config: configPath, before: before === null ? null : digest(before), after: digest(bytes), version }))
   atomicWrite(engramsPath, bytes)
-  setSchemaVersion(configPath, version)
+  // A migration is a PLUR write: keep the backup gate's baseline in step
+  // (decision P2). The staged save above recorded the staging file's name.
+  recordLastWritten(engramsPath, countEntries(engramsPath, bytes))
+  try {
+    setSchemaVersion(configPath, version)
+  } catch (stampErr) {
+    try {
+      if (before === null) fs.rmSync(engramsPath, { force: true })
+      else {
+        atomicWrite(engramsPath, before)
+        // The restore is a PLUR write too: keep the backup gate's baseline in step.
+        recordLastWritten(engramsPath, countEntries(engramsPath, before))
+      }
+    } catch (restoreErr) {
+      // The journal stays: the next run finds the migrated corpus and finishes the stamp.
+      throw new Error(
+        `Recording schema_version ${version} in ${configPath} failed (${stampErr}), and restoring ` +
+        `engrams.yaml afterwards failed too (${restoreErr}). engrams.yaml is at schema ${version} but ` +
+        `config.yaml says ${fromVersion}: set schema_version: ${version} in ${configPath} by hand, or ` +
+        `restore ${engramsPath} from its .bak.${fromVersion}.`,
+      )
+    }
+    fs.unlinkSync(journalPath)
+    fsyncDir(join(engramsPath, '..'))
+    throw new Error(
+      `Recording schema_version ${version} in ${configPath} failed: ${stampErr}. ` +
+      `engrams.yaml was restored to its previous contents; nothing changed (still schema ${fromVersion}).`,
+    )
+  }
   fs.unlinkSync(journalPath)
   fsyncDir(join(engramsPath, '..'))
+}
+
+function countEntries(engramsPath: string, bytes: Buffer): number {
+  try {
+    return engramStoreEntries(engramsPath, bytes.toString('utf8'), bytes.length).length
+  } catch {
+    return 0
+  }
 }
 
 /**
@@ -176,7 +236,7 @@ function commitMigration(engramsPath: string, configPath: string, engrams: Retur
  * - Checks schema_version in config
  * - Creates backup before running
  * - Applies each pending migration in order
- * - Leaves the live corpus untouched if any transformation fails
+ * - If any migration fails, writes nothing (the live file is left as it was)
  * - Updates schema_version after success
  */
 export function runMigrations(
@@ -229,9 +289,10 @@ export function runMigrations(
         applied.push(migration.id)
       } catch (err) {
         logger.error(`Migration ${migration.id} failed: ${err}`)
-        // Only memory changed. A version backup may predate successful writes;
-        // restoring it here would destroy those newer records.
-        throw new Error(`Migration ${migration.id} failed: ${err}. Live engrams unchanged.`)
+        // Nothing has been written yet: the live file is untouched. Do NOT copy
+        // the (possibly older) backup over it — a version backup may predate
+        // successful writes; see the note above commitMigration.
+        throw new Error(`Migration ${migration.id} failed: ${err}. engrams.yaml was not modified.`)
       }
     }
 
@@ -239,7 +300,9 @@ export function runMigrations(
       // Migrations rewrite the entire corpus by design, and a migration that
       // legitimately drops records would otherwise trip the save-side shrink
       // guard (#801). Declaring it here keeps the guard armed everywhere else.
-      commitMigration(engramsPath, configPath, engrams, currentVersion + applied.length)
+      // Inside the corpus lock: the corpus and the version it claims to be at
+      // must become visible together, or they can disagree.
+      commitMigration(engramsPath, configPath, engrams, currentVersion, currentVersion + applied.length)
     }
   })
 
@@ -292,13 +355,13 @@ export function rollbackMigrations(
         rolledBack.push(migration.id)
       } catch (err) {
         logger.error(`Rollback of ${migration.id} failed: ${err}`)
-        throw new Error(`Rollback of ${migration.id} failed: ${err}. Live engrams unchanged.`)
+        throw new Error(`Rollback of ${migration.id} failed: ${err}. engrams.yaml was not modified.`)
       }
     }
 
     // A down() migration legitimately removes fields and can remove records;
     // the shrink guard must not veto a deliberate rollback.
-    commitMigration(engramsPath, configPath, engrams, targetVersion)
+    commitMigration(engramsPath, configPath, engrams, currentVersion, targetVersion)
   })
 
   if (noop) {

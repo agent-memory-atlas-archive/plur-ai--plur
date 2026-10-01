@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as fs from 'node:fs'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { tmpdir, hostname } from 'node:os'
 import { ALL_MIGRATIONS, getSchemaVersion, runMigrations, rollbackMigrations, setSchemaVersion } from '../src/migrations/runner.js'
 import { saveEngrams } from '../src/engrams.js'
 import { EngramSchemaPassthrough } from '../src/schemas/engram.js'
@@ -11,30 +11,46 @@ import { EngramSchemaPassthrough } from '../src/schemas/engram.js'
 let root: string
 let store: string
 let config: string
-const fault = vi.hoisted(() => ({ path: '' }))
+// Crash injection (owner decision 2026-10-01, PR #1252). A schema stamp that
+// THROWS in a live process rolls the corpus back (main's
+// formal-r2-persist-schema-stamp test); the recovery journal exists for the
+// other case — the process DIES between the corpus write and the stamp, so
+// nothing can roll back. To model that death in-process: the write to
+// `fault.path` fails, and from then on nothing this "dead" process writes
+// through atomicWrite reaches disk (its rollback attempt included). What is
+// left on disk is exactly a crash's state: replaced corpus, journal, old
+// config. `restart()` brings the process back.
+const fault = vi.hoisted(() => ({ path: '', dead: false }))
 vi.mock('../src/sync.js', async importOriginal => {
   const original = await importOriginal<typeof import('../src/sync.js')>()
   return { ...original, atomicWrite: (...args: Parameters<typeof original.atomicWrite>) => {
-    if (args[0] === fault.path) throw new Error('injected commit interruption')
+    if (fault.dead) throw new Error('process is dead: write never reached disk')
+    if (args[0] === fault.path) {
+      fault.dead = true
+      throw new Error('simulated crash between corpus write and version stamp')
+    }
     return original.atomicWrite(...args)
   } }
 })
+function crashAtStamp(): void { fault.path = config; fault.dead = false }
+function restart(): void { fault.path = ''; fault.dead = false }
+
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), 'plur-migration-preserve-'))
   store = join(root, 'engrams.yaml')
   config = join(root, 'config.yaml')
-  fault.path = ''
+  restart()
 })
 
-it.each(['up', 'down'] as const)('recovers %s after corpus replacement but before the version stamp', direction => {
+it.each(['up', 'down'] as const)('recovers %s after a crash between corpus replacement and the version stamp', direction => {
   saveEngrams(store, [row(1), row(2)])
   setSchemaVersion(config, direction === 'up' ? 0 : ALL_MIGRATIONS.length)
   const run = () => direction === 'up' ? runMigrations(store, config) : rollbackMigrations(store, config, 0)
-  fault.path = config
-  expect(run).toThrow('injected commit interruption')
+  crashAtStamp()
+  expect(run).toThrow('simulated crash between corpus write and version stamp')
   const committed = fs.readFileSync(store, 'utf8')
   expect(fs.existsSync(`${store}.migration.json`)).toBe(true)
-  fault.path = ''
+  restart()
   for (const migration of ALL_MIGRATIONS) vi.spyOn(migration, direction).mockImplementation(() => { throw new Error('must not replay') })
   run()
   expect(fs.readFileSync(store, 'utf8')).toBe(committed)
@@ -42,17 +58,32 @@ it.each(['up', 'down'] as const)('recovers %s after corpus replacement but befor
   expect(fs.existsSync(`${store}.migration.json`)).toBe(false)
 })
 
-it('does not overwrite intervening writes while recovering an interrupted migration', () => {
+it('does not overwrite intervening writes while recovering a migration interrupted by a crash', () => {
   saveEngrams(store, [row(1)])
   setSchemaVersion(config, 0)
-  fault.path = config
-  expect(() => runMigrations(store, config)).toThrow('injected commit interruption')
-  fault.path = ''
+  crashAtStamp()
+  expect(() => runMigrations(store, config)).toThrow('simulated crash between corpus write and version stamp')
+  restart()
   saveEngrams(store, [row(1), row(2)])
   const newer = fs.readFileSync(store, 'utf8')
   expect(() => runMigrations(store, config)).toThrow(/reconcile/)
   expect(fs.readFileSync(store, 'utf8')).toBe(newer)
 })
+it('a stamp that throws in a live process rolls back and leaves no journal (owner decision 2026-10-01)', () => {
+  saveEngrams(store, [row(1), row(2)])
+  setSchemaVersion(config, 0)
+  const before = fs.readFileSync(store, 'utf8')
+  // A live holder of the config lock: setSchemaVersion gives up and throws.
+  fs.writeFileSync(`${config}.lock`, `${hostname()}:${process.pid}:1:0`)
+  try {
+    expect(() => runMigrations(store, config)).toThrow(/restored to its previous contents/)
+  } finally {
+    fs.unlinkSync(`${config}.lock`)
+  }
+  expect(fs.readFileSync(store, 'utf8')).toBe(before)
+  expect(getSchemaVersion(config)).toBe(0)
+  expect(fs.existsSync(`${store}.migration.json`)).toBe(false)
+}, 30_000)
 afterEach(() => { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }) })
 
 function row(n: number) {
@@ -149,12 +180,12 @@ describe('round-2 review: configuration shapes, file modes and actionable refusa
     expect(fs.statSync(`${store}.bak.0`).mode & 0o777).toBe(0o600)
   })
 
-  it('names the journal and how to reconcile when an interrupted migration cannot complete', () => {
+  it('names the journal and how to reconcile when a migration interrupted by a crash cannot complete', () => {
     saveEngrams(store, [row(1)])
     setSchemaVersion(config, 0)
-    fault.path = config
-    expect(() => runMigrations(store, config)).toThrow('injected commit interruption')
-    fault.path = ''
+    crashAtStamp()
+    expect(() => runMigrations(store, config)).toThrow('simulated crash between corpus write and version stamp')
+    restart()
     saveEngrams(store, [row(1), row(2)])
     let message = ''
     try { runMigrations(store, config) } catch (error) { message = String(error) }
