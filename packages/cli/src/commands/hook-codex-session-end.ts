@@ -1,6 +1,7 @@
 import { unlinkSync } from 'fs'
 import { type GlobalFlags } from '../plur.js'
-import { isPlurConfigured } from '../lib/plur-configured.js'
+import { hookFolderOn, payloadDir, plurRoot } from '../lib/folder-gate.js'
+import { endFolderNonceSession } from '@plur-ai/core'
 import { flushOutboxForHook, HOOK_OUTBOX_BUDGET_MS } from '../lib/hook-outbox-flush.js'
 import {
   readStdinJson,
@@ -36,9 +37,12 @@ import {
  */
 export async function run(_args: string[], flags: GlobalFlags): Promise<void> {
   await runCodexHook('codex session-end', async () => {
-    if (!isPlurConfigured()) return
-
     const input = readStdinJson()
+    // #1347: this session's ask-flow nonces expire with it, whatever the mode.
+    const endingId = typeof input.session_id === 'string' ? input.session_id : ''
+    if (endingId) try { endFolderNonceSession(plurRoot(flags), endingId) } catch { /* best-effort */ }
+    // Otherwise silent unless the folder map says on (#1347).
+    if (!hookFolderOn(payloadDir(input), flags)) return
     const sessionId = codexSessionId(input)
     if (sessionId && sessionDirSafeToSweep(sessionDir())) {
       // Never unlink through a symlinked or foreign directory (cli#8) — the

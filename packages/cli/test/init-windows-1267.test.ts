@@ -111,8 +111,9 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     const shim = join(home, '.plur', 'bin', 'plur-hook.cmd').replace(/\\/g, '/')
     const cursor = JSON.parse(readFileSync(join(home, '.cursor', 'hooks.json'), 'utf-8'))
     const commands = Object.values(cursor.hooks as Record<string, HookSpec[]>).flat().map((h) => h.command)
-    expect(commands.length).toBe(4)
-    for (const c of commands) expect(c.startsWith(`& "${shim}" hook-cursor-`)).toBe(true)
+    // Four hook-cursor-* hooks plus the auto-rate afterAgentResponse hook (#1310).
+    expect(commands.length).toBe(5)
+    for (const c of commands) expect(c.startsWith(`& "${shim}" hook-cursor-`) || c === `& "${shim}" hook-auto-rate cursor`, c).toBe(true)
   })
 
   it('two init runs leave exactly one PLUR hook set per event', () => {
@@ -123,8 +124,13 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     expect(second.hooks).toEqual(first.hooks)
     for (const entries of Object.values(second.hooks ?? {})) {
       const perMatcher = new Map<string, number>()
-      for (const e of entries) perMatcher.set(e.matcher ?? '', (perMatcher.get(e.matcher ?? '') ?? 0) + 1)
-      // Every event's PLUR entries are distinct matchers — nothing doubled.
+      // Keyed by matcher and the hooks' subcommands: Stop carries two '*'
+      // entries by design, hook-learn-check and the auto-rate hook (#1310).
+      for (const e of entries) {
+        const key = `${e.matcher ?? ''}|${e.hooks.map((h) => h.args?.slice(1).join(' ')).join(',')}`
+        perMatcher.set(key, (perMatcher.get(key) ?? 0) + 1)
+      }
+      // Every event's PLUR entries are distinct — nothing doubled.
       for (const n of perMatcher.values()) expect(n).toBe(1)
     }
   })
@@ -150,9 +156,10 @@ describe('plur init on win32 with a home dir containing a space (#1267)', { time
     const commands = allCommands(settings)
     expect(commands.some((c) => c.includes(winHome))).toBe(false)
     expect(settings.hooks?.UserPromptSubmit?.filter((e) => e.hooks[0].args?.[1] === 'hook-inject')).toHaveLength(1)
-    // hook-session-remind once, plus (since #1274) the compact rehydrate.
-    expect(settings.hooks?.SessionStart?.map((e) => e.hooks[0].args?.slice(1).join(' '))).toEqual(['hook-session-remind', 'hook-inject --rehydrate'])
-    expect(settings.hooks?.Stop).toHaveLength(1)
+    // hook-session-remind once, the resume re-ask (#1347), plus (since #1274) the compact rehydrate.
+    expect(settings.hooks?.SessionStart?.map((e) => e.hooks[0].args?.slice(1).join(' '))).toEqual(['hook-session-remind', 'hook-session-resume', 'hook-inject --rehydrate'])
+    // hook-learn-check once (the two legacy copies are gone), plus #1310's auto-rate.
+    expect(settings.hooks?.Stop?.map((e) => e.hooks[0].args?.slice(1).join(' '))).toEqual(['hook-learn-check', 'hook-auto-rate claude'])
     // The user's own hook survives.
     expect(commands).toContain('C:\\tools\\my-own-hook.exe')
   })

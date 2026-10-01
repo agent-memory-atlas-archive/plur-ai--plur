@@ -67,7 +67,9 @@ export class StubServer {
   // user; override per-test with setMe() to simulate multi-team authorization.
   // #345 D2: scope_metadata is optional and defaults to absent so older-server
   // behavior is the default; setMe({ scope_metadata }) opts a test into it.
-  private me: { username: string; org_id: string; role: string; scopes: string[]; scope_metadata?: unknown[] } = {
+  // #1310: `capabilities` is optional and absent by default (older server);
+  // setMe({ capabilities: ['feedback.source'] }) simulates a capable server.
+  private me: { username: string; org_id: string; role: string; scopes: string[]; scope_metadata?: unknown[]; capabilities?: unknown[] } = {
     username: 'testuser', org_id: 'test-org', role: 'developer', scopes: ['group:test'],
   }
   /** When set, POST /engrams returns this as the assigned id instead of a valid
@@ -118,6 +120,21 @@ export class StubServer {
    *  number — lets a test hold one write on the wire while another client runs
    *  (deterministic interleaving across two clients). */
   appendHook: ((n: number) => Promise<void>) | null = null
+  /** Every POST /engrams/:id/feedback body received, in order (#1310: assert
+   *  whether `source` was sent). */
+  feedbackBodies: Array<Record<string, unknown>> = []
+  /** Number of GET /api/v1/me requests received (#1310 capability caching). */
+  meCalls = 0
+  /** Number of GET /api/v1/engrams/:id requests received (#1318 review: remote
+   *  ids are fetched only from stores that advertise the capability). */
+  getByIdCalls = 0
+  /** Delay before answering POST /engrams/:id/feedback, ms — to simulate a
+   *  slow server a hook watchdog cuts off mid-way (#1318 review). */
+  feedbackDelayMs = 0
+  /** When set, GET /api/v1/me answers only after this settles — a server
+   *  that holds the answer while the test changes the client's world (#1415
+   *  review: a folder swapped for a symlink to $HOME during the round trip). */
+  beforeMe: (() => void | Promise<void>) | null = null
 
   // --- POST /api/v1/recall (#776 server-authoritative recall envelope) ---
   /** Rows served in the envelope's `results` (top-level engram shape, each
@@ -148,7 +165,7 @@ export class StubServer {
   /** Override the GET /api/v1/me response (authorized scope set, identity).
    *  #345 D2: pass `scope_metadata` to simulate a server that serves
    *  self-describing scope metadata. */
-  setMe(me: Partial<{ username: string; org_id: string; role: string; scopes: string[]; scope_metadata: unknown[] }>): void {
+  setMe(me: Partial<{ username: string; org_id: string; role: string; scopes: string[]; scope_metadata: unknown[]; capabilities: unknown[] }>): void {
     this.me = { ...this.me, ...me }
   }
 
@@ -251,6 +268,11 @@ export class StubServer {
     this.recallCalls = 0
     this.lastRecallBody = null
     this.lastAppendBody = null
+    this.feedbackBodies = []
+    this.meCalls = 0
+    this.getByIdCalls = 0
+    this.feedbackDelayMs = 0
+    this.beforeMe = null
   }
 
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -267,6 +289,13 @@ export class StubServer {
 
     // GET /api/v1/me — resolved identity + authorized scopes (#292)
     if (method === 'GET' && path === '/api/v1/me') {
+      this.meCalls++
+      const hook = this.beforeMe
+      if (hook) {
+        const me = this.me
+        Promise.resolve().then(() => hook()).then(() => this.json(res, 200, me), () => this.json(res, 500, { error: 'beforeMe failed' }))
+        return
+      }
       this.json(res, 200, this.me)
       return
     }
@@ -403,6 +432,7 @@ export class StubServer {
     // GET /api/v1/engrams/:id — get by ID
     const idMatch = path.match(/^\/api\/v1\/engrams\/([^/]+)$/)
     if (method === 'GET' && idMatch) {
+      this.getByIdCalls++
       const id = decodeURIComponent(idMatch[1])
       const engram = this.engrams.get(id)
       if (!engram) {
@@ -486,7 +516,9 @@ export class StubServer {
         this.json(res, 404, { error: 'Not found' })
         return
       }
-      this.readBody(req, (body) => {
+      this.readBody(req, async (body) => {
+        if (this.feedbackDelayMs > 0) await new Promise(r => setTimeout(r, this.feedbackDelayMs))
+        this.feedbackBodies.push(body)
         const signal = body.signal as string
         const data = engram.data as any
         if (!data.feedback_signals) {

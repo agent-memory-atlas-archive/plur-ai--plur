@@ -71,8 +71,9 @@ Commands:
   stores add <path>       Add a knowledge store
   stores add --url <u>    Add a remote store (verified; --scope, --token-env)
   stores prune            Remove config.yaml store entries that name the primary store file (#1356)
-  trust [dir]             Trust a directory's .plur.yaml scope/domain (default: cwd) [--list] [--nonce <n>]
-  untrust [dir]           Revoke a directory's trust grant (default: cwd)
+  remote                  Show this folder's team-store connection and check it (#1413)
+  remote --url <u> --token <t> --scope <s>
+                          Connect this folder to a team store (verified; [--scopes a,b])
   folders list            Your per-folder decisions (~/.plur/folders.yaml, #1347)
   folders set <folder>    --scope <s> | --on | --off | --ask  [--trusted|--no-trusted] [--nonce <n>]
   folders rm <folder>     Remove a folder's entry
@@ -83,7 +84,6 @@ Commands:
   reindex-tokens          Re-derive BM25 tokens after a tokenizer change (Postgres only)
   reindex-hashes          Repair engrams whose content_hash is stale or missing (#852)
   init                    Wire PLUR into detected harnesses (Claude Code, Cursor, Codex, Antigravity)
-  init-remote             Opt this project into recall from a PLUR Enterprise server
   login --status          Enterprise token validity per host (probe + expiry) (#587)
   doctor                  Diagnose Claude Code / Claude Desktop / Cursor / Codex / Antigravity / opencode integration
   rerank-eval             Per-store reranker self-eval gate (advisory, #451)
@@ -97,12 +97,14 @@ Commands:
   hook-session-end        (internal) SessionEnd hook — auto-close memory lifecycle
   hook-session-mark       (internal) Hook handler for session sentinel
   hook-session-remind     (internal) Hook handler for session start reminder
+  hook-session-resume     (internal) SessionStart(resume) hook: re-ask the folder question
   hook-correction-detect  (internal) UserPromptSubmit hook — detect corrections
   hook-revert-detect      (internal) PostToolUse hook — detect revert operations
   hook-cursor-session-start (internal) Cursor sessionStart hook handler
   hook-cursor-guard      (internal) Cursor preToolUse hook handler
   hook-cursor-post-tool  (internal) Cursor postToolUse hook handler
   hook-cursor-stop       (internal) Cursor stop hook handler
+  hook-auto-rate <editor> (internal) End-of-turn hook — rate injected engrams from the reply
   hook-codex-session-start (internal) Codex SessionStart hook handler
   hook-codex-inject      (internal) Codex UserPromptSubmit hook handler
   hook-codex-guard       (internal) Codex PreToolUse hook handler
@@ -169,6 +171,10 @@ const COMMANDS: Record<string, string> = {
   rescope: './commands/rescope.js',
   'similarity-search': './commands/similarity-search.js',
   stores: './commands/stores.js',
+  remote: './commands/remote.js',
+  // Hidden from --help (#1413, design r3): trust is granted by the ask flow,
+  // `plur folders set <dir> --trusted` or the trust.yaml import. Both keep
+  // working so existing scripts and runbooks do.
   trust: './commands/trust.js',
   untrust: './commands/untrust.js',
   folders: './commands/folders.js',
@@ -178,6 +184,7 @@ const COMMANDS: Record<string, string> = {
   'reindex-hashes': './commands/reindex-hashes.js',
   migrate: './commands/migrate.js',
   init: './commands/init.js',
+  // Hidden alias of `remote` (#1413); `--verify` is bare `plur remote`.
   'init-remote': './commands/init-remote.js',
   // `login` is registered for `--status` (#587: token validity per host). The
   // OAuth device flow itself (#532) stays GATED INSIDE the command — it is
@@ -196,12 +203,14 @@ const COMMANDS: Record<string, string> = {
   'hook-session-end': './commands/hook-session-end.js',
   'hook-session-mark': './commands/hook-session-mark.js',
   'hook-session-remind': './commands/hook-session-remind.js',
+  'hook-session-resume': './commands/hook-session-resume.js',
   'hook-correction-detect': './commands/hook-correction-detect.js',
   'hook-revert-detect': './commands/hook-revert-detect.js',
   'hook-cursor-session-start': './commands/hook-cursor-session-start.js',
   'hook-cursor-guard': './commands/hook-cursor-guard.js',
   'hook-cursor-post-tool': './commands/hook-cursor-post-tool.js',
   'hook-cursor-stop': './commands/hook-cursor-stop.js',
+  'hook-auto-rate': './commands/hook-auto-rate.js',
   'hook-codex-session-start': './commands/hook-codex-session-start.js',
   'hook-codex-inject': './commands/hook-codex-inject.js',
   'hook-codex-guard': './commands/hook-codex-guard.js',

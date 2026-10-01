@@ -299,8 +299,8 @@ function installMcpBinary(): { shimPath: string; status: string } {
 
 // Enforcement hooks ensure plur_session_start is always called first.
 // Installed into global ~/.claude/settings.json unconditionally (issue #95) so
-// they fire from any subdirectory project. Each hook silent-passes when
-// isPlurConfigured() is false, so projects without plur are unaffected.
+// they fire from any subdirectory project. Each hook silent-passes unless the
+// folder map says on (#1347), so folders without plur are unaffected.
 export function buildEnforcementHooks(launch: HookLaunch | string): Record<string, HookEntry[]> {
   const mk = asHookLaunch(launch)
   return {
@@ -308,6 +308,16 @@ export function buildEnforcementHooks(launch: HookLaunch | string): Record<strin
       {
         hooks: [
           { type: 'command', ...mk('hook-session-remind'), timeout: 3 },
+        ],
+      },
+      // `claude --resume` keeps the session id, and SessionEnd below deleted
+      // its folder-question nonces: forget that the session was asked, so the
+      // resumed session asks again with a fresh nonce (#1347, option C). In
+      // the same file as SessionEnd, so the pair is always installed together.
+      {
+        matcher: 'resume',
+        hooks: [
+          { type: 'command', ...mk('hook-session-resume'), timeout: 3 },
         ],
       },
     ],
@@ -440,6 +450,17 @@ export function buildInjectionHooks(launch: HookLaunch | string): Record<string,
         matcher: '*',
         hooks: [
           { type: 'command', ...mk('hook-learn-check'), timeout: 2 },
+        ],
+      },
+      // Auto-rate injected engrams from the reply (#1310). Its own entry.
+      // Synchronous on purpose: verified in a real `claude -p` session, an
+      // async Stop hook is killed when the session exits and never rates the
+      // last (in headless mode, the only) reply. It skips without opening the
+      // store when nothing was injected, and is bounded well inside 10s.
+      {
+        matcher: '*',
+        hooks: [
+          { type: 'command', ...mk('hook-auto-rate', 'claude'), timeout: 10 },
         ],
       },
     ],
@@ -1610,7 +1631,7 @@ export async function run(args: string[], flags: GlobalFlags): Promise<void> {
   outputInfo(`  command: ${entry.command} ${entry.args.join(' ')}`, flags)
   outputInfo('', flags)
   outputInfo(`Enforcement hooks (4, always global): ${enforcementHooksStatus}`, flags)
-  outputInfo('  SessionStart      — enforce plur_session_start before any work', flags)
+  outputInfo('  SessionStart      — enforce plur_session_start before any work; on resume, re-ask the folder question', flags)
   outputInfo('  SessionEnd        — auto-close memory lifecycle (captures closing episode)', flags)
   outputInfo('  PreToolUse        — session guard (blocks tools until session started)', flags)
   outputInfo('  PostToolUse       — session sentinel (marks session as started)', flags)

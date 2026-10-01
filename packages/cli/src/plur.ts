@@ -135,10 +135,18 @@ export function getLastPlurInstance(): Plur | null {
  * mutation throws `ReadonlyStoreError`, and recall skips its activation
  * refresh. Read-only commands (`list`, `status`, `tensions` list mode) pass it
  * so lazy engine side-effects cannot mutate the store from a pure query.
+ *
+ * `autoDiscover: false` skips the constructor's walk for a `<cwd>/.plur`
+ * store, which otherwise registers that store in config.yaml. The folder
+ * question passes it: asking about a folder must change nothing (#1418 review).
  */
-export function createPlur(flags: GlobalFlags, options?: { readonly?: boolean }): Plur {
+export function createPlur(flags: GlobalFlags, options?: { readonly?: boolean; autoDiscover?: boolean }): Plur {
   const path = flags.path || process.env.PLUR_PATH || undefined
-  lastInstance = new Plur({ path, readonly: options?.readonly })
+  lastInstance = new Plur({
+    path,
+    readonly: options?.readonly,
+    ...(options?.autoDiscover !== undefined ? { autoDiscover: options.autoDiscover } : {}),
+  })
   return lastInstance
 }
 
