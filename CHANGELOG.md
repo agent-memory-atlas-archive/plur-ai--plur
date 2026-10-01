@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.21.0
+
+Team memory you can trust, in every editor.
+
+- Team writes never vanish silently
+- Per-folder memory decisions
+- Windows setup fixed
+- Faster first prompt
+
+### The first prompt of a session no longer waits on a cold embedding cache (#1414)
+
+**The first prompt of every session blocked for about 14 seconds**, because the
+hooks never built the embedding cache: hybrid search missed its deadline, fell
+back to keyword search, and nothing ever warmed the cache, so it never got
+better. When that happens now, `plur hook-inject` starts one background build at
+the lowest CPU priority, one per store, stopped after an hour, and the cache is
+saved once the whole store is embedded.
+
+### Forgetting an engram reaches the store that holds it (#1209, #1126)
+
+**`plur forget` could stop at the wrong remote store.** Two different scopes can
+share the same three-letter id prefix, so a store that could not be reached was
+taken for the intended target and the walk stopped there with "Cannot reach …",
+before it reached the store that held the engram. The walk now finishes, and
+reports an unreachable store only if no store retired the engram.
 
 ### A push claim is released only by the writer that took it
 
@@ -656,7 +680,7 @@ just written, after a live connectivity check. And a nonce shows that a
 command matches an answer the question offered; it does not show that a
 person chose that answer.
 
-### A failed hook no longer prints an error document to the editor
+### A failed hook no longer prints an error document to the editor (#1422)
 
 **When a `plur hook-*` command threw, the CLI printed `{"error": …}` on
 stdout and exited 1**. Editors read a hook's stdout as its result and show
@@ -711,7 +735,7 @@ opencode project)` when `--opencode` forced it.
   left as it is; init no longer appends a second, bare entry that opencode
   would load in its place.
 
-### `plur init` works on Windows, including home directories with a space
+### `plur init` works on Windows, including home directories with a space (#1270)
 
 **An enterprise deployment reported editors on Windows not set up, or set up
 twice** (#1267). Three separate faults:
@@ -1105,7 +1129,7 @@ repo's request. Only the CLI writes the map.
     the folder you give it.
   - A `~` in the map expands to your home as written and to its canonical path.
 
-### A refused write to one scope no longer pauses writes to the whole server
+### A refused write to one scope no longer pauses writes to the whole server (#1309)
 
 **A few refused writes to one scope could stop queued writes to every other
 scope on the same server** (#1308). Each failed outbox push counted toward the
@@ -1118,7 +1142,7 @@ Now a 401/403/404/422 answer to an outbox push neither counts toward the
 breaker nor resets it. Network errors, timeouts and 5xx still count, so a
 server that is really down still opens it.
 
-### Queued writes that can never succeed now say so
+### Queued writes that can never succeed now say so (#1307)
 
 **A queued team write the store keeps refusing was silent** (#1299). On one
 developer store, ten writes had been refused with `403 Cannot write to scope`
@@ -1159,7 +1183,7 @@ at once. **Nothing is dropped, rescoped or rewritten automatically.** Only the
 retry bookkeeping changes: `attempt_count`, `last_attempt`, `last_error` and
 `last_status`.
 
-### SessionEnd finds the checkpoint for session ids with unusual characters
+### SessionEnd finds the checkpoint for session ids with unusual characters (#1400)
 
 **`plur hook-session-end` could miss the session checkpoint, so the session
 was not auto-closed.** The Stop hook writes the checkpoint under a key that
@@ -1260,7 +1284,7 @@ looked for `./engrams.yaml` in the current directory, so it skipped a store
 under `~/.plur` that had queued writes. An empty value now counts as unset,
 as it does everywhere else (#1395).
 
-### Claude Code: one full injection per session, and the reminder fires
+### Claude Code: one full injection per session, and the reminder fires (#1396)
 
 **Every prompt in a Claude Code session re-ran the full "session started"
 injection, and the 10-minute memory reminder never fired** (#1278). The
